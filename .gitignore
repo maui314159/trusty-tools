@@ -6,3 +6,36 @@
 *.redb
 .idea/
 .vscode/
+.fastembed_cache/
+
+# MCP config (machine-local)
+.mcp.json
+.trusty-search
+
+# Ignore all of .claude/ and .claude-mpm/ by default, then re-include what we want
+.claude/
+.claude-mpm/*
+
+# Re-include tracked files from .claude/
+!.claude/
+!.claude/settings.json
+!.claude/agents/
+!.claude/agents/**
+
+# Re-include tracked files from .claude-mpm/
+!.claude-mpm/INSTRUCTIONS.md
+!.claude-mpm/AGENT_DELEGATION.md
+
+# Exclude local-only Claude settings
+.claude/settings.local.json
+
+# Exclude internal PM artifacts
+.claude-mpm/logs/
+.claude-mpm/responses/
+.claude-mpm/templates/
+.claude-mpm/config/
+.claude-mpm/PM_INSTRUCTIONS*.md
+.claude-mpm/pm_skills_registry.yaml
+
+!CLAUDE.md
+!README.md

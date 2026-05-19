@@ -1,0 +1,134 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(rustup *)",
+      "Bash(rustc *)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(cp *)",
+      "Bash(rsync *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/masa/.cache/uv/archive-v0/hUv7Yod7WmAiyltgOpfy0/lib/python3.12/site-packages/claude_mpm/scripts/claude-hook-fast.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
