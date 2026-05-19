@@ -1,0 +1,32 @@
+[package]
+name = "trusty-rpc"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "General-purpose CLI for JSON-RPC services (stdio + HTTP)"
+keywords = ["jsonrpc", "mcp", "cli", "rpc"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "trpc"
+path = "src/main.rs"
+
+[dependencies]
+trusty-mcp-core = { path = "../trusty-mcp-core" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "io-std", "macros", "rt", "rt-multi-thread", "sync", "process"] }
+reqwest = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+colored = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "io-std", "macros", "rt", "rt-multi-thread", "sync", "process", "net", "time"] }

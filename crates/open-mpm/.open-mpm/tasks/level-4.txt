@@ -1,0 +1,89 @@
+Build a Document Processing Pipeline (Level 4 of the AI Coding Bake-Off challenge).
+
+## Problem
+Design a document processing pipeline with text extraction, NLP analysis, full-text search indexing, and REST API, with extensible plugin architecture.
+
+## Language/Stack
+- Python 3.12+ with type hints
+- Web framework: FastAPI
+- SQLite with FTS5 for search
+- NLP library: spaCy for entity extraction
+- Document types: PDF (.pdf), text (.txt, .md)
+- PDF extraction: pypdf or pdfplumber
+
+## Pipeline Stages (Extensible)
+1. Ingestion: Watch directory for new PDF/text files, route to extractors
+2. Text Extraction: .txt/.md read directly; .pdf extract using library
+3. NLP Processing: Entity extraction (people, orgs, locations), key phrase extraction, summary (first N sentences), word count and reading time
+4. Indexing: Full-text search with relevance ranking using SQLite FTS5
+5. Storage: Persist metadata in SQLite
+
+## REST API Endpoints
+- POST /api/documents/upload
+- GET /api/documents
+- GET /api/documents/{id}
+- DELETE /api/documents/{id}
+- GET /api/search?q=query
+- GET /api/search?q=query&type=pdf
+- GET /api/entities
+- GET /api/entities?type=PERSON
+- GET /api/stats
+- GET /api/health
+
+## Admin CLI
+python3 -m doc_pipeline reprocess --id 123
+python3 -m doc_pipeline reindex
+python3 -m doc_pipeline stats
+python3 -m doc_pipeline watch /path/to/incoming/
+
+## Architecture Requirements
+1. Plugin Architecture: New stages can be added without modifying existing code. Implement PipelineStage interface/ABC. Support stage ordering and dependencies.
+2. Error Isolation: Failed stages logged, others continue
+3. Architecture Diagram: Mermaid or ASCII showing pipeline flow
+
+## Example NLP Output
+{
+  "document_id": 1,
+  "filename": "q3-earnings.pdf",
+  "file_type": "pdf",
+  "word_count": 2450,
+  "reading_time_minutes": 9.8,
+  "summary": "Q3 revenue increased 12% YoY...",
+  "entities": [
+    {"text": "Amazon", "type": "ORGANIZATION", "count": 15},
+    {"text": "Andy Jassy", "type": "PERSON", "count": 3},
+    {"text": "Seattle", "type": "LOCATION", "count": 2}
+  ],
+  "key_phrases": ["cloud services growth", "operating margin"],
+  "processed_at": "2026-04-01T14:30:00Z",
+  "processing_time_ms": 1250
+}
+
+## Deliverables
+- Pipeline with all 5 stages
+- REST API with all endpoints
+- Admin CLI for management
+- Architecture diagram (Mermaid or ASCII)
+- Comprehensive tests (unit and integration)
+- README documenting architecture decisions
+
+## Evaluation Rubric
+- Correctness (15%): All endpoints work, NLP extraction accurate
+- Code Quality (15%): Clean Python, type hints
+- Architecture (30%): Extensible design, plugin system, modularity
+- Testing (15%): Good test coverage
+- Error Handling (10%): Graceful failures, missing data
+- Documentation (10%): Architecture decisions, setup
+- Bonus - Extensibility (5%): Easy to add new stages
+
+## Output Location
+Save all files to the current working directory (out_dir). The project should be a complete, runnable Python package named doc_pipeline.
+
+## Module Interface (REQUIRED — tests import these directly)
+The following modules MUST exist as flat top-level modules under `doc_pipeline/`:
+- `doc_pipeline/extractors.py` — must export `extract_text(path: Path) -> str`
+- `doc_pipeline/nlp.py` — must export `extract_entities(text: str)`, `extract_key_phrases(text: str)`, `generate_summary(text: str) -> str`
+- `doc_pipeline/pipeline.py` — must export `Pipeline` class with `process(path: Path)` method, and `PipelineStage` base class
+- `doc_pipeline/search.py` — must export `SearchIndex` class with `add(doc_id, title, content)` and `search(query) -> list` methods
+
+Do NOT nest these under subdirectories like `pipeline/stages/`. Internal helpers can be nested but these public interfaces must be directly importable from the package root.

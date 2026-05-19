@@ -1,0 +1,58 @@
+//! `tga classify` — stage 2 (classification cascade) entry point.
+
+use tga::classify::ClassificationPipeline;
+use tga::core::config::{ClassificationConfig, Config};
+use tga::core::db::Database;
+
+use crate::ClassifyArgs;
+
+/// Run the classification stage over previously-collected commits.
+///
+/// Honors `--rules` and `--use-llm` overrides by mutating the
+/// [`ClassificationConfig`] section of the loaded YAML config.
+pub async fn run(config: Config, db: &mut Database, args: ClassifyArgs) -> anyhow::Result<()> {
+    let mut cfg = config;
+
+    // Ensure a classification section exists so overrides have somewhere to land.
+    if cfg.classification.is_none() && (args.rules.is_some() || args.use_llm) {
+        cfg.classification = Some(ClassificationConfig::default());
+    }
+    if let Some(ref mut c) = cfg.classification {
+        if let Some(rules) = args.rules {
+            c.rules_file = Some(rules);
+        }
+        if args.use_llm {
+            c.use_llm = true;
+        }
+    }
+
+    let pipeline = ClassificationPipeline::new(cfg);
+
+    // Backfill mode: fill in only the missing complexity scores and return,
+    // leaving existing category/confidence/method verdicts untouched.
+    if args.backfill_complexity {
+        let updated = pipeline.backfill_complexity(db).await?;
+        println!("Backfilled complexity for {updated} commit(s)");
+        return Ok(());
+    }
+
+    let stats = pipeline.run(db).await?;
+
+    println!(
+        "Classified {}/{} commits ({:.1}% coverage)",
+        stats.classified, stats.total_commits, stats.coverage_pct
+    );
+    if !stats.by_method.is_empty() {
+        println!("By method:");
+        for (method, count) in &stats.by_method {
+            println!("  {method}: {count}");
+        }
+    }
+    if !stats.by_category.is_empty() {
+        println!("By category:");
+        for (category, count) in &stats.by_category {
+            println!("  {category}: {count}");
+        }
+    }
+    Ok(())
+}

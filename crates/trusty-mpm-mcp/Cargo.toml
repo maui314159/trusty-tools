@@ -1,0 +1,24 @@
+[package]
+name = "trusty-mpm-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server exposing trusty-mpm orchestration tools to Claude Code sessions"
+
+[dependencies]
+trusty-mpm-core.workspace = true
+trusty-mcp-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

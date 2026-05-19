@@ -1,0 +1,1340 @@
+//! Reindex orchestration with SSE progress tracking.
+//!
+//! Why: A full reindex of a project may touch hundreds or thousands of files.
+//! The CLI wants to render a progress bar; the daemon wants to fire-and-forget.
+//! This module bridges the two via `tokio::sync::broadcast` channels and a
+//! per-index `ReindexProgress` snapshot stored on `SearchAppState`.
+//!
+//! What:
+//! - `ReindexProgress` — current state of a reindex (status counters + replay
+//!   buffer + broadcast sender).
+//! - `spawn_reindex` — kick off a background task that walks `root_path`,
+//!   indexes each file, and emits progress events.
+//!
+//! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
+
+use crate::core::indexer::CommitTimings;
+use crate::core::memguard::{current_rss_mb, memory_limit_mb};
+use crate::core::registry::{IndexHandle, IndexId};
+use crate::service::walker::{should_skip_content, walk_source_files};
+use crossbeam_utils::atomic::AtomicCell;
+use dashmap::DashMap;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, Mutex, Semaphore};
+
+/// Machine-wide reindex serializer.
+///
+/// Why: The ONNX fastembed model allocates large working buffers per session
+/// (~7–10 GB virtual mem per concurrent `embed()` call on a real codebase).
+/// When multiple `POST /indexes/:id/reindex` requests arrive concurrently
+/// (e.g. benchmark agents, parallel CLI runs), each `spawn_reindex` task
+/// races into `parse_and_embed_files` and the daemon balloons to 28–46 GB,
+/// triggering macOS Jetsam to kill the process.
+///
+/// What: A 1-permit semaphore. Waiting reindexes queue (the SSE stream is
+/// already connected and will start emitting events once the permit is held).
+/// The permit is released when the spawned task's async block returns.
+fn reindex_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(1))
+}
+
+/// Files per parallel batch. Each batch is parsed in parallel via rayon and
+/// embedded in ONNX batches (`EMBED_BATCH_SIZE` chunks at a time inside the
+/// batch). The full `ParsedBatch` (chunk content + embeddings + entities for
+/// every file in the batch) is held in memory until the commit phase finishes.
+///
+/// 128 files bounds peak memory during reindex. On a 595-file repo with ~8
+/// chunks/file, a 512-file batch held ~4k chunks of source content plus their
+/// 384-dim f32 embeddings plus ONNX intermediate activation tensors retained
+/// across the embed loop — pushing RSS to 33–50 GB and triggering macOS Jetsam
+/// kill. With 128 files per batch, the working set caps at ~1k chunks worth of
+/// memory, and the ONNX session arena gets multiple opportunities to release
+/// transient buffers between commits. SSE progress events fire per batch, so a
+/// smaller batch size also gives more granular progress updates — the downside
+/// is slightly more lock-acquisition overhead, which is negligible vs. the
+/// per-batch parse+embed cost.
+const REINDEX_BATCH_SIZE: usize = 128;
+
+/// Per-index, per-process content-hash cache. Used to skip reindexing files
+/// whose content hasn't changed since the last reindex in this daemon's
+/// lifetime. Survives across `POST /indexes/:id/reindex` calls but not daemon
+/// restarts (acceptable: cold start re-embeds everything anyway, and on warm
+/// daemons the user expects "skip unchanged" behaviour).
+fn file_hashes() -> &'static DashMap<IndexId, Arc<DashMap<PathBuf, String>>> {
+    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, String>>>> = OnceLock::new();
+    FILE_HASHES.get_or_init(DashMap::new)
+}
+
+fn hashes_for(id: &IndexId) -> Arc<DashMap<PathBuf, String>> {
+    file_hashes()
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(DashMap::new()))
+        .clone()
+}
+
+/// Per-index ceiling on the content-hash cache (issue #75). Each entry holds
+/// a `PathBuf` + 64-char hex SHA-256 string, so 200k entries ≈ ~30–60 MB.
+/// When exceeded we drain ~10% of the entries (DashMap has no ordering, so
+/// the eviction set is arbitrary — those files are simply re-hashed on the
+/// next reindex, which is the safe, correct fallback).
+const MAX_FILE_HASHES_PER_INDEX: usize = 200_000;
+
+/// Drop ~10% of entries from `map` when above `MAX_FILE_HASHES_PER_INDEX`.
+///
+/// Why: prevents an unbounded growth in the per-daemon content-hash cache
+/// when a project gets ever-larger or files are renamed many times. The
+/// hash cache is a pure speed optimisation (skip re-embed for unchanged
+/// files), so evicting entries is always safe — affected files just get
+/// re-hashed and re-embedded on the next reindex.
+/// What: collects an arbitrary subset of keys and removes them. DashMap has
+/// no insertion-order metadata so we can't do "true" LRU; arbitrary eviction
+/// is acceptable for a cache whose miss penalty is just extra work.
+/// Test: covered indirectly by the reindex test (oversizing not exercised).
+fn shrink_hashes_if_needed(map: &DashMap<PathBuf, String>) {
+    let len = map.len();
+    if len <= MAX_FILE_HASHES_PER_INDEX {
+        return;
+    }
+    let target = MAX_FILE_HASHES_PER_INDEX * 9 / 10;
+    let to_remove = len.saturating_sub(target);
+    let keys: Vec<PathBuf> = map
+        .iter()
+        .take(to_remove)
+        .map(|e| e.key().clone())
+        .collect();
+    for k in keys {
+        map.remove(&k);
+    }
+    tracing::info!(
+        "file-hash cache exceeded {} entries — dropped {} to bound memory",
+        MAX_FILE_HASHES_PER_INDEX,
+        to_remove
+    );
+}
+
+/// Max replay events buffered on a `ReindexProgress`. A full reindex emits
+/// ~100 events for a 14k-file repo (one per batch + start/complete), but
+/// pathological cases (per-file errors) could otherwise grow the vector
+/// without bound. Late SSE subscribers still see the most recent 500 events,
+/// which is more than enough to replay context.
+const MAX_REPLAY_EVENTS: usize = 500;
+
+/// How long to keep a completed (`Complete` / `Failed`) `ReindexProgress`
+/// on `SearchAppState::reindex_progress` before garbage-collecting it.
+/// 60 s is enough for late SSE subscribers to attach and read the final
+/// state but short enough that long-running daemons don't accumulate
+/// thousands of stale progress entries.
+const REINDEX_PROGRESS_TTL_SECS: u64 = 60;
+
+/// Stable content fingerprint for the "skip unchanged file" optimization.
+///
+/// Why: SHA-256 is collision-resistant and stable across processes, builds,
+/// and Rust versions. `DefaultHasher` (SipHash) is randomized per build and
+/// has weaker collision properties — fine for `HashMap` keys but unsafe for
+/// content fingerprinting where a false negative silently skips a real edit.
+/// What: SHA-256 of the file's UTF-8 bytes, hex-encoded.
+/// Test: see `reindex_walks_directory_and_emits_events` — a re-run of the
+/// reindex with unchanged files must mark them as skipped (proves the hash
+/// is stable across two invocations within the same process).
+fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Capacity of the per-reindex broadcast channel. Lagged subscribers will
+/// drop events older than this — the SSE handler also replays from the buffer
+/// stored in `events`, so late subscribers still see the full history.
+const BROADCAST_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReindexStatus {
+    Running,
+    Complete,
+    /// Issue #120: the reindex aborted because the soft RSS ceiling
+    /// (`TRUSTY_MEMORY_LIMIT_MB`) was breached. Distinguished from `Complete`
+    /// so external callers can apply a cooldown before retrying — re-running
+    /// immediately would just hit the limit again, producing an infinite
+    /// reindex loop.
+    AbortedMemory,
+    Failed,
+}
+
+/// Live state of a reindex. Wrapped in `Arc` and stored on
+/// `SearchAppState::reindex_progress` so concurrent SSE subscribers can read
+/// the same snapshot without coordinating.
+pub struct ReindexProgress {
+    pub status: AtomicCell<ReindexStatus>,
+    pub total_files: std::sync::atomic::AtomicUsize,
+    pub indexed: std::sync::atomic::AtomicUsize,
+    pub total_chunks: std::sync::atomic::AtomicUsize,
+    pub errors: std::sync::atomic::AtomicUsize,
+    /// Files skipped because their content hash matched the previous reindex.
+    pub skipped: std::sync::atomic::AtomicUsize,
+    /// Append-only log of JSON-encoded events. Replayed to late SSE
+    /// subscribers so they don't miss earlier `start` / `progress` events.
+    pub events: Arc<Mutex<Vec<String>>>,
+    /// Live event broadcaster. Subscribers receive new events as they're sent.
+    pub sender: broadcast::Sender<String>,
+}
+
+impl ReindexProgress {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            status: AtomicCell::new(ReindexStatus::Running),
+            total_files: Default::default(),
+            indexed: Default::default(),
+            total_chunks: Default::default(),
+            errors: Default::default(),
+            skipped: Default::default(),
+            events: Arc::new(Mutex::new(Vec::new())),
+            sender,
+        }
+    }
+
+    /// Push an event onto the replay buffer and broadcast it to live subscribers.
+    /// Caps the replay buffer at `MAX_REPLAY_EVENTS` to bound memory under
+    /// pathological reindexes (e.g. one error event per file).
+    pub async fn push(&self, event: serde_json::Value) {
+        let line = event.to_string();
+        {
+            let mut buf = self.events.lock().await;
+            if buf.len() >= MAX_REPLAY_EVENTS {
+                // Drop the oldest event. `remove(0)` is O(n) but n ≤ 500.
+                buf.remove(0);
+            }
+            buf.push(line.clone());
+        }
+        // Broadcast errors (no receivers) are fine — replay buffer still has it.
+        let _ = self.sender.send(line);
+    }
+}
+
+impl Default for ReindexProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawn a background tokio task that walks `handle.root_path`, indexes each
+/// source file, and emits progress events into `progress`.
+///
+/// Returns immediately; the caller (the HTTP handler) drops its reference and
+/// the task runs to completion. When `cleanup_map` is `Some`, the entry for
+/// `handle.id` is removed from the map `REINDEX_PROGRESS_TTL_SECS` after
+/// completion (issue #75: bounds long-running daemon memory by GC'ing stale
+/// progress entries while still letting late SSE subscribers read the final
+/// state for a short window).
+pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, force: bool) {
+    spawn_reindex_with_cleanup(handle, progress, force, None, None);
+}
+
+/// Walk every configured subtree under `handle.root_path`, apply repo-config
+/// filters (`exclude_globs`, `extensions`), and de-duplicate.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator body is dominated by control flow rather than walker plumbing.
+/// `include_paths` empty → walk the whole `root_path`; otherwise walk each
+/// configured subtree and concatenate (this is how `trusty-search.yaml` slices
+/// a polyrepo into independent indexes).
+/// What: returns the merged `WalkResult` whose `files` are sorted and unique.
+/// Test: covered by `reindex_honours_include_paths_filter` below.
+fn collect_files_to_index(handle: &IndexHandle) -> crate::service::walker::WalkResult {
+    let include_paths: Vec<PathBuf> = if handle.include_paths.is_empty() {
+        vec![handle.root_path.clone()]
+    } else {
+        handle.include_paths.clone()
+    };
+    let mut walked_files: Vec<PathBuf> = Vec::new();
+    let mut total_skipped_dirs: usize = 0;
+    for subtree in &include_paths {
+        let w = walk_source_files(subtree);
+        walked_files.extend(w.files);
+        total_skipped_dirs = total_skipped_dirs.saturating_add(w.skipped_dirs);
+    }
+
+    // Apply repo-config filters. These are AND-composed on top of the
+    // walker's built-in ignores (`SKIP_DIRS`, `should_skip_path`).
+    //
+    // 1. `exclude_globs`: drop any file whose path matches one of the
+    //    user-supplied glob patterns.
+    // 2. `extensions`: when non-empty, keep only files whose extension
+    //    appears in the allow-list (caller writes them without the leading
+    //    dot, e.g. `["rs", "py"]`).
+    if !handle.exclude_globs.is_empty() {
+        let excludes = handle.exclude_globs.clone();
+        walked_files.retain(|p| !crate::core::repo_config::path_matches_any_glob(p, &excludes));
+    }
+    if !handle.extensions.is_empty() {
+        let allowed = handle.extensions.clone();
+        walked_files.retain(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| allowed.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                .unwrap_or(false)
+        });
+    }
+
+    // Issue #111: `path_filter` restricts indexing to files under immediate
+    // subdirectories of `root_path` matching one of the configured glob
+    // patterns. Distinct from `include_paths` (absolute subtrees) — this
+    // operates on the *basename* of the first component under `root_path`,
+    // so callers can write `["common-*", "duetto-common*"]` without enumerating
+    // every repo path manually.
+    if !handle.path_filter.is_empty() {
+        let patterns = handle.path_filter.clone();
+        let root = handle.root_path.clone();
+        walked_files.retain(|p| crate::core::registry::path_matches_filter(p, &root, &patterns));
+    }
+
+    // De-duplicate when multiple `include_paths` overlap (e.g. `["."]` plus
+    // `["src"]`). `walk_source_files` returns canonicalised paths inside each
+    // subtree but doesn't dedupe across subtrees.
+    walked_files.sort();
+    walked_files.dedup();
+
+    crate::service::walker::WalkResult {
+        files: walked_files,
+        skipped_dirs: total_skipped_dirs,
+    }
+}
+
+/// Spawn the background RSS poller that watches for `TRUSTY_MEMORY_LIMIT_MB`
+/// breaches. Returns the join handle plus a stop-flag the caller flips when
+/// the reindex finishes.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// memory-protection plumbing is isolated from the batch loop. Always run
+/// even when no `mem_limit` is configured so `peak_rss_mb` is accurate for
+/// the final log line — the overhead is one sysinfo refresh per second.
+/// What: ticks every `MEM_POLL_INTERVAL`, updates `peak_rss` monotonically,
+/// and trips `mem_abort` the first time RSS crosses `mem_limit`.
+fn spawn_memory_poller(
+    mem_limit: Option<u64>,
+    mem_abort: Arc<AtomicBool>,
+    peak_rss: Arc<AtomicU64>,
+    index_id: String,
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+    /// How often the background poller samples RSS. 1 s strikes a balance
+    /// between catching mid-batch spikes and the cost of
+    /// `sysinfo::refresh_processes_specifics` (~1–3 ms on macOS).
+    const MEM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MEM_POLL_INTERVAL);
+        // Drop the immediate first tick so we don't double-sample with the
+        // synchronous `current_rss_mb()` already done before spawning.
+        ticker.tick().await;
+        loop {
+            if stop_clone.load(AtomicOrdering::Acquire) {
+                break;
+            }
+            if let Some(rss) = current_rss_mb() {
+                // Update peak monotonically (CAS loop: the post-commit RSS
+                // check on the main task can race this poller).
+                let mut prev = peak_rss.load(AtomicOrdering::Acquire);
+                while rss > prev {
+                    match peak_rss.compare_exchange_weak(
+                        prev,
+                        rss,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(cur) => prev = cur,
+                    }
+                }
+                if let Some(limit) = mem_limit {
+                    if rss >= limit && !mem_abort.load(AtomicOrdering::Acquire) {
+                        tracing::warn!(
+                            "reindex memory poller: rss={}MB >= limit={}MB \
+                             — tripping abort flag for index {}",
+                            rss,
+                            limit,
+                            index_id,
+                        );
+                        mem_abort.store(true, AtomicOrdering::Release);
+                        // Keep polling so peak_rss continues to track until
+                        // the main loop notices the flag.
+                    }
+                }
+            }
+            ticker.tick().await;
+        }
+    });
+    (handle, stop)
+}
+
+/// Schedule deferred GC of the `reindex_progress` map entry for this index.
+///
+/// Why: issue #75 — bounds long-running daemon memory by GC'ing stale progress
+/// entries while still letting late SSE subscribers read the final
+/// `complete` / `error` event for `REINDEX_PROGRESS_TTL_SECS`.
+fn schedule_progress_cleanup(
+    cleanup_map: Option<Arc<DashMap<IndexId, Arc<ReindexProgress>>>>,
+    cleanup_id: IndexId,
+) {
+    let Some(map) = cleanup_map else {
+        return;
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REINDEX_PROGRESS_TTL_SECS)).await;
+        map.remove(&cleanup_id);
+    });
+}
+
+/// Refresh `handle.context_embedding` and `handle.context_summary` from the
+/// root-level metadata files (issue #112).
+///
+/// Why: cross-index fan-out routing in `POST /search` weights each index by
+/// cosine similarity between the query embedding and the index's stored
+/// context embedding. The embedding is regenerated at the end of every
+/// reindex so it tracks changes to README / CLAUDE.md / manifest files.
+/// What: scrapes metadata via `context_inference::scrape_metadata_summary`,
+/// embeds the resulting string with the indexer's embedder, and writes the
+/// result into the handle's `RwLock`-guarded slots. Failure (no metadata,
+/// no embedder, embed error) leaves the slots as `None` so the router
+/// treats this index with a neutral 1.0 weight.
+/// Test: `context_embedding_populated_after_reindex` in this module.
+async fn refresh_context_embedding(handle: &Arc<IndexHandle>) {
+    use crate::service::context_inference::{make_display_summary, scrape_metadata_summary};
+
+    let Some(summary) = scrape_metadata_summary(&handle.root_path) else {
+        tracing::debug!(
+            "context_inference: no recognised metadata files under {} for index {}",
+            handle.root_path.display(),
+            handle.id.0
+        );
+        *handle.context_embedding.write().await = None;
+        *handle.context_summary.write().await = None;
+        return;
+    };
+
+    let display = make_display_summary(&summary);
+
+    let indexer = handle.indexer.read().await;
+    let embed_result = indexer.embed_text(&summary).await;
+    drop(indexer);
+
+    match embed_result {
+        Ok(Some(vec)) => {
+            *handle.context_embedding.write().await = Some(vec);
+            *handle.context_summary.write().await = Some(display);
+            tracing::info!(
+                "context_inference: refreshed context embedding for index {}",
+                handle.id.0
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "context_inference: no embedder wired on index {} — skipping context embedding",
+                handle.id.0
+            );
+            *handle.context_embedding.write().await = None;
+            *handle.context_summary.write().await = Some(display);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "context_inference: embed failed for index {}: {e}",
+                handle.id.0
+            );
+            *handle.context_embedding.write().await = None;
+            *handle.context_summary.write().await = Some(display);
+        }
+    }
+}
+
+/// Shared context threaded into `process_one_batch` so the per-batch helper
+/// doesn't take a dozen arguments. Cheap to clone (everything is `Arc` /
+/// `PathBuf` / scalar).
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator's per-batch body is testable and bounded in size.
+struct BatchCtx {
+    handle: Arc<IndexHandle>,
+    progress: Arc<ReindexProgress>,
+    root: PathBuf,
+    index_id: IndexId,
+    hashes: Arc<DashMap<PathBuf, String>>,
+    mem_limit: Option<u64>,
+    mem_abort: Arc<AtomicBool>,
+    peak_rss_atomic: Arc<AtomicU64>,
+    started: Instant,
+    total: usize,
+}
+
+/// What a single batch contributed to the run-level totals. The orchestrator
+/// folds each `BatchOutcome` into its accumulators and breaks the batch loop
+/// when `mem_limit_hit` is set.
+#[derive(Default)]
+struct BatchOutcome {
+    parse_ms: u64,
+    embed_ms: u64,
+    bm25_ms: u64,
+    vector_upsert_ms: u64,
+    vector_count: usize,
+    /// True when the post-commit RSS check tripped the abort flag — caller
+    /// must break out of the batch loop.
+    mem_limit_hit: bool,
+}
+
+/// Process a single batch end-to-end: read files, filter (hash-skip,
+/// minified), parse+embed, commit, emit SSE events, and run the post-commit
+/// memory check.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) to bring the
+/// orchestrator's cyclomatic complexity below the threshold. Combines the
+/// stages that share read/filter state into one function whose responsibility
+/// is "advance the index by one batch".
+async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
+    // 1) Read + filter (errors, minified, hash-skip) → BatchPayload.
+    let payload = prepare_batch_payload(ctx, batch).await;
+    if payload.to_index.is_empty() {
+        return BatchOutcome::default();
+    }
+
+    // 2) Parse + embed (read lock) → commit (write lock).
+    let result = parse_embed_and_commit(&ctx.handle, payload.to_index.clone()).await;
+    let (parse_ms, embed_ms, vector_count, commit) = match result {
+        Ok(t) => t,
+        Err(e) => {
+            emit_batch_error(ctx, &payload.to_index_paths, e).await;
+            return BatchOutcome::default();
+        }
+    };
+
+    // 3) Apply success → update totals, persist hashes, emit `batch` event.
+    let batch_files = payload.to_index.len();
+    apply_successful_commit(ctx, payload.new_hashes, batch_files, &commit).await;
+
+    // 4) Post-commit memory check (issue #82).
+    let mem_limit_hit = check_post_commit_memory(ctx);
+
+    BatchOutcome {
+        parse_ms,
+        embed_ms,
+        bm25_ms: commit.bm25_ms,
+        vector_upsert_ms: commit.vector_upsert_ms,
+        vector_count,
+        mem_limit_hit,
+    }
+}
+
+/// Sanitised contents of one batch after read + filter passes.
+struct BatchPayload {
+    to_index: Vec<(String, String)>,
+    to_index_paths: Vec<PathBuf>,
+    new_hashes: Vec<(PathBuf, String)>,
+}
+
+/// Read every file in `batch` concurrently, then drop read errors, minified
+/// content, and hash-matches. Each drop emits the right SSE event so the UI
+/// progress bar advances even for skipped/error files.
+async fn prepare_batch_payload(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchPayload {
+    use std::sync::atomic::Ordering;
+
+    // Read every file in the batch concurrently.
+    let read_futs = batch.iter().map(|path| {
+        let path = path.clone();
+        async move {
+            let content = tokio::fs::read_to_string(&path).await;
+            (path, content)
+        }
+    });
+    let read_results = futures::future::join_all(read_futs).await;
+
+    let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
+    let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
+    let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
+    for (path, content_res) in read_results {
+        let rel = path
+            .strip_prefix(&ctx.root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let content = match content_res {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.progress.errors.fetch_add(1, Ordering::Release);
+                ctx.progress
+                    .push(serde_json::json!({
+                        "event": "error",
+                        "file": rel,
+                        "message": format!("read: {e}"),
+                        "indexed": ctx.progress.indexed.load(Ordering::Acquire),
+                        "total_files": ctx.total,
+                    }))
+                    .await;
+                continue;
+            }
+        };
+        if should_skip_content(&path, &content) {
+            tracing::debug!("reindex: skipping minified content in {}", path.display());
+            emit_skip(ctx, &rel, Some("minified")).await;
+            continue;
+        }
+        let h = hash_content(&content);
+        if ctx
+            .hashes
+            .get(&path)
+            .map(|prev| *prev == h)
+            .unwrap_or(false)
+        {
+            emit_skip(ctx, &rel, None).await;
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        to_index.push((path_str, content));
+        to_index_paths.push(path.clone());
+        new_hashes.push((path, h));
+    }
+
+    BatchPayload {
+        to_index,
+        to_index_paths,
+        new_hashes,
+    }
+}
+
+/// Push a `skip` SSE event, bumping the per-progress skipped/indexed
+/// counters. `reason` is included when supplied (e.g. `"minified"`).
+async fn emit_skip(ctx: &BatchCtx, rel: &str, reason: Option<&str>) {
+    use std::sync::atomic::Ordering;
+    ctx.progress.skipped.fetch_add(1, Ordering::Release);
+    let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
+    let mut event = serde_json::json!({
+        "event": "skip",
+        "file": rel,
+        "indexed": indexed,
+        "total_files": ctx.total,
+    });
+    if let Some(r) = reason {
+        event["reason"] = serde_json::Value::String(r.to_string());
+    }
+    ctx.progress.push(event).await;
+}
+
+/// Run parse+embed under a read lock, then the commit under a write lock.
+///
+/// Why: split this way to keep the read lock (concurrent search-safe) for the
+/// long, pure-CPU parse+embed phase, and only take the write lock for the
+/// short corpus/BM25/HNSW commit window. Returns the parse/embed timings plus
+/// the structured `CommitTimings` from the commit phase.
+async fn parse_embed_and_commit(
+    handle: &IndexHandle,
+    to_index: Vec<(String, String)>,
+) -> anyhow::Result<(u64, u64, usize, CommitTimings)> {
+    let parsed = {
+        let indexer = handle.indexer.read().await;
+        indexer.parse_and_embed_files(to_index).await?
+    };
+    let parse_ms = parsed.parse_ms;
+    let embed_ms = parsed.embed_ms;
+    let vector_count = parsed.vector_count;
+    let indexer = handle.indexer.write().await;
+    let commit = indexer.commit_parsed_batch(parsed, true).await?;
+    Ok((parse_ms, embed_ms, vector_count, commit))
+}
+
+/// Emit one `error` SSE event covering every file in a failed batch. Caller
+/// can retry the failing files individually via `index_file`.
+async fn emit_batch_error(ctx: &BatchCtx, to_index_paths: &[PathBuf], err: anyhow::Error) {
+    use std::sync::atomic::Ordering;
+    let files_in_batch: Vec<String> = to_index_paths
+        .iter()
+        .map(|p| p.strip_prefix(&ctx.root).unwrap_or(p).display().to_string())
+        .collect();
+    ctx.progress
+        .errors
+        .fetch_add(to_index_paths.len(), Ordering::Release);
+    ctx.progress
+        .push(serde_json::json!({
+            "event": "error",
+            "files": files_in_batch,
+            "message": format!("batch index: {err}"),
+            "indexed": ctx.progress.indexed.load(Ordering::Acquire),
+            "total_files": ctx.total,
+        }))
+        .await;
+}
+
+/// Apply a successful commit: update progress counters, persist hashes,
+/// shrink the hash cache if oversize, and emit the per-batch SSE event.
+async fn apply_successful_commit(
+    ctx: &BatchCtx,
+    new_hashes: Vec<(PathBuf, String)>,
+    batch_files: usize,
+    commit: &CommitTimings,
+) {
+    use std::sync::atomic::Ordering;
+    let new_chunks = commit.chunks;
+    ctx.progress
+        .total_chunks
+        .fetch_add(new_chunks, Ordering::Release);
+    let indexed = ctx
+        .progress
+        .indexed
+        .fetch_add(batch_files, Ordering::Release)
+        + batch_files;
+    let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
+    let chunks_per_sec = (ctx.progress.total_chunks.load(Ordering::Acquire) as u64 * 1000)
+        .checked_div(elapsed_ms)
+        .unwrap_or(0);
+    for (path, h) in new_hashes {
+        ctx.hashes.insert(path, h);
+    }
+    // Issue #75: cap per-index hash-cache size. Pure speed cache, so arbitrary
+    // eviction is always safe.
+    shrink_hashes_if_needed(&ctx.hashes);
+    ctx.progress
+        .push(serde_json::json!({
+            "event": "batch",
+            "batch_files": batch_files,
+            "batch_chunks": new_chunks,
+            "indexed": indexed,
+            "total_files": ctx.total,
+            "elapsed_ms": elapsed_ms,
+            "chunks_per_sec": chunks_per_sec,
+        }))
+        .await;
+}
+
+/// Sample RSS after the commit phase and trip the abort flag if the limit was
+/// hit. Returns `true` when the caller must break out of the batch loop.
+///
+/// Why: issue #82 — the commit phase (HNSW insert + redb write + BM25 update)
+/// is the single largest in-batch allocator. Sampling RSS here, in addition
+/// to the pre-batch abort-flag check, means a runaway batch can only push RSS
+/// one batch over the limit before being noticed.
+fn check_post_commit_memory(ctx: &BatchCtx) -> bool {
+    let Some(limit) = ctx.mem_limit else {
+        return false;
+    };
+    let Some(rss) = current_rss_mb() else {
+        return false;
+    };
+    let prev_peak = ctx.peak_rss_atomic.load(AtomicOrdering::Acquire);
+    if rss > prev_peak {
+        ctx.peak_rss_atomic.store(rss, AtomicOrdering::Release);
+    }
+    if rss >= limit {
+        tracing::warn!(
+            "reindex: memory limit hit after commit \
+             (rss={}MB >= limit={}MB) — skipping \
+             remaining batches for index {}",
+            rss,
+            limit,
+            ctx.index_id.0
+        );
+        ctx.mem_abort.store(true, AtomicOrdering::Release);
+        return true;
+    }
+    false
+}
+
+/// Result of the final symbol-graph rebuild.
+struct KgRebuildOutcome {
+    symbol_count: usize,
+    edge_count: usize,
+    kg_ms: u64,
+    kg_skipped: bool,
+}
+
+/// Rebuild the symbol graph once for the whole reindex.
+///
+/// Why: deferred from per-batch rebuilds because each rebuild is O(N + E) over
+/// the entire corpus and would scale quadratically with file count. Issue #90:
+/// always run even after a memory abort — the persisted chunks carry
+/// `function_name` and `calls`, graph construction is bounded by
+/// `TRUSTY_MAX_KG_NODES`, and it is independent of the embedding pipeline
+/// that caused the abort.
+async fn rebuild_symbol_graph_for_reindex(handle: &IndexHandle) -> KgRebuildOutcome {
+    let kg_start = Instant::now();
+    let indexer = handle.indexer.read().await;
+    indexer.rebuild_symbol_graph_now().await;
+    let g = indexer.symbol_graph().await;
+    KgRebuildOutcome {
+        symbol_count: g.node_count(),
+        edge_count: g.edge_count(),
+        kg_ms: kg_start.elapsed().as_millis() as u64,
+        kg_skipped: false,
+    }
+}
+
+/// Run-level timing + memory totals collected across every batch.
+struct RunTotals {
+    parse_ms: u64,
+    embed_ms: u64,
+    bm25_ms: u64,
+    vector_upsert_ms: u64,
+    vector_count: usize,
+    mem_limit_hit: bool,
+}
+
+/// Emit the terminal `complete` SSE event with run-level timings + counters.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator doesn't carry a ~30-line JSON literal at its tail.
+async fn emit_complete_event(
+    progress: &ReindexProgress,
+    started: Instant,
+    peak_rss_mb: u64,
+    totals: &RunTotals,
+    kg: &KgRebuildOutcome,
+) {
+    use std::sync::atomic::Ordering;
+    let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let chunks_per_sec = (total_chunks as u64 * 1000)
+        .checked_div(elapsed_ms)
+        .unwrap_or(0);
+    let indexed_final = progress.indexed.load(Ordering::Acquire);
+    // Issue #120: surface the terminal status string in the SSE payload so
+    // external callers (CLI, dashboard, open-mpm) can distinguish a clean
+    // completion from a memory-abort without reading the daemon log.
+    let status_str = if totals.mem_limit_hit {
+        "aborted_memory"
+    } else {
+        "complete"
+    };
+    progress
+        .push(serde_json::json!({
+            "event": "complete",
+            "status": status_str,
+            "indexed": indexed_final,
+            "total_chunks": total_chunks,
+            "skipped": progress.skipped.load(Ordering::Acquire),
+            "errors": progress.errors.load(Ordering::Acquire),
+            "elapsed_ms": elapsed_ms,
+            "chunks_per_sec": chunks_per_sec,
+            "peak_rss_mb": peak_rss_mb,
+            "memory_limit_hit": totals.mem_limit_hit,
+            "kg_skipped": kg.kg_skipped,
+            "timings": {
+                "parse_ms": totals.parse_ms,
+                "embed_ms": totals.embed_ms,
+                "bm25_ms": totals.bm25_ms,
+                "vector_upsert_ms": totals.vector_upsert_ms,
+                "kg_ms": kg.kg_ms,
+                "vector_count": totals.vector_count,
+                "symbol_count": kg.symbol_count,
+                "edge_count": kg.edge_count,
+            },
+        }))
+        .await;
+}
+
+/// Variant of `spawn_reindex` that GC's the progress map after completion.
+/// See `spawn_reindex` for the rationale.
+pub fn spawn_reindex_with_cleanup(
+    handle: Arc<IndexHandle>,
+    progress: Arc<ReindexProgress>,
+    force: bool,
+    cleanup_map: Option<Arc<DashMap<IndexId, Arc<ReindexProgress>>>>,
+    aborted_map: Option<Arc<DashMap<IndexId, Instant>>>,
+) {
+    let cleanup_id = handle.id.clone();
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+
+        // Serialize reindexes machine-wide to avoid stacking multiple
+        // simultaneous ONNX embedder sessions (Jetsam kill at ~28GB on macOS).
+        // Late arrivals queue here; their SSE stream is already attached and
+        // will replay buffered events once the permit is acquired.
+        let _permit = reindex_semaphore()
+            .acquire()
+            .await
+            .expect("reindex semaphore is never closed");
+
+        let started = Instant::now();
+        let root = handle.root_path.clone();
+        let index_id: IndexId = handle.id.clone();
+
+        // Phase 1: walk + filter the source tree (helper-extracted: issue #98).
+        let walk = collect_files_to_index(&handle);
+        let total = walk.files.len();
+        progress.total_files.store(total, Ordering::Release);
+        progress
+            .push(serde_json::json!({
+                "event": "start",
+                "total_files": total,
+                "index_id": index_id.0,
+                "root_path": root,
+                "force": force,
+            }))
+            .await;
+
+        let hashes = hashes_for(&index_id);
+        // `--force` wipes the per-index content-hash cache so every file is
+        // re-parsed, re-embedded, and re-committed even if its bytes haven't
+        // changed since the last reindex in this daemon's lifetime. Without
+        // this, the hash-skip check below silently turns `--force` into a
+        // no-op on a warm daemon.
+        if force {
+            hashes.clear();
+        }
+
+        // Per-subsystem timing accumulators. Each phase (parse, embed, BM25,
+        // vector upsert) is measured inside the indexer (see `ParsedBatch` /
+        // `CommitTimings`) and summed across all batches here. KG is measured
+        // separately at the end. Together with `vector_count`, this gives
+        // operators per-subsystem visibility — and crucially, a non-zero
+        // `embed_ms` with `vector_count == 0` is the smoking-gun signal for the
+        // "embedder silently fell back to BM25" failure mode.
+        let mut total_parse_ms: u64 = 0;
+        let mut total_embed_ms: u64 = 0;
+        let mut total_bm25_ms: u64 = 0;
+        let mut total_vector_upsert_ms: u64 = 0;
+        let mut total_vector_count: usize = 0;
+
+        // Memory-protection state (issues #76, #82). `mem_limit` is `Some`
+        // only when `TRUSTY_MEMORY_LIMIT_MB` is set. The previous design
+        // sampled RSS every 10 batches *before* parse/embed/commit, which let
+        // a single batch push RSS 4× over the configured limit before being
+        // noticed (issue #82: 10 GB limit → 40 GB actual).
+        //
+        // The new design has three layers of protection:
+        //   1. A background poller task (spawned below) samples RSS every
+        //      `MEM_POLL_INTERVAL` and sets `mem_abort` the moment the limit
+        //      is breached. This catches mid-batch spikes that batch-boundary
+        //      checks miss.
+        //   2. The main loop checks `mem_abort` on EVERY batch (not every 10)
+        //      and also AFTER `commit_parsed_batch` returns, so the largest
+        //      allocator (HNSW + redb commit) is bracketed by checks.
+        //   3. The KG rebuild at the end also honours the abort flag.
+        //
+        // `peak_rss_mb` is updated by the poller via an atomic so the final
+        // log line reflects the true peak, not just batch-boundary samples.
+        let mem_limit = memory_limit_mb();
+        let mem_abort = Arc::new(AtomicBool::new(false));
+        let peak_rss_atomic = Arc::new(AtomicU64::new(current_rss_mb().unwrap_or(0)));
+        let mut mem_limit_hit: bool = false;
+
+        // Spawn the background poller (helper-extracted: issue #98). Runs
+        // until `poller_stop` flips, updating `peak_rss_atomic` and tripping
+        // `mem_abort` whenever RSS crosses `mem_limit`.
+        let (poller_handle, poller_stop) = spawn_memory_poller(
+            mem_limit,
+            mem_abort.clone(),
+            peak_rss_atomic.clone(),
+            index_id.0.clone(),
+        );
+
+        // Phase 2: batch-driven parse/embed/commit. The per-batch body lives
+        // in `process_one_batch`; the orchestrator here only observes the
+        // aggregate `BatchOutcome` and the mem-limit signal.
+        let ctx = BatchCtx {
+            handle: handle.clone(),
+            progress: progress.clone(),
+            root: root.clone(),
+            index_id: index_id.clone(),
+            hashes: hashes.clone(),
+            mem_limit,
+            mem_abort: mem_abort.clone(),
+            peak_rss_atomic: peak_rss_atomic.clone(),
+            started,
+            total,
+        };
+        for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
+            // Memory-protection pre-check (issues #76, #82): if the background
+            // poller has tripped the abort flag, bail out before doing more
+            // work. Skipping remaining batches preserves all committed chunks.
+            if mem_abort.load(AtomicOrdering::Acquire) {
+                let rss = current_rss_mb().unwrap_or(0);
+                tracing::warn!(
+                    "reindex: memory limit hit before batch (rss={}MB, \
+                     limit={:?}MB) — skipping remaining batches for index {}",
+                    rss,
+                    mem_limit,
+                    index_id.0
+                );
+                mem_limit_hit = true;
+                break;
+            }
+            let outcome = process_one_batch(&ctx, batch).await;
+            total_parse_ms = total_parse_ms.saturating_add(outcome.parse_ms);
+            total_embed_ms = total_embed_ms.saturating_add(outcome.embed_ms);
+            total_bm25_ms = total_bm25_ms.saturating_add(outcome.bm25_ms);
+            total_vector_upsert_ms =
+                total_vector_upsert_ms.saturating_add(outcome.vector_upsert_ms);
+            total_vector_count = total_vector_count.saturating_add(outcome.vector_count);
+            if outcome.mem_limit_hit {
+                mem_limit_hit = true;
+                break;
+            }
+        }
+
+        // Phase 3: rebuild the symbol graph once for the whole reindex.
+        // Issue #90: always run, even after a memory abort — graph
+        // construction is bounded by `TRUSTY_MAX_KG_NODES` and independent of
+        // the embedding spike. See `rebuild_symbol_graph_for_reindex`.
+        let kg = rebuild_symbol_graph_for_reindex(&handle).await;
+        if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
+            tracing::warn!(
+                "reindex: memory limit was breached during batch processing for \
+                 index {} (peak_rss={}MB, limit={:?}MB) — KG was still rebuilt \
+                 (symbols={}, edges={}) because graph construction is bounded by \
+                 TRUSTY_MAX_KG_NODES and independent of the embedding spike",
+                index_id.0,
+                peak_rss_atomic.load(AtomicOrdering::Acquire),
+                mem_limit,
+                kg.symbol_count,
+                kg.edge_count,
+            );
+        }
+
+        // Stop the background poller and collect the true peak it observed.
+        poller_stop.store(true, AtomicOrdering::Release);
+        // Best-effort: don't fail completion if the poller is wedged.
+        let _ = poller_handle.await;
+
+        // Issue #120: distinguish memory-abort from clean completion so the
+        // HTTP reindex_handler can apply a cooldown before honouring the next
+        // reindex request. Also record the abort timestamp on the shared map
+        // so the cooldown survives across handler invocations.
+        let aborted_memory = mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire);
+        if aborted_memory {
+            progress.status.store(ReindexStatus::AbortedMemory);
+            if let Some(map) = aborted_map.as_ref() {
+                map.insert(index_id.clone(), Instant::now());
+            }
+        } else {
+            progress.status.store(ReindexStatus::Complete);
+        }
+
+        // Final synchronous RSS poll so the peak reflects post-KG memory
+        // (the symbol graph rebuild may itself push RSS higher than any
+        // background sample taken before it ran).
+        if let Some(rss) = current_rss_mb() {
+            let prev = peak_rss_atomic.load(AtomicOrdering::Acquire);
+            if rss > prev {
+                peak_rss_atomic.store(rss, AtomicOrdering::Release);
+            }
+        }
+        let peak_rss_mb = peak_rss_atomic.load(AtomicOrdering::Acquire);
+        let indexed_final = progress.indexed.load(Ordering::Acquire);
+        let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            "reindex complete: index={} files={} chunks={} elapsed_ms={} \
+             peak_rss_mb={} memory_limit_hit={}",
+            index_id.0,
+            indexed_final,
+            total_chunks,
+            elapsed_ms,
+            peak_rss_mb,
+            mem_limit_hit,
+        );
+
+        let totals = RunTotals {
+            parse_ms: total_parse_ms,
+            embed_ms: total_embed_ms,
+            bm25_ms: total_bm25_ms,
+            vector_upsert_ms: total_vector_upsert_ms,
+            vector_count: total_vector_count,
+            mem_limit_hit,
+        };
+        emit_complete_event(&progress, started, peak_rss_mb, &totals, &kg).await;
+
+        // Issue #112: refresh the per-index context embedding from the
+        // root-level metadata files. Best-effort — failure here is logged
+        // and the handle's `context_embedding` stays `None`, which the
+        // fan-out router treats as a neutral 1.0 weight.
+        refresh_context_embedding(&handle).await;
+
+        // Issue #75: GC the progress entry after a short delay
+        // (helper-extracted: issue #98).
+        schedule_progress_cleanup(cleanup_map, cleanup_id);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::indexer::CodeIndexer;
+    use std::fs;
+    use std::sync::atomic::Ordering;
+
+    /// Filter wiring: with `include_paths` set on the handle, the reindex
+    /// must walk ONLY those subtrees. Files outside the configured slice
+    /// must not appear in the corpus.
+    ///
+    /// Why: `trusty-search.yaml` declares `paths: [api/src]` to slice a
+    /// polyrepo. Without this test, a regression that drops the
+    /// `handle.include_paths` branch silently reverts to "walk everything",
+    /// which is the bug the YAML config exists to avoid.
+    /// What: stage a fixture with `api/keep.rs` and `ui/drop.rs`, register a
+    /// handle whose `include_paths = [<root>/api]`, run the reindex, and
+    /// assert only the api file was indexed.
+    /// Test: this test.
+    #[tokio::test]
+    async fn reindex_honours_include_paths_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("api")).unwrap();
+        fs::create_dir_all(root.join("ui")).unwrap();
+        fs::write(root.join("api/keep.rs"), "fn keep_me() {}\n").unwrap();
+        fs::write(root.join("ui/drop.rs"), "fn drop_me() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("filter-test", root.clone());
+        let handle = Arc::new(IndexHandle {
+            id: IndexId::new("filter-test"),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: root.clone(),
+            include_paths: vec![root.join("api")],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+            path_filter: vec![],
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+        });
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        // Wait up to 10s for completion.
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert_eq!(
+            progress.total_files.load(Ordering::Acquire),
+            1,
+            "only api/keep.rs should be walked"
+        );
+
+        // And the corpus must contain `keep_me` but not `drop_me`.
+        let idx = handle.indexer.read().await;
+        let r = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "keep_me".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(r.iter().any(|c| c.content.contains("keep_me")));
+        let r2 = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "drop_me".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !r2.iter().any(|c| c.content.contains("drop_me")),
+            "ui/drop.rs must not have been indexed"
+        );
+    }
+
+    /// Issue #111 end-to-end: with `path_filter = ["common-*"]`, the reindex
+    /// must include files inside `common-utils/` but exclude `other-repo/`.
+    /// Uses the BM25-only path (no embedder needed) for hermetic execution.
+    #[tokio::test]
+    async fn reindex_honours_path_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("common-utils")).unwrap();
+        std::fs::create_dir_all(root.join("other-repo")).unwrap();
+        std::fs::write(root.join("common-utils/keep.rs"), "fn keep_common() {}\n").unwrap();
+        std::fs::write(root.join("other-repo/drop.rs"), "fn drop_other() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("pf-test", root.clone());
+        let handle = Arc::new(IndexHandle {
+            id: IndexId::new("pf-test"),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: root.clone(),
+            include_paths: vec![],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+            path_filter: vec!["common-*".to_string()],
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+        });
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert_eq!(
+            progress.total_files.load(Ordering::Acquire),
+            1,
+            "only common-utils/keep.rs should pass the path_filter"
+        );
+
+        let idx = handle.indexer.read().await;
+        let r = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "keep_common".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(r.iter().any(|c| c.content.contains("keep_common")));
+        let r2 = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "drop_other".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !r2.iter().any(|c| c.content.contains("drop_other")),
+            "other-repo must not have been indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_walks_directory_and_emits_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+        fs::write(root.join("b.py"), "def b():\n    pass\n").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/skip.rs"), "fn skip() {}").unwrap();
+
+        let indexer = CodeIndexer::new("test".to_string(), root.clone());
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("test"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle, progress.clone(), false);
+
+        // Wait up to 10s for completion.
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert_eq!(progress.total_files.load(Ordering::Acquire), 2);
+        assert_eq!(progress.indexed.load(Ordering::Acquire), 2);
+
+        let events = progress.events.lock().await;
+        assert!(events
+            .first()
+            .map(|s| s.contains("\"start\""))
+            .unwrap_or(false));
+        assert!(events
+            .last()
+            .map(|s| s.contains("\"complete\""))
+            .unwrap_or(false));
+    }
+
+    /// Issue #112: after a reindex completes, the handle's
+    /// `context_embedding` and `context_summary` must be populated when
+    /// recognised metadata files exist in `root_path`. Uses a `MockEmbedder`
+    /// so the test is fully hermetic.
+    #[tokio::test]
+    async fn context_embedding_populated_after_reindex() {
+        use crate::core::embed::{Embedder, MockEmbedder};
+        use crate::core::store::{UsearchStore, VectorStore};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Stage a source file plus a README so the metadata scraper has
+        // something to embed.
+        fs::write(root.join("lib.rs"), "fn hello() {}\n").unwrap();
+        fs::write(
+            root.join("README.md"),
+            "# proj\n\nA test project for #112.\n",
+        )
+        .unwrap();
+
+        let dim = 32;
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
+        let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(dim).expect("usearch new"));
+        let indexer = CodeIndexer::new("ctx-test", root.clone()).with_components(embedder, store);
+
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("ctx-test"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+
+        let ctx = handle.context_embedding.read().await.clone();
+        assert!(
+            ctx.is_some(),
+            "context_embedding must be populated when metadata is present and embedder is wired"
+        );
+        assert_eq!(ctx.unwrap().len(), dim, "embedding must have embedder dim");
+
+        let summary = handle.context_summary.read().await.clone();
+        assert!(summary.is_some(), "context_summary must be populated");
+        let s = summary.unwrap();
+        assert!(s.contains("proj") || s.contains("README"));
+    }
+
+    /// Issue #112: when no recognised metadata files exist, the context
+    /// embedding stays `None` so the router falls back to a neutral 1.0
+    /// weight for this index.
+    #[tokio::test]
+    async fn context_embedding_none_when_no_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Only a source file — no README, no Cargo.toml, etc.
+        fs::write(root.join("lib.rs"), "fn hello() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("no-meta", root.clone());
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("no-meta"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert!(handle.context_embedding.read().await.is_none());
+        assert!(handle.context_summary.read().await.is_none());
+    }
+}

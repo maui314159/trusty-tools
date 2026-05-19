@@ -1,0 +1,22 @@
+//! Storage backends: vector index (HNSW) + temporal knowledge graph (SQLite).
+//!
+//! Why: Two complementary data shapes — dense vectors for semantic recall and
+//! triples-with-time for relational facts — covered by separate modules so each
+//! can evolve independently.
+//! What: Re-exports `VectorStore` trait and `KnowledgeGraph` type.
+//! Test: See submodule tests.
+
+pub mod chat_sessions;
+pub mod kg;
+pub mod kuzu;
+pub mod l1_cache;
+pub mod palace_store;
+pub mod payload_store;
+pub mod vector;
+
+pub use chat_sessions::{ChatSession, ChatSessionMeta, ChatSessionStore};
+pub use kg::{KnowledgeGraph, Triple};
+pub use l1_cache::{L1Cache, L1CacheError};
+pub use palace_store::{PalaceStore, PalaceStoreError};
+pub use payload_store::{PayloadRow, PayloadStore, PayloadStoreError};
+pub use vector::{VectorHit, VectorStore};

@@ -1,0 +1,14 @@
+Write a Go program called fetch.go that:
+- Uses net/http to fetch JSON from a URL
+- Parses the response body with encoding/json into a map[string]any
+- CLI using the flag package: accepts --url (required) and --timeout (default 10s) flags
+- Retries on HTTP 5xx responses with exponential backoff: 3 attempts max, base delay 1s, doubling each retry
+- Prints parsed JSON fields to stdout (one key=value per line, keys sorted)
+- Exits with code 1 on failure, printing a descriptive error to stderr
+- Wraps all errors with fmt.Errorf("context: %w", err) so the full chain is visible
+
+Include fetch_test.go with table-driven tests using net/http/httptest to mock:
+- A server returning 200 with valid JSON
+- A server returning 500 twice then 200 (verifies retry logic)
+- A server returning 500 three times (verifies exit error)
+- An invalid JSON body (verifies parse error)

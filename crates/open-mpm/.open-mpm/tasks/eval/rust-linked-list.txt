@@ -1,0 +1,8 @@
+Implement a generic singly-linked list in Rust.
+
+Requirements:
+- Define a LinkedList<T> type that works for any T: Clone
+- Implement: push_front, pop_front, peek, len, is_empty, iter (yielding &T)
+- Implement Display trait showing elements as [a -> b -> c -> nil]
+- Handle ownership correctly — no unsafe code
+- Write unit tests covering: push/pop round-trip, peek on empty, len after operations, iter order, display format, generic over i32 and String

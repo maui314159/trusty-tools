@@ -1,0 +1,104 @@
+[package]
+name = "trusty-symgraph"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "Standalone symbol-graph engine: AST -> SymbolRegistry -> emit, with knowledge-graph queries."
+license = "Apache-2.0 OR MIT"
+repository.workspace = true
+readme = "README.md"
+keywords = ["ast", "symbol-graph", "code-analysis", "tree-sitter"]
+categories = ["development-tools"]
+homepage = "https://github.com/bobmatnyc/trusty-tools"
+
+[lib]
+name = "trusty_symgraph"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "trusty-symgraph"
+path = "src/bin/serve.rs"
+required-features = ["server"]
+
+[dependencies]
+# Core — always-on contracts surface (no tree-sitter, no parser deps).
+anyhow = { workspace = true }
+thiserror = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }
+
+# Parser-path deps (gated behind `parser` feature).
+indexmap = { version = "2", features = ["serde"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+similar = { version = "2", features = ["text"], optional = true }
+walkdir = { version = "2.5", optional = true }
+
+# Graph backend (#351 substrate upgrade — used as a derived view today;
+# replacement of the in-memory adjacency lists is incremental and gated
+# behind helper methods to avoid breaking the public serde shape).
+petgraph = { version = "0.8", features = ["serde-1"], optional = true }
+
+# Tree-sitter — multi-language parsing path (Rust, Python, JavaScript, Go).
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.23", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+
+# Rust-native AST (kept available for the future Rust-only emitter path; the
+# tree-sitter pipeline is still the source of truth for v1).
+syn = { version = "2.0", features = ["full"], optional = true }
+prettyplease = { version = "0.2", optional = true }
+proc-macro2 = { version = "1.0", optional = true }
+quote = { version = "1.0", optional = true }
+
+# Multi-language code generation with auto-imports (kept available for the
+# future emitter path; tree-sitter source bodies are emitted verbatim today).
+genco = { version = "0.19", optional = true }
+
+# Optional HTTP server feature
+axum = { workspace = true, optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { workspace = true, optional = true }
+
+[features]
+default = []
+# Full parser + emitter + graph stack. Pulls in tree-sitter and all grammar
+# crates. Downstream crates that only consume the `contracts` data types
+# (EntityType / RawEntity / EdgeKind / fact_hash_str / tables) should leave
+# this feature off to avoid the `links = "tree-sitter"` conflict.
+parser = [
+    "dep:indexmap",
+    "dep:uuid",
+    "dep:similar",
+    "dep:walkdir",
+    "dep:petgraph",
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:syn",
+    "dep:prettyplease",
+    "dep:proc-macro2",
+    "dep:quote",
+    "dep:genco",
+]
+server = ["parser", "dep:axum", "dep:tokio", "dep:tower-http"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

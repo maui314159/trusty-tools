@@ -1,0 +1,27 @@
+[package]
+name = "trusty-mpm-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ratatui dashboard for monitoring trusty-mpm sessions and agents"
+
+[lib]
+name = "trusty_mpm_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trusty-mpm-tui"
+path = "src/main.rs"
+
+[dependencies]
+trusty-mpm-core.workspace = true
+trusty-mpm-client.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+clap.workspace = true
+# The coordinator-context poll parses session UUID strings back into SessionId.
+uuid.workspace = true

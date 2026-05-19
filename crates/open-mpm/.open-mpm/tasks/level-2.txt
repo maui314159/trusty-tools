@@ -1,0 +1,217 @@
+Build a complete Python package called `git_analyzer` that analyzes git repository commit history and produces insightful metrics.
+
+## CRITICAL: Module structure
+
+The test suite imports from these EXACT paths. You MUST use this exact structure:
+
+```
+git_analyzer/
+├── __init__.py
+├── __main__.py
+├── parser.py
+├── metrics.py
+└── reporter.py
+```
+
+Do NOT use a `src/` layout. The package must be importable as `git_analyzer` directly
+(i.e. place the `git_analyzer/` folder at the top level of the output, not inside `src/`).
+
+The test suite does:
+```python
+from git_analyzer.parser import parse_git_log
+from git_analyzer.metrics import calculate_author_stats
+from git_analyzer.metrics import calculate_bus_factor
+from git_analyzer.metrics import calculate_commit_patterns
+```
+
+## git_analyzer/parser.py
+
+Implement `parse_git_log(log_text: str) -> list` that parses the output of
+`git log --stat` format. Each element must be an object (dataclass or namedtuple)
+with these attributes:
+- `hash` (str): the full commit hash
+- `author` (str): the author name (NOT email, just the name part)
+- `date` (datetime): parsed datetime object from the "Date:" line
+- `message` (str): the commit subject line
+- `insertions` (int): number of lines inserted (0 if none)
+- `deletions` (int): number of lines deleted (0 if none)
+
+## git_analyzer/metrics.py
+
+Implement these three functions:
+
+### calculate_author_stats(commits) -> dict
+
+Returns a dict keyed by author name. Each value is an object or dict with:
+- `commits` (int): total commit count for this author
+- `insertions` (int): total lines added
+- `deletions` (int): total lines deleted
+- `active_days` (int): number of unique calendar days with commits
+- `first_commit` (datetime): earliest commit date
+- `last_commit` (datetime): latest commit date
+
+### calculate_bus_factor(commits) -> int
+
+Returns an integer (the bus factor value itself, NOT a dict or tuple).
+The bus factor is the minimum number of developers who together own >= 50%
+of total lines changed (insertions + deletions). Must be >= 1 and <= total authors.
+
+### calculate_commit_patterns(commits) -> dict
+
+Returns a dict with at least these keys:
+- `weekend_commits` (int): number of commits on Saturday or Sunday
+- `weekday_commits` (int): number of commits on weekdays
+- `time_of_day` (dict): counts by period, e.g. {"morning": N, "afternoon": N, "evening": N, "night": N}
+- `most_active_day` (str): day of week name with most commits
+- `most_active_hour` (int): hour (0-23) with most commits
+
+## Fixture format reference
+
+The test suite reads from its own fixtures directory. Here is the EXACT format of the
+git log data you must parse (this is `git log --stat` output):
+
+```
+commit a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+Author: Alice Johnson <alice@example.com>
+Date:   Mon Mar 10 09:15:32 2025 +0000
+
+    feat: add user authentication module
+
+ src/auth.py       | 142 +++++++++++++++++++++++++++++
+ src/models/user.py |  38 ++++++++
+ tests/test_auth.py |  67 ++++++++++++++
+ 3 files changed, 247 insertions(+), 0 deletions(-)
+
+commit b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3
+Author: Bob Smith <bob@example.com>
+Date:   Mon Mar 10 14:22:10 2025 +0000
+
+    fix: resolve login redirect loop
+
+ src/auth.py       | 12 ++++++------
+ src/middleware.py  |  5 +++--
+ 2 files changed, 9 insertions(+), 8 deletions(-)
+```
+
+The summary line format is: `N files changed, X insertions(+), Y deletions(-)`
+OR `N files changed, X insertions(+)` (no deletions) or `N files changed, Y deletions(-)` (no insertions).
+Also sometimes `0 deletions(-)` appears explicitly.
+
+Parse the TOTAL from the summary line (e.g. "247 insertions(+), 0 deletions(-)"), NOT by summing file lines.
+
+## Test data facts (10 commits in the fixture)
+
+Authors and their commit counts:
+- Alice Johnson: 4 commits (Mar 10, Mar 11, Mar 12, Mar 17)
+- Bob Smith: 3 commits (Mar 10, Mar 12, Mar 17)
+- Charlie Brown: 2 commits (Mar 11, Mar 18)
+- Diana Prince: 1 commit (Sat Mar 15 — the ONLY weekend commit)
+
+First commit (Alice, Mar 10 09:15:32):
+- insertions=247, deletions=0
+
+The bus factor must be an integer in range [1, 4].
+
+Weekend detection: Saturday=5, Sunday=6 in Python's weekday() system.
+Diana's commit on Sat Mar 15 2025 is the only weekend commit => weekend_commits == 1.
+
+## git_analyzer/__main__.py
+
+CLI entry point for `python3 -m git_analyzer`. Support:
+```bash
+python3 -m git_analyzer [path]          # analyze repo at path (default: current dir)
+python3 -m git_analyzer --format json   # output as JSON
+python3 -m git_analyzer --since 90      # last N days only
+python3 -m git_analyzer --author "Alice"  # filter by author
+```
+
+Use `subprocess.run(["git", "log", "--stat", ...])` to get the log, then call parser.parse_git_log().
+
+## git_analyzer/__init__.py
+
+Export the main public API:
+```python
+from .parser import parse_git_log
+from .metrics import calculate_author_stats, calculate_bus_factor, calculate_commit_patterns
+```
+
+## git_analyzer/reporter.py
+
+Format the output. Two formats:
+1. Terminal (default): readable summary with sections
+2. JSON: `--format json` dumps all metrics as JSON
+
+## Additional tests (write at least 5 more tests)
+
+In a file called `test_git_analyzer.py` at the top level, write at least 5 additional tests.
+Cover edge cases like:
+- Empty log text returns empty list
+- Single commit with only insertions (no deletions line)
+- calculate_bus_factor returns 1 when one author owns >= 50%
+- calculate_commit_patterns weekend_commits=0 for all-weekday input
+- calculate_author_stats active_days counts unique days correctly
+
+## pyproject.toml
+
+Include a minimal `pyproject.toml`:
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "git-analyzer"
+version = "0.1.0"
+description = "Git repository commit history analyzer"
+requires-python = ">=3.9"
+
+[project.scripts]
+git-analyzer = "git_analyzer.__main__:main"
+```
+
+## Output format for file extraction
+
+Use EXACTLY this format so the file extractor can find your files:
+
+## File: git_analyzer/__init__.py
+```python
+<content>
+```
+
+## File: git_analyzer/parser.py
+```python
+<content>
+```
+
+## File: git_analyzer/metrics.py
+```python
+<content>
+```
+
+## File: git_analyzer/__main__.py
+```python
+<content>
+```
+
+## File: git_analyzer/reporter.py
+```python
+<content>
+```
+
+## File: test_git_analyzer.py
+```python
+<content>
+```
+
+## File: pyproject.toml
+```toml
+<content>
+```
+
+## File: README.md
+```markdown
+<content>
+```
+
+Each file MUST start with `## File: <path>` followed immediately by a fenced code block.
+Do NOT put any prose between the header and the opening fence.

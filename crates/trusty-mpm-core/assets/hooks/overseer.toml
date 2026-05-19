@@ -1,0 +1,23 @@
+# trusty-mpm session overseer — framework hook configuration
+# Deployed by: trusty-mpm install
+# Docs: docs/architecture/overseer.md
+
+[overseer]
+enabled = false   # opt-in
+
+[deterministic]
+blocklist = ["rm -rf /", "git push --force main", "DROP TABLE", "truncate /"]
+auto_approve = ["git status", "cargo check", "ls", "pwd", "echo"]
+max_tool_calls_per_minute = 120
+token_budget_limit = 200000
+
+[auto_responses]
+"shall i proceed" = "yes, proceed"
+"should i proceed" = "yes, proceed"
+"should i commit" = "yes, commit with a descriptive message"
+"ready to continue" = "yes, continue"
+
+# [llm]
+# provider = "anthropic"
+# model = "claude-haiku-4-5"
+# api_key_env = "ANTHROPIC_API_KEY"

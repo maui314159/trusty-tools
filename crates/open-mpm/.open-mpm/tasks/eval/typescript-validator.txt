@@ -1,0 +1,10 @@
+Implement a runtime schema validator in TypeScript without using any external validation libraries (no zod, no yup, no ajv).
+
+Requirements:
+- Define a Schema<T> type that can validate unknown values as T at runtime
+- Support primitive types: string, number, boolean, null
+- Support objects with required and optional fields
+- Support arrays with element type validation
+- Support union types (A | B)
+- Return typed Result<T, ValidationError[]> — never throw
+- Write Jest tests covering: valid primitives, missing required field, wrong type, nested object, array validation, union type, multiple errors collected (not fail-fast)

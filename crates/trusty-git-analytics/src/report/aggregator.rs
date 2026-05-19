@@ -1,0 +1,1011 @@
+//! Database aggregation: turn raw rows into [`ReportData`].
+//!
+//! The aggregator runs a single scan of the `commits` table (left-joined
+//! against `classifications`) and groups the results in-memory. For the
+//! data sizes typical of `trusty-git-analytics` this is simpler and
+//! faster than emitting multiple grouped SQL queries.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use chrono::{DateTime, Datelike, Utc};
+use regex::Regex;
+use tracing::{debug, warn};
+
+use crate::core::config::Config;
+use crate::core::db::Database;
+use crate::report::errors::Result;
+use crate::report::models::{
+    ActivityWeights, AuthorSummary, DeveloperActivitySummary, DoraMetrics, QualitySummary,
+    ReportData, ReportSummary, RepositorySummary, UntrackedCommit, VelocitySummary, WeeklyActivity,
+    WeeklyCategorization, WeeklyMetrics, WeeklyVelocity,
+};
+
+/// Helper that walks the database and assembles [`ReportData`].
+pub struct Aggregator;
+
+/// Internal row pulled from the commit/classification join.
+struct CommitRow {
+    sha: String,
+    author_name: String,
+    author_email: String,
+    timestamp: DateTime<Utc>,
+    repository: String,
+    insertions: i64,
+    deletions: i64,
+    files_changed: i64,
+    category: Option<String>,
+    message: String,
+    ticketed: bool,
+}
+
+/// Minimal PR row used by velocity / DORA computations.
+struct PrRow {
+    created_at: DateTime<Utc>,
+    merged_at: Option<DateTime<Utc>>,
+}
+
+/// Default regex patterns identifying machine-generated commits.
+///
+/// Why: keep boilerplate (lock-file bumps, version bumps, merge commits, …)
+/// from skewing per-developer averages. Matched case-insensitively against
+/// the first line of each commit message.
+const DEFAULT_BOILERPLATE_PATTERNS: &[&str] = &[
+    r"^[Mm]erge branch",
+    r"^[Mm]erge pull request",
+    r"^[Bb]ump version",
+    r"^[Uu]pdate package-lock",
+    r"^[Uu]pdate yarn\.lock",
+    r"[Gg]enerated by",
+    r"[Aa]uto-generated",
+];
+
+/// Default revert-detection patterns.
+const DEFAULT_REVERT_PATTERNS: &[&str] = &[r"^[Rr]evert", r"^[Ff]ix.*[Rr]evert"];
+
+/// Boilerplate threshold (avg lines per commit) above which a commit is
+/// flagged independently of message-pattern match.
+const BOILERPLATE_LINES_THRESHOLD: i64 = 500;
+
+/// Heuristic boilerplate detector.
+///
+/// Why: prevents auto-generated commits (lock-file bumps, version bumps,
+/// generated code) from skewing per-developer averages.
+/// What: returns `true` when the message matches any boilerplate pattern OR
+/// the lines-changed budget exceeds [`BOILERPLATE_LINES_THRESHOLD`].
+/// Test: feed a `"Update package-lock.json"` message → `true`; a normal
+/// `"feat: x"` message with small diff → `false`.
+fn is_boilerplate(message: &str, lines_changed: i64, patterns: &[Regex]) -> bool {
+    let first_line = message.lines().next().unwrap_or(message);
+    if lines_changed > BOILERPLATE_LINES_THRESHOLD {
+        // Large diff alone is not enough; require pattern OR very-large diff
+        // (10x threshold) to flag as boilerplate.
+        if lines_changed > BOILERPLATE_LINES_THRESHOLD * 10 {
+            return true;
+        }
+    }
+    patterns.iter().any(|p| p.is_match(first_line))
+}
+
+/// Heuristic revert detector.
+///
+/// Why: revert commits indicate broken changes and contribute to quality /
+/// DORA change-failure-rate metrics.
+/// What: returns `true` if the message's first line matches any revert
+/// pattern.
+/// Test: `"Revert \"feat: x\""` → `true`; `"feat: x"` → `false`.
+fn is_revert(message: &str, patterns: &[Regex]) -> bool {
+    let first_line = message.lines().next().unwrap_or(message);
+    patterns.iter().any(|p| p.is_match(first_line))
+}
+
+/// Compile a list of pattern strings into [`Regex`] values, logging and
+/// skipping any that fail to parse so a bad user-supplied pattern can't
+/// brick the entire report run.
+fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
+    patterns
+        .iter()
+        .filter_map(|p| match Regex::new(p) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(pattern = %p, error = %e, "skipping invalid regex pattern");
+                None
+            }
+        })
+        .collect()
+}
+
+impl Aggregator {
+    /// Build a full [`ReportData`] from the given database.
+    ///
+    /// The optional `_config` argument is currently unused but kept on the
+    /// signature so future filtering (date ranges from `RepositoryConfig`,
+    /// include/exclude merges, etc.) can be added without breaking callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::report::ReportError::Core`] if the underlying queries fail.
+    pub fn build(db: &Database, config: &Config) -> Result<ReportData> {
+        let rows = Self::load_rows(db)?;
+        let prs = Self::load_prs(db).unwrap_or_default();
+        let unresolved_db = Self::count_unresolved_author_commits(db).unwrap_or(0);
+        let mut data = Self::aggregate(rows, prs);
+
+        // Issue #68 / #67: surface coverage and unresolved-identity counts
+        // so consumers know the scope of the report. `repository_coverage`
+        // counts distinct repositories observed in the data (not the size
+        // of the configured roster, so that a misconfigured `repositories[]`
+        // entry that produced no commits is not double-counted).
+        data.repository_coverage = data.repositories.len();
+
+        // Aggregate the configured-alias set so we can flag author summaries
+        // whose canonical email is not part of any configured identity. These
+        // are "phantom" identities that inflate distinct-developer counts.
+        let alias_set = configured_alias_emails(config);
+        let unresolved_authors = if alias_set.is_empty() {
+            // Without a configured alias map there is no signal — every
+            // author is "unresolved" in that sense, which would be noise.
+            // Surface zero so downstream consumers don't double-count.
+            0
+        } else {
+            data.authors
+                .iter()
+                .filter(|a| !alias_set.contains(&a.email.to_lowercase()))
+                .count()
+        };
+        data.unresolved_authors = unresolved_authors;
+        data.unresolved_author_commits = unresolved_db;
+
+        // Issue #69: warn when adjacent weeks have different repository
+        // coverage in `collection_runs`. This detects baseline drift that
+        // would otherwise silently break week-over-week deltas.
+        check_weekly_coverage_drift(db, &data.weekly_metrics);
+
+        if unresolved_db > 0 {
+            tracing::warn!(
+                count = unresolved_db,
+                "WARNING: {unresolved_db} commits have unresolved author identities and may \
+                 inflate developer counts. Run `tga aliases list` to review, or extend \
+                 `developer_aliases` in the config to map missing identities."
+            );
+        }
+        Ok(data)
+    }
+
+    /// Count commits where `author_id IS NULL` — the canonical "unresolved"
+    /// signal. This is distinct from `unresolved_authors` (configured-alias
+    /// membership): an `author_id IS NULL` commit means identity resolution
+    /// never ran for it, so it is silently treated as its own developer.
+    fn count_unresolved_author_commits(db: &Database) -> Result<usize> {
+        let conn = db.connection();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commits WHERE author_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(crate::core::TgaError::from)?;
+        Ok(n as usize)
+    }
+
+    /// Load PR rows for velocity / DORA computations.
+    ///
+    /// Why: lead-time, cycle-time, and deployment frequency depend on
+    /// merged-PR timing.
+    /// What: returns the subset of `pull_requests` with parseable timestamps;
+    /// rows with un-parseable timestamps are silently dropped.
+    /// Test: insert a row with valid `created_at`/`merged_at`, assert vector
+    /// length 1 with matching timestamps.
+    fn load_prs(db: &Database) -> Result<Vec<PrRow>> {
+        let conn = db.connection();
+        let mut stmt = conn
+            .prepare("SELECT created_at, merged_at FROM pull_requests")
+            .map_err(crate::core::TgaError::from)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let created: String = row.get(0)?;
+                let merged: Option<String> = row.get(1)?;
+                Ok((created, merged))
+            })
+            .map_err(crate::core::TgaError::from)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (created_s, merged_s) = r.map_err(crate::core::TgaError::from)?;
+            let created_at = match DateTime::parse_from_rfc3339(&created_s) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(_) => continue,
+            };
+            let merged_at = merged_s
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            out.push(PrRow {
+                created_at,
+                merged_at,
+            });
+        }
+        Ok(out)
+    }
+
+    fn load_rows(db: &Database) -> Result<Vec<CommitRow>> {
+        let conn = db.connection();
+        // Prefer the canonical identity from the `authors` table when the
+        // commit has been linked (i.e. `author_id IS NOT NULL`). This ensures
+        // that aliases configured in `developer_aliases` are honored at
+        // aggregation time: every commit by the same person — regardless of
+        // the raw name/email recorded in git — collapses to one canonical
+        // `(name, email)` pair in reports.
+        //
+        // Falls back to the raw commit fields when no `author_id` is set
+        // (which can happen for commits inserted before
+        // `upsert_observed_authors` ran).
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.sha, \
+                        COALESCE(a.canonical_name,  c.author_name)  AS author_name, \
+                        COALESCE(NULLIF(a.canonical_email, ''), c.author_email) AS author_email, \
+                        c.timestamp, c.repository, \
+                        c.insertions, c.deletions, c.files_changed, cl.category, \
+                        c.message, c.ticketed \
+                 FROM commits c \
+                 LEFT JOIN authors a ON a.id = c.author_id \
+                 LEFT JOIN classifications cl ON cl.id = c.classification_id",
+            )
+            .map_err(crate::core::TgaError::from)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let ts_str: String = row.get(3)?;
+                let timestamp = DateTime::parse_from_rfc3339(&ts_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let ticketed: i64 = row.get(10).unwrap_or(0);
+                Ok(CommitRow {
+                    sha: row.get(0)?,
+                    author_name: row.get(1)?,
+                    author_email: row.get(2)?,
+                    timestamp,
+                    repository: row.get(4)?,
+                    insertions: row.get(5)?,
+                    deletions: row.get(6)?,
+                    files_changed: row.get(7)?,
+                    category: row.get(8)?,
+                    message: row.get(9)?,
+                    ticketed: ticketed != 0,
+                })
+            })
+            .map_err(crate::core::TgaError::from)?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(crate::core::TgaError::from)?);
+        }
+        debug!(count = out.len(), "loaded commit rows for aggregation");
+        Ok(out)
+    }
+
+    fn aggregate(rows: Vec<CommitRow>, prs: Vec<PrRow>) -> ReportData {
+        let generated_at = Utc::now().to_rfc3339();
+        let mut data = ReportData::empty(generated_at);
+
+        if rows.is_empty() {
+            return data;
+        }
+
+        // Compile boilerplate / revert patterns once. Pattern lists are
+        // currently built-in; user-supplied lists can be wired in later
+        // through `analysis.boilerplate_patterns` without changing the
+        // signature.
+        let boilerplate_re = compile_patterns(DEFAULT_BOILERPLATE_PATTERNS);
+        let revert_re = compile_patterns(DEFAULT_REVERT_PATTERNS);
+
+        // Boilerplate / revert flags per row (computed once, reused).
+        let mut row_is_boilerplate: Vec<bool> = Vec::with_capacity(rows.len());
+        let mut row_is_revert: Vec<bool> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let lines = row.insertions + row.deletions;
+            row_is_boilerplate.push(is_boilerplate(&row.message, lines, &boilerplate_re));
+            row_is_revert.push(is_revert(&row.message, &revert_re));
+        }
+        let boilerplate_count = row_is_boilerplate.iter().filter(|b| **b).count();
+        let revert_count = row_is_revert.iter().filter(|b| **b).count();
+
+        // Period bounds.
+        let mut min_ts = rows[0].timestamp;
+        let mut max_ts = rows[0].timestamp;
+
+        // Per-author state.
+        struct AuthorAcc {
+            name: String,
+            email: String,
+            commits: usize,
+            insertions: i64,
+            deletions: i64,
+            files_changed: i64,
+            categories: HashMap<String, usize>,
+            first: DateTime<Utc>,
+            last: DateTime<Utc>,
+        }
+        // Keyed by author_email only — the same person committing with the same email
+        // but slightly different display names (e.g. "Bob Smith" vs "bobsmith") should
+        // be aggregated into a single author row. We retain the longest display name
+        // seen as the canonical name for that email.
+        let mut authors: HashMap<String, AuthorAcc> = HashMap::new();
+
+        // Per-repo state.
+        struct RepoAcc {
+            commits: usize,
+            authors: HashSet<String>,
+            insertions: i64,
+            deletions: i64,
+            categories: HashMap<String, usize>,
+        }
+        let mut repos: HashMap<String, RepoAcc> = HashMap::new();
+
+        // Weekly buckets keyed by (week, author, repository).
+        struct WeekAcc {
+            commits: usize,
+            insertions: i64,
+            deletions: i64,
+            categories: HashMap<String, usize>,
+        }
+        let mut weekly: BTreeMap<(String, String, String), WeekAcc> = BTreeMap::new();
+
+        let mut category_total: HashMap<String, usize> = HashMap::new();
+
+        // Cross-developer per-week roll-up keyed by week label.
+        #[derive(Default)]
+        struct WeekTotal {
+            commits: usize,
+            categories: HashMap<String, usize>,
+            developers: HashSet<String>,
+        }
+        let mut week_totals: BTreeMap<String, WeekTotal> = BTreeMap::new();
+
+        // Per-developer per-week active-week tracking (email → set of weeks).
+        let mut dev_weeks: HashMap<String, HashSet<String>> = HashMap::new();
+        // Per-developer category histogram for primary_work_type.
+        let mut dev_categories: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        // Per-developer ticketed-commit counter.
+        let mut dev_ticketed: HashMap<String, usize> = HashMap::new();
+
+        for (idx, row) in rows.iter().enumerate() {
+            if row.timestamp < min_ts {
+                min_ts = row.timestamp;
+            }
+            if row.timestamp > max_ts {
+                max_ts = row.timestamp;
+            }
+
+            // Authors. Group by email only; pick the longest display name seen
+            // as the canonical name (heuristic: longer names tend to be the full
+            // "Firstname Lastname" form rather than a short login handle).
+            let key = row.author_email.clone();
+            let a = authors.entry(key).or_insert_with(|| AuthorAcc {
+                name: row.author_name.clone(),
+                email: row.author_email.clone(),
+                commits: 0,
+                insertions: 0,
+                deletions: 0,
+                files_changed: 0,
+                categories: HashMap::new(),
+                first: row.timestamp,
+                last: row.timestamp,
+            });
+            if row.author_name.len() > a.name.len() {
+                a.name = row.author_name.clone();
+            }
+            a.commits += 1;
+            a.insertions += row.insertions;
+            a.deletions += row.deletions;
+            a.files_changed += row.files_changed;
+            if row.timestamp < a.first {
+                a.first = row.timestamp;
+            }
+            if row.timestamp > a.last {
+                a.last = row.timestamp;
+            }
+            if let Some(cat) = &row.category {
+                *a.categories.entry(cat.clone()).or_insert(0) += 1;
+            }
+
+            // Repositories.
+            let r = repos
+                .entry(row.repository.clone())
+                .or_insert_with(|| RepoAcc {
+                    commits: 0,
+                    authors: HashSet::new(),
+                    insertions: 0,
+                    deletions: 0,
+                    categories: HashMap::new(),
+                });
+            r.commits += 1;
+            r.authors.insert(row.author_email.clone());
+            r.insertions += row.insertions;
+            r.deletions += row.deletions;
+            if let Some(cat) = &row.category {
+                *r.categories.entry(cat.clone()).or_insert(0) += 1;
+            }
+
+            // Weekly. Keyed by email (not display name) so that the same identity
+            // committing under multiple names lands in a single weekly bucket.
+            let week = iso_week_label(&row.timestamp);
+            let wkey = (week, row.author_email.clone(), row.repository.clone());
+            let w = weekly.entry(wkey).or_insert_with(|| WeekAcc {
+                commits: 0,
+                insertions: 0,
+                deletions: 0,
+                categories: HashMap::new(),
+            });
+            w.commits += 1;
+            w.insertions += row.insertions;
+            w.deletions += row.deletions;
+            if let Some(cat) = &row.category {
+                *w.categories.entry(cat.clone()).or_insert(0) += 1;
+            }
+
+            // Category totals.
+            if let Some(cat) = &row.category {
+                *category_total.entry(cat.clone()).or_insert(0) += 1;
+            }
+
+            // Cross-developer weekly totals.
+            let week_label = iso_week_label(&row.timestamp);
+            let wt = week_totals.entry(week_label.clone()).or_default();
+            wt.commits += 1;
+            wt.developers.insert(row.author_email.clone());
+            // Treat boilerplate rows as a synthetic category so they show
+            // up in `weekly_categorization.csv` rather than being silently
+            // bucketed into whatever the classifier returned.
+            if row_is_boilerplate[idx] {
+                *wt.categories.entry("boilerplate".to_string()).or_insert(0) += 1;
+            } else if let Some(cat) = &row.category {
+                *wt.categories.entry(cat.clone()).or_insert(0) += 1;
+            } else {
+                *wt.categories.entry("unclassified".to_string()).or_insert(0) += 1;
+            }
+
+            // Per-developer week / category / ticketed tracking.
+            dev_weeks
+                .entry(row.author_email.clone())
+                .or_default()
+                .insert(week_label);
+            if let Some(cat) = &row.category {
+                *dev_categories
+                    .entry(row.author_email.clone())
+                    .or_default()
+                    .entry(cat.clone())
+                    .or_insert(0) += 1;
+            }
+            if row.ticketed {
+                *dev_ticketed.entry(row.author_email.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Materialize authors.
+        let mut author_summaries: Vec<AuthorSummary> = authors
+            .into_values()
+            .map(|a| AuthorSummary {
+                name: a.name,
+                email: a.email,
+                commit_count: a.commits,
+                insertions: a.insertions,
+                deletions: a.deletions,
+                files_changed: a.files_changed,
+                categories: a.categories,
+                first_commit: a.first.to_rfc3339(),
+                last_commit: a.last.to_rfc3339(),
+            })
+            .collect();
+        author_summaries.sort_by_key(|a| std::cmp::Reverse(a.commit_count));
+
+        // Materialize repositories.
+        let mut repo_summaries: Vec<RepositorySummary> = repos
+            .into_iter()
+            .map(|(name, r)| {
+                let mut top: Vec<(String, usize)> = r.categories.into_iter().collect();
+                top.sort_by_key(|t| std::cmp::Reverse(t.1));
+                RepositorySummary {
+                    name,
+                    commit_count: r.commits,
+                    author_count: r.authors.len(),
+                    insertions: r.insertions,
+                    deletions: r.deletions,
+                    top_categories: top,
+                }
+            })
+            .collect();
+        repo_summaries.sort_by_key(|r| std::cmp::Reverse(r.commit_count));
+
+        // Build email → canonical display name map from the author summaries
+        // so that the weekly activity rows display the same canonical name as
+        // the authors table (avoids "Bob" in one report and "bobmatnyc" in
+        // another for the same underlying identity).
+        let email_to_name: HashMap<String, String> = author_summaries
+            .iter()
+            .map(|a| (a.email.clone(), a.name.clone()))
+            .collect();
+
+        // Materialize weekly activity. The bucket key uses email; resolve to
+        // canonical display name for the output row.
+        let weekly_activity: Vec<WeeklyActivity> = weekly
+            .into_iter()
+            .map(|((week, email, repository), w)| WeeklyActivity {
+                week,
+                author: email_to_name.get(&email).cloned().unwrap_or(email),
+                repository,
+                commit_count: w.commits,
+                insertions: w.insertions,
+                deletions: w.deletions,
+                categories: w.categories,
+            })
+            .collect();
+
+        let total_commits = rows.len();
+        let total_authors = author_summaries.len();
+        let total_weeks = week_totals.len();
+
+        // ---- Weekly metrics (cross-developer) ----
+        let weekly_metrics: Vec<WeeklyMetrics> = week_totals
+            .iter()
+            .map(|(week, wt)| WeeklyMetrics {
+                week: week.clone(),
+                total_commits: wt.commits,
+                feature_commits: *wt.categories.get("feature").unwrap_or(&0),
+                bugfix_commits: *wt.categories.get("bugfix").unwrap_or(&0),
+                maintenance_commits: *wt.categories.get("maintenance").unwrap_or(&0),
+                refactor_commits: *wt.categories.get("refactor").unwrap_or(&0),
+                test_commits: *wt.categories.get("test").unwrap_or(&0),
+                doc_commits: *wt.categories.get("documentation").unwrap_or(&0)
+                    + *wt.categories.get("docs").unwrap_or(&0),
+                active_developers: wt.developers.len(),
+                story_points: 0.0,
+            })
+            .collect();
+
+        // ---- Weekly categorization ----
+        let mut weekly_categorization: Vec<WeeklyCategorization> = Vec::new();
+        for (week, wt) in &week_totals {
+            let total = wt.commits as f64;
+            let mut entries: Vec<(&String, &usize)> = wt.categories.iter().collect();
+            entries.sort_by_key(|e| e.0);
+            for (cat, count) in entries {
+                weekly_categorization.push(WeeklyCategorization {
+                    week: week.clone(),
+                    change_type: cat.clone(),
+                    commit_count: *count,
+                    pct_of_week: if total > 0.0 {
+                        (*count as f64) * 100.0 / total
+                    } else {
+                        0.0
+                    },
+                });
+            }
+        }
+
+        // ---- Untracked commits ----
+        let mut untracked_commits: Vec<UntrackedCommit> = rows
+            .iter()
+            .filter(|r| !r.ticketed && r.category.as_deref() != Some("boilerplate"))
+            .filter(|r| {
+                // Treat NULL category OR explicit "unclassified" as untracked.
+                r.category.is_none() || r.category.as_deref() == Some("unclassified") || !r.ticketed
+            })
+            .map(|r| UntrackedCommit {
+                sha: r.sha.clone(),
+                author: email_to_name
+                    .get(&r.author_email)
+                    .cloned()
+                    .unwrap_or_else(|| r.author_name.clone()),
+                date: r.timestamp.to_rfc3339(),
+                message: r.message.lines().next().unwrap_or("").to_string(),
+            })
+            .collect();
+        // Deterministic ordering: newest first.
+        untracked_commits.sort_by(|a, b| b.date.cmp(&a.date));
+
+        // ---- Velocity / DORA helpers ----
+        // Cycle times (hours) for merged PRs, outlier-filtered to [0.5, 720].
+        let mut cycle_times: Vec<f64> = prs
+            .iter()
+            .filter_map(|p| {
+                p.merged_at.map(|m| {
+                    let secs = (m - p.created_at).num_seconds();
+                    (secs as f64) / 3600.0
+                })
+            })
+            .filter(|h| *h >= 0.5 && *h <= 720.0)
+            .collect();
+        cycle_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pr_count = cycle_times.len();
+        let cycle_time_avg = if pr_count == 0 {
+            0.0
+        } else {
+            cycle_times.iter().sum::<f64>() / pr_count as f64
+        };
+        let cycle_time_median = if pr_count == 0 {
+            0.0
+        } else {
+            cycle_times[pr_count / 2]
+        };
+
+        // PRs merged per week (bucket merged_at by ISO week).
+        let mut pr_per_week: HashMap<String, usize> = HashMap::new();
+        for pr in &prs {
+            if let Some(merged) = pr.merged_at {
+                *pr_per_week.entry(iso_week_label(&merged)).or_insert(0) += 1;
+            }
+        }
+        let pr_throughput_per_week = if pr_per_week.is_empty() {
+            0.0
+        } else {
+            pr_per_week.values().copied().sum::<usize>() as f64 / pr_per_week.len() as f64
+        };
+
+        let velocity = Some(VelocitySummary {
+            pr_cycle_time_avg_hours: cycle_time_avg,
+            pr_cycle_time_median_hours: cycle_time_median,
+            pr_throughput_per_week,
+            revision_rate: 0.0,
+            pr_count,
+        });
+
+        // ---- Weekly velocity ----
+        let weekly_velocity: Vec<WeeklyVelocity> = week_totals
+            .iter()
+            .map(|(week, wt)| {
+                let prs_merged = *pr_per_week.get(week).unwrap_or(&0);
+                let active = wt.developers.len();
+                let commits_per_dev = if active == 0 {
+                    0.0
+                } else {
+                    wt.commits as f64 / active as f64
+                };
+                WeeklyVelocity {
+                    week: week.clone(),
+                    prs_merged,
+                    avg_pr_cycle_time_hours: cycle_time_avg,
+                    story_points: 0.0,
+                    commits_per_developer: commits_per_dev,
+                }
+            })
+            .collect();
+
+        // ---- DORA ----
+        let total_weeks_f = total_weeks.max(1) as f64;
+        let deploys = prs.iter().filter(|p| p.merged_at.is_some()).count();
+        let deployment_frequency = deploys as f64 / total_weeks_f;
+        let bugfix_total = category_total
+            .get("bugfix")
+            .copied()
+            .unwrap_or(0)
+            .max(revert_count);
+        let change_failure_rate = if total_commits == 0 {
+            0.0
+        } else {
+            bugfix_total as f64 / total_commits as f64
+        };
+        // MTTR approximation: average hours from a revert commit's predecessor
+        // (assumed bug introduction) to the revert itself. Without a richer
+        // mapping we approximate via the gap between consecutive bugfix
+        // commits, capped by available data.
+        let mut bugfix_ts: Vec<DateTime<Utc>> = rows
+            .iter()
+            .zip(row_is_revert.iter())
+            .filter(|(r, is_rev)| **is_rev || r.category.as_deref() == Some("bugfix"))
+            .map(|(r, _)| r.timestamp)
+            .collect();
+        bugfix_ts.sort();
+        let mttr_hours = if bugfix_ts.len() < 2 {
+            0.0
+        } else {
+            let mut gaps: Vec<f64> = Vec::new();
+            for w in bugfix_ts.windows(2) {
+                let secs = (w[1] - w[0]).num_seconds().abs();
+                gaps.push(secs as f64 / 3600.0);
+            }
+            gaps.iter().sum::<f64>() / gaps.len() as f64
+        };
+        let performance_level = dora_level(
+            deployment_frequency,
+            cycle_time_avg,
+            change_failure_rate,
+            mttr_hours,
+        );
+        let dora = Some(DoraMetrics {
+            deployment_frequency,
+            lead_time_hours: cycle_time_avg,
+            change_failure_rate,
+            mttr_hours,
+            performance_level,
+        });
+
+        // ---- Quality ----
+        let bugfix_pct = if total_commits == 0 {
+            0.0
+        } else {
+            bugfix_total as f64 / total_commits as f64
+        };
+        let revert_pct = if total_commits == 0 {
+            0.0
+        } else {
+            revert_count as f64 / total_commits as f64
+        };
+        let raw_quality = 1.0 - (bugfix_pct * 0.4) - (revert_pct * 0.6);
+        let quality_score = raw_quality.clamp(0.0, 1.0);
+        let non_bugfix = total_commits.saturating_sub(bugfix_total);
+        let defect_rate = if non_bugfix == 0 {
+            0.0
+        } else {
+            bugfix_total as f64 / non_bugfix as f64
+        };
+        let quality = Some(QualitySummary {
+            quality_score,
+            revert_count,
+            revert_pct,
+            bugfix_pct,
+            defect_rate,
+        });
+
+        // ---- Developer activity summary + scoring ----
+        let weights = ActivityWeights::default();
+        let developer_activity =
+            compute_developer_activity(&author_summaries, &dev_weeks, &dev_categories, &weights);
+
+        // ---- Summary ----
+        let classified_commits = rows.iter().filter(|r| r.category.is_some()).count();
+        let classification_coverage_pct = if total_commits == 0 {
+            0.0
+        } else {
+            classified_commits as f64 * 100.0 / total_commits as f64
+        };
+        let date_range = format!("{} .. {}", min_ts.to_rfc3339(), max_ts.to_rfc3339());
+        let summary = Some(ReportSummary {
+            date_range,
+            total_commits,
+            total_developers: total_authors,
+            total_weeks,
+            classification_coverage_pct,
+        });
+
+        data.total_commits = total_commits;
+        data.total_authors = total_authors;
+        data.period_start = Some(min_ts.to_rfc3339());
+        data.period_end = Some(max_ts.to_rfc3339());
+        data.authors = author_summaries;
+        data.repositories = repo_summaries;
+        data.weekly_activity = weekly_activity;
+        data.category_breakdown = category_total;
+        data.weekly_metrics = weekly_metrics;
+        data.developer_activity = developer_activity;
+        data.summary = summary;
+        data.untracked_commits = untracked_commits;
+        data.weekly_categorization = weekly_categorization;
+        data.weekly_velocity = weekly_velocity;
+        data.dora = dora;
+        data.velocity = velocity;
+        data.quality = quality;
+        data.boilerplate_count = boilerplate_count;
+        data.revert_count = revert_count;
+        // Silence unused-field warnings for trackers that today only feed
+        // activity scoring; future scoring tweaks will consume these.
+        let _ = dev_ticketed;
+        data
+    }
+}
+
+/// Compute composite developer activity scores and roll-up rows.
+///
+/// Why: provides a single configurable number for ranking developers across
+/// commits / impact / hygiene without committing to one dimension.
+/// What: applies min-max normalization to each component across the period,
+/// then a weighted sum per `ActivityWeights`.
+/// Test: seed two authors with different commit counts; assert the higher
+/// commit count yields the higher activity score.
+fn compute_developer_activity(
+    authors: &[AuthorSummary],
+    dev_weeks: &HashMap<String, HashSet<String>>,
+    dev_categories: &HashMap<String, HashMap<String, usize>>,
+    weights: &ActivityWeights,
+) -> Vec<DeveloperActivitySummary> {
+    if authors.is_empty() {
+        return Vec::new();
+    }
+
+    // Min-max normalization helper. Returns 0.0 when all values are equal.
+    fn norm(values: &[f64], idx: usize) -> f64 {
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if (max - min).abs() < f64::EPSILON {
+            0.0
+        } else {
+            (values[idx] - min) / (max - min)
+        }
+    }
+
+    let commits_v: Vec<f64> = authors.iter().map(|a| a.commit_count as f64).collect();
+    let impact_v: Vec<f64> = authors
+        .iter()
+        .map(|a| (a.insertions + a.deletions) as f64)
+        .collect();
+    let complexity_v: Vec<f64> = authors
+        .iter()
+        .map(|a| {
+            if a.commit_count == 0 {
+                0.0
+            } else {
+                a.files_changed as f64 / a.commit_count as f64
+            }
+        })
+        .collect();
+    // PRs and ticketing are placeholders until per-developer PR aggregation
+    // exists; using categories-sum as a stand-in keeps the field stable.
+    let prs_v: Vec<f64> = vec![0.0; authors.len()];
+    let ticketing_v: Vec<f64> = authors
+        .iter()
+        .map(|a| a.categories.values().copied().sum::<usize>() as f64)
+        .collect();
+
+    authors
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let score = weights.commits * norm(&commits_v, i)
+                + weights.prs * norm(&prs_v, i)
+                + weights.code_impact * norm(&impact_v, i)
+                + weights.complexity * norm(&complexity_v, i)
+                + weights.ticketing * norm(&ticketing_v, i);
+            let active_weeks = dev_weeks.get(&a.email).map(|s| s.len()).unwrap_or(0);
+            let avg_commits_per_week = if active_weeks == 0 {
+                0.0
+            } else {
+                a.commit_count as f64 / active_weeks as f64
+            };
+            let primary_work_type = dev_categories
+                .get(&a.email)
+                .and_then(|m| m.iter().max_by_key(|(_, v)| **v).map(|(k, _)| k.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+            DeveloperActivitySummary {
+                developer_id: a.email.clone(),
+                display_name: a.name.clone(),
+                total_commits: a.commit_count,
+                active_weeks,
+                avg_commits_per_week,
+                primary_work_type,
+                story_points_total: 0.0,
+                activity_score: score,
+            }
+        })
+        .collect()
+}
+
+/// DORA performance-level classifier.
+///
+/// Why: surface the four-band rubric defined in `docs/requirements/reporting.md`.
+/// What: returns `"elite" | "high" | "medium" | "low"` based on the four DORA
+/// metrics.
+/// Test: feed elite-range inputs (>= 1 deploy/week, < 1h lead, < 0.15 cfr,
+/// < 1h MTTR) and assert the returned label is `"elite"`.
+fn dora_level(deploys_per_week: f64, lead_h: f64, cfr: f64, mttr_h: f64) -> String {
+    let elite = deploys_per_week >= 1.0 && lead_h < 1.0 && cfr < 0.15 && mttr_h < 1.0;
+    if elite {
+        return "elite".to_string();
+    }
+    let high = deploys_per_week >= 0.25 && lead_h < 168.0 && cfr < 0.30 && mttr_h < 24.0;
+    if high {
+        return "high".to_string();
+    }
+    let medium = deploys_per_week >= 0.04 && lead_h < 720.0 && cfr < 0.30 && mttr_h < 168.0;
+    if medium {
+        return "medium".to_string();
+    }
+    "low".to_string()
+}
+
+/// Parse an ISO week label of the form `"YYYY-Www"` into `(year, week)`.
+///
+/// Returns `None` for malformed labels — callers should skip the entry
+/// rather than abort the entire report.
+fn parse_iso_week_label(label: &str) -> Option<(i32, u32)> {
+    let (year_s, week_s) = label.split_once("-W")?;
+    let year: i32 = year_s.parse().ok()?;
+    let week: u32 = week_s.parse().ok()?;
+    Some((year, week))
+}
+
+/// Emit a warning when adjacent weekly metric rows were collected with
+/// different repository counts (issue #69). Coverage drift between weeks
+/// makes week-over-week deltas misleading.
+///
+/// Why: weekly snapshots collected at different times may have different
+/// `repositories[]` rosters; without surfacing this, WoW deltas look like
+/// engineering changes when they're really configuration changes.
+/// What: walks consecutive `weekly_metrics` entries, looks up the recorded
+/// `repo_count` per week via [`crate::core::db::repo_count_for_week`], and
+/// warns when the values disagree.
+/// Test: seed `collection_runs` with two weeks at different repo_counts,
+/// build a report, assert a warning is logged (smoke-tested via the
+/// public `Aggregator::build` path).
+fn check_weekly_coverage_drift(
+    db: &Database,
+    weekly_metrics: &[crate::report::models::WeeklyMetrics],
+) {
+    if weekly_metrics.len() < 2 {
+        return;
+    }
+    let mut prev: Option<(String, i64)> = None;
+    for wm in weekly_metrics {
+        let (year, week) = match parse_iso_week_label(&wm.week) {
+            Some(v) => v,
+            None => continue,
+        };
+        let count = match crate::core::db::repo_count_for_week(db, year, week) {
+            Ok(Some(n)) => n,
+            // No recorded count for this week — either pre-migration data or
+            // legacy `record_collection_run` calls. Skip silently; the user
+            // will see normal output and we avoid noisy warnings on fresh
+            // databases.
+            _ => continue,
+        };
+        if let Some((prev_label, prev_count)) = &prev {
+            if *prev_count != count {
+                tracing::warn!(
+                    prev_week = %prev_label,
+                    prev_repo_count = prev_count,
+                    week = %wm.week,
+                    repo_count = count,
+                    "WARNING: Week-over-week comparison may be inaccurate — W{prev} was \
+                     collected with {n_prev} repos, W{cur} with {n_cur} repos. Re-run \
+                     `tga collect --force --from <week-start> --to <week-end>` for the \
+                     prior week to normalize coverage.",
+                    prev = prev_label,
+                    n_prev = prev_count,
+                    cur = wm.week,
+                    n_cur = count,
+                );
+            }
+        }
+        prev = Some((wm.week.clone(), count));
+    }
+}
+
+/// Collect every email address referenced by the configured alias map
+/// (`developer_aliases` + `team.members.email` + `team.members.aliases`)
+/// for "is this author in the configured roster?" lookups.
+///
+/// Why: see issue #68 — when an author's canonical email is not in the
+/// configured alias map they are a "phantom" identity that inflates the
+/// developer count.
+/// What: returns a set of lowercased email addresses; non-email aliases
+/// (login handles) are filtered out so case-insensitive email comparison
+/// is sufficient.
+/// Test: build a `Config` with one developer_aliases entry, assert the
+/// returned set contains the lowercased email.
+fn configured_alias_emails(config: &Config) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for entries in config.developer_aliases.values() {
+        for e in entries {
+            if e.contains('@') {
+                out.insert(e.to_lowercase());
+            }
+        }
+    }
+    if let Some(team) = &config.team {
+        for m in &team.members {
+            if m.email.contains('@') {
+                out.insert(m.email.to_lowercase());
+            }
+            for a in &m.aliases {
+                if a.contains('@') {
+                    out.insert(a.to_lowercase());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Format an ISO week label such as `"2024-W03"` from a UTC timestamp.
+fn iso_week_label(ts: &DateTime<Utc>) -> String {
+    let iso = ts.iso_week();
+    format!("{}-W{:02}", iso.year(), iso.week())
+}

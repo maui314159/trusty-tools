@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="description" content="open-mpm — AI agent orchestration" />
+    <meta name="theme-color" content="#3B4CCA" />
+    <meta name="color-scheme" content="light dark" />
+    <title>open-mpm</title>
+    <script>
+      // Why: Apply the persisted theme before first paint so users don't see a
+      // flash of the wrong palette during JS bootstrap. The theme store also
+      // calls applyTheme on import, but this inline script runs strictly
+      // earlier (before any module evaluation).
+      (function () {
+        try {
+          var stored = localStorage.getItem('ompm-theme');
+          var theme = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+          var isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (isDark) document.documentElement.classList.add('dark');
+        } catch (_) {}
+      })();
+    </script>
+    <style>
+      /* System font stack — no external HTTP requests, renders immediately.
+         Tailwind font-sans maps to Inter; we fall through to system UI fonts
+         so the page never blocks on CDN availability. */
+      @font-face {
+        font-family: 'Inter';
+        font-style: normal;
+        font-weight: 100 900;
+        font-display: swap;
+        src: local('-apple-system'), local('BlinkMacSystemFont'), local('Segoe UI'),
+             local('Helvetica Neue'), local('Arial'), local('sans-serif');
+      }
+      @font-face {
+        font-family: 'JetBrains Mono';
+        font-style: normal;
+        font-weight: 100 900;
+        font-display: swap;
+        src: local('SF Mono'), local('Monaco'), local('Cascadia Code'),
+             local('Consolas'), local('Liberation Mono'), local('monospace');
+      }
+    </style>
+  </head>
+  <body class="bg-ompm-light-bg text-ompm-light-text dark:bg-ompm-bg dark:text-ompm-text">
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

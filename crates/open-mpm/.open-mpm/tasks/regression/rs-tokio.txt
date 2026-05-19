@@ -1,0 +1,18 @@
+Write a Rust module called task_queue.rs that implements a bounded async task queue:
+- TaskQueue<T: Send + 'static> struct backed by tokio::sync::mpsc::channel
+- Methods:
+    pub fn new(capacity: usize, concurrency: usize) -> Self
+    pub async fn enqueue(&self, item: T) -> Result<(), QueueError>
+    pub async fn process<F, Fut>(&self, handler: F) -> Result<ProcessStats, QueueError>
+      where F: Fn(T) -> Fut + Send + Sync + 'static, Fut: Future<Output = Result<(), QueueError>> + Send
+- ProcessStats struct: { completed: usize, failed: usize }
+- Concurrency limited by tokio::sync::Semaphore (configurable at construction)
+- Graceful shutdown: process() drains the queue fully before returning
+- QueueError enum with thiserror: ChannelClosed, HandlerFailed(String), QueueFull
+- No .unwrap() anywhere in library code; use ? or map_err throughout
+
+Include #[tokio::test] tests in the same file or a tests/ submodule:
+- Enqueue 10 items, process with concurrency=3, assert all 10 complete
+- Handler that fails on item 5: assert ProcessStats.failed == 1, completed == 9
+- Enqueue beyond capacity: assert QueueError::QueueFull is returned
+- Track call order: use Arc<Mutex<Vec<usize>>> in handler to verify all items processed

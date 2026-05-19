@@ -1,0 +1,62 @@
+[package]
+name = "trusty-memory-core"
+version = "0.1.19"
+edition = "2021"
+description = "Core types, storage, and retrieval for trusty-memory"
+license = "MIT"
+
+[lib]
+# Why: Explicit `rlib` keeps the crate linkable as a Rust library from
+#      host processes (open-mpm) that want to embed it directly rather
+#      than spawn it over MCP/stdio. Matches the rest of the trusty-*
+#      ecosystem (see trusty-mcp-core) and prevents future drift if a
+#      `cdylib` or other crate-type is ever added.
+crate-type = ["rlib"]
+
+[dependencies]
+# workspace
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+
+# storage
+usearch = { workspace = true }
+rusqlite = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+
+# embedding (extracted to shared crate)
+trusty-embedder = { workspace = true }
+
+# utils
+tiktoken-rs = { workspace = true }
+dirs = { workspace = true }
+
+# git history extraction
+git2 = { workspace = true }
+regex = { workspace = true }
+
+# optional: kuzu graph DB read-only integration
+kuzu = { workspace = true, optional = true }
+
+[features]
+default = []
+kuzu = ["dep:kuzu"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "retrieval"
+harness = false

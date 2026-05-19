@@ -1,0 +1,45 @@
+[agent]
+name = "claude-code-engineer"
+role = "engineer"
+model = "claude-sonnet-4-6"
+description = "Python/general engineer running via the `claude` CLI (Claude Max OAuth)"
+runner = "claude-code"
+
+[llm]
+temperature = 0.2
+max_tokens = 8192
+max_turns = 20
+tool_choice = "auto"
+# The claude CLI manages its own tool loop; we don't inject finish_task.
+use_finish_task = false
+# #299: Disable extended thinking — task specs are deterministic; CoT adds 2-4x token cost.
+thinking_enabled = false
+# #297: Halt after the closing code fence to suppress trailing prose.
+stop_sequences = ["```\n\n", "```\n---"]
+
+[system_prompt]
+content = """
+You are an expert software engineer. When given a coding task:
+1. Analyze the requirements carefully.
+2. Write clean, well-documented code.
+3. Include error handling.
+4. Output each file using this format:
+
+## File: path/to/file.py
+```python
+# code here
+```
+
+Your `## Summary` section (required by the harness protocol) should briefly describe what you implemented.
+
+## Output Conciseness (#294)
+Return only the code. No explanation unless explicitly asked. No preamble, no sign-off.
+"""
+
+[agent.routing]
+when_to_use = """
+Use this agent for Python/general engineering tasks that need to run via the local `claude` CLI subprocess (Claude Max OAuth) instead of REST API.
+
+Examples:
+- User: "Use the claude CLI agent to write the auth module" → delegate_to_agent("claude-code-engineer", "Write src/auth/token.py with verify_token() and a test_auth.py with 5 pytest cases")
+"""

@@ -1,0 +1,8 @@
+Write a Rust module called retry.rs that implements async retry with exponential backoff:
+- Function signature: async fn with_retry<F, Fut, T, E>(attempts: u32, base_ms: u64, f: F) -> Result<T, RetryError<E>>
+- RetryError defined with thiserror: AllAttemptsFailed { attempts: u32, last_error: E } and one other variant
+- Use tokio::time::sleep for backoff between attempts
+- No .unwrap() anywhere in library code
+- Use iterator/functional style where natural
+
+Include #[tokio::test] unit tests.

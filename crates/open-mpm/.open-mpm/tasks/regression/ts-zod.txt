@@ -1,0 +1,16 @@
+Write a TypeScript module called schemas.ts using Zod that defines:
+- UserId: a branded string type (z.string().uuid().brand<"UserId">())
+- UserProfile schema: id (UserId), email (valid email format), name (min 2 chars, max 100), role (enum: "admin" | "user" | "guest"), createdAt (z.coerce.date())
+- ApiResponse<T> discriminated union: { success: true; data: T } | { success: false; error: { code: string; message: string } }
+- PaginatedList<T> schema factory: items (array of T), total (non-negative int), page (min 1), pageSize (min 1, max 100)
+- Export parseUserProfile(input: unknown): { ok: true; value: UserProfile } | { ok: false; error: ZodError } — no throwing
+- Strict TypeScript: no `any`, no non-null assertions, strict mode enabled
+
+Include vitest tests in schemas.test.ts covering:
+- Valid UserProfile with all fields passes
+- Invalid email format fails with ZodError
+- Name shorter than 2 chars fails
+- Role outside enum fails
+- pageSize > 100 fails on PaginatedList
+- ApiResponse success and failure variants both parse correctly
+- parseUserProfile returns ok:false (not throws) for invalid input

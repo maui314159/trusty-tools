@@ -1,0 +1,11 @@
+Implement a generic LRU (Least Recently Used) cache in Java.
+
+Requirements:
+- LruCache<K, V> class with capacity constructor parameter
+- get(K key) → Optional<V>, updates access order on hit
+- put(K key, V value) → void, evicts LRU entry when over capacity
+- remove(K key) → boolean
+- size() → int, capacity() → int
+- Thread-safe: all public methods synchronized
+- No external dependencies — use only java.util (LinkedHashMap acceptable as backing structure)
+- Write JUnit 5 tests covering: get miss, get hit updates order, eviction of LRU, remove, size/capacity, concurrent access (basic)

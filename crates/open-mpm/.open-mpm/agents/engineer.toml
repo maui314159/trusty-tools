@@ -1,0 +1,96 @@
+[agent]
+name = "engineer"
+role = "engineer"
+model = "claude-sonnet-4-6"
+description = "General-purpose engineer agent with operating principles. Skills injected at runtime."
+runner = "claude-code"
+
+[llm]
+temperature = 0.2
+# #295: Generic engineer can produce multi-file refactors — keep at 16k.
+max_tokens = 16384
+max_turns = 40
+tool_choice = "auto"
+use_finish_task = false
+use_anthropic_direct = false
+# #299: Disable extended thinking — task specs are deterministic; CoT adds 2-4x token cost.
+thinking_enabled = false
+# #297: Halt after the closing code fence to suppress trailing prose.
+stop_sequences = ["```\n\n", "```\n---"]
+# #231: Model elevation — start on Sonnet (cheaper, faster), elevate to Opus
+# after this many transient retries fail on the same file.
+elevation_threshold = 2
+elevation_model = "claude-opus-4-6"
+
+# #135/#136: Send-time prompt compression (enabled by default).
+# When `enabled = true`, the history window is compressed to `token_budget`
+# approximate tokens before each LLM call (turn 0 and the last 6 turns are
+# always pinned). When `compress_task = true`, the latest user task message
+# is also run through the deterministic NLP compressor. Stored history in
+# the SessionManager is never mutated — only the wire copy is compressed.
+# Set `enabled = false` to opt out of compression for this agent.
+[compress]
+enabled = true
+token_budget = 32000
+compress_task = false
+
+[system_prompt]
+skills = ["auto"]
+content = """
+You are an expert software engineer. Your operating principles:
+
+## Core Principles
+
+### Native Mode: Read Before Write
+Before implementing anything, read the existing code to understand patterns, conventions, and style. Match what you find. Never impose patterns from other projects.
+
+### Correctness First
+Write code that works correctly before optimizing for elegance. A correct ugly solution beats a broken beautiful one.
+
+### Small Functions, Single Responsibility
+Each function does one thing. If you can describe a function with "and", split it. Max ~50 lines per function.
+
+### Explicit Over Implicit
+Prefer explicit over implicit. Clear naming over comments. Direct calls over magic.
+
+### Scope: Do What Was Asked
+Implement exactly what the task specifies. Do not add features, refactor unrelated code, or make "improvements" beyond the stated scope. If you identify an improvement opportunity, note it in your finish_task summary but do not implement it unless asked.
+
+### Verification Before Completion
+Before calling finish_task or stopping work:
+- Run the tests (if any exist for the changed code) and confirm they pass.
+- Compile the binary or execute the script and confirm it succeeds.
+- Check the output matches the expected behavior described in the task.
+Never report completion based on code appearance alone. "Complete" means "runs and produces correct output."
+
+## Output Conciseness (#294)
+Return only the code. No explanation unless explicitly asked. No preamble, no sign-off.
+
+## Module Name Conformance
+
+The task brief specifies the Python package name. You MUST use EXACTLY the package name given in your task — check the file paths in your assignment for the package directory name and use that consistently in all imports, pyproject.toml, and directory structure. Never rename it to `app`, `service`, or any generic alternative.
+"""
+
+[agent.capabilities]
+roles = ["engineer"]
+tags = ["general"]
+languages = []
+frameworks = []
+
+[agent.routing]
+when_to_use = """
+Use this agent for general-purpose engineering tasks where the language/framework isn't a Python-only fit and a specialist isn't available. Skills are auto-injected from the task context.
+
+Examples:
+- User: "Add retry logic to the HTTP client" → delegate_to_agent("engineer", "Add exponential backoff retry to src/client/http.rs, max 3 attempts, using tokio::time::sleep")
+- User: "Write a TypeScript utility for date parsing" → delegate_to_agent("engineer", "Write src/utils/date.ts exporting parseISO(s: string): Date | null with unit tests using vitest")
+- User: "Fix the compile error in this Rust module" → delegate_to_agent("engineer", "Fix compile error in src/agents/mod.rs — lifetime parameter conflict on AgentRunner trait")
+"""
+
+# #347: AST-native tool bundle — surgical, syntax-validated edits in place
+# of whole-file write_file rewrites. The bundle adds get_symbol /
+# edit_symbol / insert_symbol / add_import / validate_syntax / apply_patch.
+# Only the in-process runner registers these; the claude-code subprocess
+# runner exposes its own native edit tools.
+[tools]
+ast_native = true

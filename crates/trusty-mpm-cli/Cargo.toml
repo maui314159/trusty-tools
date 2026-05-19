@@ -1,0 +1,50 @@
+[package]
+name = "trusty-mpm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI client for the trusty-mpm daemon"
+
+[[bin]]
+name = "trusty-mpm"
+path = "src/main.rs"
+
+[[bin]]
+name = "tm"
+path = "src/main.rs"
+
+[features]
+# `gui` is enabled by default for local builds. CI and crates.io builds use
+# `--no-default-features` to avoid GTK native deps. trusty-mpm-gui is not
+# published to crates.io (publish = false) so it cannot be a dep here.
+default = []
+# Declare the feature so cfg(feature = "gui") guards in main.rs compile cleanly.
+# The trusty-mpm-gui dep is intentionally omitted (publish=false, Tauri build.rs
+# writes outside OUT_DIR). Enable via a local .cargo/config.toml override only.
+gui = []
+
+[dependencies]
+# Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
+trusty-mpm-core.workspace = true
+trusty-mpm-client.workspace = true
+trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.2.9" }
+trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.2.9" }
+trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.2.9" }
+
+tokio.workspace = true
+# Async (not blocking) reqwest: `#[tokio::main]` covers every subcommand, so the
+# blocking client is no longer needed.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+# Used solely to query the terminal width (`TIOCGWINSZ`) for the launch banner.
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

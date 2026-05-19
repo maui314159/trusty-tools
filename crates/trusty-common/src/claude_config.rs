@@ -1,0 +1,509 @@
+//! Claude Code configuration discovery and patching.
+//!
+//! Why: trusty-search, trusty-analyze, and trusty-memory each grew their own
+//! "setup" command that scans `$HOME` for `.claude/settings*.json`, upserts an
+//! MCP server entry, and writes JSON atomically. Three divergent copies meant
+//! three subtly different skip-lists, three backup strategies, and three sets
+//! of bugs. This module is the single shared implementation.
+//!
+//! What: pure-ish helpers — directory scanning, idempotent JSON upsert, atomic
+//! writes with backup, and Claude Code hook merging. No global state.
+//!
+//! Test: `cargo test -p trusty-common` covers `mcp_server_entry` shape,
+//! `merge_hook_entries` idempotency, and `discover_claude_settings` skip-dir
+//! behaviour. Filesystem-touching tests are `#[ignore]`.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde_json::{Map, Value, json};
+
+/// Directory names that are never recursed into while scanning for Claude
+/// settings files.
+///
+/// Why: `$HOME` contains huge, irrelevant subtrees (`node_modules`, `target`,
+/// `Library`). Walking them is slow and pollutes results. A shared const keeps
+/// every trusty-* setup command skipping exactly the same directories.
+/// What: a flat slice of directory base-names compared case-sensitively.
+/// Test: `discover_claude_settings_skips_blacklisted_dirs` plants a settings
+/// file inside `node_modules` and asserts it is not returned.
+pub const SCAN_SKIP_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "Library",
+    "Applications",
+    ".Trash",
+    "build",
+    "dist",
+    ".cache",
+    ".npm",
+    ".cargo",
+];
+
+/// Default recursion depth for [`discover_claude_settings`].
+const DEFAULT_SETTINGS_MAX_DEPTH: usize = 8;
+
+/// Scan `home` for every `.claude/settings.json` and `.claude/settings.local.json`.
+///
+/// Why: a Claude Code user can have settings files scattered across many
+/// project directories. Setup commands need to find them all to offer the user
+/// a choice of where to install an MCP server. Each sibling project reinvented
+/// this walk; centralising it fixes the skip-list once.
+/// What: recursively walks `home` up to `max_depth` directories deep, skipping
+/// any directory whose base-name is in [`SCAN_SKIP_DIRS`]. For every `.claude`
+/// directory found, checks for `settings.json` and `settings.local.json` and
+/// collects the ones that exist. A `max_depth` of 0 inspects only `home`
+/// itself. Use [`DEFAULT_SETTINGS_MAX_DEPTH`] (8) as a sensible default.
+/// Returns paths sorted for deterministic output.
+/// Test: `discover_claude_settings_skips_blacklisted_dirs` (`#[ignore]`, real
+/// filesystem) verifies both discovery and skip behaviour.
+pub fn discover_claude_settings(home: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_claude_settings(home, max_depth, &mut found);
+    found.sort();
+    found
+}
+
+/// Recursive worker for [`discover_claude_settings`].
+fn collect_claude_settings(dir: &Path, depth_remaining: usize, out: &mut Vec<PathBuf>) {
+    // If this directory is a `.claude` dir, harvest its settings files.
+    if dir.file_name().and_then(|n| n.to_str()) == Some(".claude") {
+        for name in ["settings.json", "settings.local.json"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+        // `.claude` directories don't contain nested projects worth scanning.
+        return;
+    }
+
+    if depth_remaining == 0 {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // permission denied / not a dir — skip silently
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Always allow `.claude` itself; otherwise honour the skip-list.
+        if name != ".claude" && SCAN_SKIP_DIRS.contains(&name) {
+            continue;
+        }
+        collect_claude_settings(&path, depth_remaining.saturating_sub(1), out);
+    }
+}
+
+/// Default [`discover_claude_settings`] depth, exposed for callers that want
+/// the library default without hard-coding the number.
+///
+/// Why: keeps the "8" in one place so a future tuning change is one edit.
+/// What: returns [`DEFAULT_SETTINGS_MAX_DEPTH`].
+/// Test: compile-time constant; no runtime test needed.
+pub const fn default_settings_max_depth() -> usize {
+    DEFAULT_SETTINGS_MAX_DEPTH
+}
+
+/// Build a standard MCP server entry JSON object.
+///
+/// Why: every trusty-* MCP server is registered with the same `{command, args}`
+/// shape. A constructor avoids hand-built `json!` literals drifting in field
+/// names or omitting `args`.
+/// What: returns `{"command": <command>, "args": [<args...>]}`. `args` is always
+/// present (an empty array when no args are supplied) because Claude Code
+/// expects the key.
+/// Test: `mcp_server_entry_has_expected_shape`.
+pub fn mcp_server_entry(command: &str, args: &[&str]) -> Value {
+    json!({
+        "command": command,
+        "args": args,
+    })
+}
+
+/// Atomically write `value` as pretty-printed JSON to `path`.
+///
+/// Why: a crash or `^C` mid-write must never leave a half-written settings
+/// file — that would brick the user's Claude Code config. Writing to a temp
+/// file then renaming makes the swap atomic on every supported OS.
+/// What: serialises `value` to pretty JSON; if `path` already exists it is
+/// first copied to `<path>.bak`; the JSON is written to `<path>.tmp`; finally
+/// `<path>.tmp` is renamed onto `path`. Parent directories are created if
+/// missing.
+/// Test: `write_json_atomic_creates_and_backs_up` (`#[ignore]`, real fs).
+pub fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent dir {}", parent.display()))?;
+    }
+
+    let serialized =
+        serde_json::to_string_pretty(value).context("serialize JSON for atomic write")?;
+
+    if path.exists() {
+        let backup = backup_path(path);
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
+    }
+
+    let tmp = tmp_path(path);
+    std::fs::write(&tmp, serialized.as_bytes())
+        .with_context(|| format!("write temp file {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} onto {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Idempotently upsert a single entry into the `mcpServers` object of a JSON
+/// config file.
+///
+/// Why: setup commands must be safe to re-run. Running `setup` twice should not
+/// duplicate the server entry, clobber unrelated config, or rewrite the file
+/// when nothing changed. All three sibling projects needed this exact contract.
+/// What: loads `path` (treating a missing file as an empty `{}` object),
+/// ensures a `mcpServers` object exists, and sets `mcpServers[server_key] =
+/// entry`. If the key already maps to a value equal to `entry`, nothing is
+/// written and `Ok(false)` is returned. Otherwise the merged config is written
+/// via [`write_json_atomic`] (which backs the original up to `<path>.bak`) and
+/// `Ok(true)` is returned. Creates the file if it does not exist.
+/// Test: `patch_mcp_server_is_idempotent` (`#[ignore]`, real fs).
+pub fn patch_mcp_server(path: &Path, server_key: &str, entry: &Value) -> Result<bool> {
+    let mut root = load_json_object(path)?;
+
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()));
+
+    // If `mcpServers` exists but isn't an object, replace it with one.
+    if !servers.is_object() {
+        *servers = Value::Object(Map::new());
+    }
+    let servers_obj = servers
+        .as_object_mut()
+        .expect("mcpServers coerced to object above");
+
+    if servers_obj.get(server_key) == Some(entry) {
+        return Ok(false); // already present and identical — no write
+    }
+
+    servers_obj.insert(server_key.to_string(), entry.clone());
+    write_json_atomic(path, &Value::Object(root))?;
+    Ok(true)
+}
+
+/// Merge Claude Code hook entries from `additions` into `existing`.
+///
+/// Why: trusty-* setup commands install Stop / PostToolUse / UserPromptSubmit
+/// hooks. A naive overwrite would destroy hooks the user (or another tool)
+/// already configured. Merging additively is the safe, shared behaviour.
+/// What: returns a new `Value` that is `existing` deep-cloned with the `hooks`
+/// object merged. For each known hook event (`Stop`, `PostToolUse`,
+/// `UserPromptSubmit`) the arrays from `additions.hooks.<event>` are appended
+/// to `existing.hooks.<event>`, skipping any addition already present (deep
+/// equality) so the operation is idempotent. Hook events outside the known set
+/// are also merged the same way so callers are not blocked by this list.
+/// `existing` entries are never removed or reordered.
+/// Test: `merge_hook_entries_is_idempotent` and
+/// `merge_hook_entries_preserves_existing`.
+pub fn merge_hook_entries(existing: &Value, additions: &Value) -> Value {
+    let mut result = existing.clone();
+
+    let Some(add_hooks) = additions.get("hooks").and_then(Value::as_object) else {
+        return result; // nothing to merge
+    };
+
+    // Ensure result is an object with a `hooks` object.
+    if !result.is_object() {
+        result = Value::Object(Map::new());
+    }
+    let root = result
+        .as_object_mut()
+        .expect("result coerced to object above");
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let hooks_obj = hooks
+        .as_object_mut()
+        .expect("hooks coerced to object above");
+
+    for (event, add_value) in add_hooks {
+        let Some(add_array) = add_value.as_array() else {
+            continue; // hook events are arrays in Claude Code config
+        };
+        let target = hooks_obj
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !target.is_array() {
+            *target = Value::Array(Vec::new());
+        }
+        let target_array = target
+            .as_array_mut()
+            .expect("target coerced to array above");
+        for item in add_array {
+            if !target_array.contains(item) {
+                target_array.push(item.clone());
+            }
+        }
+    }
+
+    result
+}
+
+// ─── internal helpers ─────────────────────────────────────────────────────
+
+/// Path of the backup file written before an atomic JSON write: `<path>.bak`.
+fn backup_path(path: &Path) -> PathBuf {
+    append_extension(path, "bak")
+}
+
+/// Path of the temp file used during an atomic JSON write: `<path>.tmp`.
+fn tmp_path(path: &Path) -> PathBuf {
+    append_extension(path, "tmp")
+}
+
+/// Append `suffix` to a path's file name, preserving the existing extension
+/// (`settings.json` → `settings.json.bak`).
+fn append_extension(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Load `path` as a JSON object map, returning an empty map when the file is
+/// absent. Errors on malformed JSON or a non-object top-level value.
+fn load_json_object(path: &Path) -> Result<Map<String, Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            if text.trim().is_empty() {
+                return Ok(Map::new());
+            }
+            let value: Value = serde_json::from_str(&text)
+                .with_context(|| format!("parse JSON config {}", path.display()))?;
+            match value {
+                Value::Object(map) => Ok(map),
+                other => anyhow::bail!(
+                    "config {} is not a JSON object (found {})",
+                    path.display(),
+                    json_type_name(&other)
+                ),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(e) => {
+            Err(anyhow::Error::new(e)).with_context(|| format!("read config {}", path.display()))
+        }
+    }
+}
+
+/// Human-readable JSON type name for error messages.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("trusty-claude-config-{tag}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn mcp_server_entry_has_expected_shape() {
+        let e = mcp_server_entry("trusty-search", &["mcp", "--stdio"]);
+        assert_eq!(e["command"], "trusty-search");
+        assert_eq!(e["args"], json!(["mcp", "--stdio"]));
+    }
+
+    #[test]
+    fn mcp_server_entry_always_includes_args_array() {
+        let e = mcp_server_entry("foo", &[]);
+        assert!(e["args"].is_array());
+        assert_eq!(e["args"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn merge_hook_entries_preserves_existing() {
+        let existing = json!({
+            "hooks": { "Stop": [{ "command": "user-hook" }] },
+            "other": "untouched"
+        });
+        let additions = json!({
+            "hooks": { "Stop": [{ "command": "trusty-hook" }] }
+        });
+        let merged = merge_hook_entries(&existing, &additions);
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert!(stop.contains(&json!({ "command": "user-hook" })));
+        assert!(stop.contains(&json!({ "command": "trusty-hook" })));
+        assert_eq!(merged["other"], "untouched");
+    }
+
+    #[test]
+    fn merge_hook_entries_is_idempotent() {
+        let existing = json!({ "hooks": {} });
+        let additions = json!({
+            "hooks": {
+                "PostToolUse": [{ "command": "trusty" }],
+                "UserPromptSubmit": [{ "command": "trusty-prompt" }]
+            }
+        });
+        let once = merge_hook_entries(&existing, &additions);
+        let twice = merge_hook_entries(&once, &additions);
+        assert_eq!(
+            once, twice,
+            "merging the same additions twice must be a no-op"
+        );
+        assert_eq!(once["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            once["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn merge_hook_entries_handles_missing_hooks_block() {
+        let existing = json!({ "model": "claude" });
+        let additions = json!({ "hooks": { "Stop": [{ "command": "trusty" }] } });
+        let merged = merge_hook_entries(&existing, &additions);
+        assert_eq!(merged["model"], "claude");
+        assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_hook_entries_noop_when_no_additions() {
+        let existing = json!({ "hooks": { "Stop": [{ "command": "x" }] } });
+        let merged = merge_hook_entries(&existing, &json!({}));
+        assert_eq!(merged, existing);
+    }
+
+    #[test]
+    fn append_extension_preserves_original() {
+        let p = Path::new("/tmp/.claude/settings.json");
+        assert_eq!(backup_path(p), Path::new("/tmp/.claude/settings.json.bak"));
+        assert_eq!(tmp_path(p), Path::new("/tmp/.claude/settings.json.tmp"));
+    }
+
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn write_json_atomic_creates_and_backs_up() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("settings.json");
+
+        write_json_atomic(&path, &json!({ "v": 1 })).unwrap();
+        assert!(path.exists());
+        assert!(!backup_path(&path).exists(), "no backup on first write");
+
+        write_json_atomic(&path, &json!({ "v": 2 })).unwrap();
+        let backup = std::fs::read_to_string(backup_path(&path)).unwrap();
+        assert!(backup.contains("\"v\": 1"));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("\"v\": 2"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn patch_mcp_server_is_idempotent() {
+        let dir = scratch_dir("patch");
+        let path = dir.join("settings.json");
+        let entry = mcp_server_entry("trusty-search", &["mcp"]);
+
+        let first = patch_mcp_server(&path, "trusty-search", &entry).unwrap();
+        assert!(first, "first patch must modify the file");
+
+        let second = patch_mcp_server(&path, "trusty-search", &entry).unwrap();
+        assert!(!second, "re-patching identical entry must be a no-op");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["mcpServers"]["trusty-search"], entry);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn patch_mcp_server_preserves_other_keys() {
+        let dir = scratch_dir("patch-preserve");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"claude","mcpServers":{"existing":{"command":"x"}}}"#,
+        )
+        .unwrap();
+
+        let entry = mcp_server_entry("trusty-memory", &["mcp"]);
+        patch_mcp_server(&path, "trusty-memory", &entry).unwrap();
+
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["model"], "claude");
+        assert_eq!(parsed["mcpServers"]["existing"]["command"], "x");
+        assert_eq!(parsed["mcpServers"]["trusty-memory"], entry);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn discover_claude_settings_skips_blacklisted_dirs() {
+        let home = scratch_dir("discover");
+
+        // A real project: home/proj/.claude/settings.json
+        let real = home.join("proj").join(".claude");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("settings.json"), "{}").unwrap();
+        std::fs::write(real.join("settings.local.json"), "{}").unwrap();
+
+        // A buried one inside node_modules — must be skipped.
+        let buried = home.join("node_modules").join("pkg").join(".claude");
+        std::fs::create_dir_all(&buried).unwrap();
+        std::fs::write(buried.join("settings.json"), "{}").unwrap();
+
+        let found = discover_claude_settings(&home, default_settings_max_depth());
+        assert_eq!(found.len(), 2, "should find only the two non-skipped files");
+        assert!(
+            found
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("node_modules"))
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

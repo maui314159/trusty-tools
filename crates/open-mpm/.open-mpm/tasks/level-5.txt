@@ -1,0 +1,48 @@
+Build a full-stack team task management application with FastAPI, JWT authentication, WebSocket real-time updates, and Docker Compose deployment.
+
+## Data Models
+- User: id, email, password_hash, display_name, role (admin|member), created_at
+- Board: id, name, description, created_by (FK User), created_at
+- Column: id, board_id (FK), name, position (int)
+- Task: id, title, description, column_id (FK), assignee_id (FK User, nullable), priority (low|medium|high|urgent), created_by (FK User), created_at, updated_at
+- Activity: id, task_id (FK), user_id (FK), action, details (JSON), created_at
+
+## REST API Endpoints
+- POST /auth/register, POST /auth/login, POST /auth/refresh, GET /auth/me
+- CRUD /boards, /boards/{id}/columns, /columns/{id}/tasks
+- POST /tasks/{id}/move — move task to column (optionally reorder)
+- GET /tasks/{id}/activity — activity log
+- GET /ws — WebSocket connection for real-time updates
+
+## Authentication
+- JWT (access token 30min, refresh token 7 days)
+- JWT middleware on all non-auth routes
+- Password hashing with bcrypt
+
+## WebSocket
+- Broadcast task_created, task_updated, task_moved, task_deleted events to all connected clients
+- Handle disconnects gracefully
+
+## Docker Compose
+- FastAPI service
+- PostgreSQL (or SQLite for simplicity)
+- Redis for WebSocket pub/sub (or fakeredis for tests)
+
+## Tests (57 tests targeting full coverage)
+- Auth: register, login, refresh, me
+- Board/Column/Task CRUD
+- Task move
+- Activity log
+- WebSocket connection and broadcast
+- JWT middleware enforcement
+- Use fakeredis for tests
+
+## Project structure (FLAT layout)
+- pyproject.toml (at root, declares fakeredis, pydantic[email], python-jose[cryptography], passlib[bcrypt] as test deps)
+- task_board/ (Python package — MUST use this exact name)
+  - main.py, models.py, auth.py, websocket.py, routers/
+- tests/
+  - conftest.py (AsyncClient with lifespan="on", fakeredis fixture)
+  - test_auth.py, test_boards.py, test_tasks.py, test_websocket.py, test_activity.py
+- docker-compose.yml
+- README.md

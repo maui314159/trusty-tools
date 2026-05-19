@@ -1,0 +1,124 @@
+[workspace]
+# Glob picks up every crate directory under `crates/`. Add a new crate by
+# dropping its directory in `crates/` with its own Cargo.toml.
+members = ["crates/*"]
+resolver = "2"
+# Exclude paths inside copied projects that contain stray manifests we don't
+# want Cargo to treat as workspace members. open-mpm bundles a `weather_alerter`
+# scratch dir; trusty-mpm-gui's `src-tauri` is included via its parent crate.
+exclude = []
+
+[workspace.package]
+edition = "2024"
+# Required for let-chains used by trusty-mpm crates (stabilized in 1.88).
+rust-version = "1.88"
+# Inherited by the trusty-mpm-* crates which declare `version.workspace = true`.
+# Other crates set their own `version` and are unaffected.
+version = "0.2.9"
+# NOTE: workspace-level license preserved because several existing crates
+# (trusty-common, trusty-mcp-core, trusty-mpm-core, …) reference it via
+# `license.workspace = true`. Per migration instructions we must not alter
+# individual crates' license fields. trusty-memory-* and a few others declare
+# their own (MIT or Elastic-2.0) directly and are unaffected.
+license = "Elastic-2.0"
+repository = "https://github.com/bobmatnyc/trusty-tools"
+authors = ["Bob Matsuoka <bob@matsuoka.com>"]
+
+[workspace.dependencies]
+# ── Internal crates (path deps so the monorepo builds without publish cycles) ──
+trusty-common = { path = "crates/trusty-common", version = "0.3" }
+trusty-mcp-core = { path = "crates/trusty-mcp-core", version = "0.1" }
+trusty-embedder = { path = "crates/trusty-embedder", version = "0.1" }
+trusty-symgraph = { path = "crates/trusty-symgraph", version = "0.2" }
+# trusty-mpm internal crates (consumed by trusty-mpm-* sub-crates).
+trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.2.9" }
+trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp", version = "0.2.9" }
+trusty-mpm-client = { path = "crates/trusty-mpm-client", version = "0.2.9" }
+
+# ── Async runtime / HTTP ────────────────────────────────────────────────────
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# Widened to `full` so trusty-mpm + open-mpm + trusty-memory get
+# process/signal/time/fs; the originally-listed feature set is a strict
+# subset of `full`.
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+fastembed = { version = "5", default-features = false }
+lru = "0.12"
+parking_lot = "0.12"
+dirs = "5"
+colored = "2"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+futures = "0.3"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+libc = "0.2"
+
+# CLI / TUI / Telegram (trusty-mpm-tui, trusty-mpm-telegram).
+ratatui = "0.29"
+crossterm = "0.28"
+teloxide = { version = "0.13", features = ["macros"] }
+
+# Misc utilities used across crates.
+dashmap = "6"
+walkdir = "2"
+regex = "1"
+gray_matter = "0.2"
+notify = "6"
+
+# Storage / KG / embeddings (trusty-memory-core).
+usearch = "2.25"
+# Align with trusty-memory upstream (rusqlite 0.39, bundled libsqlite3).
+rusqlite = { version = "0.39", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.33"
+tiktoken-rs = "0.5"
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+kuzu = "0.9"
+
+# Embedded assets (trusty-memory-mcp, open-mpm).
+rust-embed = { version = "8", features = ["include-exclude", "interpolate-folder-path"] }
+mime_guess = "2"
+
+# OpenAPI / Swagger (utoipa 5 + axum 0.8 — see trusty-mpm-mcp).
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Testing
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── [patch.crates-io] ──────────────────────────────────────────────────────
+# trusty-search and a handful of other crates depend on trusty-common,
+# trusty-mcp-core, trusty-embedder, and trusty-symgraph by version (because
+# they were previously published from separate repos). In the monorepo we
+# want those resolves to hit the in-tree paths, so patch them here. Cargo
+# only honours `[patch]` tables at the workspace root.
+[patch.crates-io]
+trusty-common = { path = "crates/trusty-common" }
+trusty-embedder = { path = "crates/trusty-embedder" }
+trusty-mcp-core = { path = "crates/trusty-mcp-core" }
+trusty-symgraph = { path = "crates/trusty-symgraph" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

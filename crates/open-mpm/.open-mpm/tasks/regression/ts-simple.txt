@@ -1,0 +1,7 @@
+Write a TypeScript module called result.ts that implements a Result<T, E> type:
+- Use a discriminated union (not a class): { ok: true; value: T } | { ok: false; error: E }
+- Provide functions: ok(value), err(error), isOk(), isErr(), map(fn), flatMap(fn), unwrapOr(default)
+- Use strict TypeScript — no `any`, no non-null assertions
+- Export branded ID types: UserId and SessionId as string brands
+
+Include vitest unit tests.

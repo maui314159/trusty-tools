@@ -1,0 +1,171 @@
+2026-04-22T22:06:23Z	build=11	workflow=prescriptive-gpt	dur_ms=2750	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T00:25:57Z	build=21	workflow=prescriptive	dur_ms=4237	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T00:27:37Z	build=23	workflow=prescriptive	dur_ms=2168	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T00:28:48Z	build=25	workflow=prescriptive	dur_ms=131	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T00:29:35Z	build=27	workflow=prescriptive	dur_ms=1776	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T00:31:00Z	build=29	workflow=prescriptive	dur_ms=87122	prompt=55458	completion=3804	cache_r=0	cache_w=0	cost_usd=0.576702
+2026-04-23T00:37:54Z	build=37	workflow=prescriptive	dur_ms=126278	prompt=66273	completion=7417	cache_r=0	cache_w=0	cost_usd=0.995406
+2026-04-23T00:48:31Z	build=45	workflow=prescriptive	dur_ms=146928	prompt=58928	completion=8558	cache_r=0	cache_w=0	cost_usd=0.915438
+2026-04-23T01:19:58Z	build=52	workflow=prescriptive-gpt	dur_ms=112449	prompt=55760	completion=7239	cache_r=0	cache_w=0	cost_usd=0.611973
+2026-04-23T02:05:14Z	build=61	workflow=prescriptive	dur_ms=139184	prompt=50150	completion=11470	cache_r=0	cache_w=0	cost_usd=1.262724
+2026-04-23T02:05:18Z	build=63	workflow=prescriptive	dur_ms=159295	prompt=98349	completion=11865	cache_r=0	cache_w=0	cost_usd=1.345470
+2026-04-23T06:29:54Z	build=75	workflow=prescriptive	dur_ms=473443	prompt=633856	completion=27413	cache_r=0	cache_w=0	cost_usd=9.167475
+2026-04-23T06:39:40Z	build=81	workflow=prescriptive	dur_ms=412521	prompt=499419	completion=24468	cache_r=0	cache_w=0	cost_usd=8.100081
+2026-04-23T06:48:41Z	build=87	workflow=prescriptive	dur_ms=346353	prompt=462978	completion=21684	cache_r=0	cache_w=0	cost_usd=7.384986
+2026-04-23T07:05:00Z	build=93	workflow=prescriptive	dur_ms=314339	prompt=78885	completion=917	cache_r=0	cache_w=0	cost_usd=0.868602
+2026-04-23T07:14:37Z	build=97	workflow=prescriptive	dur_ms=446560	prompt=82801	completion=737	cache_r=0	cache_w=0	cost_usd=0.688446
+2026-04-23T11:36:43Z	build=102	workflow=prescriptive	dur_ms=476644	prompt=89790	completion=899	cache_r=0	cache_w=0	cost_usd=0.976863
+2026-04-23T13:27:37Z	build=106	workflow=prescriptive	dur_ms=310047	prompt=40593	completion=488	cache_r=0	cache_w=0	cost_usd=0.129099
+2026-04-23T13:33:41Z	build=109	workflow=prescriptive	dur_ms=768015	prompt=182444	completion=10540	cache_r=0	cache_w=0	cost_usd=2.692212
+2026-04-23T14:00:03Z	build=115	workflow=prescriptive	dur_ms=829659	prompt=132047	completion=10420	cache_r=0	cache_w=0	cost_usd=2.276733
+2026-04-23T14:22:48Z	build=119	workflow=prescriptive	dur_ms=518748	prompt=149748	completion=11240	cache_r=0	cache_w=0	cost_usd=2.380908
+2026-04-23T14:35:41Z	build=123	workflow=prescriptive	dur_ms=219	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T14:40:52Z	build=125	workflow=prescriptive	dur_ms=974260	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T15:02:30Z	build=126	workflow=prescriptive	dur_ms=1558659	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T15:31:28Z	build=127	workflow=prescriptive	dur_ms=2032146	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T17:13:27Z	build=130	workflow=prescriptive	dur_ms=789591	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T17:29:39Z	build=131	workflow=prescriptive	dur_ms=970242	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:13:36Z	build=134	workflow=prescriptive	dur_ms=2	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:22:48Z	build=139	workflow=prescriptive	dur_ms=1	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:23:22Z	build=140	workflow=prescriptive	dur_ms=1	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:14:19Z	build=135	workflow=prescriptive	dur_ms=704217	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:27:17Z	build=144	workflow=prescriptive	dur_ms=124913	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:39:23Z	build=145	workflow=prescriptive	dur_ms=125508	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:24:24Z	build=141	workflow=prescriptive	dur_ms=1231492	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:25:28Z	build=142	workflow=prescriptive	dur_ms=1280231	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:26:57Z	build=143	workflow=prescriptive	dur_ms=1275714	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:49:23Z	build=147	workflow=prescriptive	dur_ms=7	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T18:49:42Z	build=148	workflow=prescriptive	dur_ms=1170822	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T19:14:55Z	build=152	workflow=prescriptive	dur_ms=7	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T19:15:18Z	build=153	workflow=prescriptive	dur_ms=6	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T19:15:58Z	build=154	workflow=prescriptive	dur_ms=1044543	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T19:58:32Z	build=156	workflow=prescriptive	dur_ms=6	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T19:59:56Z	build=157	workflow=prescriptive	dur_ms=1203001	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T20:42:29Z	build=158	workflow=prescriptive	dur_ms=1237880	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T20:53:59Z	build=159	workflow=prescriptive	dur_ms=1817627	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-23T23:30:38Z	build=162	workflow=prescriptive	dur_ms=1524292	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T00:02:49Z	build=163	workflow=prescriptive	dur_ms=2312710	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:10:10Z	build=167	workflow=prescriptive	dur_ms=372531	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:10:06Z	build=166	workflow=prescriptive	dur_ms=385083	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:16:46Z	build=169	workflow=prescriptive	dur_ms=648774	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:10:11Z	build=168	workflow=prescriptive	dur_ms=1589692	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:10:05Z	build=164	workflow=prescriptive	dur_ms=1660232	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T01:10:06Z	build=165	workflow=prescriptive	dur_ms=2476949	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:08:08Z	build=175	workflow=prescriptive	dur_ms=637464	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:08:02Z	build=174	workflow=prescriptive	dur_ms=1345689	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:27:24Z	build=176	workflow=prescriptive	dur_ms=784201	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:43:09Z	build=178	workflow=prescriptive	dur_ms=525870	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:52:02Z	build=179	workflow=prescriptive	dur_ms=222362	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T02:56:00Z	build=180	workflow=prescriptive	dur_ms=1698628	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T03:28:30Z	build=181	workflow=prescriptive	dur_ms=1163263	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T03:33:32Z	build=182	workflow=prescriptive	dur_ms=870109	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T03:49:48Z	build=183	workflow=prescriptive	dur_ms=1108899	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T04:12:26Z	build=184	workflow=prescriptive	dur_ms=1576845	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T04:50:59Z	build=185	workflow=prescriptive	dur_ms=1724933	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T05:21:59Z	build=186	workflow=prescriptive	dur_ms=1353205	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T05:54:42Z	build=187	workflow=prescriptive	dur_ms=1214487	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T06:15:37Z	build=188	workflow=prescriptive	dur_ms=730761	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T06:36:02Z	build=189	workflow=prescriptive	dur_ms=3809080	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T07:48:25Z	build=190	workflow=prescriptive	dur_ms=2845635	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T08:37:14Z	build=191	workflow=prescriptive	dur_ms=2599101	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T09:26:26Z	build=192	workflow=prescriptive	dur_ms=448633	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T09:34:31Z	build=193	workflow=prescriptive	dur_ms=3136847	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T10:49:03Z	build=206	workflow=prescriptive	dur_ms=798999	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T11:04:35Z	build=207	workflow=prescriptive	dur_ms=2141904	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T11:42:50Z	build=208	workflow=prescriptive	dur_ms=3231974	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-24T11:57:33Z	build=209	workflow=prescriptive	dur_ms=2570021	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+
+# Bake-off Level 3-5 (2026-04-24, v0.1.31)
+## L3: weather_service (REST API + FastAPI + SQLite + APScheduler)
+- Files: 20, Tests: 35/35, Time: 46.2 min, Cost: $2.37
+- QA verdict: partial (13/35) → Fix: LifespanManager in conftest → 35/35
+- Root cause: httpx ASGITransport doesn't auto-trigger ASGI lifespan in 0.28+
+
+## L4: doc_pipeline (FastAPI + NLP/spacy + plugin architecture)
+- Files: 31, Tests: 71/71, Time: 70.3 min, Cost: $1.12
+- QA verdict: success (71/71 clean pass) — no fixes needed
+
+## L5: task_manager (JWT + WebSocket + Docker Compose + Redis)
+- Files: 22, Tests: 57/57, Time: 44.4 min, Cost: $0.25
+- QA verdict: partial (6/57) → Fix: pin bcrypt<4.0.0 → 57/57
+- Root cause: passlib incompatible with bcrypt>=4.x (known upstream issue)
+
+## Final Scorecard (all levels)
+- L1 table_formatter:  14/14  ✅  no fix  ~$0.30
+- L2 git_analyzer:     14/14  ✅  no fix  $0.38
+- L3 weather_service:  35/35  ✅  1-line  $2.37
+- L4 doc_pipeline:     71/71  ✅  no fix  $1.12
+- L5 task_manager:     57/57  ✅  1-line  $0.25
+- TOTAL: 191/191 tests, 87 files, ~$4.42
+2026-04-24T21:45:30Z	build=432	workflow=prescriptive	dur_ms=2082087	prompt=102989	completion=6383	cache_r=0	cache_w=0	cost_usd=0.404712
+2026-04-24T22:41:59Z	build=433	workflow=prescriptive	dur_ms=1963925	prompt=116142	completion=7176	cache_r=0	cache_w=0	cost_usd=0.456066
+2026-04-25T02:58:03Z	build=437	workflow=prescriptive	dur_ms=898929	prompt=127396	completion=6968	cache_r=0	cache_w=0	cost_usd=0.486708
+2026-04-25T03:19:53Z	build=438	workflow=prescriptive	dur_ms=1072840	prompt=150889	completion=5827	cache_r=0	cache_w=0	cost_usd=0.540072
+2026-04-25T03:45:15Z	build=441	workflow=prescriptive	dur_ms=287225	prompt=42473	completion=1308	cache_r=0	cache_w=0	cost_usd=0.147039
+2026-04-25T03:50:56Z	build=442	workflow=prescriptive	dur_ms=229836	prompt=42439	completion=1113	cache_r=0	cache_w=0	cost_usd=0.144012
+2026-04-25T03:40:52Z	build=439	workflow=prescriptive	dur_ms=2306271	prompt=332706	completion=8557	cache_r=0	cache_w=0	cost_usd=1.126473
+2026-04-25T12:58:12Z	build=446	workflow=prescriptive	dur_ms=2543790	prompt=956162	completion=8479	cache_r=0	cache_w=0	cost_usd=2.995671
+2026-04-25T12:58:45Z	build=448	workflow=prescriptive	dur_ms=3232923	prompt=320915	completion=8592	cache_r=0	cache_w=0	cost_usd=1.091625
+2026-04-25T12:58:20Z	build=447	workflow=prescriptive	dur_ms=3272356	prompt=270800	completion=9151	cache_r=0	cache_w=0	cost_usd=0.949665
+2026-04-25T13:01:51Z	build=449	workflow=prescriptive	dur_ms=3122854	prompt=622358	completion=8816	cache_r=0	cache_w=0	cost_usd=1.999314
+2026-04-25T14:47:10Z	build=450	workflow=prescriptive	dur_ms=2965953	prompt=584132	completion=9237	cache_r=0	cache_w=0	cost_usd=1.890951
+2026-04-25T21:13:55Z	build=582	workflow=prescriptive	dur_ms=275	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T02:15:11Z	build=584	workflow=prescriptive	dur_ms=277	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T02:38:15Z	build=585	workflow=prescriptive	dur_ms=1011292	prompt=266541	completion=9629	cache_r=0	cache_w=0	cost_usd=0.519740
+2026-04-26T02:49:12Z	build=586	workflow=prescriptive	dur_ms=1134660	prompt=257210	completion=9870	cache_r=0	cache_w=0	cost_usd=0.486423
+2026-04-26T02:59:23Z	build=587	workflow=prescriptive	dur_ms=1125288	prompt=351078	completion=10094	cache_r=0	cache_w=0	cost_usd=0.731162
+2026-04-26T03:21:14Z	build=588	workflow=prescriptive	dur_ms=1028542	prompt=858953	completion=14919	cache_r=0	cache_w=0	cost_usd=2.150911
+2026-04-26T03:33:27Z	build=589	workflow=prescriptive	dur_ms=1121834	prompt=215458	completion=8025	cache_r=0	cache_w=0	cost_usd=0.398700
+2026-04-26T03:43:34Z	build=590	workflow=prescriptive	dur_ms=934469	prompt=314442	completion=12406	cache_r=0	cache_w=0	cost_usd=0.776954
+2026-04-26T03:53:35Z	build=591	workflow=prescriptive	dur_ms=707954	prompt=697782	completion=17503	cache_r=0	cache_w=0	cost_usd=1.424488
+2026-04-26T04:04:00Z	build=592	workflow=prescriptive	dur_ms=917574	prompt=230759	completion=5483	cache_r=0	cache_w=0	cost_usd=0.402462
+2026-04-26T10:11:28Z	build=596	workflow=prescriptive	dur_ms=62611	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T10:30:01Z	build=600	workflow=prescriptive	dur_ms=57136	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T10:21:52Z	build=599	workflow=prescriptive	dur_ms=765725	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T10:31:29Z	build=601	workflow=prescriptive	dur_ms=583707	prompt=171256	completion=3501	cache_r=0	cache_w=0	cost_usd=0.566283
+2026-04-26T12:45:41Z	build=1064	workflow=prescriptive	dur_ms=509577	prompt=610951	completion=7762	cache_r=0	cache_w=0	cost_usd=0.583644
+2026-04-26T15:42:06Z	build=1078	workflow=prescriptive	dur_ms=953191	prompt=801435	completion=9757	cache_r=0	cache_w=0	cost_usd=1.063962
+2026-04-26T15:52:53Z	build=1079	workflow=prescriptive	dur_ms=641863	prompt=802716	completion=13621	cache_r=0	cache_w=0	cost_usd=1.217179
+2026-04-26T16:03:10Z	build=1080	workflow=prescriptive	dur_ms=362133	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T16:09:17Z	build=1081	workflow=prescriptive	dur_ms=827019	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T16:20:25Z	build=1083	workflow=prescriptive	dur_ms=387118	prompt=584816	completion=11099	cache_r=0	cache_w=0	cost_usd=0.992696
+2026-04-26T19:06:44Z	build=1094	workflow=prescriptive	dur_ms=428099	prompt=1210549	completion=16623	cache_r=0	cache_w=0	cost_usd=1.588110
+2026-04-26T19:09:14Z	build=1097	workflow=prescriptive	dur_ms=586040	prompt=976245	completion=17251	cache_r=0	cache_w=0	cost_usd=1.380950
+2026-04-26T19:09:13Z	build=1096	workflow=prescriptive	dur_ms=695950	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:09:13Z	build=1095	workflow=prescriptive	dur_ms=800815	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:24:15Z	build=1100	workflow=prescriptive	dur_ms=25296	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:23:46Z	build=1098	workflow=prescriptive	dur_ms=62250	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:24:56Z	build=1101	workflow=prescriptive	dur_ms=301	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:25:05Z	build=1102	workflow=prescriptive	dur_ms=137	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:29:48Z	build=1106	workflow=prescriptive	dur_ms=167	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:26:29Z	build=1105	workflow=prescriptive	dur_ms=268897	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:31:39Z	build=1108	workflow=prescriptive	dur_ms=263	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:26:25Z	build=1104	workflow=prescriptive	dur_ms=371328	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:31:43Z	build=1109	workflow=prescriptive	dur_ms=272274	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:40:24Z	build=1113	workflow=prescriptive	dur_ms=256	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:25:37Z	build=1103	workflow=prescriptive	dur_ms=1012442	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:54:59Z	build=1116	workflow=prescriptive	dur_ms=236	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:55:00Z	build=1117	workflow=prescriptive	dur_ms=131	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:55:01Z	build=1119	workflow=prescriptive	dur_ms=170	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T19:55:01Z	build=1118	workflow=prescriptive	dur_ms=822978	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T20:13:18Z	build=1127	workflow=prescriptive	dur_ms=316	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T20:18:11Z	build=1129	workflow=prescriptive	dur_ms=301	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T20:18:23Z	build=1130	workflow=prescriptive	dur_ms=2007	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T20:18:47Z	build=1131	workflow=prescriptive	dur_ms=293	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-26T20:29:11Z	build=1135	workflow=prescriptive	dur_ms=919060	prompt=270223	completion=3354	cache_r=0	cache_w=0	cost_usd=0.860979
+2026-04-26T20:26:35Z	build=1134	workflow=prescriptive	dur_ms=1082067	prompt=125492	completion=2632	cache_r=0	cache_w=0	cost_usd=0.415956
+2026-04-26T20:46:06Z	build=1136	workflow=prescriptive	dur_ms=385346	prompt=154350	completion=2967	cache_r=0	cache_w=0	cost_usd=0.507555
+2026-04-27T00:05:09Z	build=1264	workflow=prescriptive	dur_ms=111463	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T00:25:54Z	build=1272	workflow=prescriptive	dur_ms=136158	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T00:28:11Z	build=1273	workflow=prescriptive	dur_ms=583362	prompt=116762	completion=3639	cache_r=0	cache_w=0	cost_usd=0.404871
+2026-04-27T01:50:19Z	build=1304	workflow=prescriptive	dur_ms=167461	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T01:53:14Z	build=1305	workflow=prescriptive	dur_ms=140329	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T09:36:38Z	build=1327	workflow=prescriptive	dur_ms=1340332	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T09:51:28Z	build=1328	workflow=prescriptive	dur_ms=754860	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T10:34:11Z	build=1331	workflow=prescriptive	dur_ms=677629	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T10:45:32Z	build=1332	workflow=prescriptive	dur_ms=864762	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T11:00:01Z	build=1333	workflow=prescriptive	dur_ms=853938	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T11:14:18Z	build=1334	workflow=prescriptive	dur_ms=837825	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-27T11:32:40Z	build=1335	workflow=prescriptive	dur_ms=962650	prompt=0	completion=0	cache_r=0	cache_w=0	cost_usd=0.000000
+2026-04-28T23:05:03Z	build=1358	workflow=prescriptive	dur_ms=489631	prompt=682	completion=13558	cache_r=1763911	cache_w=258343	cost_usd=4.984251
+2026-04-28T23:53:11Z	build=1359	workflow=prescriptive	dur_ms=411650	prompt=543	completion=13531	cache_r=1343393	cache_w=108942	cost_usd=2.747779

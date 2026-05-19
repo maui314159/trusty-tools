@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "trusty-search": {
+      "type": "stdio",
+      "command": "trusty-search",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}

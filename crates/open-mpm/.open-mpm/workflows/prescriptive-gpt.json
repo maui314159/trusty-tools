@@ -1,0 +1,38 @@
+{
+  "name": "prescriptive-gpt",
+  "description": "Research -> Plan -> Code (GPT-5.1-Codex) -> QA -> Observe — A/B vs prescriptive.json",
+  "phases": [
+    {
+      "name": "research",
+      "agent": "research-agent",
+      "model": "anthropic/claude-sonnet-4-6",
+      "context_template": "{{task}}"
+    },
+    {
+      "name": "plan",
+      "agent": "plan-agent",
+      "model": "anthropic/claude-opus-4-6",
+      "context_template": "Task: {{task}}\n\nResearch:\n{{research}}"
+    },
+    {
+      "name": "code",
+      "agent": "gpt5-codex-engineer",
+      "model": "openai/gpt-5.1-codex",
+      "produces_files": true,
+      "context_template": "Task: {{task}}\n\nResearch:\n{{research}}\n\nPlan:\n{{plan}}"
+    },
+    {
+      "name": "qa",
+      "agent": "qa-agent",
+      "model": "anthropic/claude-sonnet-4-6",
+      "skills": ["auto"],
+      "context_template": "Code was written to: {{out_dir}}\nDetected project root: {{project_dir}}\n\nDetect the project stack by inspecting {{project_dir}} (or {{out_dir}} if empty), then run the appropriate test runner via pytest_exec EXACTLY ONCE:\n  - Cargo.toml      → cargo test\n  - package.json    → npx vitest run / npx jest / npm test\n  - go.mod          → go test ./...\n  - pyproject.toml /\n    requirements.txt → PYTHONPATH=src:. python3 -m pytest -v\n\nAlways cd into the project directory first. Return a JSON summary with passed/failed/errors/status/summary/details. Do NOT call pytest_exec more than once."
+    },
+    {
+      "name": "observe",
+      "agent": "observe-agent",
+      "model": "anthropic/claude-sonnet-4-6",
+      "context_template": "Task: {{task}}\n\nResearch:\n{{research}}\n\nPlan:\n{{plan}}\n\nCode:\n{{code}}\n\nQA:\n{{qa}}"
+    }
+  ]
+}

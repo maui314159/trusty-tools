@@ -1,0 +1,193 @@
+[package]
+name = "trusty-search"
+version = "0.3.45"
+edition = "2021"
+description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
+license-file = "LICENSE"
+repository = "https://github.com/bobmatnyc/trusty-tools"
+homepage = "https://github.com/bobmatnyc/trusty-tools"
+keywords = ["search", "code-search", "mcp", "vector-search", "bm25"]
+categories = ["command-line-utilities", "development-tools"]
+build = "build.rs"
+include = [
+    "src/**/*",
+    "build.rs",
+    "ui-dist/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+
+[lib]
+name = "trusty_search"
+path = "src/lib.rs"
+# Why: explicit rlib so downstream host crates (e.g. open-mpm) can link
+# trusty-search as a Rust library and consume `SearchMcpService` directly
+# (issue #115). Default would already be rlib, but stating it explicitly
+# documents the intent and guards against future bin-only changes.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "trusty-search"
+path = "src/main.rs"
+
+# [patch.crates-io] moved to workspace root Cargo.toml — Cargo only honours
+# [patch] tables at the workspace root. The monorepo root patches
+# trusty-common / trusty-embedder / trusty-mcp-core / trusty-symgraph to the
+# in-tree paths so version-based deps below resolve to the local crates.
+
+[dependencies]
+# ── Shared trusty-common crates ────────────────────────────────────────────
+trusty-common = { version = "0.3.2", features = ["axum-server"] }
+trusty-mcp-core = { version = "0.1.1" }
+trusty-embedder = { version = "0.1.5", default-features = false, features = ["test-support"] }
+trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts surface only — no tree-sitter
+
+# ── Async runtime / HTTP ───────────────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+async-trait = "0.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+eventsource-stream = "0.2"
+futures = "0.3"
+futures-util = "0.3"
+
+# ── Serde / errors / logs ──────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+serde_yml = "0.0"
+glob = "0.3"
+
+# ── CLI / UX ───────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+colored = "2"
+indicatif = "0.17"
+dotenvy = "0.15"
+open = "5"
+
+# ── Storage / vector / KG / chunking ───────────────────────────────────────
+usearch = "2.25"
+redb = "2.6"
+dashmap = "5"
+petgraph = "0.6"
+lru = "0.12"
+# Clustering deps are only compiled when the `clustering` feature is enabled.
+# Why: linfa + ndarray pull in a deep BLAS/numerical stack that significantly
+# slows cold compile time even though only `core::concept_cluster` consumes
+# them. Off by default; turn on with `--features clustering` to enable
+# ConceptCluster entities derived from doc-comment k-means clustering.
+linfa = { version = "0.7", optional = true }
+linfa-clustering = { version = "0.7", optional = true }
+ndarray = { version = "0.15", optional = true }
+ndarray-rand = { version = "0.14", optional = true }
+rand = "0.8"
+rayon = "1"
+sha2 = "0.10"
+regex = "1"
+
+# ── Tree-sitter grammars (ABI 15) ──────────────────────────────────────────
+# Upgraded to tree-sitter 0.26 to align with open-mpm (issue #116) so that
+# trusty-search can be directly linked as an rlib without violating Cargo's
+# `links = "tree-sitter"` single-copy rule. Grammar versions match the set
+# used by open-mpm where possible; remaining grammars bumped to the latest
+# release compatible with tree-sitter 0.26.
+tree-sitter = "0.26"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-scala = "0.26"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-swift = "0.7"
+
+# ── File watching / FS ─────────────────────────────────────────────────────
+notify = "6"
+notify-debouncer-mini = "0.4"
+fs4 = { version = "0.8", features = ["sync"] }
+walkdir = "2"
+crossbeam-utils = "0.8"
+dirs = "5"
+
+# ── Process memory introspection (TRUSTY_MEMORY_LIMIT_MB, peak RSS log) ────
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+# ── Embedded UI ────────────────────────────────────────────────────────────
+include_dir = "0.7"
+
+# ── Optional ONNX NER (feature-gated) ──────────────────────────────────────
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "user"] }
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+
+[features]
+# Default: bundle ORT static libs via trusty-embedder. Works on macOS and
+# modern Linux (glibc ≥ 2.38). For glibc 2.34 hosts (e.g. Amazon Linux
+# 2023) building with `--features cuda`, also pass `--no-default-features`
+# so trusty-embedder switches fastembed to `ort-load-dynamic` and the
+# operator can provide `ORT_DYLIB_PATH=/path/to/libonnxruntime.so` at
+# runtime (see trusty-search#114).
+default = ["bundled-ort"]
+# Forwards `trusty-embedder/bundled-ort`. Enables static linking of the
+# fastembed-downloaded ORT 1.24.x libraries. Mutually exclusive with the
+# load-dynamic path that `cuda` activates (see below).
+bundled-ort = ["trusty-embedder/bundled-ort"]
+# Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so
+# downstream integration tests can reuse them. Kept for parity with the
+# previous trusty-search-core feature surface.
+test-support = []
+# Compile in the ONNX NER extractor. Even with this feature on, NER stays
+# inert at runtime unless `~/.trusty-search/models/ner.onnx` is present.
+ner = ["dep:ort", "dep:tokenizers"]
+# GPU-accelerated embedding via fastembed-rs CUDA backend. Activates the
+# `ort/cuda` + `ort/load-dynamic` path in trusty-embedder, so this build
+# does NOT bundle the (glibc-2.38-bound) ORT static libs. Install on
+# AL2023 with:
+#
+#     cargo install trusty-search --no-default-features --features cuda
+#     export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+#
+# Enabling `cuda` alongside the default `bundled-ort` feature is not
+# supported — Cargo will compile but the resulting binary will fail to
+# link ORT correctly. Always pair `--features cuda` with
+# `--no-default-features`.
+cuda = ["trusty-embedder/cuda"]
+# Dynamic ORT loading without CUDA — for AL2023 (glibc 2.34) CPU-only cross-compilation.
+# Enables fastembed/ort-load-dynamic so no glibc-2.38-bound static ORT binaries are bundled.
+# Build: cargo build --no-default-features --features load-dynamic
+# Runtime: set ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+load-dynamic = ["trusty-embedder/load-dynamic"]
+# Deprecated: CoreML / Metal GPU acceleration is now auto-detected at runtime
+# on Apple Silicon and requires no opt-in. The `coreml` feature is kept as a
+# no-op alias for backward compatibility so `cargo install --features coreml`
+# still works.
+coreml = ["trusty-embedder/coreml"]
+# ConceptCluster entities via k-means over doc-comment embeddings (issue #108).
+# Off by default — pulls in linfa, linfa-clustering, ndarray, and
+# ndarray-rand, which materially extend cold compile time. Enable with
+# `cargo build --features clustering` when ConceptCluster entities are
+# desired in the KG / BM25 enrichment passes.
+clustering = ["dep:linfa", "dep:linfa-clustering", "dep:ndarray", "dep:ndarray-rand"]

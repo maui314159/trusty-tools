@@ -1,0 +1,23 @@
+Write a bash script called log_summary.sh that:
+- Accepts one positional argument: log directory (default: current directory)
+- Accepts --since YYYY-MM-DD to filter log lines whose date prefix is >= that date
+- Scans all *.log files in the directory (non-recursive)
+- Counts lines matching each severity: ERROR, WARN, INFO, DEBUG (case-sensitive)
+- Outputs a summary table to stdout using printf for column alignment, e.g.:
+    Level   Count
+    ------  -----
+    ERROR       3
+    WARN       12
+    INFO      104
+    DEBUG      47
+- Prints "No log files found in <dir>" to stderr and exits 0 when no *.log files exist
+- Uses grep, awk, and sort; no Python or other scripting languages
+- Is POSIX-compatible (works with bash 3.2+, macOS and Linux)
+
+Include a self-test function run when the script is called as: bash log_summary.sh --self-test
+The self-test must:
+- Create a temp directory with two synthetic *.log files containing known line counts
+- Call the main logic against that temp directory
+- Verify the printed ERROR count matches expected
+- Clean up the temp directory
+- Print PASS or FAIL and exit accordingly

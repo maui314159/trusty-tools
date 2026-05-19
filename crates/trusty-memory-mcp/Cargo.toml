@@ -1,0 +1,43 @@
+[package]
+name = "trusty-memory-mcp"
+version = "0.1.19"
+edition = "2021"
+description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
+license = "MIT"
+
+[lib]
+# Why: Explicit `rlib` keeps the crate linkable as a Rust library from
+#      host processes (open-mpm) that want to register `MemoryMcpService`
+#      directly via the shared `ServiceDescriptor` trait, rather than
+#      spawning a separate MCP stdio child. Matches the rest of the
+#      trusty-* ecosystem (see trusty-mcp-core) for consistency.
+crate-type = ["rlib"]
+
+[dependencies]
+trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
+trusty-mcp-core = { workspace = true }
+trusty-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

@@ -1,0 +1,26 @@
+[package]
+name = "trusty-mpm-gui"
+version = "0.2.9"
+edition = "2024"
+rust-version = "1.88"
+description = "Tauri + web dashboard for trusty-mpm fleet management"
+publish = false
+
+[lib]
+name = "trusty_mpm_gui"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "trusty-mpm-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+anyhow = "1"

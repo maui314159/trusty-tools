@@ -1,0 +1,9 @@
+Write a Python CLI script called word_count.py that:
+- Accepts a filename argument using argparse
+- Reads the file and counts: total words, unique words, top 5 most common words
+- Uses pathlib.Path for file access, collections.Counter for word counting
+- Uses type hints throughout
+- Handles FileNotFoundError gracefully with a helpful error message
+- Prints results in a clean formatted table using f-strings
+
+Include pytest unit tests that test the counting logic with a tmp_path fixture.

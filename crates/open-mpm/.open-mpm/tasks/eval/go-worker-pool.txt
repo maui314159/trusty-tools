@@ -1,0 +1,9 @@
+Implement a concurrent worker pool in Go.
+
+Requirements:
+- WorkerPool struct with configurable worker count and job queue capacity
+- Submit(ctx context.Context, job func() (Result, error)) for non-blocking job submission
+- Start() / Stop() lifecycle — Stop drains in-flight jobs then exits cleanly
+- Context cancellation propagates to running jobs
+- Results available via a channel with Result{Value interface{}, Err error}
+- Write table-driven tests covering: basic job execution, pool shutdown mid-run, context cancellation, zero workers (should error), submit after stop (should error)

@@ -1,0 +1,11 @@
+# trusty-mpm token optimizer — framework hook configuration
+# Deployed by: trusty-mpm install
+# Purpose: controls PostToolUse output compression for Claude Code sessions
+
+[default]
+level = "Trim"          # Off | Trim | Summarise | Caveman
+
+[tools]
+# Per-tool overrides (tool name → level)
+# "Read" = "Off"        # example: never compress file reads
+# "Bash" = "Summarise"  # example: summarise bash output

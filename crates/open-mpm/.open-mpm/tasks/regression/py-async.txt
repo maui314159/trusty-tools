@@ -1,0 +1,14 @@
+Write a Python async URL health checker called url_checker.py that:
+- Accepts a list of URLs via CLI (argparse): positional args or --urls-file FILE (one URL per line)
+- Accepts --concurrency N (default 5) to cap simultaneous requests with asyncio.Semaphore
+- Accepts --timeout SECONDS (default 10) per request
+- Uses aiohttp (preferred) or httpx[asyncio] for HTTP requests
+- For each URL reports: url, status_code (or "ERROR"), response_time_ms, error (empty string if none)
+- Prints results as a formatted table to stdout after all requests complete
+- Uses type hints throughout (Python 3.11+)
+- Returns exit code 1 if any URL returned an error or non-2xx status
+
+Include pytest-asyncio tests in test_url_checker.py that:
+- Use aiohttp.test_utils or pytest-httpserver (or aioresponses) to mock HTTP — no real network calls
+- Test: all URLs succeed, concurrency limit is respected (mock tracks concurrent calls), one URL times out, one URL returns 503
+- All tests are async and marked with @pytest.mark.asyncio

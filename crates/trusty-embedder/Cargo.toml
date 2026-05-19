@@ -1,0 +1,98 @@
+[package]
+name = "trusty-embedder"
+version = "0.1.5"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared embedding abstraction + fastembed-backed implementation for trusty-* projects"
+readme = "README.md"
+keywords = ["embeddings", "vector", "fastembed", "mcp", "ml"]
+categories = ["science"]
+homepage = "https://github.com/bobmatnyc/trusty-tools"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# Default: bundle the ONNX Runtime static libs via fastembed's
+# `ort-download-binaries-native-tls`. This is the right choice for macOS and
+# modern Linux (glibc ≥ 2.38) where the prebuilt ORT 1.24.x just works.
+default = ["bundled-ort"]
+test-support = []
+# Statically link the ONNX Runtime libraries that fastembed-rs downloads at
+# build time. Off-switch for hosts whose glibc is older than 2.38 (e.g.
+# Amazon Linux 2023's glibc 2.34, see trusty-search#114) — disable this and
+# enable `cuda` (or another consumer-side feature that turns on
+# `fastembed/ort-load-dynamic`) to dynamically load a system ONNX Runtime
+# shared library via `ORT_DYLIB_PATH` instead.
+bundled-ort = ["fastembed/ort-download-binaries-native-tls"]
+# GPU-accelerated embedding via ort's CUDA execution provider.
+#
+# Why: the all-MiniLM-L6-v2 model fastembed-rs ships uses the ONNX runtime
+# path (not candle), so `fastembed/cuda` (which only enables candle-cuda)
+# does not move embedding work to the GPU. The correct lever is the
+# `ort/cuda` feature, which lets us register `ort::ep::CUDA` at runtime as
+# the preferred execution provider.
+#
+# How the build is wired (issue trusty-search#114):
+#   - `fastembed/ort-load-dynamic` switches fastembed to dynamic linking, so
+#     no glibc-2.38-bound static ORT binaries are bundled. Operators provide
+#     a host-compatible `libonnxruntime.so` (e.g. ORT 1.20.x for AL2023's
+#     glibc 2.34) and point to it with `ORT_DYLIB_PATH=/path/to/lib`.
+#   - `ort/cuda` keeps the CUDA EP registerable at runtime.
+#   - `fastembed/cuda` enables candle-cuda for parity with future qwen3 /
+#     nomic-v2-moe model swaps; it's a no-op for AllMiniLML6V2(Q).
+#
+# CUDA builds intentionally do NOT enable `bundled-ort` — the two are
+# mutually exclusive at the `ort-sys` level (download-binaries vs
+# disable-linking). To install on AL2023 / older glibc hosts:
+#
+#     cargo install trusty-search --no-default-features --features cuda
+#     export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+#     trusty-search start
+#
+# Requires CUDA toolkit + compatible NVIDIA GPU at build time. Default
+# builds stay CPU-only and bundle ORT; opt in with `--features cuda`.
+cuda = ["fastembed/cuda", "fastembed/ort-load-dynamic", "ort/cuda", "ort/load-dynamic"]
+# Dynamic ORT loading without CUDA — for AL2023 (glibc 2.34) CPU-only builds.
+# Enables `fastembed/ort-load-dynamic` + `ort/load-dynamic` so no glibc-2.38-bound
+# static ORT binaries are bundled. Set ORT_DYLIB_PATH at runtime.
+# Build: cargo build --no-default-features --features load-dynamic
+load-dynamic = ["fastembed/ort-load-dynamic", "ort/load-dynamic"]
+# Deprecated: CoreML is now auto-detected at runtime on macOS. The `coreml`
+# feature flag is kept as a no-op alias for backward compatibility so
+# `cargo build --features coreml` still works. New code should not need it.
+coreml = []
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+# Defaults disabled so we can opt into either bundled (CPU/macOS) or
+# dynamic-load (Linux + CUDA on older glibc) ORT linking via our own
+# features. `hf-hub-native-tls` is still required so fastembed can fetch
+# the model file on first run; `image-models` is dropped (we are
+# text-only).
+fastembed = { workspace = true, features = ["hf-hub-native-tls"] }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+tracing = { workspace = true }
+
+# Cross-platform direct ort dep. Pinned to the exact version fastembed-rs
+# requires (`=2.0.0-rc.12`). We need ort as a direct dep on every platform
+# so we can register execution providers at runtime:
+#   - CoreML on Apple Silicon (always, no feature flag needed)
+#   - CUDA on Linux/Windows when the `cuda` feature is enabled
+# The default-features set is minimal; per-platform extras are stacked via
+# the platform-specific blocks below.
+[dependencies.ort]
+version = "=2.0.0-rc.12"
+default-features = false
+features = ["std", "api-24"]
+
+# macOS-specific: add the `coreml` feature so the runtime can build a CoreML
+# EP on Apple Silicon. This only adds a few KB of glue code linking against
+# the system CoreML.framework — no extra toolchain required from the user.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml", "std", "api-24"] }

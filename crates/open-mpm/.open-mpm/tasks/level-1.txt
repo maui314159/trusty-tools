@@ -1,0 +1,52 @@
+Build a Python package called `table_formatter` that reads CSV files and outputs formatted Markdown tables.
+
+## Package structure required
+- table_formatter/__init__.py
+- table_formatter/__main__.py
+- table_formatter/core.py
+- test_table_formatter.py (at least 5 tests)
+- README.md (brief usage guide)
+
+## CLI interface
+python3 -m table_formatter input.csv [options]
+
+Options:
+  --sort COLUMN         Sort rows by column (ascending)
+  --sort-desc COLUMN    Sort rows by column (descending)
+  --filter EXPRESSION   Filter rows (e.g. "age>30", "name=Alice", "salary>=50000")
+  --output FILE         Write output to file instead of stdout
+  --max-width N         Truncate cell content to N characters (with "..." ellipsis)
+
+## Column alignment (IMPORTANT)
+- Detect each column's type by examining its data values
+- Numeric columns (integers/floats): RIGHT-aligned using `---:` in separator
+- Text columns: LEFT-aligned using `:---` in separator
+- Mixed or ambiguous: LEFT-aligned
+- Do NOT treat leading-zero strings (e.g. zip codes "01234") as numeric
+
+## Markdown table format
+| Header1  | Header2 |
+|:---------|--------:|
+| text     |     123 |
+
+## Edge cases to handle
+- Empty CSV (headers only, no data rows) → output header + separator only
+- Missing values (empty cells) → empty cell in table
+- Unicode characters (emoji 🎉, CJK characters, accented é) → handle correctly
+- Quoted CSV fields containing commas
+- Very long cell content (respect --max-width)
+- Numeric strings that should stay as strings (zip codes, phone numbers with leading zeros)
+
+## Example
+Input (sales.csv):
+Product,Q1 Sales,Q2 Sales,Region
+Widget A,15234,18902,North America
+Widget B,8921,7654,Europe
+Gadget Y,,12340,North America
+
+Output:
+| Product  | Q1 Sales | Q2 Sales | Region        |
+|:---------|--------:|--------:|:--------------|
+| Widget A |   15234 |   18902 | North America |
+| Widget B |    8921 |    7654 | Europe        |
+| Gadget Y |         |   12340 | North America |

@@ -1,0 +1,1053 @@
+//! `SymbolGraph`: petgraph-backed call graph derived from the chunk corpus.
+//!
+//! Why: query intent like "who calls `authenticate`?" or "what does `process_request`
+//! delegate to?" can't be answered well by BM25/HNSW alone. A directed call graph
+//! (caller → callee) lets the search pipeline expand around a hit, surfacing
+//! adjacent code at a discounted score (KG-expansion = 0.7 × trigger RRF score).
+//!
+//! What: a `petgraph::DiGraph<SymbolNode, ()>` keyed by symbol name (the
+//! `function_name` recorded on each `RawChunk` — qualified for Rust methods, e.g.
+//! `Foo::bar`). Edges point from caller symbol to callee symbol. The graph is
+//! cheap to rebuild from the corpus and is held in `Arc<SymbolGraph>` so search
+//! handlers can read concurrently without locking.
+//!
+//! Test: see the `tests` module — covers basic build, `callers_of`, `callees_of`,
+//! 1-hop and 2-hop traversal, qualified-method names, and unknown-symbol queries.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
+use petgraph::Direction;
+use serde::{Deserialize, Serialize};
+
+use crate::core::chunker::ChunkType;
+use crate::core::entity::EdgeKind;
+
+/// Default cap on symbol graph nodes (issue: 180GB RSS fix).
+///
+/// Why: each node clones three `String`s (symbol, chunk_id, file) plus the
+/// `by_symbol` and `chunk_to_symbol` HashMaps clone more strings. Edges are
+/// cheap (`EdgeKind` enum) but `build_suffix_lookup` builds yet another
+/// `HashMap<String, NodeIndex>`. On a 1M-chunk monorepo this graph can pin
+/// 3-5 GB of RAM. Capping at 100k symbols keeps KG expansion useful for the
+/// most-referenced code while bounding memory. Override via
+/// `TRUSTY_MAX_KG_NODES`; set to 0 to disable the cap entirely (legacy).
+const DEFAULT_MAX_KG_NODES: usize = 100_000;
+
+/// Read `TRUSTY_MAX_KG_NODES` from the environment, falling back to the
+/// default. Zero disables the cap (use only if you trust your corpus size).
+pub fn max_kg_nodes() -> usize {
+    std::env::var("TRUSTY_MAX_KG_NODES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_KG_NODES)
+}
+
+/// A node in the symbol graph. One node per defining symbol (function or method).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolNode {
+    /// Defining symbol name. For Rust methods this is qualified (`Foo::bar`);
+    /// for free functions it's the bare name.
+    pub symbol: String,
+    /// `RawChunk.id` of the chunk that defines this symbol.
+    pub chunk_id: String,
+    /// Source file path (for debugging / display).
+    pub file: String,
+}
+
+/// Tuple shape consumed by [`SymbolGraph::build_from_chunks`].
+///
+/// Fields, in order: `(chunk_id, file, function_name, calls, inherits_from,
+/// chunk_type)`. Aliased so the public signature stays clippy-clean (large
+/// inline tuple types trip `clippy::type_complexity`).
+pub type ChunkTuple = (
+    String,
+    String,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+    ChunkType,
+);
+
+/// A petgraph-backed directed call graph: edge `A → B` means "A calls B".
+///
+/// Built from a slice of `(chunk_id, file, function_name, calls)` tuples; the
+/// chunker (`chunk_ast`) is responsible for populating the `function_name` and
+/// `calls` fields per chunk, so the graph just stitches them together.
+#[derive(Debug, Default)]
+pub struct SymbolGraph {
+    graph: DiGraph<SymbolNode, EdgeKind>,
+    /// Symbol name → node index. Holds the *first* definition seen if a symbol
+    /// is defined twice (rare; e.g. `cfg`-gated duplicates).
+    by_symbol: HashMap<String, NodeIndex>,
+    /// chunk_id → symbol name, so callers can resolve a search hit to its node.
+    chunk_to_symbol: HashMap<String, String>,
+}
+
+impl SymbolGraph {
+    /// Construct an empty graph.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a graph from the chunk corpus.
+    ///
+    /// Each tuple is
+    /// `(chunk_id, file, function_name, calls, inherits_from, chunk_type)`:
+    /// - `function_name`: `None` for non-callable chunks (structs, modules, …);
+    ///   such chunks contribute no node.
+    /// - `calls`: simple-name callees (the chunker reduces `obj.method` and
+    ///   `foo::bar` to the trailing identifier). We add a `CallsFunction` edge
+    ///   per call only if the callee symbol is also defined in the corpus, so
+    ///   the graph stays closed over local code (no edges pointing into the
+    ///   void).
+    /// - `inherits_from`: parent type names. For each parent that's defined in
+    ///   the corpus, emit an `Implements` edge from the child symbol → parent.
+    /// - `chunk_type`: container chunks (`Impl`, `Class`, `Struct`, `Module`)
+    ///   emit `ModuleContains` edges to every other defining symbol that lives
+    ///   in the same file. Coarse but cheap; nesting-depth refinement can come
+    ///   later.
+    pub fn build_from_chunks(chunks: &[ChunkTuple]) -> Self {
+        let mut g = Self::new();
+
+        // Pass 1: register all defining symbols.
+        g.register_symbol_nodes(chunks);
+
+        // Build a `simple_name → first-NodeIndex` lookup for qualified-symbol
+        // resolution. Replaces the per-edge `O(symbols)` linear suffix scan
+        // that used to live inside `resolve_callee`. On a 115k-chunk corpus
+        // with thousands of qualified methods this collapses what was an
+        // O(N²) build pass into O(N).
+        let by_suffix = g.build_suffix_lookup();
+
+        // Pass 2: add CallsFunction + Implements edges.
+        g.add_call_and_inherit_edges(chunks, &by_suffix);
+
+        // Pass 3: ModuleContains edges from container chunks.
+        g.add_module_contains_edges(chunks);
+
+        g
+    }
+
+    /// Pass 1: register one `SymbolNode` per unique `function_name` in the corpus.
+    ///
+    /// Why: every later pass keys on `by_symbol`, so symbols must exist before
+    /// any edges are drawn. Splitting this out keeps `build_from_chunks` flat.
+    /// What: inserts a node for each first-seen name; later duplicates only
+    /// update `chunk_to_symbol` (first-write-wins).
+    /// Test: covered by `test_build_simple_graph` and
+    /// `test_chunk_with_no_function_name_is_skipped`.
+    fn register_symbol_nodes(&mut self, chunks: &[ChunkTuple]) {
+        // Issue (180GB RSS fix): hard cap on graph node count. Once exceeded,
+        // we stop adding **new** symbols. Existing symbol updates (and
+        // chunk_to_symbol pointers for already-known symbols) still proceed
+        // so KG expansion keeps working for the symbols already in the graph.
+        let cap = max_kg_nodes();
+        let mut cap_warned = false;
+        for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
+            self.register_one_symbol(chunk_id, file, name.as_deref(), cap, &mut cap_warned);
+        }
+    }
+
+    /// Register a single chunk's symbol, honouring the node cap and
+    /// first-write-wins semantics.
+    ///
+    /// Why: keeps `register_symbol_nodes` flat — each branch (skip, alias an
+    /// existing symbol, hit the cap, or insert a new node) lives in one place
+    /// rather than as nested `continue` arms.
+    /// What: returns nothing; mutates `self` and toggles `cap_warned` the first
+    /// time the cap is hit.
+    /// Test: covered transitively by `test_build_simple_graph` and
+    /// `test_chunk_with_no_function_name_is_skipped`.
+    fn register_one_symbol(
+        &mut self,
+        chunk_id: &str,
+        file: &str,
+        name: Option<&str>,
+        cap: usize,
+        cap_warned: &mut bool,
+    ) {
+        let Some(name) = name else { return };
+        if name.is_empty() {
+            return;
+        }
+        // First-write-wins so chunk_to_symbol stays stable.
+        if self.by_symbol.contains_key(name) {
+            self.chunk_to_symbol
+                .insert(chunk_id.to_string(), name.to_string());
+            return;
+        }
+        if Self::cap_exceeded(cap, self.by_symbol.len()) {
+            Self::warn_cap_once(cap, cap_warned);
+            return;
+        }
+        let idx = self.graph.add_node(SymbolNode {
+            symbol: name.to_string(),
+            chunk_id: chunk_id.to_string(),
+            file: file.to_string(),
+        });
+        self.by_symbol.insert(name.to_string(), idx);
+        self.chunk_to_symbol
+            .insert(chunk_id.to_string(), name.to_string());
+    }
+
+    /// Returns true when a non-zero cap has been reached.
+    ///
+    /// Why: isolates the `cap > 0` sentinel so call sites read as a simple
+    /// boolean predicate.
+    /// What: `false` if the cap is disabled (`0`), else `current >= cap`.
+    /// Test: indirectly exercised by `register_one_symbol`'s callers.
+    fn cap_exceeded(cap: usize, current: usize) -> bool {
+        cap > 0 && current >= cap
+    }
+
+    /// Emit the node-cap warning exactly once per build.
+    ///
+    /// Why: `register_one_symbol` is called per chunk, and we don't want a
+    /// log line for every overflow.
+    /// What: logs at warn level and flips `cap_warned` on first invocation.
+    /// Test: behavioural — verified indirectly by builds completing without
+    /// log spam under the cap.
+    fn warn_cap_once(cap: usize, cap_warned: &mut bool) {
+        if !*cap_warned {
+            tracing::warn!(
+                "symbol graph node cap ({}) reached — skipping further new symbols \
+                 (override via TRUSTY_MAX_KG_NODES; 0 = unlimited)",
+                cap
+            );
+            *cap_warned = true;
+        }
+    }
+
+    /// Build a `simple_name → NodeIndex` map for fast qualified-callee resolution.
+    ///
+    /// Why: callers often write `bar()` even when only `Foo::bar` is defined;
+    /// looking up by trailing identifier avoids an O(N) per-edge scan.
+    /// What: for every symbol `A::B::name`, registers `name → idx` (first-write-wins).
+    /// Test: covered by `test_simple_callee_resolves_to_qualified_definition`.
+    fn build_suffix_lookup(&self) -> HashMap<String, NodeIndex> {
+        let mut by_suffix: HashMap<String, NodeIndex> = HashMap::new();
+        for (sym, &idx) in self.by_symbol.iter() {
+            if let Some(suffix) = sym.rsplit("::").next() {
+                // First-write-wins to match the original semantics (the old
+                // `find` returned the first qualified hit).
+                by_suffix.entry(suffix.to_string()).or_insert(idx);
+            }
+        }
+        by_suffix
+    }
+
+    /// Pass 2: add `CallsFunction` and `Implements` edges for each chunk.
+    ///
+    /// Why: separates edge construction from node construction so each pass
+    /// reads top-to-bottom in `build_from_chunks`.
+    /// What: for each named chunk, draws one edge per resolvable callee and
+    /// one per resolvable parent type. Self-edges are filtered to prevent
+    /// recursive functions from polluting their own KG-expansion results.
+    /// Test: covered by `test_calls_function_edges_present_in_graph`,
+    /// `test_inherits_from_emits_implements_edges`, and
+    /// `test_self_call_does_not_create_self_loop`.
+    fn add_call_and_inherit_edges(
+        &mut self,
+        chunks: &[ChunkTuple],
+        by_suffix: &HashMap<String, NodeIndex>,
+    ) {
+        for (_chunk_id, _file, name, calls, inherits_from, _ct) in chunks {
+            let Some(name) = name else { continue };
+            let Some(&from) = self.by_symbol.get(name) else {
+                continue;
+            };
+            self.add_edges_for_targets(from, calls, by_suffix, EdgeKind::CallsFunction);
+            // Issue #33: INHERITS / Implements edges from `inherits_from`.
+            self.add_edges_for_targets(from, inherits_from, by_suffix, EdgeKind::Implements);
+        }
+    }
+
+    /// Add one edge of `kind` from `from` to each resolvable target name.
+    ///
+    /// Why: the call-edge and inherit-edge loops were structurally identical;
+    /// extracting this helper removes a branch from
+    /// `add_call_and_inherit_edges` and concentrates the self-edge filter.
+    /// What: resolves each target through `resolve_callee_fast` and appends an
+    /// edge if it doesn't form a self-loop.
+    /// Test: indirectly covered by the same tests as
+    /// `add_call_and_inherit_edges`.
+    fn add_edges_for_targets(
+        &mut self,
+        from: NodeIndex,
+        targets: &[String],
+        by_suffix: &HashMap<String, NodeIndex>,
+        kind: EdgeKind,
+    ) {
+        for target in targets {
+            let Some(to) = self.resolve_callee_fast(target, by_suffix) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            self.graph.add_edge(from, to, kind.clone());
+        }
+    }
+
+    /// Pass 3: emit `ModuleContains` edges from container chunks to siblings.
+    ///
+    /// Why: structural relationships (an `impl` block "contains" its methods)
+    /// drive intent-gated KG expansion for definition-style queries.
+    /// What: if any container chunk exists, group all symbols by file, then
+    /// for each container emit one edge per other symbol in the same file.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn add_module_contains_edges(&mut self, chunks: &[ChunkTuple]) {
+        if !Self::has_any_container(chunks) {
+            return;
+        }
+        let by_file = self.group_symbols_by_file(chunks);
+        for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
+            self.emit_container_edges_for(file, name.as_deref(), ct, &by_file);
+        }
+    }
+
+    /// Emit `ModuleContains` edges from one container chunk to its file-mates.
+    ///
+    /// Why: peeling the per-chunk guards (`is_container`, name resolution,
+    /// sibling lookup) out of the outer loop drops the nesting depth and
+    /// removes three early-`continue` arms from
+    /// `add_module_contains_edges`.
+    /// What: no-op unless the chunk is a container with a registered symbol
+    /// and known siblings; otherwise calls `add_sibling_edges`.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn emit_container_edges_for(
+        &mut self,
+        file: &str,
+        name: Option<&str>,
+        ct: &ChunkType,
+        by_file: &HashMap<&str, Vec<(&str, NodeIndex)>>,
+    ) {
+        if !Self::is_container(ct) {
+            return;
+        }
+        let Some(name) = name else { return };
+        let Some(&from) = self.by_symbol.get(name) else {
+            return;
+        };
+        let Some(siblings) = by_file.get(file) else {
+            return;
+        };
+        self.add_sibling_edges(from, name, siblings);
+    }
+
+    /// Wire one `ModuleContains` edge per non-self sibling.
+    ///
+    /// Why: keeps the inner loop free of the self-edge / same-name filter so
+    /// the iteration intent is obvious.
+    /// What: walks `siblings`, skipping the container itself, and appends a
+    /// `ModuleContains` edge from `from` to every other registered symbol.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn add_sibling_edges(&mut self, from: NodeIndex, owner: &str, siblings: &[(&str, NodeIndex)]) {
+        for (sib_name, sib_idx) in siblings {
+            if *sib_idx == from || *sib_name == owner {
+                continue;
+            }
+            self.graph
+                .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
+        }
+    }
+
+    /// Returns true if any chunk is a container (Impl/Class/Struct/Module) with a name.
+    ///
+    /// Why: pass 3 builds a `by_file` map that's expensive to materialize for
+    /// codebases without any container chunks (e.g. pure-function corpora).
+    /// What: short-circuits the first qualifying chunk.
+    /// Test: indirectly covered — when no container exists, pass 3 is a no-op
+    /// (see `test_build_simple_graph`).
+    fn has_any_container(chunks: &[ChunkTuple]) -> bool {
+        chunks
+            .iter()
+            .any(|(_, _, name, _, _, ct)| name.is_some() && Self::is_container(ct))
+    }
+
+    /// Returns true if a chunk type owns sibling symbols (impl/class/struct/module).
+    ///
+    /// Why: the same `matches!` predicate appeared twice in pass 3; extracting
+    /// it removes a duplicated branching expression.
+    /// What: pattern-matches the four container variants.
+    /// Test: indirectly covered by
+    /// `test_module_contains_edges_from_container_chunks`.
+    fn is_container(ct: &ChunkType) -> bool {
+        matches!(
+            ct,
+            ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
+        )
+    }
+
+    /// Group all defined symbols by their source file.
+    ///
+    /// Why: pass 3 needs O(1) "what else is in this file?" lookups; building
+    /// the map once is cheaper than re-scanning the corpus per container.
+    /// What: returns `file → [(symbol, NodeIndex)]` covering every chunk whose
+    /// `function_name` resolves to a registered node.
+    /// Test: indirectly covered by
+    /// `test_module_contains_edges_from_container_chunks` (cross-file leak check).
+    fn group_symbols_by_file<'a>(
+        &self,
+        chunks: &'a [ChunkTuple],
+    ) -> HashMap<&'a str, Vec<(&'a str, NodeIndex)>> {
+        let mut by_file: HashMap<&str, Vec<(&str, NodeIndex)>> = HashMap::new();
+        for (_chunk_id, file, name, _calls, _inh, _ct) in chunks {
+            if let Some(name) = name {
+                if let Some(&idx) = self.by_symbol.get(name) {
+                    by_file
+                        .entry(file.as_str())
+                        .or_default()
+                        .push((name.as_str(), idx));
+                }
+            }
+        }
+        by_file
+    }
+
+    /// O(1) callee lookup using a precomputed `simple_name → NodeIndex` map.
+    ///
+    /// Why: the previous implementation linearly scanned every symbol per call
+    /// edge looking for a `::callee` suffix. On a 115k-chunk corpus this was
+    /// the single biggest cost in `build_from_chunks`. We now materialize the
+    /// suffix map once per build and look up in O(1).
+    fn resolve_callee_fast(
+        &self,
+        callee: &str,
+        by_suffix: &HashMap<String, NodeIndex>,
+    ) -> Option<NodeIndex> {
+        if let Some(&idx) = self.by_symbol.get(callee) {
+            return Some(idx);
+        }
+        by_suffix.get(callee).copied()
+    }
+
+    /// Number of symbol nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    /// Number of call edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    /// Look up the defining symbol for a chunk_id, if any.
+    pub fn symbol_for_chunk(&self, chunk_id: &str) -> Option<&str> {
+        self.chunk_to_symbol.get(chunk_id).map(|s| s.as_str())
+    }
+
+    /// Iterate all nodes, returning `(symbol, chunk_id, file)` tuples.
+    ///
+    /// Why: the `GET /indexes/{id}/graph` endpoint (issue #128) needs to export
+    /// the entire graph as JSON, but every existing accessor is BFS-scoped to a
+    /// single seed symbol. This is the only whole-graph node enumeration.
+    /// What: clones the three string fields of every `SymbolNode` in node-index
+    /// order (petgraph's `node_weights` iteration order; stable for a built
+    /// graph).
+    /// Test: covered by `test_all_nodes_enumerates_every_symbol`.
+    pub fn all_nodes(&self) -> Vec<(String, String, String)> {
+        self.graph
+            .node_weights()
+            .map(|n| (n.symbol.clone(), n.chunk_id.clone(), n.file.clone()))
+            .collect()
+    }
+
+    /// Iterate all edges, returning `(source_symbol, target_symbol, edge_kind)`
+    /// tuples.
+    ///
+    /// Why: companion to [`Self::all_nodes`] for the issue #128 graph export —
+    /// D3/Cytoscape clients need the full edge list, not just BFS neighbours.
+    /// What: walks every edge reference, resolving both endpoints back to their
+    /// symbol names; an edge whose endpoint node is somehow missing is skipped
+    /// (defensive — should not happen on a graph built via `build_from_chunks`).
+    /// Test: covered by `test_all_edges_enumerates_every_edge`.
+    pub fn all_edges(&self) -> Vec<(String, String, EdgeKind)> {
+        self.graph
+            .edge_references()
+            .filter_map(|e| {
+                let src = self.graph.node_weight(e.source())?;
+                let tgt = self.graph.node_weight(e.target())?;
+                Some((src.symbol.clone(), tgt.symbol.clone(), e.weight().clone()))
+            })
+            .collect()
+    }
+
+    /// BFS up to `hops` levels: symbols that (transitively) call `symbol`.
+    /// Returns `Vec<(symbol, chunk_id)>` excluding `symbol` itself.
+    pub fn callers_of(&self, symbol: &str, hops: usize) -> Vec<(String, String)> {
+        self.bfs_neighbors(symbol, hops, Direction::Incoming)
+    }
+
+    /// BFS up to `hops` levels: symbols (transitively) called by `symbol`.
+    /// Returns `Vec<(symbol, chunk_id)>` excluding `symbol` itself.
+    pub fn callees_of(&self, symbol: &str, hops: usize) -> Vec<(String, String)> {
+        self.bfs_neighbors(symbol, hops, Direction::Outgoing)
+    }
+
+    /// BFS up to `hops` levels, walking only edges whose `EdgeKind` is in
+    /// `edge_kinds`. Returns `(symbol, chunk_id, edge_kind)` triples for each
+    /// neighbour discovered (excluding `symbol` itself).
+    ///
+    /// Used by intent-gated KG expansion (issue #18) so each query intent
+    /// traverses the subset of edge types most likely to surface relevant
+    /// adjacent code (`Implements`/`UsesType` for definitions, `CallsFunction`
+    /// for usage, `RaisesError` for bug-debt, …).
+    pub fn neighbors_by_edge(
+        &self,
+        symbol: &str,
+        edge_kinds: &[EdgeKind],
+        hops: usize,
+    ) -> Vec<(String, String, EdgeKind)> {
+        let Some(start) = self.start_index(symbol, hops) else {
+            return Vec::new();
+        };
+        if edge_kinds.is_empty() {
+            return Vec::new();
+        }
+        let allowed: HashSet<&EdgeKind> = edge_kinds.iter().collect();
+        let mut out: Vec<(String, String, EdgeKind)> = Vec::new();
+        self.bfs_walk(
+            start,
+            hops,
+            &[Direction::Outgoing, Direction::Incoming],
+            |edge| allowed.contains(edge.weight()),
+            |node, edge| {
+                out.push((
+                    node.symbol.clone(),
+                    node.chunk_id.clone(),
+                    edge.weight().clone(),
+                ));
+            },
+        );
+        out
+    }
+
+    fn bfs_neighbors(&self, symbol: &str, hops: usize, dir: Direction) -> Vec<(String, String)> {
+        let Some(start) = self.start_index(symbol, hops) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        // Only walk call-graph edges; other `EdgeKind`s belong to entity
+        // expansion paths (Phase A/B/C) and shouldn't pollute callers/callees.
+        self.bfs_walk(
+            start,
+            hops,
+            &[dir],
+            |edge| edge.weight() == &EdgeKind::CallsFunction,
+            |node, _edge| {
+                out.push((node.symbol.clone(), node.chunk_id.clone()));
+            },
+        );
+        out
+    }
+
+    /// Resolve a start node for BFS expansion.
+    ///
+    /// Why: both `neighbors_by_edge` and `bfs_neighbors` open with the same
+    /// "look up the seed symbol, bail on `hops==0`" guard. Extracting it keeps
+    /// the BFS bodies focused on traversal.
+    /// What: returns `None` when the symbol is unknown or `hops==0`; otherwise
+    /// the node index of the seed.
+    /// Test: indirectly covered by `test_unknown_symbol_returns_empty` and the
+    /// `test_callers_of_*` family.
+    fn start_index(&self, symbol: &str, hops: usize) -> Option<NodeIndex> {
+        if hops == 0 {
+            return None;
+        }
+        self.by_symbol.get(symbol).copied()
+    }
+
+    /// Shared BFS engine for KG expansion.
+    ///
+    /// Why: `neighbors_by_edge` and `bfs_neighbors` previously duplicated the
+    /// visited-set / queue / direction-fan-out scaffolding, only differing in
+    /// the edge predicate and the per-neighbour visit callback. Centralising
+    /// this loop lets the public methods state *what* they want (edge filter +
+    /// output shape) without re-implementing *how* the traversal proceeds.
+    /// What: BFS up to `hops` levels from `start`, fanning out across every
+    /// direction in `dirs`. For each candidate edge, calls `edge_filter`; for
+    /// each newly-discovered neighbour, invokes `on_visit(node, edge)`.
+    /// Test: covered transitively by all `callers_of` / `callees_of` /
+    /// `neighbors_by_edge` tests in this module.
+    fn bfs_walk<F, V>(
+        &self,
+        start: NodeIndex,
+        hops: usize,
+        dirs: &[Direction],
+        edge_filter: F,
+        mut on_visit: V,
+    ) where
+        F: Fn(petgraph::graph::EdgeReference<'_, EdgeKind>) -> bool,
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        visited.insert(start);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
+            self.expand_node(
+                node,
+                depth,
+                dirs,
+                &edge_filter,
+                &mut on_visit,
+                &mut visited,
+                &mut queue,
+            );
+        }
+    }
+
+    /// Visit every allowed neighbour of `node` and enqueue newly-seen ones.
+    ///
+    /// Why: keeps `bfs_walk`'s loop body small — direction fan-out, edge
+    /// filtering, and the visited/queue bookkeeping each have a clear home.
+    /// What: for each direction in `dirs`, iterates edges, applies
+    /// `edge_filter`, and forwards the resolved neighbour to
+    /// `record_neighbor`.
+    /// Test: covered by every `bfs_walk` consumer
+    /// (`callers_of`, `callees_of`, `neighbors_by_edge` tests).
+    #[allow(clippy::too_many_arguments)]
+    fn expand_node<F, V>(
+        &self,
+        node: NodeIndex,
+        depth: usize,
+        dirs: &[Direction],
+        edge_filter: &F,
+        on_visit: &mut V,
+        visited: &mut HashSet<NodeIndex>,
+        queue: &mut VecDeque<(NodeIndex, usize)>,
+    ) where
+        F: Fn(petgraph::graph::EdgeReference<'_, EdgeKind>) -> bool,
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
+        for &dir in dirs {
+            for edge in self.graph.edges_directed(node, dir) {
+                if !edge_filter(edge) {
+                    continue;
+                }
+                let nb = Self::neighbor_in_direction(edge, dir);
+                self.record_neighbor(nb, edge, depth, on_visit, visited, queue);
+            }
+        }
+    }
+
+    /// Resolve the "other end" of an edge given the traversal direction.
+    ///
+    /// Why: makes the direction → endpoint mapping explicit and reusable.
+    /// What: returns `target` for outgoing edges, `source` for incoming.
+    /// Test: implicitly covered by every BFS test.
+    fn neighbor_in_direction(
+        edge: petgraph::graph::EdgeReference<'_, EdgeKind>,
+        dir: Direction,
+    ) -> NodeIndex {
+        match dir {
+            Direction::Outgoing => edge.target(),
+            Direction::Incoming => edge.source(),
+        }
+    }
+
+    /// Record a newly-discovered neighbour and enqueue it for further expansion.
+    ///
+    /// Why: centralises the "first visit" check so we don't accidentally
+    /// double-emit a node when both directions reach it.
+    /// What: returns early when `nb` was already visited; otherwise calls
+    /// `on_visit` and pushes `(nb, depth+1)` onto the BFS queue.
+    /// Test: covered transitively by the `bfs_walk` consumers.
+    fn record_neighbor<V>(
+        &self,
+        nb: NodeIndex,
+        edge: petgraph::graph::EdgeReference<'_, EdgeKind>,
+        depth: usize,
+        on_visit: &mut V,
+        visited: &mut HashSet<NodeIndex>,
+        queue: &mut VecDeque<(NodeIndex, usize)>,
+    ) where
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
+        if visited.insert(nb) {
+            let n = &self.graph[nb];
+            on_visit(n, edge);
+            queue.push_back((nb, depth + 1));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(id: &str, file: &str, name: Option<&str>, calls: &[&str]) -> ChunkTuple {
+        chunk_full(id, file, name, calls, &[], ChunkType::Function)
+    }
+
+    fn chunk_full(
+        id: &str,
+        file: &str,
+        name: Option<&str>,
+        calls: &[&str],
+        inherits_from: &[&str],
+        chunk_type: ChunkType,
+    ) -> ChunkTuple {
+        (
+            id.to_string(),
+            file.to_string(),
+            name.map(String::from),
+            calls.iter().map(|s| s.to_string()).collect(),
+            inherits_from.iter().map(|s| s.to_string()).collect(),
+            chunk_type,
+        )
+    }
+
+    #[test]
+    fn test_build_simple_graph() {
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo", "bar"]),
+            chunk("a:2", "a.rs", Some("foo"), &["bar"]),
+            chunk("a:3", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.node_count(), 3);
+        // main→foo, main→bar, foo→bar = 3 edges
+        assert_eq!(g.edge_count(), 3);
+    }
+
+    #[test]
+    fn test_callers_of_one_hop() {
+        let chunks = vec![
+            chunk("m:1", "m.rs", Some("main"), &["authenticate"]),
+            chunk("h:1", "h.rs", Some("login_handler"), &["authenticate"]),
+            chunk("a:1", "a.rs", Some("authenticate"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let mut callers = g.callers_of("authenticate", 1);
+        callers.sort();
+        assert_eq!(
+            callers,
+            vec![
+                ("login_handler".to_string(), "h:1".to_string()),
+                ("main".to_string(), "m:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_callees_of_one_hop() {
+        let chunks = vec![
+            chunk(
+                "a:1",
+                "a.rs",
+                Some("authenticate"),
+                &["hash_password", "lookup_user"],
+            ),
+            chunk("p:1", "p.rs", Some("hash_password"), &[]),
+            chunk("u:1", "u.rs", Some("lookup_user"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let mut callees = g.callees_of("authenticate", 1);
+        callees.sort();
+        assert_eq!(
+            callees,
+            vec![
+                ("hash_password".to_string(), "p:1".to_string()),
+                ("lookup_user".to_string(), "u:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_two_hop_traversal() {
+        // a → b → c
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("a"), &["b"]),
+            chunk("b:1", "b.rs", Some("b"), &["c"]),
+            chunk("c:1", "c.rs", Some("c"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let one_hop = g.callees_of("a", 1);
+        assert_eq!(one_hop.len(), 1);
+        assert_eq!(one_hop[0].0, "b");
+
+        let two_hop = g.callees_of("a", 2);
+        let names: Vec<&str> = two_hop.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn test_unknown_symbol_returns_empty() {
+        let chunks = vec![chunk("a:1", "a.rs", Some("a"), &[])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert!(g.callers_of("nonexistent", 1).is_empty());
+        assert!(g.callees_of("nonexistent", 1).is_empty());
+    }
+
+    #[test]
+    fn test_qualified_method_resolves_simple_callee() {
+        // `Foo::bar` calls `baz`; only `Foo::bar` and `baz` are in the corpus.
+        let chunks = vec![
+            chunk("f:1", "f.rs", Some("Foo::bar"), &["baz"]),
+            chunk("b:1", "b.rs", Some("baz"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let callers = g.callers_of("baz", 1);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].0, "Foo::bar");
+    }
+
+    #[test]
+    fn test_simple_callee_resolves_to_qualified_definition() {
+        // Caller writes `bar()`; only `Foo::bar` is defined.
+        let chunks = vec![
+            chunk("c:1", "c.rs", Some("caller"), &["bar"]),
+            chunk("f:1", "f.rs", Some("Foo::bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let callees = g.callees_of("caller", 1);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].0, "Foo::bar");
+    }
+
+    #[test]
+    fn test_chunk_with_no_function_name_is_skipped() {
+        let chunks = vec![
+            chunk("s:1", "s.rs", None, &[]),
+            chunk("f:1", "f.rs", Some("f"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.node_count(), 1);
+    }
+
+    #[test]
+    fn test_zero_hops_returns_empty() {
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("a"), &["b"]),
+            chunk("b:1", "b.rs", Some("b"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert!(g.callees_of("a", 0).is_empty());
+    }
+
+    #[test]
+    fn test_symbol_for_chunk() {
+        let chunks = vec![chunk("a:1", "a.rs", Some("alpha"), &[])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.symbol_for_chunk("a:1"), Some("alpha"));
+        assert_eq!(g.symbol_for_chunk("missing"), None);
+    }
+
+    #[test]
+    fn test_neighbors_by_edge_filters_by_kind() {
+        // Build a graph with two edge kinds. neighbors_by_edge must only
+        // return neighbours reachable via the requested kinds.
+        let mut g = SymbolGraph::new();
+        let a = g.graph.add_node(SymbolNode {
+            symbol: "a".into(),
+            chunk_id: "a:1".into(),
+            file: "a.rs".into(),
+        });
+        let b = g.graph.add_node(SymbolNode {
+            symbol: "b".into(),
+            chunk_id: "b:1".into(),
+            file: "b.rs".into(),
+        });
+        let c = g.graph.add_node(SymbolNode {
+            symbol: "c".into(),
+            chunk_id: "c:1".into(),
+            file: "c.rs".into(),
+        });
+        g.by_symbol.insert("a".into(), a);
+        g.by_symbol.insert("b".into(), b);
+        g.by_symbol.insert("c".into(), c);
+        g.graph.add_edge(a, b, EdgeKind::CallsFunction);
+        g.graph.add_edge(a, c, EdgeKind::Implements);
+
+        let calls = g.neighbors_by_edge("a", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "b");
+
+        let impls = g.neighbors_by_edge("a", &[EdgeKind::Implements], 1);
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].0, "c");
+
+        let both = g.neighbors_by_edge("a", &[EdgeKind::CallsFunction, EdgeKind::Implements], 1);
+        assert_eq!(both.len(), 2);
+
+        // Empty edge set returns nothing.
+        assert!(g.neighbors_by_edge("a", &[], 1).is_empty());
+        // Zero hops returns nothing.
+        assert!(g
+            .neighbors_by_edge("a", &[EdgeKind::CallsFunction], 0)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_calls_function_edges_present_in_graph() {
+        // Issue #33: a chunk whose `calls` field lists `bar` must produce a
+        // `CallsFunction` edge from the caller's symbol to bar.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("alpha"), &["bar"]),
+            chunk("b:1", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let calls = g.neighbors_by_edge("alpha", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one CallsFunction neighbour, got {calls:?}"
+        );
+        assert_eq!(calls[0].0, "bar");
+        assert!(matches!(calls[0].2, EdgeKind::CallsFunction));
+    }
+
+    #[test]
+    fn test_inherits_from_emits_implements_edges() {
+        // Issue #33: a chunk's `inherits_from` field should produce
+        // `Implements` edges to each parent that's defined in the corpus.
+        let chunks = vec![
+            chunk_full(
+                "c:1",
+                "c.rs",
+                Some("Child"),
+                &[],
+                &["Parent"],
+                ChunkType::Class,
+            ),
+            chunk_full("p:1", "p.rs", Some("Parent"), &[], &[], ChunkType::Class),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let impls = g.neighbors_by_edge("Child", &[EdgeKind::Implements], 1);
+        assert_eq!(impls.len(), 1, "expected one Implements edge: {impls:?}");
+        assert_eq!(impls[0].0, "Parent");
+    }
+
+    #[test]
+    fn test_module_contains_edges_from_container_chunks() {
+        // Issue #33: a container chunk (Impl/Class/Struct/Module) should emit
+        // `ModuleContains` edges to other defining symbols in the same file.
+        let chunks = vec![
+            chunk_full("i:1", "f.rs", Some("FooImpl"), &[], &[], ChunkType::Impl),
+            chunk_full("m:1", "f.rs", Some("method_a"), &[], &[], ChunkType::Method),
+            chunk_full("m:2", "f.rs", Some("method_b"), &[], &[], ChunkType::Method),
+            // A symbol in a different file should NOT be contained.
+            chunk_full(
+                "o:1",
+                "other.rs",
+                Some("outside"),
+                &[],
+                &[],
+                ChunkType::Function,
+            ),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let contained = g.neighbors_by_edge("FooImpl", &[EdgeKind::ModuleContains], 1);
+        let names: HashSet<&str> = contained.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains("method_a"), "got {names:?}");
+        assert!(names.contains("method_b"), "got {names:?}");
+        assert!(!names.contains("outside"), "cross-file leak: {names:?}");
+    }
+
+    #[test]
+    fn test_neighbors_by_edge_only_returns_filtered_kinds() {
+        // Issue #33: a graph with mixed edge kinds — filtering by one kind
+        // must not surface neighbours reachable only through other kinds.
+        let chunks = vec![
+            chunk_full(
+                "a:1",
+                "a.rs",
+                Some("Alpha"),
+                &["beta"],
+                &["BaseAlpha"],
+                ChunkType::Class,
+            ),
+            chunk("b:1", "a.rs", Some("beta"), &[]),
+            chunk_full(
+                "ba:1",
+                "a.rs",
+                Some("BaseAlpha"),
+                &[],
+                &[],
+                ChunkType::Class,
+            ),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+
+        let calls = g.neighbors_by_edge("Alpha", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "beta");
+        assert!(calls.iter().all(|(_, _, k)| k == &EdgeKind::CallsFunction));
+
+        let impls = g.neighbors_by_edge("Alpha", &[EdgeKind::Implements], 1);
+        assert!(impls.iter().any(|(n, _, _)| n == "BaseAlpha"));
+        assert!(impls.iter().all(|(_, _, k)| k == &EdgeKind::Implements));
+    }
+
+    #[test]
+    fn test_all_nodes_enumerates_every_symbol() {
+        // Issue #128: all_nodes must return one tuple per defining symbol.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo"]),
+            chunk("a:2", "a.rs", Some("foo"), &[]),
+            chunk("b:1", "b.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let nodes = g.all_nodes();
+        assert_eq!(nodes.len(), 3);
+        let names: HashSet<&str> = nodes.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(names.contains("main"));
+        assert!(names.contains("foo"));
+        assert!(names.contains("bar"));
+        // chunk_id + file are carried through.
+        let main = nodes.iter().find(|(s, _, _)| s == "main").unwrap();
+        assert_eq!(main.1, "a:1");
+        assert_eq!(main.2, "a.rs");
+    }
+
+    #[test]
+    fn test_all_edges_enumerates_every_edge() {
+        // Issue #128: all_edges must return one tuple per edge with both
+        // endpoints resolved to symbol names.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo", "bar"]),
+            chunk("a:2", "a.rs", Some("foo"), &["bar"]),
+            chunk("a:3", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let edges = g.all_edges();
+        // main→foo, main→bar, foo→bar.
+        assert_eq!(edges.len(), 3);
+        assert!(edges
+            .iter()
+            .all(|(_, _, k)| matches!(k, EdgeKind::CallsFunction)));
+        let pairs: HashSet<(&str, &str)> = edges
+            .iter()
+            .map(|(s, t, _)| (s.as_str(), t.as_str()))
+            .collect();
+        assert!(pairs.contains(&("main", "foo")));
+        assert!(pairs.contains(&("main", "bar")));
+        assert!(pairs.contains(&("foo", "bar")));
+    }
+
+    #[test]
+    fn test_all_nodes_and_edges_empty_graph() {
+        // Issue #128: an empty graph yields empty exports, not a panic.
+        let g = SymbolGraph::new();
+        assert!(g.all_nodes().is_empty());
+        assert!(g.all_edges().is_empty());
+    }
+
+    #[test]
+    fn test_self_call_does_not_create_self_loop() {
+        // Recursive function: `f` calls `f`. We skip self-edges so KG expansion
+        // doesn't surface the trigger chunk as its own neighbor.
+        let chunks = vec![chunk("f:1", "f.rs", Some("f"), &["f"])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.edge_count(), 0);
+    }
+}

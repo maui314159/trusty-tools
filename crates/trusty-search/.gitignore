@@ -1,0 +1,23 @@
+target/
+.env.local
+*.pid
+search.pid
+trusty-search.pid
+.DS_Store
+*.swp
+
+# fastembed model cache (large, auto-downloaded)
+.fastembed_cache/
+**/.fastembed_cache/
+
+# UI build artifacts and dependencies (source; ui-dist/ is the embedded copy tracked in git)
+ui/dist/
+ui/node_modules/
+
+# Local tooling
+.claude-mpm/
+.claude/settings.local.json
+.mcp-vector-search/
+.mcp.json
+.trusty-search
+.env

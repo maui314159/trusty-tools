@@ -1,0 +1,113 @@
+[package]
+name = "open-mpm"
+version = "0.38.3"
+edition = "2024"
+
+[dependencies]
+trusty-symgraph = { path = "../trusty-symgraph", features = ["parser"] }
+trusty-memory-core = { path = "../trusty-memory-core" }
+# Why: issue #460 unified rpc.discover — host needs the ServiceDescriptor
+#      trait + OpenRpcBuilder, plus the in-process MemoryMcpService and
+#      SearchMcpService impls. trusty-search now aligns on tree-sitter 0.26
+#      (matches trusty-symgraph) so the previous `links = "tree-sitter"`
+#      single-copy conflict is resolved and we link it directly.
+trusty-mcp-core = { path = "../trusty-mcp-core" }
+trusty-memory-mcp = { path = "../trusty-memory-mcp" }
+trusty-search = { path = "../trusty-search" }
+# #484: Shared service layer. `tc-services::cto_db` owns the CTO DB service
+# adapter (schema emission + dispatch); `src/tools/cto_db.rs` is now a thin
+# `ToolExecutor` wrapper over it. `trusty-cto-db` is still a direct dep because
+# the wrapper test references `trusty_cto_db::ENV_CTO_DB_PATH`.
+tc-services = { path = "../tc-services" }
+trusty-cto-db = { path = "../trusty-cto-db" }
+tokio = { version = "1", features = ["full"] }
+async-openai = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+scraper = "0.21"
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+redb = "2.6"
+usearch = "2.25"
+fastembed = "5.13"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+walkdir = "2.5"
+notify = { version = "8", features = ["macos_fsevent"] }
+notify-debouncer-mini = { version = "0.6", default-features = false, features = ["macos_fsevent"] }
+fs4 = "1.0"
+regex = "1"
+once_cell = "1"
+stop-words = "0.8"
+dirs = "5"
+sha2 = "0.10"
+comrak = { version = "0.52", default-features = false }
+serde_yml = "0.0.12"
+toml_edit = "0.22"
+base64 = "0.22"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
+clap = { version = "4", features = ["derive"] }
+backon = "1"
+indexmap = { version = "2", features = ["serde"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+local-ip-address = "0.6"
+hostname = "0.4"
+async-stream = "0.3"
+tokio-stream = "0.1"
+crossterm = "0.28"
+ratatui = "0.29"
+strip-ansi-escapes = "0.2"
+nu-ansi-term = "0.50"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
+aws-types = "1"
+aws-smithy-types = "1"
+git2 = { version = "0.20", features = ["vendored-libgit2"] }
+teloxide = { version = "0.17", features = ["macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+flate2 = "1"
+rand = "0.8"
+similar = { version = "2", features = ["text"] }
+petgraph = { version = "0.8", features = ["serde-1"] }
+libc = "0.2"
+lru = "0.12"
+
+# [patch.crates-io] moved to workspace root Cargo.toml (Cargo requires
+# [patch] tables to live in the workspace root; see #460 for context).
+
+[[bin]]
+name = "open-mpm"
+path = "src/main.rs"
+
+[[bin]]
+name = "ompm"
+path = "src/bin/ompm.rs"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+serial_test = "3"
+
+[lints.clippy]
+doc_lazy_continuation = "allow"

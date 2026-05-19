@@ -1,0 +1,30 @@
+[package]
+name = "tc-services"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+description = "Shared service-layer implementations for the Trusty ecosystem (CTO DB, Granola, Google Workspace)."
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# CTO DB service is a framework-agnostic adapter over trusty-cto-db.
+trusty-cto-db = { path = "../trusty-cto-db" }
+# Phase 2: native Granola HTTP client + Google Workspace bridge.
+# `reqwest` is inherited from the workspace (rustls-tls, json) so the
+# Granola client links the same TLS stack as the rest of trusty-common.
+reqwest = { workspace = true }
+# `trusty-gworkspace` provides the authenticated Google API client; the
+# `gworkspace` module is a thin schema-emission + dispatch bridge over it.
+trusty-gworkspace = { path = "../trusty-gworkspace" }
+# `async-openai` is intentionally NOT a dependency: tc-services only emits
+# OpenAI-compatible function schemas as `serde_json::Value`. Hosts that need
+# the typed async-openai representation (e.g. open-mpm) own that bridge.

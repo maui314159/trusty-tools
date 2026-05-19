@@ -1,0 +1,47 @@
+Build a REST API service that monitors weather for configured cities and triggers alerts when thresholds are exceeded, with persistent storage and scheduled checks.
+
+## Stack
+- Python 3.12+ with type hints
+- FastAPI
+- SQLite (via aiosqlite)
+- APScheduler (AsyncIOScheduler)
+- httpx for weather API calls
+
+## Endpoints
+- POST/GET /api/cities — CRUD for monitored cities
+- GET/PATCH/DELETE /api/cities/{id}
+- POST/GET /api/cities/{id}/thresholds — CRUD for alert thresholds (temperature_gt, temperature_lt, wind_speed_gt, humidity_gt, etc.)
+- DELETE /api/thresholds/{id}
+- GET /api/alerts — paginated, filterable alert history (filter by city_id, page/page_size)
+- GET /api/weather/{city_id} — latest cached weather snapshot
+- GET /api/health — health check (db status, scheduler state)
+
+## Behavior
+- Background scheduler checks weather every 5 minutes
+- Stores weather snapshots in SQLite
+- Evaluates thresholds and creates alert records when exceeded
+- Mock/demo mode: when WEATHER_API_KEY is absent or "demo", return deterministic mock data (no real API calls)
+
+## Tests
+- Full test suite using pytest-asyncio with AsyncClient
+- Test all CRUD endpoints
+- Test threshold evaluation logic
+- Test scheduler job methods directly
+- Test mock weather mode
+- Use in-memory SQLite for tests (no real DB file)
+
+## Project structure (FLAT layout — pyproject.toml at root)
+- pyproject.toml (at root)
+- weather_alerter/ (Python package)
+  - __init__.py
+  - app.py (exports `app = FastAPI(...)`)
+  - models.py
+  - database.py
+  - weather_client.py
+  - scheduler.py
+  - routers/
+    - cities.py, thresholds.py, alerts.py, weather.py, health.py
+- tests/
+  - conftest.py
+  - test_cities.py, test_thresholds.py, test_alerts.py, test_weather.py, test_health.py, test_scheduler.py
+- README.md
