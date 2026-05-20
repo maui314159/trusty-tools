@@ -66,6 +66,22 @@ cargo fmt
 
 # Run ONNX-backed integration tests (slow; skipped in CI)
 cargo test -- --include-ignored
+
+# Build and run a specific binary (development)
+cargo run -p trusty-search -- start
+cargo run -p trusty-mpm-cli -- --help
+
+# Build a specific binary in release mode
+cargo build --release -p trusty-search
+
+# Check only a specific crate (faster than workspace check)
+cargo check -p trusty-common
+
+# Update dependencies (review Cargo.lock diff before committing)
+cargo update
+
+# Audit dependencies for known vulnerabilities
+cargo audit   # requires: cargo install cargo-audit
 ```
 
 ## Code Structure
@@ -236,6 +252,117 @@ When publishing a crate to crates.io:
 - The top-level MPM orchestration platform. Consumes `trusty-search`,
   `trusty-memory-core`, and `trusty-symgraph`.
 - Uses edition 2024 and let-chains extensively.
+
+## Development Environment
+
+### Required Tools
+
+- **Rust**: `rustup` with the toolchain pinned to MSRV `1.88` or later.
+  Install: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **Node / pnpm**: only needed if working on the Svelte UIs embedded in
+  `trusty-search` or `trusty-memory-mcp`. Install pnpm via `npm i -g pnpm`.
+- **Git**: standard; the workspace uses git tags for per-crate releases.
+
+### Environment Variables
+
+| Variable | Required by | Purpose |
+|---|---|---|
+| `OPENROUTER_API_KEY` | `trusty-search` `/chat`, `trusty-common` chat helpers | LLM chat via OpenRouter. Pass as argument to library helpers; never read from env inside library crates. |
+| `RUST_LOG` | all daemons | Tracing filter, e.g. `RUST_LOG=debug` or `RUST_LOG=trusty_search=debug,warn`. |
+| `TRUSTY_MEMORY_LIMIT_MB` | `trusty-search` | Soft RSS ceiling for indexing pipeline. Auto-tuned from system RAM; override only when needed. |
+| `TRUSTY_MAX_CHUNKS` | `trusty-search` | Hard cap on chunks per index. Auto-tuned; rarely set manually. |
+| `TRUSTY_MAX_BATCH_SIZE` | `trusty-search` | ONNX embedding batch size. Auto-tuned; set if OOM during reindex. |
+| `TRUSTY_EMBEDDING_CACHE` | `trusty-search` | LRU embedding cache capacity (entries). |
+| `ORT_DYLIB_PATH` | `trusty-search` (CUDA, glibc < 2.38) | Path to `libonnxruntime.so` on hosts with glibc < 2.38 and CUDA builds. |
+| `SKIP_UI_BUILD` | `trusty-search` `build.rs` | Set to `1` to skip the Svelte UI build step (CI publish flows). |
+
+### Recommended IDE Setup
+
+**VS Code / Cursor**:
+- Install `rust-analyzer` extension.
+- Install `Even Better TOML` for `Cargo.toml` editing.
+- Workspace-level `rust-analyzer` picks up the root `Cargo.toml` automatically;
+  no per-crate `.vscode/settings.json` needed.
+- Recommended settings in `.vscode/settings.json`:
+  ```json
+  {
+    "rust-analyzer.cargo.features": "all",
+    "rust-analyzer.checkOnSave.command": "clippy"
+  }
+  ```
+
+**RustRover**: open the repo root; it detects the workspace automatically.
+
+### Running Individual MCP Servers Locally
+
+Each MCP server reads from stdin / writes to stdout (JSON-RPC 2.0 framing).
+All daemons log to **stderr** — never stdout.
+
+```bash
+# trusty-search daemon (HTTP + MCP stdio)
+RUST_LOG=info cargo run -p trusty-search -- start
+# Query via CLI
+cargo run -p trusty-search -- query "fn authenticate" --index <id>
+# MCP stdio mode (used by Claude Code via .mcp.json)
+cargo run -p trusty-search -- serve
+
+# MPM daemon
+RUST_LOG=info cargo run -p trusty-mpm-daemon --bin trusty-mpmd
+
+# MPM CLI (tm / trusty-mpm)
+cargo run -p trusty-mpm-cli -- --help
+
+# trusty-memory-mcp (MCP server + embedded Svelte UI)
+RUST_LOG=info cargo run -p trusty-memory-mcp
+
+# Build a specific binary in release mode
+cargo build --release -p trusty-search
+./target/release/trusty-search start
+```
+
+To wire a locally-built binary into Claude Code, update your project's
+`.mcp.json` or `~/.claude/mcp.json` to point `command` at the absolute path
+of the built binary (e.g. `target/release/trusty-search`).
+
+## Common Pitfalls
+
+🔴 **Using `unwrap()` in library crates** — the compiler does not stop you, but
+it violates the project's hard rule. Use `?` with `thiserror` error types in
+libraries. `expect()` is allowed only for invariants that genuinely cannot
+occur at runtime (not for "I think this will always be Some").
+
+🔴 **Logging to stdout in a daemon or MCP server** — MCP JSON-RPC framing uses
+stdout as the transport channel. A stray `println!` corrupts the protocol.
+Always use `tracing::info!` / `tracing::debug!` etc. (which write to stderr).
+
+🔴 **Adding `axum` as an unconditional dependency in a library crate** — put it
+behind the `axum-server` feature flag, matching the pattern in `trusty-common`.
+Otherwise every library consumer pulls in the full axum + tower stack.
+
+🟡 **Editing a shared crate without propagating changes** — modifying
+`trusty-common`, `trusty-mcp-core`, `trusty-embedder`, or `trusty-symgraph`
+can silently break dependents. Always run `cargo check` (workspace-wide) and
+`cargo test -p <consumer>` for every crate that imports the edited library.
+
+🟡 **Forgetting the Why/What/Test doc pattern on new public items** — clippy
+does not enforce this. Review public APIs manually before committing.
+
+🟡 **Building the Svelte UI manually before `cargo build`** — `trusty-search`
+uses `build.rs` to invoke pnpm if `ui-dist/` is stale. If pnpm is not
+installed, the build script fails loudly. Install pnpm or set
+`SKIP_UI_BUILD=1` if you are not changing the UI.
+
+🟡 **`[patch.crates-io]` only works at the workspace root** — do not add
+`[patch]` tables inside individual crate `Cargo.toml` files; Cargo ignores
+them. All patches must live in the root `Cargo.toml`.
+
+🟢 **MSRV drift** — the workspace pins `rust-version = "1.88"`. Running
+`rustup update` and picking up a new nightly may introduce syntax that
+compiles locally but fails on CI. Prefer stable channel toolchains.
+
+🟢 **Edition mismatch** — `trusty-mpm-*` and `open-mpm` use edition 2024;
+all other crates use edition 2021. Let-chains (`if let … && let …`) only
+work in edition 2024. Do not copy let-chain patterns into edition-2021 crates.
 
 ## Former Repos Reference
 
