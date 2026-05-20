@@ -1,11 +1,6 @@
 # trusty-analyzer
 
-[![CI](https://github.com/bobmatnyc/trusty-analyze/actions/workflows/ci.yml/badge.svg)](https://github.com/bobmatnyc/trusty-analyze/actions/workflows/ci.yml)
-[![Publish](https://github.com/bobmatnyc/trusty-analyze/actions/workflows/publish.yml/badge.svg)](https://github.com/bobmatnyc/trusty-analyze/actions/workflows/publish.yml)
-[![crates.io: trusty-analyzer-types](https://img.shields.io/crates/v/trusty-analyzer-types.svg?label=trusty-analyzer-types)](https://crates.io/crates/trusty-analyzer-types)
-[![crates.io: trusty-analyzer-core](https://img.shields.io/crates/v/trusty-analyzer-core.svg?label=trusty-analyzer-core)](https://crates.io/crates/trusty-analyzer-core)
-[![crates.io: trusty-analyzer-lang](https://img.shields.io/crates/v/trusty-analyzer-lang.svg?label=trusty-analyzer-lang)](https://crates.io/crates/trusty-analyzer-lang)
-[![crates.io: trusty-analyzer-mcp](https://img.shields.io/crates/v/trusty-analyzer-mcp.svg?label=trusty-analyzer-mcp)](https://crates.io/crates/trusty-analyzer-mcp)
+[![crates.io](https://img.shields.io/crates/v/trusty-analyzer.svg)](https://crates.io/crates/trusty-analyzer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Sidecar code-analysis daemon for [trusty-search](../trusty-search). Fetches chunk
@@ -14,71 +9,140 @@ HTTP (port 7879) and MCP stdio.
 
 ## Installation
 
-The `trusty-analyze` binary is distributed via GitHub Releases and `cargo install`:
-
 ```bash
-cargo install --git https://github.com/bobmatnyc/trusty-analyze trusty-analyzer
+cargo install trusty-analyzer
 ```
 
-> The crate name on crates.io is `trusty-analyzer`, but the installed binary is
-> named `trusty-analyze`.
-
-The library crates (`trusty-analyzer-types`, `trusty-analyzer-core`,
-`trusty-analyzer-lang`, `trusty-analyzer-mcp`) are published to crates.io and
-can be added directly:
-
-```toml
-[dependencies]
-trusty-analyzer-core = "0.1"
-```
-
-> **Note:** the workspace also contains `trusty-embedder` and
-> `trusty-analyzer-service`, which are intentionally workspace-internal
-> (`publish = false`). The name `trusty-embedder` collides with an unrelated
-> crate already on crates.io; rather than rename our internal type, the crate
-> and its dependents are not uploaded. The binary is the supported
-> distribution unit for embedded/server functionality.
+The installed binary is named `trusty-analyze`. The crate name on crates.io is
+`trusty-analyzer`.
 
 ## Quick Start
 
 ```bash
-# trusty-search must be running first
+# trusty-search must be running first (hard runtime dependency)
 trusty-search daemon
 
 # Run the analyzer sidecar
 trusty-analyze serve --search-url http://127.0.0.1:7878
 
-# Analyze an index
+# Analyze a named index
 trusty-analyze analyze <index-id> --top-k 20
+
+# Check liveness
+trusty-analyze health
 ```
 
 ## Features
 
 - Cyclomatic and cognitive complexity per chunk, file, and index
-- Code smell detection with configurable thresholds
-- Quality grade aggregation (A–F)
-- Git blame temporal decay scoring
-- Concept clustering (k-means over embeddings)
-- Facts store: `(subject, predicate, object)` knowledge triples
-- Full HTTP API + MCP stdio server (tool parity)
+- Code smell detection with configurable thresholds and named categories
+- Quality grade aggregation (A–F) per file and per index
+- Git blame temporal decay scoring (stale high-complexity code surfaces first)
+- Concept clustering (k-means over embeddings, BoW or neural)
+- Facts store: `(subject, predicate, object)` knowledge triples, persisted in redb
+- SCIP protobuf ingest for LSP-quality symbol data
+- Full HTTP API + MCP stdio server (every endpoint has a tool equivalent)
 
-## Workspace
+## Claude Code Integration
+
+Add to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "trusty-analyzer": {
+      "command": "trusty-analyze",
+      "args": ["serve", "--mcp"],
+      "env": {}
+    }
+  }
+}
+```
+
+`trusty-search` must already be running. The analyzer performs a startup health
+check against `http://127.0.0.1:7878/health` and exits with code 1 if
+unreachable.
+
+## MCP Tools
+
+| Tool | HTTP equivalent |
+|------|-----------------|
+| `analyzer_health` | `GET /health` |
+| `complexity_hotspots` | `GET /indexes/:id/complexity_hotspots` |
+| `find_smells` | `GET /indexes/:id/smells` |
+| `analyze_quality` | `GET /indexes/:id/quality` |
+| `list_facts` | `GET /facts` |
+| `upsert_fact` | `POST /facts` |
+| `delete_fact` | `DELETE /facts/:id` |
+| `ingest_scip` | `POST /indexes/:id/scip` |
+| `cluster_concepts` | `GET /indexes/:id/clusters` |
+
+## HTTP API
+
+Port 7879. Requires trusty-search on port 7878.
 
 ```
-crates/
-  trusty-common/          shared types (also used by trusty-search)
-  trusty-analyzer-core/   analysis engines
-  trusty-analyzer-service/ axum HTTP daemon
-  trusty-analyzer-mcp/    MCP stdio server
-src/main.rs               CLI binary
+GET  /health
+GET  /indexes/:id/complexity_hotspots[?top_k=N]
+GET  /indexes/:id/smells[?category=<name>]
+GET  /indexes/:id/quality
+GET  /indexes/:id/clusters?k=N&method=bow|neural
+GET  /facts[?subject=<s>&predicate=<p>]
+POST /facts
+DELETE /facts/:id
+POST /indexes/:id/scip
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRUSTY_SEARCH_URL` | `http://127.0.0.1:7878` | trusty-search daemon address |
+| `TRUSTY_ANALYZER_PORT` | `7879` | Analyzer listen port |
+| `RUST_LOG` | `warn` | Tracing filter |
+
+## Features Flag
+
+| Flag | Description |
+|---|---|
+| `ner` | Optional ONNX-backed named entity recognition |
+
+## Architecture
+
+The crate is a single `trusty-analyzer` package containing the CLI binary
+(`trusty-analyze`) and a library. All analysis engines, the HTTP server, and the
+MCP stdio server live within this one crate. Shared types (complexity metrics,
+code smells, knowledge-graph entities, facts) come from `trusty-common`.
+
+```
+trusty-search (port 7878)                trusty-analyzer (port 7879)
+  GET /indexes/:id/chunks  ──────────►   complexity analysis (tree-sitter)
+  (bulk corpus export)                   blame + temporal decay
+                                         quality grade aggregation
+                                         k-means concept clustering
+                                         facts store (redb)
+                                         axum HTTP API + MCP stdio
 ```
 
 ## Development
 
 ```bash
-cargo build
-cargo test --workspace
-cargo clippy --all-targets --all-features -- -D warnings
+# Build
+cargo build -p trusty-analyzer
+
+# Test
+cargo test -p trusty-analyzer
+
+# Lint
+cargo clippy -p trusty-analyzer --all-targets -- -D warnings
 ```
 
 See [CLAUDE.md](./CLAUDE.md) for full architecture, API reference, and project history.
+
+## License
+
+Licensed under the [MIT License](https://opensource.org/licenses/MIT).
+
+## Repository
+
+<https://github.com/bobmatnyc/trusty-tools>
