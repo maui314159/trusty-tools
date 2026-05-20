@@ -20,7 +20,9 @@ pub async fn handle_reindex(
 ) -> Result<()> {
     let (index_id, warned) = resolve_index(explicit_index);
     print_index_header(&index_id, warned);
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
+    // Issue #24: prefer CPU EP for auto-spawned daemon (CoreML init OOMs the
+    // indexing path on Apple Silicon). Already-running daemons are untouched.
+    crate::commands::daemon_guard::ensure_daemon_running_for_indexing(&daemon_base_url()).await?;
     let reindex_path = path.unwrap_or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
         detect_project(&cwd).root_path

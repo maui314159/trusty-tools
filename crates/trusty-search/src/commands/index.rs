@@ -43,7 +43,15 @@ pub async fn handle_index(
     // 0. Auto-start the daemon if needed. `index` is useless without it,
     //    so we proactively boot it rather than dump a confusing connection
     //    error on the user.
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
+    //
+    //    Why CPU-by-default here (issue #24): on Apple Silicon the CoreML
+    //    EP session-init alone allocates ~72 GB of virtual RSS, which macOS
+    //    jetsam treats as memory pressure and SIGKILLs ~14s in — before any
+    //    files are indexed. `ensure_daemon_running_for_indexing` propagates
+    //    `--device cpu` to the auto-spawned daemon (overridable via
+    //    `TRUSTY_INDEX_DEVICE=auto|gpu`). Already-running daemons are not
+    //    affected; this only changes the auto-spawn behaviour.
+    crate::commands::daemon_guard::ensure_daemon_running_for_indexing(&daemon_base_url()).await?;
 
     // 1. Repo-level config detection. `trusty-search.yaml` at the project root
     //    declares one or more named indexes; when present it overrides the

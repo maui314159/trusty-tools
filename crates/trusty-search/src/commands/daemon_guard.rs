@@ -78,13 +78,36 @@ async fn probe_health(base: &str) -> bool {
 /// prevents SIGHUP from a closing tmux pane / terminal from killing the
 /// daemon.
 pub(crate) fn spawn_daemon() -> Result<u32> {
+    spawn_daemon_with_device(None)
+}
+
+/// Spawn `trusty-search start --foreground` as a detached background process,
+/// optionally forcing a specific execution-provider device.
+///
+/// Why (issue #24): on Apple Silicon, CoreML EP session-init alone allocates
+/// from the unified memory pool and inflates virtual RSS to ~72 GB before any
+/// inference runs. macOS jetsam SIGKILLs the daemon within ~14s during the
+/// `index --force` flow, before any files are processed. Auto-spawning the
+/// daemon with `--device cpu` (or `TRUSTY_INDEX_DEVICE=cpu` honoured by the
+/// caller) sidesteps CoreML init entirely for the indexing path. Operators who
+/// want CoreML for query-time embeddings can still run
+/// `trusty-search start --device auto` (or `gpu`) manually.
+/// What: invokes `<exe> start --foreground` and, when `device` is `Some`,
+/// appends `--device <device>` so the child's `handle_start` translates it to
+/// `TRUSTY_DEVICE=<device>` for `trusty-embedder`. Stdio is fully detached.
+/// Test: `cargo check -p trusty-search` plus
+/// `trusty-search index --force` no longer SIGKILLs on M-series.
+pub(crate) fn spawn_daemon_with_device(device: Option<&str>) -> Result<u32> {
     let exe = std::env::current_exe().map_err(|e| anyhow!("could not resolve current_exe: {e}"))?;
     // Detach stdio — we don't want the daemon's logs streaming into the
     // user's terminal session while they're waiting on a `query` result,
     // and we need the daemon to survive the parent shell closing.
-    let child = std::process::Command::new(&exe)
-        .arg("start")
-        .arg("--foreground")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("start").arg("--foreground");
+    if let Some(dev) = device {
+        cmd.arg("--device").arg(dev);
+    }
+    let child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -114,6 +137,24 @@ pub(crate) fn spawn_daemon() -> Result<u32> {
 /// lockfile first: if a daemon is already running, skip the spawn entirely
 /// and go straight to polling — we just need to wait for `/health` to flip.
 pub async fn ensure_daemon_running(base: &str) -> Result<()> {
+    ensure_daemon_running_with_device(base, None).await
+}
+
+/// Like `ensure_daemon_running` but passes `--device <device>` to the spawned
+/// daemon when an auto-spawn is performed.
+///
+/// Why (issue #24): the `index --force` flow on Apple Silicon was killed by
+/// macOS jetsam before any indexing happened, because CoreML EP init alone
+/// inflated virtual RSS to ~72 GB. Forcing CPU for the spawned daemon avoids
+/// the spike entirely. An already-running daemon's device is left untouched —
+/// the caller can decide what to do (we currently just attach to it).
+/// What: when the daemon is auto-spawned, propagates `device` to
+/// `spawn_daemon_with_device`. `device=None` preserves the legacy auto-detect
+/// behaviour (so unrelated commands like `query` and `status` still get GPU
+/// acceleration on M-series).
+/// Test: covered indirectly by `cargo check -p trusty-search` and by the
+/// `index --force` no-OOM behavioural test on M-series.
+pub async fn ensure_daemon_running_with_device(base: &str, device: Option<&str>) -> Result<()> {
     // Fast path: already up.
     if probe_health(base).await {
         return Ok(());
@@ -132,8 +173,14 @@ pub async fn ensure_daemon_running(base: &str) -> Result<()> {
             "◉".cyan()
         );
     } else {
-        eprintln!("{} Starting trusty-search daemon…", "◉".cyan());
-        spawn_daemon()?;
+        match device {
+            Some(dev) => eprintln!(
+                "{} Starting trusty-search daemon (--device {dev})…",
+                "◉".cyan()
+            ),
+            None => eprintln!("{} Starting trusty-search daemon…", "◉".cyan()),
+        }
+        spawn_daemon_with_device(device)?;
     }
 
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -190,6 +237,51 @@ pub async fn ensure_daemon_running_or_exit(base: &str) -> Result<()> {
     ensure_daemon_running(base).await
 }
 
+/// Variant of `ensure_daemon_running_or_exit` that prefers CPU EP for an
+/// auto-spawned daemon during the indexing flow.
+///
+/// Why (issue #24): the indexing path is the load-bearing OOM site on Apple
+/// Silicon — CoreML EP init alone allocates ~72 GB of virtual RSS during
+/// `FastEmbedder::new()`, and macOS jetsam SIGKILLs the daemon ~14s in,
+/// before any chunks are processed. Forcing `--device cpu` on auto-spawn from
+/// the `index`/`add` commands eliminates the CoreML init spike entirely.
+/// Operators who need CoreML for query-time embeddings can start the daemon
+/// manually with `trusty-search start --device auto` first; this helper only
+/// affects the auto-spawn case.
+/// What: resolves the desired device from `TRUSTY_INDEX_DEVICE` (override) or
+/// defaults to `"cpu"`. Already-running daemons are left untouched. Passing
+/// the explicit value `auto` (case-insensitive) restores legacy behaviour.
+/// Test: `cargo test -p trusty-search` (compile) + manual `trusty-search index
+/// --force` on M-series no longer SIGKILL.
+pub async fn ensure_daemon_running_for_indexing(base: &str) -> Result<()> {
+    let device = resolve_indexing_device();
+    let device_opt = if device.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(device.as_str())
+    };
+    ensure_daemon_running_with_device(base, device_opt).await
+}
+
+/// Resolve the auto-spawn device for the indexing flow.
+///
+/// Why: keep the env-var contract in one place so tests and docs match
+/// behaviour. Reads `TRUSTY_INDEX_DEVICE` (`cpu` | `gpu` | `auto`); defaults
+/// to `cpu` because that is the OOM-safe choice on Apple Silicon and a near-
+/// negligible throughput cost elsewhere (the indexing path is I/O- and
+/// chunking-bound long before it is embedder-bound on CPU EP with the no-
+/// arena allocator).
+/// What: returns a lowercased owned `String` so the caller can match on it
+/// or pass it directly into `--device`.
+/// Test: `resolve_indexing_device_defaults_to_cpu` and
+/// `resolve_indexing_device_honours_env_override`.
+fn resolve_indexing_device() -> String {
+    match std::env::var("TRUSTY_INDEX_DEVICE") {
+        Ok(v) if !v.is_empty() => v.to_ascii_lowercase(),
+        _ => "cpu".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +322,63 @@ mod tests {
         // Connect-refused is near-instant; even if it had to time out we'd be
         // bounded by PROBE_TIMEOUT (750ms) + a small slack.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Why: the indexing flow must default to CPU EP on Apple Silicon to avoid
+    /// the ~72 GB virtual-RSS spike from CoreML EP init (issue #24, the
+    /// blocking OOM bug). If this default ever regresses to `auto`/`gpu`,
+    /// `trusty-search index --force` will be SIGKILLed by jetsam again on
+    /// M-series.
+    /// What: clears `TRUSTY_INDEX_DEVICE`, calls `resolve_indexing_device`,
+    /// asserts it returns `"cpu"`.
+    /// Test: this test.
+    // Shared env lock for all TRUSTY_INDEX_DEVICE tests in this module.
+    // Why: separate per-test statics let parallel tests race on the same env
+    // var, producing flaky "cpu vs gpu" assertion failures.
+    use std::sync::Mutex;
+    static INDEX_DEVICE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_indexing_device_defaults_to_cpu() {
+        let _guard = INDEX_DEVICE_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("TRUSTY_INDEX_DEVICE").ok();
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("TRUSTY_INDEX_DEVICE") };
+
+        assert_eq!(resolve_indexing_device(), "cpu");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TRUSTY_INDEX_DEVICE", v),
+                None => std::env::remove_var("TRUSTY_INDEX_DEVICE"),
+            }
+        }
+    }
+
+    /// Why: operators with enough headroom (or on non-Apple platforms) may
+    /// want GPU during indexing for throughput. `TRUSTY_INDEX_DEVICE` is the
+    /// documented escape hatch — if it stops being honoured, the documented
+    /// contract breaks silently.
+    /// What: sets `TRUSTY_INDEX_DEVICE=gpu` (then `auto`) and asserts
+    /// `resolve_indexing_device` echoes the lowercased value.
+    /// Test: this test.
+    #[test]
+    fn resolve_indexing_device_honours_env_override() {
+        let _guard = INDEX_DEVICE_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("TRUSTY_INDEX_DEVICE").ok();
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_INDEX_DEVICE", "GPU") };
+        assert_eq!(resolve_indexing_device(), "gpu");
+
+        unsafe { std::env::set_var("TRUSTY_INDEX_DEVICE", "auto") };
+        assert_eq!(resolve_indexing_device(), "auto");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TRUSTY_INDEX_DEVICE", v),
+                None => std::env::remove_var("TRUSTY_INDEX_DEVICE"),
+            }
+        }
     }
 }
