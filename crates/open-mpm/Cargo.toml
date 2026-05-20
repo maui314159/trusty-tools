@@ -2,6 +2,10 @@
 name = "open-mpm"
 version = "0.38.3"
 edition = "2024"
+description = "MPM orchestration platform: AI agent harness with multi-model routing, tool execution, and subprocess delegation."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 trusty-symgraph = { path = "../trusty-symgraph", version = "0.2.1", features = ["parser"] }
@@ -14,12 +18,6 @@ trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
 trusty-memory = { path = "../trusty-memory-mcp", version = "0.1.19" }
 trusty-search = { path = "../trusty-search", version = "0.3.45" }
-# #484: Shared service layer. `tc-services::cto_db` owns the CTO DB service
-# adapter (schema emission + dispatch); `src/tools/cto_db.rs` is now a thin
-# `ToolExecutor` wrapper over it. `trusty-cto-db` is still a direct dep because
-# the wrapper test references `trusty_cto_db::ENV_CTO_DB_PATH`.
-tc-services = { path = "../tc-services", version = "0.1.1" }
-trusty-cto-db = { path = "../trusty-cto-db", version = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 async-openai = "0.30"
 serde = { version = "1", features = ["derive"] }
@@ -102,7 +100,7 @@ lru = "0.12"
 #      `open-mpm-local` depend on both `open-mpm` and the agent crate, and
 #      wire them at startup via `open_mpm::install_plugins(...)` before
 #      calling `open_mpm::run()`.
-open-mpm-agent-api = { path = "../open-mpm-agent-api" }
+open-mpm-agent-api = { path = "../open-mpm-agent-api", version = "0.1.0" }
 
 # [patch.crates-io] moved to workspace root Cargo.toml (Cargo requires
 # [patch] tables to live in the workspace root; see #460 for context).
