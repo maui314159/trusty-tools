@@ -29,18 +29,17 @@ const FALLBACK_RAM_MB: u64 = 8 * 1024;
 
 /// Empirically measured ORT transient arena cost per `embed_batch` slot in MB.
 ///
-/// Why: ORT allocates working memory proportional to `batch_size × emb_dim ×
-/// seq_len` during each `embed_batch` call. The previous estimate of 55 MB
-/// per slot was measured on a small synthetic test corpus with short chunks
-/// and turned out to be a severe underestimate on real workloads. Production
-/// reindex on a 128 GB host showed peak RSS of 26–94 GB at the XLarge-tier
-/// default of 223 slots — i.e. ~150–400 MB per slot for typical code files,
-/// not 55. We now use 200 MB/slot as a realistic upper-bound estimate
-/// reflecting actual large-chunk behaviour. The between-batch RSS poller in
-/// `memguard` cannot catch this intra-call spike (it polls AFTER each batch,
-/// not during), so batch size MUST be bounded up-front from the configured
-/// memory limit. See issue #95 and the 94 GB reindex incident report.
-const EMBED_MB_PER_BATCH_SLOT: u64 = 200;
+/// Why: ORT arena allocator is disabled on CPU path
+/// (`with_arena_allocator(false)` in `trusty-common/src/embedder/mod.rs`);
+/// transient allocation is freed per-call. 32 MB/slot is a conservative
+/// estimate for CPU-no-arena transient allocation; previously used 200 MB
+/// (arena overhead) which was 6× too conservative for the current
+/// configuration. On a 16 GB machine the prior formula yielded ~15
+/// chunks/batch (Medium tier), forcing far more sequential ONNX calls than
+/// necessary; the recalibrated formula yields ~96 chunks/batch (clamped to
+/// MAX_COMPUTED_BATCH_SIZE), restoring throughput while staying within the
+/// memory budget. See issue #19.
+const EMBED_MB_PER_BATCH_SLOT: u64 = 32;
 
 /// Reserve this fraction of `memory_limit_mb` for the ORT transient arena
 /// when computing `max_batch_size`. The remaining 25% accounts for the
@@ -110,30 +109,34 @@ fn compute_max_chunks(memory_limit_mb: usize) -> usize {
 }
 
 /// Floor for the computed batch size. Below this throughput collapses but the
-/// process is still functional. Lowered from 32 → 8 to give the formula room
-/// to recommend safer values on memory-constrained hosts.
-const MIN_COMPUTED_BATCH_SIZE: usize = 8;
+/// process is still functional. Raised from 8 → 32 (issue #19): with the
+/// ORT arena allocator disabled on the CPU path, per-slot transient
+/// allocation is much smaller, so the minimum safe batch can be larger
+/// without risking OOM on the smallest supported host.
+const MIN_COMPUTED_BATCH_SIZE: usize = 32;
 
-/// Ceiling for the computed batch size. Lowered from 512 → 64 (issue: 94 GB
-/// reindex spike). At 200 MB/slot, even 64 slots × 200 MB = 12.8 GB transient
-/// peak — already close to the Medium tier's 4 GB soft cap, so anything
-/// higher would be reckless on the smallest supported host. GPU paths that
-/// genuinely need 512 explicitly opt out via `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1`
-/// (see `commands::start::tune_batch_size_for_provider`).
-const MAX_COMPUTED_BATCH_SIZE: usize = 64;
+/// Ceiling for the computed batch size. Raised from 64 → 512 (issue #19).
+/// The previous 64-slot ceiling was calibrated for the ORT arena allocator
+/// (~200 MB/slot); with the arena disabled on the CPU path, transient
+/// allocation is freed per call and 512 slots are within the soft memory
+/// budget on XLarge hosts. GPU paths that explicitly opt in via
+/// `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` may still go higher (see
+/// `commands::start::tune_batch_size_for_provider`).
+const MAX_COMPUTED_BATCH_SIZE: usize = 512;
 
 /// Compute the safe `max_batch_size` for a given memory limit so that the ORT
-/// transient arena (≈ `EMBED_MB_PER_BATCH_SLOT` per slot) stays within
-/// `memory_limit_mb × budget_fraction`. Clamped to
+/// transient allocation (≈ `EMBED_MB_PER_BATCH_SLOT` per slot, CPU-no-arena)
+/// stays within `memory_limit_mb × budget_fraction`. Clamped to
 /// `[MIN_COMPUTED_BATCH_SIZE, MAX_COMPUTED_BATCH_SIZE]`.
 ///
-/// Why: see `EMBED_MB_PER_BATCH_SLOT` doc — intra-call spikes are invisible to
-/// the RSS poller, so batch size must be sized from the limit, not against it.
-/// What: `floor(memory_limit_mb * 0.75 / 200)`, clamped to `[8, 64]`. With the
-/// corrected 200 MB/slot estimate this yields: Medium (4 GB) → 15, Large
-/// (8 GB) → 30, XLarge (16 GB) → 61. The previous formula (55 MB/slot,
-/// `[32, 512]`) produced 55/111/223 which blew through every soft cap on
-/// real workloads — see the 94 GB reindex incident report.
+/// Why: see `EMBED_MB_PER_BATCH_SLOT` doc — with the arena allocator disabled
+/// on the CPU path, per-call transient cost is ~32 MB/slot, so a 16 GB host
+/// can safely run a large batch. The previous 200 MB/slot calibration assumed
+/// arena enabled and yielded ~15 chunks/batch on a 16 GB box (issue #19),
+/// causing far too many sequential ONNX calls.
+/// What: `floor(memory_limit_mb * 0.75 / 32)`, clamped to `[32, 512]`. With
+/// the recalibrated 32 MB/slot estimate this yields: Medium (4 GB) → 96,
+/// Large (8 GB) → 192, XLarge (16 GB) → 384.
 /// Test: `test_compute_max_batch_size_from_limit` covers the tier table and
 /// the clamp endpoints.
 fn compute_max_batch_size(memory_limit_mb: usize) -> usize {
@@ -180,18 +183,19 @@ impl MemoryTier {
     /// auto-derived defaults (Medium=15, Large=30, XLarge=61) already sit
     /// well below these caps, so this hard ceiling only kicks in for explicit
     /// overrides — exactly the case where additional safety is warranted.
-    /// What: Medium=16, Large=32, XLarge=64. Lowered from {64, 128, 256}
-    /// after the 94 GB reindex incident (issue: 55→200 MB/slot correction):
-    /// at the corrected 200 MB/slot, even 64 slots × 200 MB = 12.8 GB
-    /// intra-call peak, which is already aggressive on Medium's 4 GB soft cap.
-    /// The arena disable in trusty-embedder (`with_arena_allocator(false)`)
-    /// is the primary mitigation; this cap is defense in depth.
+    /// What: Medium=128, Large=256, XLarge=512. Raised from {16, 32, 64}
+    /// (issue #19): the prior caps assumed the ORT arena allocator (~200 MB/
+    /// slot) was active, but the CPU path explicitly disables the arena
+    /// (`with_arena_allocator(false)` in trusty-common's embedder), so
+    /// per-slot transient cost is ~32 MB. At 32 MB/slot, 128 slots ≈ 4 GB
+    /// intra-call peak — comfortably within Medium's 4 GB soft cap when
+    /// combined with the 25% headroom in `compute_max_batch_size`.
     /// Test: `test_tier_batch_size_hard_cap` covers the table.
     pub fn batch_size_hard_cap(self) -> usize {
         match self {
-            MemoryTier::Medium => 16,
-            MemoryTier::Large => 32,
-            MemoryTier::XLarge => 64,
+            MemoryTier::Medium => 128,
+            MemoryTier::Large => 256,
+            MemoryTier::XLarge => 512,
         }
     }
 
@@ -218,8 +222,9 @@ impl MemoryTier {
     /// `memory_limit_mb` (see [`compute_memory_limit_mb`]).
     ///
     /// `max_batch_size` is derived from `memory_limit_mb` via
-    /// [`compute_max_batch_size`] so the ORT transient arena (≈200 MB per
-    /// batch slot) cannot exceed 75% of the configured soft cap. See issue #95.
+    /// [`compute_max_batch_size`] so the ORT transient allocation (≈32 MB per
+    /// batch slot with the CPU arena allocator disabled) cannot exceed 75% of
+    /// the configured soft cap. See issues #95 and #19.
     /// `max_chunks` is derived from `memory_limit_mb` via [`compute_max_chunks`]
     /// so capacity scales with the working-set budget rather than fixed tier
     /// buckets (issue #120). The remaining fields (`embedding_cache`,
@@ -340,8 +345,8 @@ impl MemoryPolicy {
             tracing::warn!(
                 "memory_policy: TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 — honoring \
                  TRUSTY_MAX_BATCH_SIZE={} verbatim and bypassing tier {} hard cap of {}. \
-                 Ensure you have measured the actual ORT transient-arena cost per slot \
-                 on your workload (defaults assume 200 MB/slot).",
+                 Ensure you have measured the actual ORT transient-allocation cost per slot \
+                 on your workload (defaults assume 32 MB/slot with arena disabled).",
                 raw_batch_size,
                 tier,
                 batch_cap,
@@ -547,8 +552,8 @@ mod tests {
         assert_eq!(medium.memory_limit_mb, 4_096);
         // max_chunks = clamp(4096 * 50, 50_000, 800_000) = 204_800
         assert_eq!(medium.max_chunks, 204_800);
-        // max_batch_size = floor(4096 * 0.75 / 200) = floor(15.36) = 15
-        assert_eq!(medium.max_batch_size, 15);
+        // max_batch_size = floor(4096 * 0.75 / 32) = floor(96.0) = 96
+        assert_eq!(medium.max_batch_size, 96);
         assert_eq!(medium.embedding_cache, 5_000);
 
         // 32 GB host → Large → proportional limit = 8 GB.
@@ -556,8 +561,8 @@ mod tests {
         assert_eq!(large.memory_limit_mb, 8_192);
         // max_chunks = clamp(8192 * 50, 50_000, 800_000) = 409_600
         assert_eq!(large.max_chunks, 409_600);
-        // max_batch_size = floor(8192 * 0.75 / 200) = floor(30.72) = 30
-        assert_eq!(large.max_batch_size, 30);
+        // max_batch_size = floor(8192 * 0.75 / 32) = floor(192.0) = 192
+        assert_eq!(large.max_batch_size, 192);
 
         // 64 GB host → XLarge → proportional limit = 16 GB.
         let xl = MemoryTier::XLarge.defaults(compute_memory_limit_mb(64 * 1024));
@@ -566,8 +571,8 @@ mod tests {
         assert_eq!(xl.max_chunks, 800_000);
         assert_eq!(xl.embedding_cache, 20_000);
         assert_eq!(xl.max_kg_nodes, 500_000);
-        // max_batch_size = floor(16384 * 0.75 / 200) = floor(61.44) = 61
-        assert_eq!(xl.max_batch_size, 61);
+        // max_batch_size = floor(16384 * 0.75 / 32) = floor(384.0) = 384
+        assert_eq!(xl.max_batch_size, 384);
 
         // 128 GB host → XLarge → proportional limit = 32 GB (previously
         // capped at 16 GB regardless of host size — issue #120).
@@ -662,22 +667,25 @@ mod tests {
 
     #[test]
     fn test_compute_max_batch_size_from_limit() {
-        // Tier table with corrected 200 MB/slot estimate (was 55).
-        assert_eq!(compute_max_batch_size(4_096), 15);
-        assert_eq!(compute_max_batch_size(8_192), 30);
-        assert_eq!(compute_max_batch_size(16_384), 61);
+        // Tier table with recalibrated 32 MB/slot estimate (issue #19):
+        // arena allocator disabled on CPU path, so per-slot transient cost
+        // is ~32 MB (was 200 MB when arena was enabled).
+        assert_eq!(compute_max_batch_size(4_096), 96);
+        assert_eq!(compute_max_batch_size(8_192), 192);
+        assert_eq!(compute_max_batch_size(16_384), 384);
 
         // Floor clamp: tiny limits still produce a usable batch size.
         assert_eq!(compute_max_batch_size(0), MIN_COMPUTED_BATCH_SIZE);
-        // 1024 MB → floor(1024 * 0.75 / 200) = floor(3.84) = 3 → clamped to 8
+        // 1024 MB → floor(1024 * 0.75 / 32) = floor(24.0) = 24 → clamped to 32
         assert_eq!(compute_max_batch_size(1_024), MIN_COMPUTED_BATCH_SIZE);
 
-        // Ceiling clamp: enormous limits don't push past new [8, 64] cap.
+        // Ceiling clamp at MAX_COMPUTED_BATCH_SIZE = 512.
+        // floor(64_000 * 0.75 / 32) = 1500 → clamped to 512
         assert_eq!(compute_max_batch_size(64_000), MAX_COMPUTED_BATCH_SIZE);
         assert_eq!(compute_max_batch_size(1_000_000), MAX_COMPUTED_BATCH_SIZE);
-        // Just above where the raw formula reaches 64:
-        // floor(17_067 * 0.75 / 200) = 64, anything above stays clamped at 64.
-        assert_eq!(compute_max_batch_size(20_000), MAX_COMPUTED_BATCH_SIZE);
+        // First value above the clamp boundary:
+        // floor(21_846 * 0.75 / 32) = 512, anything above stays clamped at 512.
+        assert_eq!(compute_max_batch_size(22_000), MAX_COMPUTED_BATCH_SIZE);
     }
 
     /// Verify that an env-var override beats the tier default.
@@ -718,10 +726,11 @@ mod tests {
     fn test_tier_batch_size_hard_cap() {
         // Issue #89: tier-specific batch-size hard caps protect against
         // runaway TRUSTY_MAX_BATCH_SIZE overrides on memory-constrained hosts.
-        // Lowered after the 94 GB reindex incident (55→200 MB/slot correction).
-        assert_eq!(MemoryTier::Medium.batch_size_hard_cap(), 16);
-        assert_eq!(MemoryTier::Large.batch_size_hard_cap(), 32);
-        assert_eq!(MemoryTier::XLarge.batch_size_hard_cap(), 64);
+        // Raised in issue #19 to track the recalibrated CPU-no-arena per-slot
+        // cost (~32 MB instead of the prior 200 MB arena estimate).
+        assert_eq!(MemoryTier::Medium.batch_size_hard_cap(), 128);
+        assert_eq!(MemoryTier::Large.batch_size_hard_cap(), 256);
+        assert_eq!(MemoryTier::XLarge.batch_size_hard_cap(), 512);
     }
 
     #[test]
@@ -737,13 +746,13 @@ mod tests {
             std::env::remove_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT");
         }
 
-        // 16 GB → Medium tier, hard cap = 16. Env value of 2048 must be
+        // 16 GB → Medium tier, hard cap = 128. Env value of 2048 must be
         // clamped down to the tier cap.
         let policy = MemoryPolicy::from_total_ram_mb(16 * 1024);
         assert_eq!(policy.tier, MemoryTier::Medium);
         assert_eq!(
-            policy.max_batch_size, 16,
-            "Medium tier must clamp TRUSTY_MAX_BATCH_SIZE=2048 down to 16"
+            policy.max_batch_size, 128,
+            "Medium tier must clamp TRUSTY_MAX_BATCH_SIZE=2048 down to 128"
         );
 
         // Restore.

@@ -94,23 +94,25 @@ pub(crate) fn max_chunks_per_index() -> usize {
 /// Override at runtime via `TRUSTY_MAX_BATCH_SIZE` (clamped to
 /// `[EMBED_BATCH_MIN, EMBED_BATCH_MAX]`).
 ///
-/// Default lowered from 512 → 128 (issue #79) — the ONNX activation arena
-/// retains buffers sized to the largest batch it has seen, and on Apple
-/// Silicon this triggered Jetsam kills on large repos. The authoritative
-/// per-tier default is now computed by [`crate::core::MemoryPolicy`] and
-/// written back into `TRUSTY_MAX_BATCH_SIZE` before this function is called,
-/// so the constant here is only a safety net when the env is unset.
-const DEFAULT_EMBED_BATCH_SIZE: usize = 32;
+/// Default safety-net batch size when `TRUSTY_MAX_BATCH_SIZE` is unset.
+///
+/// Raised from 32 → 64 (issue #19): the ORT arena allocator is disabled on
+/// the CPU path (`with_arena_allocator(false)` in trusty-common's embedder),
+/// so transient allocation is freed per call and 64 is the minimum safe
+/// value that amortises ONNX kernel launch overhead. The authoritative
+/// per-tier default is still computed by [`crate::core::MemoryPolicy`] and
+/// written back into `TRUSTY_MAX_BATCH_SIZE` before this function is called;
+/// this constant only kicks in when the env is unset.
+const DEFAULT_EMBED_BATCH_SIZE: usize = 64;
 /// Floor for env-clamped batch size. Aligned with
-/// `core::memory_policy::MIN_COMPUTED_BATCH_SIZE` (lowered from 32 → 8 after
-/// the 94 GB reindex incident — the corrected 200 MB/slot ORT estimate makes
-/// even 32 dangerous on the Medium tier).
-const EMBED_BATCH_MIN: usize = 8;
-/// Ceiling for env-clamped batch size. Aligned with the tier hard-cap
-/// envelope in `core::memory_policy` (XLarge=64) PLUS headroom for the GPU
-/// opt-out path (`TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` sets 512 on CUDA/CoreML).
-/// Lowered from 2048 → 512 since no real workload above 512 has been
-/// validated and the previous ceiling allowed catastrophic env-typo values.
+/// `core::memory_policy::MIN_COMPUTED_BATCH_SIZE` (32). Raised from 8 → 32
+/// (issue #19): with the CPU arena disabled the prior 200 MB/slot estimate
+/// no longer applies, so 32 is the new minimum safe value.
+const EMBED_BATCH_MIN: usize = 32;
+/// Ceiling for env-clamped batch size. Aligned with
+/// `core::memory_policy::MAX_COMPUTED_BATCH_SIZE` (512). The GPU opt-out path
+/// (`TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` on CUDA/CoreML) reaches this ceiling
+/// in production.
 const EMBED_BATCH_MAX: usize = 512;
 
 /// Read the embedding batch size from `TRUSTY_MAX_BATCH_SIZE`, clamped to

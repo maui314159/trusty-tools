@@ -13,7 +13,7 @@
 //!
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
-use crate::core::indexer::CommitTimings;
+use crate::core::indexer::{CommitTimings, ParsedBatch};
 use crate::core::memguard::{current_rss_mb, memory_limit_mb};
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::walker::{should_skip_content, walk_source_files};
@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 /// Machine-wide reindex serializer.
 ///
@@ -460,6 +460,7 @@ async fn refresh_context_embedding(handle: &Arc<IndexHandle>) {
 ///
 /// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
 /// orchestrator's per-batch body is testable and bounded in size.
+#[derive(Clone)]
 struct BatchCtx {
     handle: Arc<IndexHandle>,
     progress: Arc<ReindexProgress>,
@@ -496,28 +497,111 @@ struct BatchOutcome {
 /// orchestrator's cyclomatic complexity below the threshold. Combines the
 /// stages that share read/filter state into one function whose responsibility
 /// is "advance the index by one batch".
+///
+/// Note: this monolithic path is retained for callers/tests that prefer a
+/// single sequential per-batch helper. The pipelined orchestrator in
+/// `spawn_reindex_with_cleanup` uses [`prepare_and_parse_batch`] +
+/// [`commit_parsed_and_finalize`] to overlap batch N's commit (write lock)
+/// with batch N+1's read+parse (no write lock).
+#[allow(dead_code)]
 async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
-    // 1) Read + filter (errors, minified, hash-skip) → BatchPayload.
+    let Some(parsed) = prepare_and_parse_batch(ctx, batch).await else {
+        return BatchOutcome::default();
+    };
+    commit_parsed_and_finalize(ctx, parsed).await
+}
+
+/// One in-flight batch ready for the commit (write-lock) stage. Produced by
+/// the read+parse producer task and consumed sequentially by the orchestrator
+/// commit loop.
+///
+/// Why: pipelining batch N+1's read+parse with batch N's commit (issue #20)
+/// requires shipping a self-contained unit between tasks. `ParsedBatch` owns
+/// its chunks/embeddings (no borrows), so this struct can be sent across an
+/// mpsc channel freely.
+struct ParsedReadyBatch {
+    parsed: ParsedBatch,
+    new_hashes: Vec<(PathBuf, String)>,
+    /// Files actually submitted to the indexer (post hash/minified filtering).
+    /// Used to size the per-batch commit event.
+    batch_files: usize,
+}
+
+/// Stage 1 of the pipelined per-batch flow: read every file in `batch`,
+/// filter out hash-matches/minified/errors, then parse + embed under the
+/// indexer's READ lock. Returns `None` when no files in the batch needed
+/// indexing (so the orchestrator can skip the commit altogether).
+///
+/// Why: split from the commit stage so the producer task can race ahead of
+/// the consumer's write-lock work. This is the half that does NOT take the
+/// indexer write lock, so multiple invocations are safe to overlap with an
+/// in-progress commit on the same handle.
+///
+/// Errors from `parse_and_embed_files` are surfaced via an SSE `error` event
+/// and converted into `None` (skip), matching the previous
+/// `process_one_batch` semantics.
+async fn prepare_and_parse_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> Option<ParsedReadyBatch> {
     let payload = prepare_batch_payload(ctx, batch).await;
     if payload.to_index.is_empty() {
-        return BatchOutcome::default();
+        return None;
     }
+    let batch_files = payload.to_index.len();
+    let to_index = payload.to_index;
+    let parsed = {
+        let indexer = ctx.handle.indexer.read().await;
+        match indexer.parse_and_embed_files(to_index).await {
+            Ok(p) => p,
+            Err(e) => {
+                drop(indexer);
+                emit_batch_error(ctx, &payload.to_index_paths, e).await;
+                return None;
+            }
+        }
+    };
+    Some(ParsedReadyBatch {
+        parsed,
+        new_hashes: payload.new_hashes,
+        batch_files,
+    })
+}
 
-    // 2) Parse + embed (read lock) → commit (write lock).
-    let result = parse_embed_and_commit(&ctx.handle, payload.to_index.clone()).await;
-    let (parse_ms, embed_ms, vector_count, commit) = match result {
-        Ok(t) => t,
-        Err(e) => {
-            emit_batch_error(ctx, &payload.to_index_paths, e).await;
-            return BatchOutcome::default();
+/// Stage 2 of the pipelined per-batch flow: take the parsed/embedded chunks
+/// produced by [`prepare_and_parse_batch`], commit them under the indexer's
+/// WRITE lock, apply success bookkeeping, and run the post-commit memory
+/// check.
+///
+/// Why: commits must remain sequential (one write lock at a time), but the
+/// producer can already be reading + parsing the next batch in parallel with
+/// this work — that's the whole point of the pipeline (issue #20).
+async fn commit_parsed_and_finalize(ctx: &BatchCtx, ready: ParsedReadyBatch) -> BatchOutcome {
+    let ParsedReadyBatch {
+        parsed,
+        new_hashes,
+        batch_files,
+    } = ready;
+    let parse_ms = parsed.parse_ms;
+    let embed_ms = parsed.embed_ms;
+    let vector_count = parsed.vector_count;
+
+    let commit = {
+        let indexer = ctx.handle.indexer.write().await;
+        match indexer.commit_parsed_batch(parsed, true).await {
+            Ok(c) => c,
+            Err(e) => {
+                drop(indexer);
+                // We no longer hold the original paths here, but the prior
+                // behaviour was to attribute the error to the whole batch.
+                // Best-effort: emit a generic batch error covering the files
+                // that would have been committed.
+                let placeholder_paths: Vec<PathBuf> =
+                    new_hashes.iter().map(|(p, _)| p.clone()).collect();
+                emit_batch_error(ctx, &placeholder_paths, e).await;
+                return BatchOutcome::default();
+            }
         }
     };
 
-    // 3) Apply success → update totals, persist hashes, emit `batch` event.
-    let batch_files = payload.to_index.len();
-    apply_successful_commit(ctx, payload.new_hashes, batch_files, &commit).await;
-
-    // 4) Post-commit memory check (issue #82).
+    apply_successful_commit(ctx, new_hashes, batch_files, &commit).await;
     let mem_limit_hit = check_post_commit_memory(ctx);
 
     BatchOutcome {
@@ -622,28 +706,6 @@ async fn emit_skip(ctx: &BatchCtx, rel: &str, reason: Option<&str>) {
         event["reason"] = serde_json::Value::String(r.to_string());
     }
     ctx.progress.push(event).await;
-}
-
-/// Run parse+embed under a read lock, then the commit under a write lock.
-///
-/// Why: split this way to keep the read lock (concurrent search-safe) for the
-/// long, pure-CPU parse+embed phase, and only take the write lock for the
-/// short corpus/BM25/HNSW commit window. Returns the parse/embed timings plus
-/// the structured `CommitTimings` from the commit phase.
-async fn parse_embed_and_commit(
-    handle: &IndexHandle,
-    to_index: Vec<(String, String)>,
-) -> anyhow::Result<(u64, u64, usize, CommitTimings)> {
-    let parsed = {
-        let indexer = handle.indexer.read().await;
-        indexer.parse_and_embed_files(to_index).await?
-    };
-    let parse_ms = parsed.parse_ms;
-    let embed_ms = parsed.embed_ms;
-    let vector_count = parsed.vector_count;
-    let indexer = handle.indexer.write().await;
-    let commit = indexer.commit_parsed_batch(parsed, true).await?;
-    Ok((parse_ms, embed_ms, vector_count, commit))
 }
 
 /// Emit one `error` SSE event covering every file in a failed batch. Caller
@@ -930,9 +992,20 @@ pub fn spawn_reindex_with_cleanup(
             index_id.0.clone(),
         );
 
-        // Phase 2: batch-driven parse/embed/commit. The per-batch body lives
-        // in `process_one_batch`; the orchestrator here only observes the
-        // aggregate `BatchOutcome` and the mem-limit signal.
+        // Phase 2: pipelined parse/embed/commit (issue #20).
+        //
+        // Producer task (spawned below) walks the file batches, calls
+        // `prepare_and_parse_batch` (file reads + tree-sitter parse + ONNX
+        // embed — no write lock), and sends each `ParsedReadyBatch` over a
+        // bounded mpsc channel. The consumer loop here drains the channel
+        // and calls `commit_parsed_and_finalize` (write lock — BM25 + HNSW +
+        // redb commit), which must stay sequential.
+        //
+        // Why this pipelines: the read+parse stage uses zero indexer write
+        // locks, so it can race ahead while the previous batch's commit
+        // still holds the write lock. Channel capacity 1 caps in-flight
+        // memory at two batches (one being committed, one buffered) — the
+        // same envelope the previous sequential loop already paid for.
         let ctx = BatchCtx {
             handle: handle.clone(),
             progress: progress.clone(),
@@ -945,23 +1018,57 @@ pub fn spawn_reindex_with_cleanup(
             started,
             total,
         };
-        for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
-            // Memory-protection pre-check (issues #76, #82): if the background
-            // poller has tripped the abort flag, bail out before doing more
-            // work. Skipping remaining batches preserves all committed chunks.
-            if mem_abort.load(AtomicOrdering::Acquire) {
-                let rss = current_rss_mb().unwrap_or(0);
-                tracing::warn!(
-                    "reindex: memory limit hit before batch (rss={}MB, \
-                     limit={:?}MB) — skipping remaining batches for index {}",
-                    rss,
-                    mem_limit,
-                    index_id.0
-                );
-                mem_limit_hit = true;
-                break;
+
+        // Snapshot the batch list into owned `Vec<PathBuf>`s so the producer
+        // task can outlive the borrow on `walk.files`. Memory cost is one
+        // `PathBuf` per file (already paid by `walk`).
+        let batches: Vec<Vec<PathBuf>> = walk
+            .files
+            .chunks(REINDEX_BATCH_SIZE)
+            .map(|b| b.to_vec())
+            .collect();
+
+        // Bounded channel — capacity 1 keeps memory usage in the same
+        // envelope as the prior sequential loop (one batch in transit, one
+        // being committed).
+        let (tx, mut rx) = mpsc::channel::<ParsedReadyBatch>(1);
+        let producer_ctx = ctx.clone();
+        let producer_mem_abort = mem_abort.clone();
+        let producer_index_id = index_id.0.clone();
+        let producer = tokio::spawn(async move {
+            for batch in batches {
+                // Honour the mem-abort flag at the producer too so we stop
+                // reading/parsing as soon as the consumer (or the memory
+                // poller) trips it.
+                if producer_mem_abort.load(AtomicOrdering::Acquire) {
+                    let rss = current_rss_mb().unwrap_or(0);
+                    tracing::warn!(
+                        "reindex: memory limit hit before batch (rss={}MB, \
+                         limit={:?}MB) — producer halting for index {}",
+                        rss,
+                        producer_ctx.mem_limit,
+                        producer_index_id
+                    );
+                    break;
+                }
+                let Some(ready) = prepare_and_parse_batch(&producer_ctx, &batch).await else {
+                    continue;
+                };
+                // If the consumer has dropped the receiver (e.g. an earlier
+                // commit tripped mem-abort and we broke out of the loop),
+                // stop producing.
+                if tx.send(ready).await.is_err() {
+                    break;
+                }
             }
-            let outcome = process_one_batch(&ctx, batch).await;
+            // Dropping `tx` here signals end-of-stream to the consumer.
+        });
+
+        // Consumer loop: commits batches sequentially as the producer feeds
+        // them. The commit phase holds the indexer write lock; the producer
+        // task is concurrently running read+parse for the next batch.
+        while let Some(ready) = rx.recv().await {
+            let outcome = commit_parsed_and_finalize(&ctx, ready).await;
             total_parse_ms = total_parse_ms.saturating_add(outcome.parse_ms);
             total_embed_ms = total_embed_ms.saturating_add(outcome.embed_ms);
             total_bm25_ms = total_bm25_ms.saturating_add(outcome.bm25_ms);
@@ -970,9 +1077,18 @@ pub fn spawn_reindex_with_cleanup(
             total_vector_count = total_vector_count.saturating_add(outcome.vector_count);
             if outcome.mem_limit_hit {
                 mem_limit_hit = true;
+                // Close the receiver so the producer notices on its next
+                // `send()` and halts; then drain any already-sent batch so
+                // the producer task doesn't block on send forever.
+                rx.close();
+                while rx.recv().await.is_some() {}
                 break;
             }
         }
+        // Best-effort: the producer should already have terminated (either
+        // by running out of batches, by observing `mem_abort`, or by the
+        // receiver being closed). Awaiting it surfaces panics for tracing.
+        let _ = producer.await;
 
         // Phase 3: rebuild the symbol graph once for the whole reindex.
         // Issue #90: always run, even after a memory abort — graph
