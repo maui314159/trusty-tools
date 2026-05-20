@@ -105,6 +105,17 @@ enum Cmd {
         /// Output format: json (default, machine-readable) or text.
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
+        /// Generate an LLM prose narrative explaining the review.
+        ///
+        /// Why: deterministic metrics tell you *what* is wrong; prose
+        /// explains *why it matters* and *what to do*. Opt-in via this flag
+        /// keeps the default review path fast and free.
+        /// What: when set, calls OpenRouter (if `OPENROUTER_API_KEY` is set)
+        /// or a local Ollama server (`TRUSTY_LLM_MODEL` URL) with a grounded
+        /// prompt and prints the narrative after the JSON/text output.
+        /// Test: `trusty-analyze review --explain ...` prints the narrative.
+        #[arg(long)]
+        explain: bool,
     },
     /// Facts subcommands.
     Facts {
@@ -245,6 +256,10 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+        /// Generate an LLM prose narrative explaining the review. See
+        /// `Review::explain` for environment variables consulted.
+        #[arg(long)]
+        explain: bool,
     },
 }
 
@@ -442,6 +457,7 @@ async fn main() -> Result<()> {
             diff,
             format,
             index_id,
+            explain,
         } => {
             // Hard dependency: review pulls the index corpus from trusty-search,
             // so refuse to run if the search daemon is unreachable.
@@ -467,10 +483,15 @@ async fn main() -> Result<()> {
             } else {
                 std::fs::read_to_string(&diff).with_context(|| format!("read diff file {diff}"))?
             };
-            let report =
+            let mut report =
                 trusty_analyzer::core::analyze_diff_with_client(&diff_text, &search, &index_id)
                     .await
                     .context("analyze diff")?;
+            if explain {
+                if let Some(narrative) = run_explain(&report).await {
+                    report.narrative = Some(narrative);
+                }
+            }
             match format {
                 OutputFormat::Json => {
                     println!(
@@ -481,6 +502,9 @@ async fn main() -> Result<()> {
                 OutputFormat::Text => {
                     print!("{}", trusty_analyzer::core::render_review_text(&report));
                 }
+            }
+            if let Some(narrative) = report.narrative.as_deref() {
+                println!("\n=== Explanation ===\n{narrative}");
             }
             Ok(())
         }
@@ -595,7 +619,46 @@ async fn main() -> Result<()> {
             index_id,
             post_comment,
             format,
-        } => run_review_pr(repo, pr, index_id, post_comment, format).await,
+            explain,
+        } => run_review_pr(repo, pr, index_id, post_comment, format, explain).await,
+    }
+}
+
+/// Build a `ChatProvider` from environment configuration and run
+/// [`trusty_analyzer::core::explain_report`] against `report`.
+///
+/// Why: both `review` and `review-pr` share the same opt-in `--explain`
+/// behaviour, so the provider construction lives in one helper.
+/// What: prefers `OPENROUTER_API_KEY` (cloud) and falls back to a local
+/// Ollama server on the URL declared in `TRUSTY_LLM_URL` (or the Ollama
+/// default at `http://localhost:11434`). The model id comes from
+/// `TRUSTY_LLM_MODEL` (defaulting to `openai/gpt-4o-mini` for OpenRouter and
+/// `qwen3:30b` for Ollama). Returns `None` (with a warning) when no provider
+/// is configured or the call fails — explanation is best-effort, never a
+/// hard error.
+/// Test: covered by the explain unit tests in `core::explain`; this helper
+/// is a thin glue layer.
+async fn run_explain(report: &trusty_analyzer::core::ReviewReport) -> Option<String> {
+    use trusty_common::chat::{ChatProvider, OllamaProvider, OpenRouterProvider};
+
+    let model = std::env::var("TRUSTY_LLM_MODEL").ok();
+
+    let provider: Box<dyn ChatProvider> = if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+        let model = model.unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        Box::new(OpenRouterProvider::new(key, model))
+    } else {
+        let url = std::env::var("TRUSTY_LLM_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let model = model.unwrap_or_else(|| "qwen3:30b".to_string());
+        Box::new(OllamaProvider::new(url, model))
+    };
+
+    match trusty_analyzer::core::explain_report(report, provider.as_ref()).await {
+        Ok(narrative) => Some(narrative),
+        Err(e) => {
+            eprintln!("warning: --explain failed ({e:#}); continuing without narrative");
+            None
+        }
     }
 }
 
@@ -615,6 +678,7 @@ async fn run_review_pr(
     index_id: Option<String>,
     post_comment: bool,
     format: OutputFormat,
+    explain: bool,
 ) -> Result<()> {
     let (owner, repo_name) = repo
         .split_once('/')
@@ -640,9 +704,14 @@ async fn run_review_pr(
     let diff = trusty_analyzer::core::fetch_pr_diff(&client, owner, repo_name, pr, &token)
         .await
         .with_context(|| format!("fetch diff for {owner}/{repo_name}#{pr}"))?;
-    let report = trusty_analyzer::core::analyze_diff_with_client(&diff, &search, &index_id)
+    let mut report = trusty_analyzer::core::analyze_diff_with_client(&diff, &search, &index_id)
         .await
         .context("analyze PR diff")?;
+    if explain {
+        if let Some(narrative) = run_explain(&report).await {
+            report.narrative = Some(narrative);
+        }
+    }
 
     match format {
         OutputFormat::Json => {
@@ -654,6 +723,9 @@ async fn run_review_pr(
         OutputFormat::Text => {
             print!("{}", trusty_analyzer::core::render_review_text(&report));
         }
+    }
+    if let Some(narrative) = report.narrative.as_deref() {
+        println!("\n=== Explanation ===\n{narrative}");
     }
 
     if post_comment {

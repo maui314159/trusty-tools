@@ -15,12 +15,15 @@
 
 use std::sync::Arc;
 
+use crate::core::facts::{new_fact, FactStore};
 use crate::lang::{
-    CAnalyzer, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, JavaAnalyzer, JavaScriptAnalyzer,
-    KotlinAnalyzer, LanguageAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, StaticAnalysisResult, SwiftAnalyzer, TypeScriptAnalyzer,
+    detect_frameworks, CAnalyzer, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, JavaAnalyzer,
+    JavaScriptAnalyzer, KotlinAnalyzer, LanguageAnalyzer, PhpAnalyzer, PythonAnalyzer,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, StaticAnalysisResult, SwiftAnalyzer,
+    TypeScriptAnalyzer,
 };
 use crate::types::CodeChunk;
+use std::path::Path;
 
 /// Holds all registered language analyzers and dispatches to the right one.
 pub struct AnalyzerRegistry {
@@ -126,6 +129,34 @@ impl Default for AnalyzerRegistry {
     }
 }
 
+/// Why: framework detection is the natural sibling to the language-adapter
+/// pipeline — both run after indexing completes and both surface project-level
+/// metadata that downstream tooling (the `--explain` LLM prompt, dashboards)
+/// needs to tailor advice. Storing each detected framework as a FactStore
+/// triple makes the data queryable alongside every other static fact.
+/// What: runs [`detect_frameworks`] against `project_root` and upserts one
+/// `(<index_id>, "uses_framework", <name>)` fact per detected framework.
+/// Returns the detected framework names so callers can echo them into a
+/// `ReviewReport`. Errors from `facts.upsert` are logged at warn level and
+/// the remaining frameworks are still recorded — a single fact store hiccup
+/// shouldn't lose all the others.
+/// Test: `record_frameworks_writes_one_fact_per_framework` in `mod tests`.
+pub fn record_frameworks(facts: &FactStore, index_id: &str, project_root: &Path) -> Vec<String> {
+    let frameworks = detect_frameworks(project_root);
+    for name in &frameworks {
+        let fact = new_fact(
+            index_id.to_string(),
+            "uses_framework".to_string(),
+            name.clone(),
+            index_id.to_string(),
+        );
+        if let Err(e) = facts.upsert(fact) {
+            tracing::warn!("record_frameworks: failed to upsert {index_id} -> {name}: {e:#}");
+        }
+    }
+    frameworks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +213,26 @@ mod tests {
             Some("typescript".into())
         );
         assert!(r.analyzer_for("README.md").is_none());
+    }
+
+    #[test]
+    fn record_frameworks_writes_one_fact_per_framework() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a project with detectable frameworks.
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{ "dependencies": { "next": "14", "react": "18" } }"#,
+        )
+        .unwrap();
+        let facts_db = tempfile::tempdir().unwrap();
+        let facts = FactStore::open(&facts_db.path().join("facts.redb")).unwrap();
+        let found = record_frameworks(&facts, "my-index", tmp.path());
+        assert!(found.contains(&"Next.js".to_string()));
+        assert!(found.contains(&"React".to_string()));
+        let triples = facts
+            .query(Some("my-index"), Some("uses_framework"), None)
+            .unwrap();
+        assert_eq!(triples.len(), 2, "got {triples:?}");
     }
 
     #[test]

@@ -120,6 +120,25 @@ pub struct AnalyzerAppState {
     /// var (and skips verification when that is also unset).
     /// Test: `webhook_rejects_bad_signature` injects `Some(...)` here.
     pub webhook_secret: Option<String>,
+    /// OpenRouter API key used by the `?explain=true` review path.
+    ///
+    /// Why: the `--explain` HTTP entry point needs an LLM provider to generate
+    /// the narrative; threading the key through state lets the binary read it
+    /// once at startup and keeps tests hermetic (no live env reads in handlers).
+    /// What: `Some(key)` enables LLM narrative; `None` causes `?explain=true`
+    /// to return the review without a narrative (and log a warning).
+    /// Test: covered by `review_endpoint_ignores_explain_without_api_key`.
+    pub api_key: Option<String>,
+    /// Default LLM model identifier used for `?explain=true` calls.
+    ///
+    /// Why: model selection is deployment-specific; reading it once at
+    /// startup avoids re-parsing env vars per request and lets ops switch
+    /// models without touching code.
+    /// What: defaults to `openai/gpt-4o-mini` when not configured (the
+    /// cheapest OpenRouter model that handles structured code-review prose
+    /// well).
+    /// Test: covered transitively by `AnalyzerAppState::new`.
+    pub llm_model: String,
 }
 
 impl AnalyzerAppState {
@@ -135,6 +154,9 @@ impl AnalyzerAppState {
             scip_overlays: Arc::new(RwLock::new(HashMap::new())),
             events: events_tx,
             webhook_secret: None,
+            api_key: std::env::var("OPENROUTER_API_KEY").ok(),
+            llm_model: std::env::var("TRUSTY_LLM_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
         }
     }
 
@@ -154,7 +176,33 @@ impl AnalyzerAppState {
             scip_overlays: Arc::new(RwLock::new(HashMap::new())),
             events: events_tx,
             webhook_secret: None,
+            api_key: std::env::var("OPENROUTER_API_KEY").ok(),
+            llm_model: std::env::var("TRUSTY_LLM_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
         }
+    }
+
+    /// Override the OpenRouter API key on an existing state.
+    ///
+    /// Why: lets the binary pass an explicit key in at startup (or tests
+    /// inject `None` deterministically) instead of relying on the
+    /// environment at every handler call.
+    /// What: replaces `api_key`; returns `self` for chaining.
+    /// Test: covered by `review_endpoint_ignores_explain_without_api_key`.
+    pub fn with_api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = key;
+        self
+    }
+
+    /// Override the LLM model identifier.
+    ///
+    /// Why: callers may want to pin a specific model per deployment without
+    /// relying on ambient env vars.
+    /// What: replaces `llm_model`; returns `self` for chaining.
+    /// Test: covered transitively by the binary wiring tests.
+    pub fn with_llm_model(mut self, model: impl Into<String>) -> Self {
+        self.llm_model = model.into();
+        self
     }
 
     /// Override the GitHub webhook HMAC secret.
@@ -932,6 +980,16 @@ pub struct ReviewQueryParams {
     /// review pulls the index's chunk corpus so the report reflects already-
     /// computed complexity for the touched files.
     pub index_id: Option<String>,
+    /// When `true`, run the LLM `explain_report` step after the static review
+    /// and attach the prose to `ReviewReport::narrative`. Defaults to `false`.
+    ///
+    /// Why: lets CI clients opt into the slow/paid LLM call only when they
+    /// want narrative; default-off keeps the endpoint cheap and deterministic.
+    /// What: parsed via `Option<bool>` so omitting the key behaves the same
+    /// as `false`.
+    /// Test: covered by `review_endpoint_ignores_explain_without_api_key`.
+    #[serde(default)]
+    pub explain: Option<bool>,
 }
 
 /// Why: PR review is most valuable before code lands; this endpoint lets CI
@@ -957,15 +1015,38 @@ async fn review_diff_handler(
         .ok_or_else(|| ApiError::bad_request("missing required 'index_id' query parameter"))?;
     let diff = std::str::from_utf8(&body)
         .map_err(|e| ApiError::bad_request(format!("diff body is not valid UTF-8: {e}")))?;
-    crate::core::analyze_diff_with_client(diff, &state.search, index_id)
+    let mut report = crate::core::analyze_diff_with_client(diff, &state.search, index_id)
         .await
-        .map(Json)
         .map_err(|e| match e {
             crate::core::ReviewError::MalformedHunkHeader(_) => {
                 ApiError::bad_request(format!("invalid diff: {e}"))
             }
             crate::core::ReviewError::Search(_) => ApiError::bad_gateway(format!("{e}")),
-        })
+        })?;
+
+    if params.explain.unwrap_or(false) {
+        match state.api_key.as_deref() {
+            Some(key) if !key.is_empty() => {
+                let provider = trusty_common::chat::OpenRouterProvider::new(
+                    key.to_string(),
+                    state.llm_model.clone(),
+                );
+                match crate::core::explain_report(&report, &provider).await {
+                    Ok(narrative) => report.narrative = Some(narrative),
+                    Err(e) => {
+                        tracing::warn!("explain_report failed: {e:#}");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "?explain=true requested but no OPENROUTER_API_KEY configured; returning report without narrative"
+                );
+            }
+        }
+    }
+
+    Ok(Json(report))
 }
 
 /// Why: lets CI and tooling analyze a GitHub PR by number without having to
@@ -1497,6 +1578,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn review_endpoint_ignores_explain_without_api_key() {
+        // Why: `?explain=true` is opt-in and graceful — when no API key is
+        // configured we must still return the report (search reachability
+        // being the only hard requirement). Test confirms 502 (because the
+        // stub search is down), not 500/panic.
+        let (state, _tmp) = make_state();
+        let state = state.with_api_key(None);
+        let app = build_router(state);
+        let diff = "+++ b/src/foo.rs\n@@ -0,0 +1,2 @@\n+/// doc\n+fn f() {}\n";
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/review?index_id=my-idx&explain=true")
+                    .header("content-type", "text/x-patch")
+                    .body(Body::from(diff))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Search is the stub at port 1 → 502. The handler did not panic on
+        // the missing API key.
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 

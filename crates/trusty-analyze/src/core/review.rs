@@ -108,6 +108,28 @@ pub struct ReviewReport {
     pub changed_lines: usize,
     pub smell_count: usize,
     pub summary: String,
+    /// LLM-generated prose explanation, present only when `--explain` is used
+    /// (or the `?explain=true` query parameter is set on the HTTP endpoint).
+    ///
+    /// Why: deterministic metrics tell developers *what* is wrong; prose
+    /// explains *why* and *what to do*. Opt-in keeps the default review path
+    /// fast and free; populated by [`crate::core::explain::explain_report`].
+    /// What: a string of 2-3 paragraphs of LLM-generated narrative or `None`
+    /// when explanation was not requested.
+    /// Test: covered by the explain unit tests in `core::explain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<String>,
+    /// Framework names detected from the project's manifest files (e.g.
+    /// `"Next.js"`, `"Django"`, `"Rails"`).
+    ///
+    /// Why: framework conventions differ significantly from generic language
+    /// rules; surfacing them lets the LLM narrative (and downstream tooling)
+    /// target framework-specific anti-patterns.
+    /// What: populated by [`crate::lang::detection::detect_frameworks`] when
+    /// the analyzer has access to a project root; empty otherwise.
+    /// Test: covered by `detect_frameworks` tests in `lang::detection`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frameworks: Vec<String>,
 }
 
 /// One file's added content extracted from a unified diff.
@@ -461,6 +483,8 @@ pub fn analyze_diff_with_chunks(
         changed_lines,
         smell_count,
         summary,
+        narrative: None,
+        frameworks: Vec::new(),
     })
 }
 

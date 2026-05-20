@@ -19,6 +19,7 @@ pub mod client;
 pub mod complexity;
 pub mod complexity_ts;
 pub mod concept_cluster;
+pub mod explain;
 pub mod facts;
 pub mod github;
 pub mod linker;
@@ -35,6 +36,7 @@ pub mod tools;
 pub use client::{IndexSummary, TrustySearchClient};
 pub use complexity::compute_complexity_for;
 pub use concept_cluster::{bow_embedding, cluster, ClusterResult, ConceptCluster};
+pub use explain::{build_explain_prompt, explain_report};
 pub use facts::FactStore;
 pub use github::{
     fetch_pr_diff, format_review_as_markdown, post_pr_comment, verify_webhook_signature,
@@ -43,7 +45,7 @@ pub use github::{
 pub use linker::link;
 pub use ner::{extract_doc_comments, NerExtractor};
 pub use refactor::{analyze as analyze_refactor, RefactorSuggestion, RefactorType, Severity};
-pub use registry::AnalyzerRegistry;
+pub use registry::{record_frameworks, AnalyzerRegistry};
 pub use review::{
     analyze_diff_with_chunks, analyze_diff_with_client, render_text as render_review_text,
     ReviewError, ReviewReport,

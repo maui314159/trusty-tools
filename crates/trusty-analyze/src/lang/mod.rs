@@ -33,5 +33,5 @@ pub use adapters::scala::ScalaAnalyzer;
 pub use adapters::swift::SwiftAnalyzer;
 pub use adapters::typescript::TypeScriptAnalyzer;
 pub use adapters::{go::GoAnalyzer, java::JavaAnalyzer, python::PythonAnalyzer};
-pub use detection::{DetectionResult, LanguageDetector};
+pub use detection::{detect_frameworks, DetectionResult, LanguageDetector};
 pub use lang::{LanguageAnalyzer, StaticAnalysisResult};

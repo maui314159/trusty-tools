@@ -428,7 +428,14 @@ impl AnalyzerMcpServer {
     async fn handle_review_diff(&self, args: &Value) -> Result<Value, DispatchError> {
         let diff = require_str(args, "diff")?;
         let index_id = require_str(args, "index_id")?;
-        let path = format!("/review?index_id={}", urlencode(index_id));
+        let explain = args
+            .get("explain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut path = format!("/review?index_id={}", urlencode(index_id));
+        if explain {
+            path.push_str("&explain=true");
+        }
         self.post_text(&path, diff).await
     }
 
@@ -815,13 +822,14 @@ pub fn tool_descriptors() -> Value {
         },
         {
             "name": "review_diff",
-            "description": "Review a unified git diff and return a structured quality report (per-file complexity, code smells, grade A-F, recommendations). Cross-references the diff against the trusty-search index corpus, so trusty-search must be running.",
+            "description": "Review a unified git diff and return a structured quality report (per-file complexity, code smells, grade A-F, recommendations). Cross-references the diff against the trusty-search index corpus, so trusty-search must be running. Set explain=true to also attach an LLM-generated prose narrative (requires OPENROUTER_API_KEY on the daemon).",
             "inputSchema": {
                 "type": "object",
                 "required": ["diff", "index_id"],
                 "properties": {
                     "diff":     { "type": "string", "description": "Unified git diff text to review" },
-                    "index_id": { "type": "string", "description": "Index ID to cross-reference the diff against in trusty-search" }
+                    "index_id": { "type": "string", "description": "Index ID to cross-reference the diff against in trusty-search" },
+                    "explain":  { "type": "boolean", "description": "Attach an LLM prose narrative to the report (default false)", "default": false }
                 }
             }
         },
