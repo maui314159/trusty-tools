@@ -1,8 +1,9 @@
 //! Handler for `trusty-analyzer service` (macOS launchd integration).
 //!
 //! Mirrors the trusty-search service layout: a thin platform-gated dispatcher
-//! that maps each `ServiceAction` to a single `launchctl` operation. On
-//! non-macOS targets the entry point prints a clear message and exits 1.
+//! that maps each `ServiceAction` to a single launchd operation via the shared
+//! `trusty_common::launchd` module. On non-macOS targets the entry point
+//! prints a clear message and exits 1.
 
 use anyhow::Result;
 use colored::Colorize;
@@ -10,14 +11,14 @@ use colored::Colorize;
 /// Reverse-DNS label for the LaunchAgent. Used as the plist filename and the
 /// `Label` key — both must match for `launchctl` lookups to work.
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "com.trusty.trusty-analyze";
+const LAUNCHD_LABEL: &str = "com.trusty.analyze";
 
 /// Subcommand actions for `trusty-analyzer service`.
 ///
 /// Why: launchd is the canonical way to keep a long-lived foreground service
 /// alive on macOS — wrapping plist mechanics in `service` subcommands keeps
 /// users from having to hand-edit XML.
-/// What: each variant maps to one `launchctl` operation (or `tail -F` for Logs).
+/// What: each variant maps to one launchd operation (or `tail -F` for Logs).
 /// Test: `cargo run -- service --help` lists the four actions; on Linux,
 /// any action prints "not supported" and exits 1.
 #[derive(Debug, Clone)]
@@ -63,121 +64,84 @@ pub fn run_service_action(action: ServiceAction) -> Result<()> {
     }
 }
 
-/// Resolve the LaunchAgent plist path.
+/// Resolve the log directory for the analyzer launchd agent.
 ///
-/// Why: `setup daemon` needs to check whether the plist already exists and to
-/// `launchctl load` it.
-/// What: returns `~/Library/LaunchAgents/com.trusty.trusty-analyze.plist`.
+/// Why: align with the other trusty-* daemons by writing logs under
+/// `~/.trusty-analyze/logs/` instead of `~/Library/Logs/`. Easier to find
+/// and matches the convention shared across the workspace.
+/// What: returns `~/.trusty-analyze/logs`, creating it on demand.
 /// Test: covered transitively by `setup daemon`.
 #[cfg(target_os = "macos")]
-pub fn launchd_plist_path() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
-    Ok(home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
-}
-
-#[cfg(target_os = "macos")]
 fn launchd_log_dir() -> Result<std::path::PathBuf> {
-    // Why: align with trusty-memory by writing a single combined log under
-    // `~/.trusty-analyzer/logs/` instead of `~/Library/Logs/`. Easier to find
-    // and matches the convention shared by every trusty-* daemon.
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
     let dir = home.join(".trusty-analyze").join("logs");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Render the LaunchAgent plist body. Aligned with trusty-memory's template:
-/// `KeepAlive=true`, `ThrottleInterval=10`, a single combined log file, and
-/// no `--foreground` argument (launchd owns lifecycle, the daemon runs as-is).
+/// Build the shared `LaunchdConfig` for this daemon.
+///
+/// Why: every `service` action needs the same plist label, executable path,
+/// args, and log directory. Centralising the construction keeps install,
+/// uninstall, status, and logs in agreement.
+/// What: resolves the current executable, computes the log dir, and returns
+/// a `LaunchdConfig` configured for an always-on agent that runs
+/// `trusty-analyze serve` with a 10-second restart throttle.
+/// Test: exercised transitively by every macOS `service` subcommand.
 #[cfg(target_os = "macos")]
-fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> String {
-    let exe = exe.display();
-    // log_dir is ~/.trusty-analyzer/logs; its parent is the data dir we use as
-    // WorkingDirectory so the default relative facts path resolves to a writable
-    // location instead of `/` (the launchd default, which is read-only).
-    let data_dir = log_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| log_dir.to_path_buf());
-    let log_path = log_dir.join("daemon.log");
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>serve</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>{data}</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{log}</string>
-  <key>StandardErrorPath</key>
-  <string>{log}</string>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-</dict>
-</plist>
-"#,
-        data = data_dir.display(),
-        log = log_path.display(),
-    )
+fn launchd_config() -> Result<trusty_common::launchd::LaunchdConfig> {
+    use trusty_common::launchd::{KeepAlive, LaunchdConfig};
+
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
+    let log_dir = launchd_log_dir()?;
+    Ok(LaunchdConfig {
+        label: LAUNCHD_LABEL.to_string(),
+        exe_path: exe,
+        args: vec!["serve".to_string()],
+        log_dir,
+        keep_alive: KeepAlive::Always,
+        throttle_interval: 10,
+        env_vars: Vec::new(),
+    })
+}
+
+/// Resolve the LaunchAgent plist path.
+///
+/// Why: `setup daemon` needs to check whether the plist already exists before
+/// deciding whether to install or simply reload it.
+/// What: returns `~/Library/LaunchAgents/com.trusty.analyze.plist` via the
+/// shared `LaunchdConfig::plist_path` helper.
+/// Test: covered transitively by `setup daemon`.
+#[cfg(target_os = "macos")]
+pub fn launchd_plist_path() -> Result<std::path::PathBuf> {
+    launchd_config()?.plist_path()
 }
 
 /// Install and start the launchd LaunchAgent.
 ///
 /// Why: exposed so the `setup daemon` subcommand can install the background
 /// service without re-implementing the plist mechanics.
-/// What: writes the plist, then `bootout`s any stale agent and `bootstrap`s
-/// the fresh one into the user's GUI domain.
+/// What: writes the plist via `LaunchdConfig::install`, then `bootstrap`s it
+/// into the current user's GUI domain via the shared helper.
 /// Test: `setup daemon` on macOS installs the plist and the daemon answers
 /// `/health`; on Linux `setup daemon` skips this path with a clear message.
 #[cfg(target_os = "macos")]
 pub fn service_install() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
-    let plist_path = launchd_plist_path()?;
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let log_dir = launchd_log_dir()?;
-    let body = launchd_plist_body(&exe, &log_dir);
-    std::fs::write(&plist_path, body)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", plist_path.display()))?;
+    let cfg = launchd_config()?;
+    cfg.install()
+        .map_err(|e| anyhow::anyhow!("install LaunchAgent plist: {e}"))?;
+    let plist_path = cfg.plist_path()?;
     println!(
         "{} Wrote LaunchAgent plist: {}",
         "✓".green(),
         plist_path.display()
     );
 
-    // Bootstrap into the GUI domain of the current user. `bootout` first
-    // (ignoring errors) so a re-install replaces a previously-loaded agent
-    // cleanly.
-    let uid = unsafe { libc::getuid() };
-    let domain = format!("gui/{uid}");
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(&plist_path)
-        .status();
-    let status = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("launchctl bootstrap failed: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("launchctl bootstrap exited with {status}");
-    }
+    cfg.bootstrap()
+        .map_err(|e| anyhow::anyhow!("launchctl bootstrap: {e}"))?;
+
+    let domain = format!("gui/{}", trusty_common::launchd::current_uid());
     println!(
         "{} trusty-analyze service installed and started ({} loaded into {}).",
         "✓".green(),
@@ -186,7 +150,7 @@ pub fn service_install() -> Result<()> {
     );
     println!(
         "  Logs:    {}\n  Status:  {}",
-        log_dir.display().to_string().dimmed(),
+        cfg.log_dir.display().to_string().dimmed(),
         "trusty-analyze service status".cyan(),
     );
     Ok(())
@@ -194,14 +158,11 @@ pub fn service_install() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_uninstall() -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-    let uid = unsafe { libc::getuid() };
-    let domain = format!("gui/{uid}");
+    let cfg = launchd_config()?;
+    let plist_path = cfg.plist_path()?;
     if plist_path.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &domain])
-            .arg(&plist_path)
-            .status();
+        // bootout is best-effort: a not-loaded agent is fine here.
+        let _ = cfg.bootout();
         std::fs::remove_file(&plist_path)
             .map_err(|e| anyhow::anyhow!("remove {}: {e}", plist_path.display()))?;
         println!(
@@ -221,7 +182,7 @@ fn service_uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_status() -> Result<()> {
-    let uid = unsafe { libc::getuid() };
+    let uid = trusty_common::launchd::current_uid();
     let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let output = std::process::Command::new("launchctl")
         .args(["print", &target])
@@ -250,12 +211,15 @@ fn service_status() -> Result<()> {
 fn service_logs() -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log_dir = launchd_log_dir()?;
-    let log = log_dir.join("daemon.log");
-    if !log.exists() {
+    // trusty_common's LaunchdConfig writes separate stdout/stderr files; tail
+    // both so users see the full picture in one stream.
+    let stdout_log = log_dir.join("stdout.log");
+    let stderr_log = log_dir.join("stderr.log");
+    if !stdout_log.exists() && !stderr_log.exists() {
         eprintln!(
-            "{} No log at {} yet — start the service first.",
+            "{} No logs at {} yet — start the service first.",
             "·".dimmed(),
-            log.display()
+            log_dir.display()
         );
         return Ok(());
     }
@@ -263,7 +227,8 @@ fn service_logs() -> Result<()> {
     // follow-mode experience and we don't have to re-implement log rotation.
     let err = std::process::Command::new("tail")
         .arg("-F")
-        .arg(&log)
+        .arg(&stdout_log)
+        .arg(&stderr_log)
         .exec();
     Err(anyhow::anyhow!("exec tail failed: {err}"))
 }

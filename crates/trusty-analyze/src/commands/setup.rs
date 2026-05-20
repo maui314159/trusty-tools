@@ -5,9 +5,11 @@
 //! places. `setup` automates that so users don't have to hand-edit JSON or
 //! remember plist paths.
 //! What: each `SetupTarget` variant writes (or merges) one configuration
-//! artifact. `All` runs every target in sequence.
-//! Test: `mod tests` covers the MCP-config merge logic (idempotent re-runs,
-//! preserving sibling keys) and the markdown writers.
+//! artifact via the shared `trusty_common::claude_config` helpers. `All` runs
+//! every target in sequence.
+//! Test: `mod tests` covers the markdown writers and the path-selection
+//! plumbing; the JSON merge logic itself lives in (and is tested by)
+//! `trusty_common::claude_config`.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,18 @@ use clap::Subcommand;
 use colored::Colorize;
 
 use trusty_analyze::service::DEFAULT_PORT;
+use trusty_common::claude_config::{
+    default_settings_max_depth, discover_claude_settings, mcp_server_entry, patch_mcp_server,
+};
+
+/// Server key used in the `mcpServers` object of every host's config.
+const MCP_SERVER_KEY: &str = "trusty-analyzer";
+
+/// CLI command name (matches `[[bin]] name`).
+const MCP_SERVER_COMMAND: &str = "trusty-analyze";
+
+/// Args the host should pass to the binary to launch the MCP stdio server.
+const MCP_SERVER_ARGS: &[&str] = &["serve", "--mcp"];
 
 /// Targets for `trusty-analyze setup`.
 ///
@@ -32,7 +46,8 @@ pub enum SetupTarget {
     All,
     /// Register as MCP server in Claude Code
     ClaudeCode {
-        /// Write to global ~/.claude/mcp.json instead of project .mcp.json
+        /// Patch every discovered Claude settings file under $HOME instead of
+        /// the project's `.mcp.json`.
         #[arg(long)]
         global: bool,
         /// Project directory (default: current dir)
@@ -87,85 +102,6 @@ async fn setup_all() -> Result<()> {
     Ok(())
 }
 
-/// The MCP server entry trusty-analyze registers in every host's config.
-///
-/// Why: identical across Claude Code and Cursor — one source of truth avoids
-/// drift between the two writers.
-/// What: the `{ command, args, env }` object stored under
-/// `mcpServers."trusty-analyzer"`.
-/// Test: `mcp_server_entry_is_stable` pins the shape.
-fn mcp_server_entry() -> serde_json::Value {
-    serde_json::json!({
-        "command": "trusty-analyze",
-        "args": ["serve", "--mcp"],
-        "env": {},
-    })
-}
-
-/// Merge the `trusty-analyzer` MCP server entry into the JSON config at `path`.
-///
-/// Why: hosts' MCP config files often already contain other servers; a blind
-/// overwrite would destroy them. This reads, merges one key, and writes back.
-/// What: creates parent dirs, reads any existing file as JSON (an empty/absent
-/// file starts from `{}`), ensures `mcpServers` is an object, inserts the
-/// `trusty-analyzer` entry, and writes pretty-printed JSON. Returns `true` if
-/// the file was already up to date (no write performed).
-/// Test: `merge_into_empty_config`, `merge_preserves_sibling_servers`,
-/// `merge_is_idempotent`.
-fn merge_mcp_config(path: &Path) -> Result<bool> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create directory {}", parent.display()))?;
-        }
-    }
-
-    let mut root: serde_json::Value = if path.exists() {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        if text.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&text)
-                .with_context(|| format!("parse {} as JSON", path.display()))?
-        }
-    } else {
-        serde_json::json!({})
-    };
-
-    if !root.is_object() {
-        anyhow::bail!("{} is not a JSON object", path.display());
-    }
-
-    let entry = mcp_server_entry();
-
-    // Fast path: already configured identically → nothing to write.
-    if root
-        .get("mcpServers")
-        .and_then(|m| m.get("trusty-analyzer"))
-        == Some(&entry)
-    {
-        return Ok(true);
-    }
-
-    let obj = root.as_object_mut().expect("checked is_object above");
-    let servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
-    if !servers.is_object() {
-        anyhow::bail!("'mcpServers' in {} is not a JSON object", path.display());
-    }
-    servers
-        .as_object_mut()
-        .expect("checked is_object above")
-        .insert("trusty-analyzer".to_string(), entry);
-
-    let serialized = serde_json::to_string_pretty(&root).context("serialize merged MCP config")?;
-    std::fs::write(path, format!("{serialized}\n"))
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(false)
-}
-
 /// Resolve the project directory: the `--project` override or the current dir.
 fn project_dir(project: Option<PathBuf>) -> Result<PathBuf> {
     match project {
@@ -176,29 +112,48 @@ fn project_dir(project: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Register trusty-analyze as an MCP server in Claude Code.
 ///
-/// Why: Claude Code auto-discovers `.mcp.json` (project) and `~/.claude/mcp.json`
-/// (global); writing one of those is all it takes to expose the analyzer's MCP
-/// tools.
-/// What: merges the `trusty-analyzer` entry into the chosen config file.
-/// Test: `mod tests` covers the merge; this wrapper just picks the path.
+/// Why: Claude Code auto-discovers `.mcp.json` in the project root and reads
+/// `mcpServers` from every `~/.claude/settings.json` / `settings.local.json`
+/// under the user's home directory. Patching them with the shared
+/// `patch_mcp_server` helper makes the analyzer's MCP tools available.
+/// What: in `--global` mode, walks `$HOME` via
+/// [`discover_claude_settings`] and patches every discovered settings file. In
+/// project mode (default), patches the project's `.mcp.json`.
+/// Test: `setup_claude_code_writes_project_mcp_json` covers the project path;
+/// the underlying merge logic is tested in `trusty-common`.
 fn setup_claude_code(global: bool, project: Option<PathBuf>) -> Result<()> {
-    let path = if global {
+    let entry = mcp_server_entry(MCP_SERVER_COMMAND, MCP_SERVER_ARGS);
+
+    if global {
         let home = dirs::home_dir().context("resolve $HOME")?;
-        home.join(".claude").join("mcp.json")
+        let settings_files = discover_claude_settings(&home, default_settings_max_depth());
+        if settings_files.is_empty() {
+            // Fall back to creating the canonical global settings file so
+            // first-time users still get wired up.
+            let fallback = home.join(".claude").join("settings.json");
+            let changed = patch_mcp_server(&fallback, MCP_SERVER_KEY, &entry)?;
+            report_config_write("Claude Code", &fallback, !changed);
+            return Ok(());
+        }
+        for path in settings_files {
+            let changed = patch_mcp_server(&path, MCP_SERVER_KEY, &entry)?;
+            report_config_write("Claude Code", &path, !changed);
+        }
+        Ok(())
     } else {
-        project_dir(project)?.join(".mcp.json")
-    };
-    let already = merge_mcp_config(&path)?;
-    report_config_write("Claude Code", &path, already);
-    Ok(())
+        let path = project_dir(project)?.join(".mcp.json");
+        let changed = patch_mcp_server(&path, MCP_SERVER_KEY, &entry)?;
+        report_config_write("Claude Code", &path, !changed);
+        Ok(())
+    }
 }
 
 /// Register trusty-analyze as an MCP server in Cursor.
 ///
 /// Why: Cursor reads `.cursor/mcp.json` (project) and `~/.cursor/mcp.json`
 /// (global) for MCP server definitions.
-/// What: merges the `trusty-analyzer` entry into the chosen config file.
-/// Test: `mod tests` covers the merge; this wrapper just picks the path.
+/// What: patches the chosen config file via [`patch_mcp_server`].
+/// Test: the underlying merge logic is tested in `trusty-common`.
 fn setup_cursor(global: bool, project: Option<PathBuf>) -> Result<()> {
     let path = if global {
         let home = dirs::home_dir().context("resolve $HOME")?;
@@ -206,8 +161,9 @@ fn setup_cursor(global: bool, project: Option<PathBuf>) -> Result<()> {
     } else {
         project_dir(project)?.join(".cursor").join("mcp.json")
     };
-    let already = merge_mcp_config(&path)?;
-    report_config_write("Cursor", &path, already);
+    let entry = mcp_server_entry(MCP_SERVER_COMMAND, MCP_SERVER_ARGS);
+    let changed = patch_mcp_server(&path, MCP_SERVER_KEY, &entry)?;
+    report_config_write("Cursor", &path, !changed);
     Ok(())
 }
 
@@ -329,8 +285,8 @@ fn port_reachable(port: u16) -> bool {
 ///
 /// Why: gives users a one-command "make the daemon run forever" path.
 /// What: if the port already answers, returns early. Otherwise installs the
-/// launchd service (when not already installed), `launchctl load`s the plist,
-/// and polls `/health` for up to 10 s.
+/// launchd service (when not already installed) and polls `/health` for up to
+/// 10 s.
 /// Test: on a machine with the daemon already up, prints "already running" and
 /// exits 0; the launchd path is macOS-only and verified manually.
 async fn setup_daemon() -> Result<()> {
@@ -405,80 +361,53 @@ mod tests {
 
     #[test]
     fn mcp_server_entry_is_stable() {
-        let e = mcp_server_entry();
+        let e = mcp_server_entry(MCP_SERVER_COMMAND, MCP_SERVER_ARGS);
         assert_eq!(e["command"], "trusty-analyze");
         assert_eq!(e["args"][0], "serve");
         assert_eq!(e["args"][1], "--mcp");
-        assert!(e["env"].is_object());
+        // trusty_common's entry intentionally omits an empty `env` block;
+        // assert it stays that way so downstream Claude Code configs don't
+        // gain a stray key on every re-run.
+        assert!(e.get("env").is_none(), "env must not be set in entry");
     }
 
     #[test]
-    fn merge_into_empty_config() {
+    fn setup_claude_code_writes_project_mcp_json() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(".mcp.json");
-        let already = merge_mcp_config(&path).unwrap();
-        assert!(!already, "first write should not be a no-op");
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let result = setup_claude_code(false, Some(dir.path().to_path_buf()));
+        assert!(result.is_ok(), "setup failed: {result:?}");
+        let written = dir.path().join(".mcp.json");
+        assert!(written.exists(), ".mcp.json should be created");
+        let text = std::fs::read_to_string(&written).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            json["mcpServers"]["trusty-analyzer"]["command"],
+            parsed["mcpServers"]["trusty-analyzer"]["command"],
+            "trusty-analyze"
+        );
+        assert_eq!(parsed["mcpServers"]["trusty-analyzer"]["args"][1], "--mcp");
+    }
+
+    #[test]
+    fn setup_claude_code_is_idempotent() {
+        let dir = tempdir().unwrap();
+        setup_claude_code(false, Some(dir.path().to_path_buf())).unwrap();
+        // Second run must succeed and leave the file in a valid state.
+        setup_claude_code(false, Some(dir.path().to_path_buf())).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["trusty-analyzer"]["command"],
             "trusty-analyze"
         );
     }
 
     #[test]
-    fn merge_preserves_sibling_servers() {
+    fn setup_cursor_writes_project_mcp_json() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
-        std::fs::write(
-            &path,
-            r#"{"mcpServers":{"other":{"command":"x"}},"theme":"dark"}"#,
-        )
-        .unwrap();
-
-        merge_mcp_config(&path).unwrap();
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        // Sibling server and unrelated key both survive.
-        assert_eq!(json["mcpServers"]["other"]["command"], "x");
-        assert_eq!(json["theme"], "dark");
-        // Our entry was added.
-        assert_eq!(
-            json["mcpServers"]["trusty-analyzer"]["command"],
-            "trusty-analyze"
-        );
-    }
-
-    #[test]
-    fn merge_is_idempotent() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".mcp.json");
-        let first = merge_mcp_config(&path).unwrap();
-        assert!(!first);
-        let second = merge_mcp_config(&path).unwrap();
-        assert!(second, "second identical merge should be a no-op");
-    }
-
-    #[test]
-    fn merge_rejects_non_object_root() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("bad.json");
-        std::fs::write(&path, "[1,2,3]").unwrap();
-        assert!(merge_mcp_config(&path).is_err());
-    }
-
-    #[test]
-    fn merge_handles_empty_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("empty.json");
-        std::fs::write(&path, "   \n").unwrap();
-        let already = merge_mcp_config(&path).unwrap();
-        assert!(!already);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(json["mcpServers"]["trusty-analyzer"].is_object());
+        let result = setup_cursor(false, Some(dir.path().to_path_buf()));
+        assert!(result.is_ok(), "setup_cursor failed: {result:?}");
+        let written = dir.path().join(".cursor").join("mcp.json");
+        assert!(written.exists(), ".cursor/mcp.json should be created");
     }
 
     #[test]
