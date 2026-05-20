@@ -267,18 +267,26 @@ pub async fn ensure_daemon_running_for_indexing(base: &str) -> Result<()> {
 ///
 /// Why: keep the env-var contract in one place so tests and docs match
 /// behaviour. Reads `TRUSTY_INDEX_DEVICE` (`cpu` | `gpu` | `auto`); defaults
-/// to `cpu` because that is the OOM-safe choice on Apple Silicon and a near-
-/// negligible throughput cost elsewhere (the indexing path is I/O- and
-/// chunking-bound long before it is embedder-bound on CPU EP with the no-
-/// arena allocator).
+/// to `auto` as of trusty-search 0.3.55. The original blocking OOM (issue
+/// #24) — CoreML EP allocating ~72 GB virtual RSS from the unified-memory
+/// GPU pool — was rooted in `MLComputeUnits=ALL`. The shared
+/// `trusty-embedder` now defaults to `MLComputeUnits=CPUAndNeuralEngine`,
+/// which uses the Neural Engine's dedicated memory rather than the GPU
+/// unified-memory pool. That keeps virtual RSS bounded while restoring the
+/// ~10× throughput advantage over CPU-only indexing.
+///
+/// Operators who hit edge cases (or want to A/B benchmark) can still force
+/// CPU with `TRUSTY_INDEX_DEVICE=cpu`. Setting `TRUSTY_COREML_COMPUTE_UNITS=all`
+/// re-enables the old CPU+GPU+ANE pipeline at the cost of the original
+/// memory behaviour.
 /// What: returns a lowercased owned `String` so the caller can match on it
 /// or pass it directly into `--device`.
-/// Test: `resolve_indexing_device_defaults_to_cpu` and
+/// Test: `resolve_indexing_device_defaults_to_auto` and
 /// `resolve_indexing_device_honours_env_override`.
 fn resolve_indexing_device() -> String {
     match std::env::var("TRUSTY_INDEX_DEVICE") {
         Ok(v) if !v.is_empty() => v.to_ascii_lowercase(),
-        _ => "cpu".to_string(),
+        _ => "auto".to_string(),
     }
 }
 
@@ -324,13 +332,15 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    /// Why: the indexing flow must default to CPU EP on Apple Silicon to avoid
-    /// the ~72 GB virtual-RSS spike from CoreML EP init (issue #24, the
-    /// blocking OOM bug). If this default ever regresses to `auto`/`gpu`,
-    /// `trusty-search index --force` will be SIGKILLed by jetsam again on
-    /// M-series.
+    /// Why: as of trusty-search 0.3.55 the indexing flow defaults to `auto`
+    /// because the embedder now registers CoreML with
+    /// `MLComputeUnits=CPUAndNeuralEngine`, which eliminates the GPU
+    /// unified-memory allocation that caused the original 72 GB virtual-RSS
+    /// spike (issue #24). The Neural Engine uses dedicated memory, so the
+    /// jetsam SIGKILL no longer fires. Operators who want to A/B benchmark
+    /// can still force CPU with `TRUSTY_INDEX_DEVICE=cpu`.
     /// What: clears `TRUSTY_INDEX_DEVICE`, calls `resolve_indexing_device`,
-    /// asserts it returns `"cpu"`.
+    /// asserts it returns `"auto"`.
     /// Test: this test.
     // Shared env lock for all TRUSTY_INDEX_DEVICE tests in this module.
     // Why: separate per-test statics let parallel tests race on the same env
@@ -339,13 +349,13 @@ mod tests {
     static INDEX_DEVICE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn resolve_indexing_device_defaults_to_cpu() {
+    fn resolve_indexing_device_defaults_to_auto() {
         let _guard = INDEX_DEVICE_ENV_LOCK.lock().unwrap();
         let prev = std::env::var("TRUSTY_INDEX_DEVICE").ok();
         // SAFETY: single-threaded under ENV_LOCK.
         unsafe { std::env::remove_var("TRUSTY_INDEX_DEVICE") };
 
-        assert_eq!(resolve_indexing_device(), "cpu");
+        assert_eq!(resolve_indexing_device(), "auto");
 
         unsafe {
             match prev {

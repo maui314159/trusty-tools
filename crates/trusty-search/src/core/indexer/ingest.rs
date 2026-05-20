@@ -423,11 +423,13 @@ impl CodeIndexer {
         // builds; behavioural verification on CoreML is via an Apple
         // Silicon smoke run.
         let batch_size = match embedder.provider() {
-            trusty_common::embedder::ExecutionProvider::CoreML => {
+            trusty_common::embedder::ExecutionProvider::CoreML
+            | trusty_common::embedder::ExecutionProvider::CoreMLAne => {
                 let bs = crate::core::resolve_coreml_batch_size();
                 tracing::debug!(
-                    "embed_chunks_in_batches: CoreML provider active — using \
-                     TRUSTY_COREML_BATCH_SIZE={bs} (chunks={chunk_total})"
+                    "embed_chunks_in_batches: CoreML provider active ({:?}) — using \
+                     TRUSTY_COREML_BATCH_SIZE={bs} (chunks={chunk_total})",
+                    embedder.provider()
                 );
                 bs
             }

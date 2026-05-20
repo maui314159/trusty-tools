@@ -108,7 +108,8 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
     let dim = <crate::core::FastEmbedder as crate::core::Embedder>::dimension(&embedder);
     let provider = embedder.provider();
     let metal_hint = match provider {
-        trusty_common::embedder::ExecutionProvider::CoreML => " (Metal GPU / ANE)",
+        trusty_common::embedder::ExecutionProvider::CoreML => " (Metal GPU + ANE + CPU)",
+        trusty_common::embedder::ExecutionProvider::CoreMLAne => " (Neural Engine + CPU)",
         trusty_common::embedder::ExecutionProvider::Cuda => " (CUDA GPU)",
         trusty_common::embedder::ExecutionProvider::Cpu => "",
     };
@@ -149,11 +150,15 @@ fn tune_batch_size_for_provider(provider: trusty_common::embedder::ExecutionProv
     // `TRUSTY_COREML_BATCH_SIZE` (default 32) when CoreML is active —
     // see `core::indexer::ingest::embed_chunks_in_batches`. Leaving
     // `TRUSTY_MAX_BATCH_SIZE` at its tier default is the safe answer.
-    if matches!(provider, trusty_common::embedder::ExecutionProvider::CoreML) {
+    if matches!(
+        provider,
+        trusty_common::embedder::ExecutionProvider::CoreML
+            | trusty_common::embedder::ExecutionProvider::CoreMLAne
+    ) {
         let coreml_bs = crate::core::resolve_coreml_batch_size();
         tracing::info!(
-            "gpu_batch_tuning: provider=CoreML → using TRUSTY_COREML_BATCH_SIZE={coreml_bs} for \
-             indexing batches (unified-memory pool would inflate with TRUSTY_MAX_BATCH_SIZE bump)"
+            "gpu_batch_tuning: provider={provider} → using TRUSTY_COREML_BATCH_SIZE={coreml_bs} for \
+             indexing batches (CoreML EP allocates per-batch buffers in the unified-memory pool)"
         );
         return;
     }

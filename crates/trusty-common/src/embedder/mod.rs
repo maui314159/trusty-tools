@@ -48,7 +48,17 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionProvider {
     Cpu,
+    /// CoreML EP with `MLComputeUnits=ALL` (CPU + GPU + ANE). On Apple
+    /// Silicon this allocates from the unified-memory GPU pool and was the
+    /// source of the ~72 GB virtual-RSS spike that triggered jetsam SIGKILL
+    /// during indexing (issue #24). Retained for completeness but no longer
+    /// the default.
     CoreML,
+    /// CoreML EP with `MLComputeUnits=CPUAndNeuralEngine`. The Neural Engine
+    /// uses dedicated memory, not the GPU unified-memory pool, so this
+    /// avoids the 72 GB spike while still delivering ~10× CPU throughput.
+    /// New default on Apple Silicon as of trusty-search 0.3.55.
+    CoreMLAne,
     Cuda,
 }
 
@@ -57,6 +67,7 @@ impl ExecutionProvider {
         match self {
             ExecutionProvider::Cpu => "CPU",
             ExecutionProvider::CoreML => "CoreML",
+            ExecutionProvider::CoreMLAne => "CoreML(ANE)",
             ExecutionProvider::Cuda => "CUDA",
         }
     }
@@ -227,36 +238,86 @@ impl FastEmbedder {
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
             // Operator override: setting `TRUSTY_DEVICE=cpu` forces CPU even on
-            // Apple Silicon. This is the load-bearing escape hatch for the
-            // macOS jetsam kill (trusty-search#118 / blocking bug): CoreML on
-            // M-series allocates from the unified memory pool, which inflates
-            // *virtual* RSS to ~100+ GB during indexing of large repos
-            // (>~50 MB of source). macOS jetsam treats that virtual footprint
-            // as memory pressure and SIGKILLs the process, even though
-            // physical RAM is fine. Falling through to the CPU-only EP path
-            // (which already disables the ORT memory arena) keeps the
-            // footprint bounded — at the cost of slower embedding throughput.
-            // Operators who want GPU on Apple Silicon explicitly pass
-            // `--device auto` (default) or `--device gpu`.
+            // Apple Silicon. Historically this was the load-bearing escape
+            // hatch for the macOS jetsam kill (issue #24): the default
+            // `MLComputeUnits=ALL` configuration allocated from the unified-
+            // memory GPU pool and inflated *virtual* RSS to ~72 GB during
+            // indexing of large repos, triggering jetsam SIGKILL even though
+            // physical RAM was fine.
+            //
+            // As of trusty-search 0.3.55 the default CoreML configuration is
+            // `MLComputeUnits=CPUAndNeuralEngine` — the Neural Engine uses
+            // dedicated memory, NOT the GPU unified-memory pool, so the
+            // 72 GB virtual-RSS spike no longer occurs. Operators who want
+            // the full CPU+GPU+ANE pipeline (and have the headroom) can opt
+            // in with `TRUSTY_COREML_COMPUTE_UNITS=all`; the other values
+            // (`cpu_ane`, `cpu_gpu`, `cpu_only`) map to the corresponding
+            // `ComputeUnits` variants.
             let force_cpu = std::env::var("TRUSTY_DEVICE")
                 .map(|v| v.eq_ignore_ascii_case("cpu"))
                 .unwrap_or(false);
             if !force_cpu {
-                let coreml: ExecutionProviderDispatch = ort::ep::CoreML::default().build();
-                // CoreML first (GPU/ANE), CPU-no-arena as fallback. The CPU EP
-                // still applies its session-level DisableCpuMemArena flag even
-                // when CoreML handles most ops, which is what prevents the spike.
+                use ort::ep::coreml::{ComputeUnits, SpecializationStrategy};
+
+                let (units, units_tag) = match std::env::var("TRUSTY_COREML_COMPUTE_UNITS")
+                    .ok()
+                    .as_deref()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("all") => (ComputeUnits::All, ExecutionProvider::CoreML),
+                    Some("cpu_gpu") | Some("cpuandgpu") => {
+                        (ComputeUnits::CPUAndGPU, ExecutionProvider::CoreML)
+                    }
+                    Some("cpu_only") | Some("cpuonly") => {
+                        (ComputeUnits::CPUOnly, ExecutionProvider::CoreMLAne)
+                    }
+                    // Default: ANE+CPU. Avoids GPU unified-memory allocation
+                    // entirely (the root cause of the 72 GB virtual-RSS
+                    // spike). Empirically delivers ~10× CPU throughput while
+                    // keeping steady-state RSS in the hundreds of MB.
+                    _ => (
+                        ComputeUnits::CPUAndNeuralEngine,
+                        ExecutionProvider::CoreMLAne,
+                    ),
+                };
+
+                // Cache compiled CoreML model on disk so we don't pay the
+                // compile cost (and its transient memory) on every daemon
+                // start. Falls back to a tmp path if HOME is unset.
+                let cache_dir = std::env::var("HOME")
+                    .map(|h| {
+                        format!("{}/Library/Caches/trusty-embedder/coreml", h)
+                    })
+                    .unwrap_or_else(|_| "/tmp/trusty-embedder-coreml".to_string());
+                let _ = std::fs::create_dir_all(&cache_dir);
+
+                let coreml: ExecutionProviderDispatch = ort::ep::CoreML::default()
+                    .with_compute_units(units)
+                    // Static input shapes prevent CoreML from compiling a
+                    // separate specialized graph per encountered tensor
+                    // shape. The all-MiniLM-L6-v2 ONNX model uses dynamic
+                    // sequence length; without this flag CoreML retains
+                    // every variant in memory across the indexing batch.
+                    .with_static_input_shapes(true)
+                    .with_specialization_strategy(SpecializationStrategy::FastPrediction)
+                    .with_model_cache_dir(cache_dir.clone())
+                    .build();
+                // CoreML first (ANE/GPU per units), CPU-no-arena as fallback.
+                // The CPU EP still applies its session-level DisableCpuMemArena
+                // flag even when CoreML handles most ops, which keeps the
+                // residual CPU work from re-allocating the arena.
                 let providers: Vec<ExecutionProviderDispatch> = vec![coreml, cpu_no_arena];
                 tracing::info!(
-                    "trusty-embedder: registering CoreML + CPU(no-arena) execution providers (Apple Silicon)"
+                    "trusty-embedder: registering CoreML (compute_units={}, static_shapes=true, \
+                     cache={}) + CPU(no-arena) execution providers (Apple Silicon)",
+                    units.as_str(),
+                    cache_dir,
                 );
-                return (
-                    opts.with_execution_providers(providers),
-                    ExecutionProvider::CoreML,
-                );
+                return (opts.with_execution_providers(providers), units_tag);
             }
             tracing::info!(
-                "trusty-embedder: TRUSTY_DEVICE=cpu set — skipping CoreML EP registration (Apple Silicon jetsam-kill avoidance)"
+                "trusty-embedder: TRUSTY_DEVICE=cpu set — skipping CoreML EP registration (Apple Silicon)"
             );
         }
 
@@ -577,31 +638,82 @@ mod tests {
 
     /// Why: counterpart to the test above — confirms the default path still
     /// registers CoreML when `TRUSTY_DEVICE` is unset, so we don't regress
-    /// GPU acceleration for operators who *want* it.
-    /// What: clears `TRUSTY_DEVICE`, calls `init_options`, asserts `CoreML`.
+    /// GPU/ANE acceleration for operators who *want* it. The expected default
+    /// is now `CoreMLAne` (CPU + Neural Engine, no GPU unified-memory
+    /// allocation) — the safe replacement for the original `CoreML` (CPU + GPU
+    /// + ANE) default that caused the 72 GB virtual-RSS spike.
+    /// What: clears `TRUSTY_DEVICE` and `TRUSTY_COREML_COMPUTE_UNITS`, calls
+    /// `init_options`, asserts `CoreMLAne`.
     /// Test: this test, on M-series Mac.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn default_apple_silicon_uses_coreml() {
+    fn default_apple_silicon_uses_coreml_ane() {
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
-        let prev = std::env::var("TRUSTY_DEVICE").ok();
+        let prev_device = std::env::var("TRUSTY_DEVICE").ok();
+        let prev_units = std::env::var("TRUSTY_COREML_COMPUTE_UNITS").ok();
         // SAFETY: single-threaded under ENV_LOCK.
-        unsafe { std::env::remove_var("TRUSTY_DEVICE") };
+        unsafe {
+            std::env::remove_var("TRUSTY_DEVICE");
+            std::env::remove_var("TRUSTY_COREML_COMPUTE_UNITS");
+        }
+
+        let (_opts, provider) = FastEmbedder::init_options(EmbeddingModel::AllMiniLML6V2Q);
+        assert_eq!(
+            provider,
+            ExecutionProvider::CoreMLAne,
+            "default behaviour on Apple Silicon must register CoreML(ANE) — the OOM-safe replacement for CoreML(All)"
+        );
+
+        unsafe {
+            match prev_device {
+                Some(v) => std::env::set_var("TRUSTY_DEVICE", v),
+                None => std::env::remove_var("TRUSTY_DEVICE"),
+            }
+            match prev_units {
+                Some(v) => std::env::set_var("TRUSTY_COREML_COMPUTE_UNITS", v),
+                None => std::env::remove_var("TRUSTY_COREML_COMPUTE_UNITS"),
+            }
+        }
+    }
+
+    /// Why: operators with enough headroom may want the full CPU+GPU+ANE
+    /// pipeline; `TRUSTY_COREML_COMPUTE_UNITS=all` is the documented opt-in.
+    /// What: sets the env var, calls `init_options`, asserts `CoreML` (the
+    /// All variant tag).
+    /// Test: this test, on M-series Mac.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn coreml_compute_units_all_opt_in() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prev_device = std::env::var("TRUSTY_DEVICE").ok();
+        let prev_units = std::env::var("TRUSTY_COREML_COMPUTE_UNITS").ok();
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("TRUSTY_DEVICE");
+            std::env::set_var("TRUSTY_COREML_COMPUTE_UNITS", "all");
+        }
 
         let (_opts, provider) = FastEmbedder::init_options(EmbeddingModel::AllMiniLML6V2Q);
         assert_eq!(
             provider,
             ExecutionProvider::CoreML,
-            "default behaviour on Apple Silicon must still register CoreML"
+            "TRUSTY_COREML_COMPUTE_UNITS=all must select the CoreML(All) tag"
         );
 
         unsafe {
-            match prev {
+            match prev_device {
                 Some(v) => std::env::set_var("TRUSTY_DEVICE", v),
                 None => std::env::remove_var("TRUSTY_DEVICE"),
+            }
+            match prev_units {
+                Some(v) => std::env::set_var("TRUSTY_COREML_COMPUTE_UNITS", v),
+                None => std::env::remove_var("TRUSTY_COREML_COMPUTE_UNITS"),
             }
         }
     }
