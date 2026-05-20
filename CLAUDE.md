@@ -110,7 +110,6 @@ cargo test -p trusty-embedder -- --include-ignored
 **Crate names** match the `name` field in each crate's `Cargo.toml`, not necessarily the directory name.
 Most match (e.g. `crates/trusty-search/` → `-p trusty-search`) but note these exceptions:
 
-- `crates/trusty-memory-mcp/` → `-p trusty-memory` (package renamed in Cargo.toml)
 - `crates/trusty-git-analytics/` → `-p tga` (short name)
 - `crates/open-mpm/` → `-p open-mpm`
 
@@ -133,8 +132,8 @@ trusty-tools/               # workspace root
 │   ├── trusty-cto-db/      # SQLite CTO database (rusqlite-backed)
 │   ├── tc-services/        # service-layer adapters: CTO DB, Granola, GWorkspace
 │   ├── trusty-search/      # hybrid BM25 + vector + KG search daemon + MCP server
-│   ├── trusty-memory-core/ # memory storage engine (usearch + SQLite + fastembed)
-│   ├── trusty-memory-mcp/  # MCP server frontend for memory (includes Svelte UI); published as trusty-memory
+│   ├── trusty-memory-core/ # re-export shim — absorbed into trusty-common's memory-core feature
+│   ├── trusty-memory/      # MCP server frontend for memory (includes Svelte UI)
 │   ├── trusty-analyze/     # code analysis daemon + MCP server
 │   ├── trusty-mpm-core/    # MPM core domain types and traits
 │   ├── trusty-mpm-mcp/     # MCP server for MPM
@@ -273,7 +272,7 @@ When publishing a crate to crates.io:
 ### trusty-memory-core / trusty-memory
 - Licensed **MIT** (not Elastic-2.0). Check before assuming the workspace
   default license applies.
-- `trusty-memory` (directory: `trusty-memory-mcp`) embeds a compiled Svelte UI via `rust-embed`.
+- `trusty-memory` (directory: `trusty-memory`) embeds a compiled Svelte UI via `rust-embed`.
 
 ### trusty-mpm-gui
 - Tauri-based desktop GUI. Its `src-tauri/` subdirectory contains a nested
@@ -420,7 +419,7 @@ PRs, issues, or commit messages that reference the former repo names.
 |---|---|
 | `bobmatnyc/trusty-common` | `crates/trusty-common` + 8 library crates |
 | `bobmatnyc/trusty-search` | `crates/trusty-search` |
-| `bobmatnyc/trusty-memory` | `crates/trusty-memory-core`, `crates/trusty-memory-mcp` (published as `trusty-memory`) |
+| `bobmatnyc/trusty-memory` | `crates/trusty-common` (`memory-core` feature) + `crates/trusty-memory-core` (shim) + `crates/trusty-memory` (MCP frontend) |
 | `bobmatnyc/trusty-analyze` | `crates/trusty-analyze` |
 | `bobmatnyc/trusty-git-analytics` | `crates/trusty-git-analytics` |
 | `bobmatnyc/trusty-mpm` | `crates/trusty-mpm-{core,mcp,daemon,client,cli,tui,telegram,gui}` |

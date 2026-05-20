@@ -26,7 +26,7 @@ authors = ["Bob Matsuoka <bob@matsuoka.com>"]
 
 [workspace.dependencies]
 # ── Internal crates (path deps so the monorepo builds without publish cycles) ──
-trusty-common = { path = "crates/trusty-common", version = "0.3" }
+trusty-common = { path = "crates/trusty-common", version = "0.4" }
 trusty-mcp-core = { path = "crates/trusty-mcp-core", version = "0.1" }
 trusty-embedder = { path = "crates/trusty-embedder", version = "0.1" }
 trusty-symgraph = { path = "crates/trusty-symgraph", version = "0.2.2" }
@@ -92,7 +92,7 @@ tiktoken-rs = "0.5"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 kuzu = "0.9"
 
-# Embedded assets (trusty-memory-mcp, open-mpm).
+# Embedded assets (trusty-memory, open-mpm).
 rust-embed = { version = "8", features = ["include-exclude", "interpolate-folder-path"] }
 mime_guess = "2"
 

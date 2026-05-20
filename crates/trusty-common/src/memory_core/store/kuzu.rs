@@ -133,7 +133,7 @@ impl KuzuSource {
             name,
         };
 
-        #[cfg(feature = "kuzu")]
+        #[cfg(feature = "memory-core-kuzu")]
         {
             // TODO(kuzu): replace stub with:
             //   let db = kuzu::Database::new(&path, kuzu::SystemConfig::default())?;

@@ -15,10 +15,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, OnceCell};
 use tracing::info;
 use trusty_common::mcp::{error_codes, initialize_response, Request, Response};
+use trusty_common::memory_core::embed::FastEmbedder;
+use trusty_common::memory_core::store::ChatSessionStore;
+use trusty_common::memory_core::PalaceRegistry;
 use trusty_common::ChatProvider;
-use trusty_memory_core::embed::FastEmbedder;
-use trusty_memory_core::store::ChatSessionStore;
-use trusty_memory_core::PalaceRegistry;
 
 pub mod openrpc;
 pub mod service;
@@ -547,9 +547,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
 
         // Pre-create the default palace so remember has somewhere to land.
-        let registry = trusty_memory_core::PalaceRegistry::new();
-        let palace = trusty_memory_core::Palace {
-            id: trusty_memory_core::PalaceId::new("default-pal"),
+        let registry = trusty_common::memory_core::PalaceRegistry::new();
+        let palace = trusty_common::memory_core::Palace {
+            id: trusty_common::memory_core::PalaceId::new("default-pal"),
             name: "default-pal".to_string(),
             description: None,
             created_at: chrono::Utc::now(),

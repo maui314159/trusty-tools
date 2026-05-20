@@ -23,11 +23,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
-use trusty_memory_core::registry::PalaceRegistry;
-use trusty_memory_core::retrieval::PalaceHandle;
-use trusty_memory_core::store::payload_store::PayloadStore;
-use trusty_memory_core::store::vector::VectorStore;
+use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
+use trusty_common::memory_core::registry::PalaceRegistry;
+use trusty_common::memory_core::retrieval::PalaceHandle;
+use trusty_common::memory_core::store::payload_store::PayloadStore;
+use trusty_common::memory_core::store::vector::VectorStore;
 
 use crate::memory::store::{MemoryResult, MemoryStore, Segment};
 

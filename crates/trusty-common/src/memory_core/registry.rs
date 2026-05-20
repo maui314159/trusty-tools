@@ -8,9 +8,9 @@
 //! [`crate::retrieval`] — there is exactly one `PalaceHandle` in the crate.
 //! Test: Register two palaces on separate tasks, assert both visible via `list()`.
 
-use crate::palace::{Palace, PalaceId};
-use crate::retrieval::PalaceHandle;
-use crate::store::palace_store::PalaceStore;
+use crate::memory_core::palace::{Palace, PalaceId};
+use crate::memory_core::retrieval::PalaceHandle;
+use crate::memory_core::store::palace_store::PalaceStore;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::path::Path;
@@ -153,7 +153,7 @@ impl PalaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{kg::KnowledgeGraph, vector::UsearchStore};
+    use crate::memory_core::store::{kg::KnowledgeGraph, vector::UsearchStore};
     use tempfile::tempdir;
 
     fn make_handle(id: &str, dir: &std::path::Path) -> PalaceHandle {
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn registry_create_and_open() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         use chrono::Utc;
 
         let dir = tempdir().unwrap();
@@ -196,7 +196,7 @@ mod tests {
             assert_eq!(handle.id, PalaceId::new("alpha"));
             // Persist a tiny identity directly (PalaceHandle.identity is set
             // at open time so we mutate via PalaceStore for the test).
-            crate::store::palace_store::PalaceStore::save_identity(
+            crate::memory_core::store::palace_store::PalaceStore::save_identity(
                 &handle.id,
                 "I am Alpha",
                 handle.data_dir.as_ref().expect("data_dir set"),
@@ -228,7 +228,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn palace_payloads_survive_registry_restart() {
-        use crate::palace::{Palace, RoomType};
+        use crate::memory_core::palace::{Palace, RoomType};
         use chrono::Utc;
 
         let dir = tempdir().unwrap();

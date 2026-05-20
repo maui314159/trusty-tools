@@ -8,7 +8,7 @@
 //! `<data_dir>/l1_cache.json` plus an `is_stale` mtime helper.
 //! Test: `l1_cache_roundtrip` and `l1_cache_stale` in this module.
 
-use crate::palace::Drawer;
+use crate::memory_core::palace::Drawer;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;

@@ -1,6 +1,6 @@
 [package]
 name = "trusty-common"
-version = "0.3.3"
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -62,6 +62,23 @@ prettyplease = { version = "0.2", optional = true }
 proc-macro2 = { version = "1.0", optional = true }
 quote = { version = "1.0", optional = true }
 genco = { version = "0.19", optional = true }
+
+# Optional: enabled by the `memory-core` feature (formerly the
+# `trusty-memory-core` crate). Memory Palace storage engine — usearch
+# vector index, SQLite-backed knowledge graph, fastembed embeddings,
+# git-history extraction, dream/decay analytics. Heavy deps gated behind
+# the feature so downstream crates that only want chat / mcp / symgraph
+# pay zero cost.
+usearch = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+r2d2 = { workspace = true, optional = true }
+r2d2_sqlite = { workspace = true, optional = true }
+git2 = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+kuzu = { workspace = true, optional = true }
 
 # launchd module is macOS-only and needs getuid(2) for the gui/<uid> domain.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -167,3 +184,31 @@ symgraph-parser = [
 # Enables the symgraph HTTP server module (axum + tokio). Implies the
 # full parser stack.
 symgraph-server = ["symgraph-parser", "axum-server"]
+# Enables the `memory_core` module: Memory Palace storage engine
+# (formerly the `trusty-memory-core` crate). Pulls in usearch (HNSW
+# vector index), rusqlite + r2d2 + r2d2_sqlite (SQLite-backed knowledge
+# graph), git2 (git history extraction), and dashmap / chrono / regex /
+# parking_lot / thiserror / uuid utilities. Requires the bundled-ORT
+# embedder variant by default so FastEmbedder is available; downstream
+# consumers can switch to the load-dynamic or CUDA variants by enabling
+# `embedder-load-dynamic` / `embedder-cuda` explicitly.
+memory-core = [
+    "dep:usearch",
+    "dep:rusqlite",
+    "dep:r2d2",
+    "dep:r2d2_sqlite",
+    "dep:git2",
+    "dep:dashmap",
+    "dep:futures",
+    "dep:chrono",
+    "dep:regex",
+    "dep:parking_lot",
+    "dep:thiserror",
+    "dep:uuid",
+    "embedder",
+    "embedder-bundled-ort",
+]
+# Optional kuzu graph DB read-only integration on top of the memory-core
+# feature. Pulls in the `kuzu` crate. Off by default because kuzu adds a
+# large native dependency.
+memory-core-kuzu = ["memory-core", "dep:kuzu"]

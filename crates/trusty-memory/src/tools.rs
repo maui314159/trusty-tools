@@ -22,9 +22,9 @@
 use crate::AppState;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
-use trusty_memory_core::retrieval::{recall, recall_across_palaces, recall_deep};
-use trusty_memory_core::store::kg::Triple;
+use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
+use trusty_common::memory_core::retrieval::{recall, recall_across_palaces, recall_deep};
+use trusty_common::memory_core::store::kg::Triple;
 use uuid::Uuid;
 
 /// Marker server type. Reserved for future stateful MCP server impls.
@@ -279,7 +279,7 @@ fn parse_room(s: Option<&str>) -> RoomType {
 fn open_palace_handle(
     state: &AppState,
     palace_id: &str,
-) -> Result<std::sync::Arc<trusty_memory_core::PalaceHandle>> {
+) -> Result<std::sync::Arc<trusty_common::memory_core::PalaceHandle>> {
     let pid = PalaceId::new(palace_id);
     state
         .registry
@@ -404,7 +404,7 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
         "palace_list" => {
             let root = state.data_root.clone();
             let palaces = tokio::task::spawn_blocking(move || {
-                trusty_memory_core::PalaceRegistry::list_palaces(&root)
+                trusty_common::memory_core::PalaceRegistry::list_palaces(&root)
             })
             .await
             .context("join list_palaces")??;
@@ -567,7 +567,7 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             // namespace cannot fail the whole fan-out.
             let root = state.data_root.clone();
             let palaces = tokio::task::spawn_blocking(move || {
-                trusty_memory_core::PalaceRegistry::list_palaces(&root)
+                trusty_common::memory_core::PalaceRegistry::list_palaces(&root)
             })
             .await
             .context("join list_palaces")??;
@@ -583,8 +583,9 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             }
 
             let embedder = state.embedder().await?;
-            let erased: std::sync::Arc<dyn trusty_memory_core::embed::Embedder + Send + Sync> =
-                embedder;
+            let erased: std::sync::Arc<
+                dyn trusty_common::memory_core::embed::Embedder + Send + Sync,
+            > = embedder;
             let results = recall_across_palaces(&handles, &erased, query, top_k, deep)
                 .await
                 .context("recall_across_palaces")?;
@@ -613,7 +614,7 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
 fn serialize_recall(
     palace: &str,
     query: &str,
-    results: Vec<trusty_memory_core::retrieval::RecallResult>,
+    results: Vec<trusty_common::memory_core::retrieval::RecallResult>,
 ) -> Value {
     let payload: Vec<Value> = results
         .iter()

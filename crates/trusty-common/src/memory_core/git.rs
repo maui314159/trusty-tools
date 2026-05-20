@@ -10,7 +10,7 @@
 //!       parsing, file-path classification, importance scoring, entity extraction,
 //!       and end-to-end extraction against the trusty-memory repo itself.
 
-use crate::palace::{Drawer, RoomType};
+use crate::memory_core::palace::{Drawer, RoomType};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
@@ -395,10 +395,10 @@ impl GitExtractor {
                 .single()
                 .unwrap_or_else(Utc::now);
 
-            if let Some(since) = since {
-                if committed_at < since {
-                    break;
-                }
+            if let Some(since) = since
+                && committed_at < since
+            {
+                break;
             }
 
             let message = commit.message().unwrap_or("").to_string();

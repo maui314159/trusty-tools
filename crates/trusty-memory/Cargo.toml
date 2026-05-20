@@ -1,9 +1,10 @@
 [package]
 name = "trusty-memory"
-version = "0.1.49"
+version = "0.1.50"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
+readme = "README.md"
 
 exclude = [".fastembed_cache/"]
 
@@ -16,8 +17,7 @@ exclude = [".fastembed_cache/"]
 crate-type = ["rlib"]
 
 [dependencies]
-trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
-trusty-common = { path = "../trusty-common", version = "0.3.3", features = ["axum-server", "mcp"] }
+trusty-common = { path = "../trusty-common", version = "0.4.0", features = ["axum-server", "mcp", "memory-core"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

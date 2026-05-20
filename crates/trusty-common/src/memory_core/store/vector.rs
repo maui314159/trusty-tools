@@ -188,12 +188,12 @@ impl UsearchStore {
             })?;
         } else {
             // Ensure parent directory exists before any future save.
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create parent dir for usearch index: {parent:?}")
-                    })?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent dir for usearch index: {parent:?}")
+                })?;
             }
             index
                 .reserve(DEFAULT_INITIAL_CAPACITY)

@@ -27,7 +27,6 @@ include = [
 ]
 
 [dependencies]
-trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 # Why: issue #460 unified rpc.discover — host needs the ServiceDescriptor
 #      trait + OpenRpcBuilder, plus the in-process MemoryMcpService and
 #      SearchMcpService impls. trusty-search now aligns on tree-sitter 0.26
@@ -35,8 +34,10 @@ trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 #      single-copy conflict is resolved and we link it directly.
 # The `symgraph-parser` feature pulls in the full symbol-graph engine
 # (absorbed from the former `trusty-symgraph` crate in #5 phase 2c).
-trusty-common = { workspace = true, features = ["mcp", "symgraph-parser"] }
-trusty-memory = { path = "../trusty-memory-mcp", version = "0.1.19" }
+# The `memory-core` feature pulls in the Memory Palace storage engine
+# (absorbed from the former `trusty-memory-core` crate in #5 phase 2d).
+trusty-common = { workspace = true, features = ["mcp", "symgraph-parser", "memory-core"] }
+trusty-memory = { path = "../trusty-memory", version = "0.1.50" }
 trusty-search = { path = "../trusty-search", version = "0.3.45" }
 tokio = { version = "1", features = ["full"] }
 async-openai = "0.30"

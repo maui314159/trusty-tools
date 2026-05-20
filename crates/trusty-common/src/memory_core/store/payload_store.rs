@@ -108,13 +108,13 @@ impl PayloadStore {
     /// `payloads` table plus the `idx_payloads_uuid` lookup index.
     /// Test: `roundtrip_persists_across_reopen` opens the same path twice.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| PayloadStoreError::Sqlite {
-                    path: path.to_path_buf(),
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| PayloadStoreError::Sqlite {
+                path: path.to_path_buf(),
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
+            })?;
         }
         let manager = SqliteConnectionManager::file(path);
         let pool =

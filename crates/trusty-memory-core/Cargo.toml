@@ -1,64 +1,25 @@
 [package]
 name = "trusty-memory-core"
-version = "0.1.19"
+version = "0.2.0"
 edition = "2021"
-description = "Core types, storage, and retrieval for trusty-memory"
+description = "Backward-compat shim — use trusty_common::memory_core directly"
 license = "MIT"
+publish = false
 
 [lib]
-# Why: Explicit `rlib` keeps the crate linkable as a Rust library from
-#      host processes (open-mpm) that want to embed it directly rather
-#      than spawn it over MCP/stdio. Matches the rest of the trusty-*
-#      ecosystem (see trusty-mcp-core) and prevents future drift if a
-#      `cdylib` or other crate-type is ever added.
+# Why: Explicit `rlib` matches the rest of the trusty-* ecosystem and
+#      keeps the shim linkable from binaries that still reference this
+#      crate by name.
 crate-type = ["rlib"]
 
 [dependencies]
-# workspace
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-async-trait = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
-dashmap = { workspace = true }
-parking_lot = { workspace = true }
-futures = { workspace = true }
-
-# storage
-usearch = { workspace = true }
-rusqlite = { workspace = true }
-r2d2 = { workspace = true }
-r2d2_sqlite = { workspace = true }
-
-# embedding (absorbed into trusty-common behind the `embedder` feature;
-# pull in the default `embedder-bundled-ort` sub-feature for the bundled
-# ORT linking path).
-trusty-common = { workspace = true, features = ["embedder", "embedder-bundled-ort"] }
-
-# utils
-tiktoken-rs = { workspace = true }
-dirs = { workspace = true }
-
-# git history extraction
-git2 = { workspace = true }
-regex = { workspace = true }
-
-# optional: kuzu graph DB read-only integration
-kuzu = { workspace = true, optional = true }
+# The entire surface re-exports from trusty-common's memory-core feature.
+# No other deps are required — every type, trait, and function lives in
+# trusty_common::memory_core::*.
+trusty-common = { workspace = true, features = ["memory-core"] }
 
 [features]
 default = []
-kuzu = ["dep:kuzu"]
-
-[dev-dependencies]
-tempfile = { workspace = true }
-tokio = { workspace = true }
-criterion = { workspace = true }
-
-[[bench]]
-name = "retrieval"
-harness = false
+# Forward to trusty-common's `memory-core-kuzu` feature so existing call sites
+# that enable `trusty-memory-core/kuzu` continue to work.
+kuzu = ["trusty-common/memory-core-kuzu"]

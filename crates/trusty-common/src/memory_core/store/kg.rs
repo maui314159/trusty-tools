@@ -7,7 +7,7 @@
 //! Test: Asserting (s,p,o) twice should close the first interval and open a
 //! new one; `query_active` returns only the latest.
 
-use crate::palace::Drawer;
+use crate::memory_core::palace::Drawer;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use r2d2::Pool;

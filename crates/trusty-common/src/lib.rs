@@ -102,6 +102,23 @@ pub mod embedder;
 #[cfg(feature = "symgraph")]
 pub mod symgraph;
 
+/// Memory Palace storage engine (formerly the `trusty-memory-core` crate).
+///
+/// Why: Centralises the Memory Palace data model (`Palace` / `Wing` /
+/// `Room` / `Drawer`), storage backends (usearch vector index + SQLite
+/// knowledge graph + chat-session log + payload store), retrieval handle,
+/// and the dream / decay / analytics / git-history surfaces so every
+/// trusty-* binary that talks to a palace reuses the same types. Absorbed
+/// into `trusty-common` (issue #5 phase 2d) so we ship one fewer published
+/// crate.
+/// What: Gated behind the `memory-core` feature because it pulls in heavy
+/// storage deps (`usearch`, `rusqlite`, `r2d2`, `git2`, `kuzu`). Enables
+/// the embedder surface automatically (memory-core → embedder).
+/// Test: `cargo test -p trusty-common --features memory-core` exercises
+/// the full surface.
+#[cfg(feature = "memory-core")]
+pub mod memory_core;
+
 pub use chat::{
     ChatEvent, ChatProvider, LocalModelConfig, OllamaProvider, OpenRouterProvider, ToolCall,
     ToolDef, auto_detect_local_provider,

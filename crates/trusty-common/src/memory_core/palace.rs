@@ -145,7 +145,7 @@ impl Drawer {
     /// computed boost so `DecayConfig::effective_importance` stays pure.
     /// What: `(access_count * config.access_boost).min(config.access_boost_cap)`
     /// Test: See `decay::tests::drawer_accumulated_boost`.
-    pub fn accumulated_boost(&self, config: &crate::decay::DecayConfig) -> f32 {
+    pub fn accumulated_boost(&self, config: &crate::memory_core::decay::DecayConfig) -> f32 {
         (self.access_count as f32 * config.access_boost).min(config.access_boost_cap)
     }
 

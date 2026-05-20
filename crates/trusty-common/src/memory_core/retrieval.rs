@@ -10,16 +10,16 @@
 //! Test: `cargo test -p trusty-memory-core retrieval::` exercises L0/L1 cache
 //! and L2 vector retrieval end-to-end.
 
-use crate::analytics::{query_hash, RecallEvent, RecallLog};
+use crate::memory_core::analytics::{RecallEvent, RecallLog, query_hash};
 const RECALL_LOG_FILENAME: &str = "recall.db";
-use crate::decay::DecayConfig;
-use crate::dream::extract_keywords;
-use crate::embed::{Embedder, FastEmbedder};
-use crate::palace::{Drawer, Palace, PalaceId, RoomType};
-use crate::store::kg::KnowledgeGraph;
-use crate::store::l1_cache::L1Cache;
-use crate::store::palace_store::PalaceStore;
-use crate::store::vector::{UsearchStore, VectorStore};
+use crate::memory_core::decay::DecayConfig;
+use crate::memory_core::dream::extract_keywords;
+use crate::memory_core::embed::{Embedder, FastEmbedder};
+use crate::memory_core::palace::{Drawer, Palace, PalaceId, RoomType};
+use crate::memory_core::store::kg::KnowledgeGraph;
+use crate::memory_core::store::l1_cache::L1Cache;
+use crate::memory_core::store::palace_store::PalaceStore;
+use crate::memory_core::store::vector::{UsearchStore, VectorStore};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -1064,7 +1064,7 @@ impl RetrievalLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{kg::KnowledgeGraph, vector::UsearchStore};
+    use crate::memory_core::store::{kg::KnowledgeGraph, vector::UsearchStore};
     use tempfile::tempdir;
 
     fn make_handle(dir: &std::path::Path) -> PalaceHandle {
@@ -1092,7 +1092,9 @@ mod tests {
     async fn l2_returns_relevant_drawer() {
         let dir = tempdir().unwrap();
         let handle = make_handle(dir.path());
-        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let embedder = crate::memory_core::embed::FastEmbedder::new()
+            .await
+            .unwrap();
 
         let room_id = uuid::Uuid::new_v4();
         let drawer = Drawer::new(room_id, "Rust is a systems programming language");
@@ -1130,7 +1132,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn cli_remember_and_recall() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("test"),
@@ -1177,7 +1179,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn cli_forget_removes_drawer() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("forget-test"),
@@ -1216,7 +1218,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn cli_list_filters_by_room() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("list-test"),
@@ -1260,7 +1262,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = Arc::new(RecallLog::open(&dir.path().join("recall.db")).unwrap());
         let mut handle = make_handle(dir.path()).with_recall_log(log.clone());
-        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let embedder = crate::memory_core::embed::FastEmbedder::new()
+            .await
+            .unwrap();
 
         let room_id = uuid::Uuid::new_v4();
         let drawer = Drawer::new(room_id, "Rust is a systems programming language");
@@ -1303,7 +1307,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn open_attaches_recall_log_automatically() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("analytics-auto"),
@@ -1335,7 +1339,9 @@ mod tests {
             .await
             .unwrap();
 
-        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let embedder = crate::memory_core::embed::FastEmbedder::new()
+            .await
+            .unwrap();
         let _ = recall(&handle, &embedder, "platypus monotreme", 5)
             .await
             .unwrap();
@@ -1362,7 +1368,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn closet_updated_after_remember() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("closet-test"),
@@ -1441,7 +1447,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn cold_restart_recalls_beyond_l1_snapshot() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("cold-restart"),
@@ -1525,7 +1531,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn retrieve_l2_tag_boost_raises_rank() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
         let palace = Palace {
             id: PalaceId::new("boost-test"),
@@ -1558,7 +1564,9 @@ mod tests {
             .await
             .unwrap();
 
-        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let embedder = crate::memory_core::embed::FastEmbedder::new()
+            .await
+            .unwrap();
         let results = retrieve_l2(&handle, &embedder, "vector search performance", None, 5)
             .await
             .unwrap();
@@ -1582,7 +1590,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn recall_across_palaces_merges_results() {
-        use crate::palace::Palace;
+        use crate::memory_core::palace::Palace;
         let dir = tempdir().unwrap();
 
         let palace_a = Palace {

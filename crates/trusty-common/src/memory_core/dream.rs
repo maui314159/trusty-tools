@@ -10,18 +10,18 @@
 //! Test: `cargo test -p trusty-memory-core dream::tests::` exercises every
 //! moving part — defaults, idle clock, merge, prune, closet refresh.
 
-use crate::decay::DecayConfig;
-use crate::embed::Embedder;
-use crate::palace::Drawer;
-use crate::retrieval::{shared_embedder, PalaceHandle};
-use crate::store::vector::VectorStore;
+use crate::memory_core::decay::DecayConfig;
+use crate::memory_core::embed::Embedder;
+use crate::memory_core::palace::Drawer;
+use crate::memory_core::retrieval::{PalaceHandle, shared_embedder};
+use crate::memory_core::store::vector::VectorStore;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -674,8 +674,8 @@ type _PalaceHandleRef = RwLock<()>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::palace::{Palace, PalaceId, RoomType};
-    use crate::retrieval::PalaceHandle;
+    use crate::memory_core::palace::{Palace, PalaceId, RoomType};
+    use crate::memory_core::retrieval::PalaceHandle;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::tempdir;
 

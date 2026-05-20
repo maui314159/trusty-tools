@@ -24,15 +24,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
-use trusty_common::{ChatEvent, ChatMessage, ToolDef};
-use trusty_memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
-use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
-use trusty_memory_core::retrieval::{
+use trusty_common::memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
+use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
+use trusty_common::memory_core::retrieval::{
     recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
     recall_with_default_embedder,
 };
-use trusty_memory_core::store::kg::Triple;
-use trusty_memory_core::{PalaceHandle, PalaceRegistry};
+use trusty_common::memory_core::store::kg::Triple;
+use trusty_common::memory_core::{PalaceHandle, PalaceRegistry};
+use trusty_common::{ChatEvent, ChatMessage, ToolDef};
 use uuid::Uuid;
 
 /// Embedded UI assets produced by `pnpm build` in `ui/`.
@@ -1662,13 +1662,16 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                     tool_calls: None,
                 });
             }
-            let core_history: Vec<trusty_memory_core::store::chat_sessions::ChatMessage> = history
-                .iter()
-                .map(|m| trusty_memory_core::store::chat_sessions::ChatMessage {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                })
-                .collect();
+            let core_history: Vec<trusty_common::memory_core::store::chat_sessions::ChatMessage> =
+                history
+                    .iter()
+                    .map(
+                        |m| trusty_common::memory_core::store::chat_sessions::ChatMessage {
+                            role: m.role.clone(),
+                            content: m.content.clone(),
+                        },
+                    )
+                    .collect();
             if let Err(e) = store.upsert_session(sid, &core_history) {
                 tracing::warn!("upsert_session failed: {e:#}");
             }
@@ -1804,7 +1807,7 @@ async fn delete_chat_session(
 fn open_handle(
     state: &AppState,
     id: &str,
-) -> Result<std::sync::Arc<trusty_memory_core::PalaceHandle>, ApiError> {
+) -> Result<std::sync::Arc<trusty_common::memory_core::PalaceHandle>, ApiError> {
     state
         .registry
         .open_palace(&state.data_root, &PalaceId::new(id))
@@ -2043,7 +2046,7 @@ mod tests {
     async fn chat_session_crud_round_trip() {
         let state = test_state();
         // Pre-create a palace dir so session store has a place to live.
-        let palace = trusty_memory_core::Palace {
+        let palace = trusty_common::memory_core::Palace {
             id: PalaceId::new("sess-test"),
             name: "sess-test".to_string(),
             description: None,
@@ -2300,7 +2303,7 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn dream_status_aggregates_across_palaces() {
-        use trusty_memory_core::dream::{DreamStats, PersistedDreamStats};
+        use trusty_common::memory_core::dream::{DreamStats, PersistedDreamStats};
 
         let state = test_state();
         // Two palace directories — each must contain a `palace.json` so
@@ -2330,7 +2333,7 @@ mod tests {
                 chrono::Utc::now(),
             ),
         ] {
-            let palace = trusty_memory_core::Palace {
+            let palace = trusty_common::memory_core::Palace {
                 id: PalaceId::new(id),
                 name: id.to_string(),
                 description: None,
@@ -2403,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn dream_run_aggregates_stats() {
         let state = test_state();
-        let palace = trusty_memory_core::Palace {
+        let palace = trusty_common::memory_core::Palace {
             id: PalaceId::new("dream-run-test"),
             name: "dream-run-test".to_string(),
             description: None,
