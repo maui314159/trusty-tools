@@ -489,6 +489,24 @@ enum Commands {
         fix: bool,
     },
 
+    /// Get or set runtime daemon configuration (memory limits)
+    ///
+    /// Updates take effect immediately on the running daemon — no restart
+    /// required. Use `0`, `off`, `none`, `disable`, or `unlimited` as the
+    /// value to remove a limit.
+    ///
+    /// Examples:
+    ///   trusty-search config get
+    ///   trusty-search config get memory-limit
+    ///   trusty-search config set memory-limit 16384
+    ///   trusty-search config set index-memory-limit 65536
+    ///   trusty-search config set memory-limit off
+    #[command(display_order = 29)]
+    Config {
+        #[command(subcommand)]
+        action: commands::config::ConfigAction,
+    },
+
     /// Generate shell completion script
     ///
     /// Examples:
@@ -675,6 +693,10 @@ async fn run() -> Result<()> {
 
         Commands::Doctor { fix } => {
             commands::doctor::handle_doctor(fix).await?;
+        }
+
+        Commands::Config { action } => {
+            commands::config::handle_config(action).await?;
         }
 
         Commands::Completions { shell } => {

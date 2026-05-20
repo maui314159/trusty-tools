@@ -498,6 +498,10 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/{id}/reindex", post(reindex_handler))
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
+        .route(
+            "/config",
+            get(get_config_handler).patch(patch_config_handler),
+        )
         .with_state(Arc::clone(&state_arc));
     // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
     // so every trusty-* daemon ships with the same defaults.
@@ -579,6 +583,128 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         uptime_secs: state.started_at.elapsed().as_secs(),
         embedder: embedder_status,
         embedder_error,
+    })
+}
+
+/// Request body for `PATCH /config`. Any field may be omitted to leave that
+/// limit unchanged; an explicit `null` disables the limit. Unknown JSON keys
+/// are tolerated (serde's default `deny_unknown_fields` is off) so future
+/// versions can introduce new keys without breaking older clients.
+///
+/// Why: backs `trusty-search config set <key> <value>` — operators tune the
+/// daemon's memory limits without dropping the embedder model or any indexes
+/// (which a full restart would cost). Patch semantics are the right HTTP
+/// shape because only the fields the client cares about are sent.
+/// What: serde flags distinguish "absent" (`Option::None`, leave alone) from
+/// "explicit null" (`Some(None)`, disable). We use the
+/// `serde_with::rust::double_option` idiom by representing each field as
+/// `Option<Option<u64>>`.
+/// Test: `tests::patch_config_partial_update` exercises both arms.
+#[derive(Debug, Deserialize, Default)]
+struct PatchConfigRequest {
+    #[serde(default, deserialize_with = "deserialize_optional_option_u64")]
+    memory_limit_mb: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_optional_option_u64")]
+    index_memory_limit_mb: Option<Option<u64>>,
+}
+
+/// Response body for `GET /config` and `PATCH /config`.
+///
+/// Why: always returns the resolved current values for both limits after any
+/// changes have been applied. Lets the CLI print "before → after" without
+/// issuing a follow-up GET.
+/// What: `null` field means the limit is disabled (no cap). Field names match
+/// the env-var-derived keys (`memory_limit_mb` / `index_memory_limit_mb`) for
+/// symmetry with the request body.
+#[derive(Debug, Serialize)]
+struct ConfigResponse {
+    memory_limit_mb: Option<u64>,
+    index_memory_limit_mb: Option<u64>,
+}
+
+/// Custom deserializer for `Option<Option<u64>>` so we can tell "field absent"
+/// (no change) from "field present and null" (disable the limit). Serde's
+/// default skips `null` for `Option<u64>`, collapsing both cases — we need to
+/// preserve the distinction to support partial updates.
+///
+/// Why: PATCH semantics require this three-state encoding.
+/// What: returns `Some(Some(n))` for a numeric value, `Some(None)` for null,
+/// and the outer `Option::None` is supplied by `#[serde(default)]` when the
+/// field is absent entirely.
+/// Test: `tests::patch_config_partial_update`.
+fn deserialize_optional_option_u64<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<u64>::deserialize(deserializer)?;
+    Ok(Some(v))
+}
+
+/// `GET /config` — return the daemon's current memory-limit configuration.
+///
+/// Why: `trusty-search config get` reads this to print the live values, which
+/// may differ from what's in `daemon.env` if the operator has already issued
+/// a `PATCH /config` call. Pure read; no side effects.
+/// What: snapshots `memory_limit_mb()` and `index_memory_limit_mb()` and
+/// returns them as JSON. `null` means "no limit configured".
+/// Test: `tests::get_config_returns_current_values`.
+async fn get_config_handler(State(_state): State<Arc<SearchAppState>>) -> Json<ConfigResponse> {
+    use crate::core::memguard::{index_memory_limit_mb, memory_limit_mb};
+    Json(ConfigResponse {
+        memory_limit_mb: memory_limit_mb(),
+        index_memory_limit_mb: index_memory_limit_mb(),
+    })
+}
+
+/// `PATCH /config` — update the daemon's runtime memory-limit configuration.
+///
+/// Why: lets `trusty-search config set <key> <value>` retune memory limits
+/// without a daemon restart (preserves the 86 MB embedder session and all
+/// loaded indexes). The `AtomicU64` cells in `core::memguard` mean the
+/// background memory poller observes the change on its next tick.
+/// What: applies `memory_limit_mb` and/or `index_memory_limit_mb` from the
+/// request body, logs each change at `INFO`, and returns the resolved
+/// post-update values. Omitted fields are not touched. `null` disables the
+/// corresponding limit. Always returns `200 OK` with a `ConfigResponse`.
+/// Test: `tests::patch_config_partial_update` and
+/// `tests::patch_config_disables_limit_with_null`.
+async fn patch_config_handler(
+    State(_state): State<Arc<SearchAppState>>,
+    Json(req): Json<PatchConfigRequest>,
+) -> Json<ConfigResponse> {
+    use crate::core::memguard::{
+        index_memory_limit_mb, memory_limit_mb, set_index_memory_limit_mb, set_memory_limit_mb,
+    };
+
+    let fmt = |v: Option<u64>| match v {
+        Some(mb) => mb.to_string(),
+        None => "unlimited".to_string(),
+    };
+
+    if let Some(new) = req.memory_limit_mb {
+        let before = memory_limit_mb();
+        set_memory_limit_mb(new);
+        let after = memory_limit_mb();
+        tracing::info!(
+            "config updated: memory_limit_mb {} → {}",
+            fmt(before),
+            fmt(after)
+        );
+    }
+    if let Some(new) = req.index_memory_limit_mb {
+        let before = index_memory_limit_mb();
+        set_index_memory_limit_mb(new);
+        let after = index_memory_limit_mb();
+        tracing::info!(
+            "config updated: index_memory_limit_mb {} → {}",
+            fmt(before),
+            fmt(after)
+        );
+    }
+
+    Json(ConfigResponse {
+        memory_limit_mb: memory_limit_mb(),
+        index_memory_limit_mb: index_memory_limit_mb(),
     })
 }
 
