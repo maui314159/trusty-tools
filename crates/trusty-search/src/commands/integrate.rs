@@ -155,10 +155,7 @@ pub async fn handle_integrate(
         IntegrateTarget::Cursor => {}
     }
 
-    println!(
-        "{} Integrating trusty-search with Cursor…\n",
-        "⟳".cyan()
-    );
+    println!("{} Integrating trusty-search with Cursor…\n", "⟳".cyan());
     if dry_run {
         println!("{} Dry run — no files will be modified.\n", "·".dimmed());
     }
@@ -261,10 +258,7 @@ fn upsert_cursor_mcp(path: &Path, dry_run: bool) -> Result<McpFileResult> {
 
     // Ensure `mcpServers` exists and is an object; create it if missing.
     if !root.is_object() {
-        return Err(anyhow::anyhow!(
-            "{} is not a JSON object",
-            path.display()
-        ));
+        return Err(anyhow::anyhow!("{} is not a JSON object", path.display()));
     }
     let obj = root
         .as_object_mut()
@@ -272,9 +266,9 @@ fn upsert_cursor_mcp(path: &Path, dry_run: bool) -> Result<McpFileResult> {
     let servers_entry = obj
         .entry("mcpServers".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
-    let servers = servers_entry.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("`mcpServers` in {} is not an object", path.display())
-    })?;
+    let servers = servers_entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`mcpServers` in {} is not an object", path.display()))?;
 
     // Idempotency: a trusty-search entry already present means a previous run
     // (or the user) already configured this file — never overwrite it.
@@ -320,10 +314,7 @@ fn upsert_cursor_mcp(path: &Path, dry_run: bool) -> Result<McpFileResult> {
 /// Test: `test_upsert_creates_fresh_config` asserts the inserted value.
 fn trusty_server_entry() -> Value {
     let mut entry = Map::new();
-    entry.insert(
-        "command".to_string(),
-        Value::String(TRUSTY_KEY.to_string()),
-    );
+    entry.insert("command".to_string(), Value::String(TRUSTY_KEY.to_string()));
     entry.insert(
         "args".to_string(),
         Value::Array(vec![Value::String("serve".to_string())]),
@@ -363,8 +354,7 @@ fn write_cursor_rules(dir: &Path, dry_run: bool) -> Result<RulesResult> {
         });
     }
 
-    fs::create_dir_all(dir)
-        .with_context(|| format!("create rules dir {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("create rules dir {}", dir.display()))?;
     fs::write(&path, CURSOR_RULES_BODY)
         .with_context(|| format!("write rules file {}", path.display()))?;
 
@@ -424,12 +414,10 @@ fn make_timestamp() -> String {
 /// Test: `test_upsert_creates_fresh_config` confirms the post-write content.
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create dir {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
     }
 
-    let pretty =
-        serde_json::to_string_pretty(value).context("serialize Cursor MCP config")?;
+    let pretty = serde_json::to_string_pretty(value).context("serialize Cursor MCP config")?;
 
     // Append `.tmp` to the *full* file name so multi-dot names round-trip.
     let file_name = path
@@ -456,11 +444,10 @@ fn print_mcp_line(label: &str, display_path: &str, r: &McpFileResult) {
         McpFileStatus::Written => {
             let suffix = match &r.backup {
                 Some(b) => {
-                    let name = b
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("backup");
-                    format!(" (backup: {BACKUP_DIR_NAME}/{name})").dimmed().to_string()
+                    let name = b.file_name().and_then(|n| n.to_str()).unwrap_or("backup");
+                    format!(" (backup: {BACKUP_DIR_NAME}/{name})")
+                        .dimmed()
+                        .to_string()
                 }
                 None => String::new(),
             };
@@ -530,8 +517,7 @@ mod tests {
         assert!(result.backup.is_none(), "no backup for a fresh file");
         assert!(path.exists(), "config file should be written");
 
-        let written: Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let servers = written["mcpServers"].as_object().unwrap();
         assert_eq!(servers["trusty-search"]["command"], "trusty-search");
         assert_eq!(servers["trusty-search"]["args"][0], "serve");
@@ -583,15 +569,13 @@ mod tests {
             },
             "unrelatedTopLevel": "keep-me"
         });
-        fs::write(&path, serde_json::to_string_pretty(&input).unwrap())
-            .expect("write input");
+        fs::write(&path, serde_json::to_string_pretty(&input).unwrap()).expect("write input");
 
         let result = upsert_cursor_mcp(&path, false).expect("upsert");
         assert_eq!(result.status, McpFileStatus::Written);
         assert!(result.backup.is_some(), "existing file should be backed up");
 
-        let written: Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let servers = written["mcpServers"].as_object().unwrap();
         assert!(
             servers.contains_key("other-server"),

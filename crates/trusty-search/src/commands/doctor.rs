@@ -118,9 +118,9 @@ async fn apply_fixes(checks: &[CheckResult], empty_indexes: &[EmptyIndex]) {
     }
 
     // Fix 4: stderr.log has no rotation policy — install one (issue #127).
-    let has_rotation_warn = checks.iter().any(|c| {
-        matches!(c, CheckResult::Warn(msg) if msg.contains("no rotation policy"))
-    });
+    let has_rotation_warn = checks
+        .iter()
+        .any(|c| matches!(c, CheckResult::Warn(msg) if msg.contains("no rotation policy")));
     if has_rotation_warn {
         if !fixed_any {
             println!("\nFixing issues...");
@@ -153,10 +153,7 @@ fn fix_log_rotation() {
                 );
                 println!("    {} {}", "·".dimmed(), conf.dimmed());
             }
-            Err(e) => println!(
-                "  {} Could not install log rotation: {e}",
-                "✗".red()
-            ),
+            Err(e) => println!("  {} Could not install log rotation: {e}", "✗".red()),
         }
     }
     #[cfg(not(target_os = "macos"))]

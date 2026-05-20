@@ -168,9 +168,7 @@ pub fn rotation_configured() -> bool {
     if system.exists() {
         return true;
     }
-    newsyslog_conf_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    newsyslog_conf_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Install the user-level newsyslog config + rotation LaunchAgent.
@@ -264,7 +262,9 @@ mod tests {
 
     #[test]
     fn rotation_plist_body_invokes_newsyslog() {
-        let conf = std::path::Path::new("/Users/test/Library/Application Support/trusty-search/newsyslog.conf");
+        let conf = std::path::Path::new(
+            "/Users/test/Library/Application Support/trusty-search/newsyslog.conf",
+        );
         let body = rotation_plist_body(conf);
         assert!(body.contains("/usr/sbin/newsyslog"));
         assert!(body.contains("<string>-F</string>"));

@@ -226,18 +226,12 @@ impl McpServer {
                     .await?;
                 // Mirror the daemon's per-query INFO log (issue #125) so the
                 // MCP transport surfaces the same query/intent/latency line.
-                let query_text = body
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let query_text = body.get("text").and_then(Value::as_str).unwrap_or_default();
                 let log_intent = resp
                     .get("intent")
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown");
-                let log_latency = resp
-                    .get("latency_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let log_latency = resp.get("latency_ms").and_then(Value::as_u64).unwrap_or(0);
                 let log_results = resp
                     .get("results")
                     .and_then(Value::as_array)

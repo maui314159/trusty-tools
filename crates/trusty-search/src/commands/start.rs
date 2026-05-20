@@ -444,11 +444,8 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
             runtime_handle.block_on(build_embedder())
         });
 
-        let init_result = tokio::time::timeout(
-            Duration::from_secs(init_timeout_secs),
-            init_handle,
-        )
-        .await;
+        let init_result =
+            tokio::time::timeout(Duration::from_secs(init_timeout_secs), init_handle).await;
 
         match init_result {
             Ok(Ok(Ok(embedder))) => {

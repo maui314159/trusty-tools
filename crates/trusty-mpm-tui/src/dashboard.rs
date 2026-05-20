@@ -698,8 +698,10 @@ mod tests {
 
     #[test]
     fn command_bar_submit_records_history() {
-        let mut bar = CommandBar::default();
-        bar.input = "  hello  ".into();
+        let mut bar = CommandBar {
+            input: "  hello  ".into(),
+            ..Default::default()
+        };
         assert_eq!(bar.take_for_execution(), "hello");
         assert!(bar.input.is_empty());
         assert_eq!(bar.history, vec!["hello".to_string()]);
@@ -710,8 +712,10 @@ mod tests {
 
     #[test]
     fn command_bar_history_recall() {
-        let mut bar = CommandBar::default();
-        bar.input = "first".into();
+        let mut bar = CommandBar {
+            input: "first".into(),
+            ..Default::default()
+        };
         bar.take_for_execution();
         bar.input = "second".into();
         bar.take_for_execution();
@@ -906,8 +910,10 @@ mod tests {
 
     #[test]
     fn command_input_line_shows_cursor() {
-        let mut bar = CommandBar::default();
-        bar.input = "hello".into();
+        let bar = CommandBar {
+            input: "hello".into(),
+            ..Default::default()
+        };
         assert_eq!(command_input_line(&bar, true), "CMD> hello_");
         assert_eq!(command_input_line(&bar, false), "CMD> hello");
     }
