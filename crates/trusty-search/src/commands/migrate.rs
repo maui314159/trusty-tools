@@ -239,15 +239,28 @@ async fn run_index_phase(dry_run: bool) -> Result<()> {
 /// MCP server entry with a `trusty-search` entry.
 ///
 /// Why: this is the load-bearing surgery — it must preserve every unrelated
-/// JSON key, be idempotent, and never corrupt the file on failure.
-/// What: parses the file as `serde_json::Value`, swaps the key inside
-/// `mcpServers`, then writes atomically (backup → `.tmp` → rename).
+/// JSON key, be idempotent, and never corrupt the file on failure. The
+/// atomic-write + backup mechanics live in `trusty_common::claude_config`;
+/// this function adds the migration-specific concerns (detecting legacy
+/// keys, removing them, and distinguishing the four terminal states for
+/// the summary table).
+/// What: classifies the file (NoChange / AlreadyMigrated / migration
+/// needed). When migration is needed, removes any legacy mcp-vector-search
+/// keys and inserts the canonical trusty-search entry in a single atomic
+/// write via `trusty_common::claude_config::write_json_atomic`. The
+/// trusty-search entry shape comes from `mcp_server_entry(TRUSTY_KEY,
+/// &["serve"])`, matching `patch_mcp_server`'s upsert exactly so the two
+/// helpers stay in lock-step.
 /// Test: `test_migrate_config_replaces_key` and `test_migrate_config_idempotent`
 /// assert the rewrite and the no-op-on-already-migrated behaviour.
 pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
     let fail = |msg: String| ConfigMigrateResult {
         path: path.to_path_buf(),
         status: ConfigMigrateStatus::Failed(msg),
+    };
+    let result = |status| ConfigMigrateResult {
+        path: path.to_path_buf(),
+        status,
     };
 
     let content = match std::fs::read_to_string(path) {
@@ -262,32 +275,25 @@ pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
     let servers = match root.get_mut("mcpServers").and_then(Value::as_object_mut) {
         Some(s) => s,
         // No mcpServers block at all — nothing to migrate.
-        None => {
-            return ConfigMigrateResult {
-                path: path.to_path_buf(),
-                status: ConfigMigrateStatus::NoChange,
-            }
-        }
+        None => return result(ConfigMigrateStatus::NoChange),
     };
 
     // Idempotency: a trusty-search entry already present means a previous run
     // (or the user) already migrated this file — never double-migrate.
     if servers.contains_key(TRUSTY_KEY) {
-        return ConfigMigrateResult {
-            path: path.to_path_buf(),
-            status: ConfigMigrateStatus::AlreadyMigrated,
-        };
+        return result(ConfigMigrateStatus::AlreadyMigrated);
     }
 
     let legacy_present = LEGACY_MCP_KEYS.iter().any(|k| servers.contains_key(*k));
     if !legacy_present {
-        return ConfigMigrateResult {
-            path: path.to_path_buf(),
-            status: ConfigMigrateStatus::NoChange,
-        };
+        return result(ConfigMigrateStatus::NoChange);
     }
 
-    // Drop every legacy key and insert the canonical trusty-search entry.
+    // Drop every legacy key and insert the canonical trusty-search entry in
+    // a single atomic write. We do not call `patch_mcp_server` here because
+    // it would create its own `.bak` of the already-stripped file — we want
+    // the user's pre-migration content as the backup, which means a single
+    // read-modify-write through `write_json_atomic`.
     for k in LEGACY_MCP_KEYS {
         servers.remove(*k);
     }
@@ -297,17 +303,11 @@ pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
     );
 
     if dry_run {
-        return ConfigMigrateResult {
-            path: path.to_path_buf(),
-            status: ConfigMigrateStatus::Migrated,
-        };
+        return result(ConfigMigrateStatus::Migrated);
     }
 
     match write_json_atomic(path, &root) {
-        Ok(()) => ConfigMigrateResult {
-            path: path.to_path_buf(),
-            status: ConfigMigrateStatus::Migrated,
-        },
+        Ok(()) => result(ConfigMigrateStatus::Migrated),
         Err(e) => fail(format!("write: {e}")),
     }
 }
