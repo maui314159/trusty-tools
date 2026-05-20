@@ -17,6 +17,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use trusty_memory::commands::migrate::{handle_migrate, MigrateTarget};
+use trusty_memory::commands::service::{handle_service, ServiceAction};
+use trusty_memory::commands::setup::handle_setup;
 use trusty_memory::{run_http, run_stdio, AppState};
 
 /// Top-level CLI for `trusty-memory`.
@@ -73,6 +75,15 @@ enum Command {
         #[arg(long)]
         config_only: bool,
     },
+
+    /// First-time setup: data dir + launchd (macOS) + Claude settings patch.
+    Setup,
+
+    /// Manage the macOS launchd LaunchAgent for the daemon.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +98,8 @@ async fn main() -> Result<()> {
             dry_run,
             config_only,
         } => handle_migrate(target, dry_run, config_only),
+        Command::Setup => handle_setup(),
+        Command::Service { action } => handle_service(&action),
     }
 }
 
