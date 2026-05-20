@@ -157,6 +157,70 @@ fn compute_max_chunks(memory_limit_mb: usize) -> usize {
     (raw as usize).clamp(MAX_CHUNKS_FLOOR, MAX_CHUNKS_CEIL)
 }
 
+/// Default value for `TRUSTY_COREML_BATCH_SIZE` (chunks per embed call when
+/// the CoreML execution provider is active).
+///
+/// Why: CoreML on Apple Silicon pre-allocates GPU/ANE buffers sized for the
+/// full batch tensor shape, and those buffers are drawn from the unified
+/// memory pool. With `TRUSTY_MAX_BATCH_SIZE=512` (the tier-default for XLarge
+/// hosts that the GPU tuning path historically applied to CoreML too), a
+/// single reindex batch inflates process RSS by ~70 GB in seconds and the
+/// buffers do not release between calls — they stack until macOS jetsam
+/// SIGKILLs the daemon. The fix is to keep CoreML batches small enough that
+/// the per-batch buffer rises and falls between calls instead of stacking;
+/// 32 chunks is empirically below the size where the unified-memory spike
+/// is observable while remaining large enough to amortise ONNX kernel
+/// launch overhead.
+/// What: the default `coreml_batch_size`. Overridable via
+/// `TRUSTY_COREML_BATCH_SIZE` (clamped to `[COREML_BATCH_SIZE_MIN,
+/// COREML_BATCH_SIZE_MAX]`).
+/// Test: `test_coreml_batch_size_default` and `test_coreml_batch_size_env_override`.
+pub const DEFAULT_COREML_BATCH_SIZE: usize = 32;
+
+/// Floor for the CoreML batch size (1 chunk per call). Below this the
+/// pipeline is functionally serial; 1 is the smallest legal batch.
+pub const COREML_BATCH_SIZE_MIN: usize = 1;
+
+/// Ceiling for the CoreML batch size. Matches `MAX_COMPUTED_BATCH_SIZE`; an
+/// operator who needs more than this on CoreML almost certainly wants to
+/// disable CoreML (`TRUSTY_DEVICE=cpu`) instead.
+pub const COREML_BATCH_SIZE_MAX: usize = 512;
+
+/// Resolve the CoreML batch size from the environment, applying the documented
+/// clamp and default.
+///
+/// Why: keeps the env-parse logic in one place so the daemon startup and the
+/// reindex pipeline see identical semantics, even when called from different
+/// modules.
+/// What: reads `TRUSTY_COREML_BATCH_SIZE`, parses as `usize`, clamps to
+/// `[COREML_BATCH_SIZE_MIN, COREML_BATCH_SIZE_MAX]`. Falls back to
+/// `DEFAULT_COREML_BATCH_SIZE` when unset, empty, unparseable, or zero. Logs
+/// a warning on parse failure so typos surface.
+/// Test: `test_coreml_batch_size_env_override` and
+/// `test_coreml_batch_size_env_clamp`.
+pub fn resolve_coreml_batch_size() -> usize {
+    match std::env::var("TRUSTY_COREML_BATCH_SIZE") {
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n.clamp(COREML_BATCH_SIZE_MIN, COREML_BATCH_SIZE_MAX),
+            Ok(_) => {
+                tracing::warn!(
+                    "memory_policy: TRUSTY_COREML_BATCH_SIZE={v:?} is zero; \
+                     using default ({DEFAULT_COREML_BATCH_SIZE})"
+                );
+                DEFAULT_COREML_BATCH_SIZE
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "memory_policy: TRUSTY_COREML_BATCH_SIZE={v:?} is not a valid usize; \
+                     using default ({DEFAULT_COREML_BATCH_SIZE})"
+                );
+                DEFAULT_COREML_BATCH_SIZE
+            }
+        },
+        Err(_) => DEFAULT_COREML_BATCH_SIZE,
+    }
+}
+
 /// Floor for the computed batch size. Below this throughput collapses but the
 /// process is still functional. Raised from 8 → 32 (issue #19): with the
 /// ORT arena allocator disabled on the CPU path, per-slot transient
@@ -327,6 +391,11 @@ pub struct MemoryPolicy {
     pub max_chunks: usize,
     pub embedding_cache: usize,
     pub max_batch_size: usize,
+    /// Provider-specific batch-size cap applied **only** when the CoreML
+    /// execution provider is active. See [`DEFAULT_COREML_BATCH_SIZE`] for
+    /// motivation. The reindex pipeline reads this and uses it in place of
+    /// `max_batch_size` whenever the live embedder reports `CoreML`.
+    pub coreml_batch_size: usize,
     pub bm25_corpus_cap: usize,
     pub max_kg_nodes: usize,
 }
@@ -453,6 +522,7 @@ impl MemoryPolicy {
             max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", derived_max_chunks),
             embedding_cache: env_override_usize("TRUSTY_EMBEDDING_CACHE", d.embedding_cache),
             max_batch_size,
+            coreml_batch_size: resolve_coreml_batch_size(),
             bm25_corpus_cap: env_override_usize("TRUSTY_BM25_CORPUS_CAP", d.bm25_corpus_cap),
             max_kg_nodes: env_override_usize("TRUSTY_MAX_KG_NODES", d.max_kg_nodes),
         };
@@ -484,6 +554,10 @@ impl MemoryPolicy {
             std::env::set_var("TRUSTY_MAX_CHUNKS", self.max_chunks.to_string());
             std::env::set_var("TRUSTY_EMBEDDING_CACHE", self.embedding_cache.to_string());
             std::env::set_var("TRUSTY_MAX_BATCH_SIZE", self.max_batch_size.to_string());
+            std::env::set_var(
+                "TRUSTY_COREML_BATCH_SIZE",
+                self.coreml_batch_size.to_string(),
+            );
             std::env::set_var("TRUSTY_BM25_CORPUS_CAP", self.bm25_corpus_cap.to_string());
             std::env::set_var("TRUSTY_MAX_KG_NODES", self.max_kg_nodes.to_string());
         }
@@ -510,13 +584,14 @@ impl MemoryPolicy {
         );
         tracing::info!(
             "  MEMORY_LIMIT_MB={}  INDEX_MEMORY_LIMIT_MB={}  MAX_CHUNKS={}  \
-             EMBEDDING_CACHE={}  MAX_BATCH_SIZE={}  BM25_CORPUS_CAP={}  \
-             MAX_KG_NODES={}",
+             EMBEDDING_CACHE={}  MAX_BATCH_SIZE={}  COREML_BATCH_SIZE={}  \
+             BM25_CORPUS_CAP={}  MAX_KG_NODES={}",
             self.memory_limit_mb,
             self.index_memory_limit_mb,
             self.max_chunks,
             self.embedding_cache,
             self.max_batch_size,
+            self.coreml_batch_size,
             self.bm25_corpus_cap,
             self.max_kg_nodes,
         );
@@ -991,6 +1066,63 @@ mod tests {
             match prior_mem {
                 Some(v) => std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", v),
                 None => std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_batch_size_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_BATCH_SIZE").ok();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::remove_var("TRUSTY_COREML_BATCH_SIZE") };
+        assert_eq!(resolve_coreml_batch_size(), DEFAULT_COREML_BATCH_SIZE);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_BATCH_SIZE", v),
+                None => std::env::remove_var("TRUSTY_COREML_BATCH_SIZE"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_batch_size_env_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_BATCH_SIZE").ok();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_BATCH_SIZE", "64") };
+        assert_eq!(resolve_coreml_batch_size(), 64);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_BATCH_SIZE", v),
+                None => std::env::remove_var("TRUSTY_COREML_BATCH_SIZE"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_batch_size_env_clamp() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_BATCH_SIZE").ok();
+        // Out-of-range upper: clamp to MAX.
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_BATCH_SIZE", "10000") };
+        assert_eq!(resolve_coreml_batch_size(), COREML_BATCH_SIZE_MAX);
+        // Zero: fall back to default (with warn).
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_BATCH_SIZE", "0") };
+        assert_eq!(resolve_coreml_batch_size(), DEFAULT_COREML_BATCH_SIZE);
+        // Garbage: fall back to default (with warn).
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_BATCH_SIZE", "not-a-number") };
+        assert_eq!(resolve_coreml_batch_size(), DEFAULT_COREML_BATCH_SIZE);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_BATCH_SIZE", v),
+                None => std::env::remove_var("TRUSTY_COREML_BATCH_SIZE"),
             }
         }
     }

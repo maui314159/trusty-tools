@@ -405,7 +405,34 @@ impl CodeIndexer {
             return Ok(embeddings);
         };
         let chunk_total = chunks.len();
-        let batch_size = embed_batch_size();
+        // Provider-aware batch sizing.
+        //
+        // Why: CoreML pre-allocates GPU/ANE buffers sized for the full batch
+        // tensor shape, drawn from Apple Silicon's unified memory pool. With
+        // the default `TRUSTY_MAX_BATCH_SIZE` (up to 512 on XLarge hosts) a
+        // single reindex batch caused a 574 MB → 72 GB RSS spike in ~14 s,
+        // and the buffers do not release between calls — they stack until
+        // jetsam kills the daemon. The CPU and CUDA paths do not exhibit
+        // this behaviour (CPU has the arena allocator disabled; CUDA's
+        // buffers live in device memory, not host RSS).
+        // What: read the live embedder's provider; if CoreML, use the
+        // smaller `TRUSTY_COREML_BATCH_SIZE` (default 32) so the per-batch
+        // buffer rises and falls between calls. Otherwise use the existing
+        // `TRUSTY_MAX_BATCH_SIZE`-derived value.
+        // Test: covered indirectly by `test_index_files_batch_*` on CPU
+        // builds; behavioural verification on CoreML is via an Apple
+        // Silicon smoke run.
+        let batch_size = match embedder.provider() {
+            trusty_common::embedder::ExecutionProvider::CoreML => {
+                let bs = crate::core::resolve_coreml_batch_size();
+                tracing::debug!(
+                    "embed_chunks_in_batches: CoreML provider active — using \
+                     TRUSTY_COREML_BATCH_SIZE={bs} (chunks={chunk_total})"
+                );
+                bs
+            }
+            _ => embed_batch_size(),
+        };
         for batch_start in (0..chunk_total).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(chunk_total);
             let batch_texts: Vec<&str> = chunks[batch_start..batch_end]

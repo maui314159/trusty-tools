@@ -36,6 +36,19 @@ pub trait Embedder: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
     fn dimension(&self) -> usize;
+
+    /// Active ONNX execution provider for this embedder.
+    ///
+    /// Why: forwards the shared-crate `Embedder::provider()` through the
+    /// in-crate facade so call sites that hold a `&dyn Embedder` (i.e. the
+    /// reindex pipeline) can pick provider-appropriate batch sizes without
+    /// reaching past the facade.
+    /// What: default returns `ExecutionProvider::Cpu`; the blanket adapter
+    /// below forwards to the underlying `trusty_common::embedder::Embedder`.
+    /// Test: covered by the public-surface compile check.
+    fn provider(&self) -> trusty_common::embedder::ExecutionProvider {
+        trusty_common::embedder::ExecutionProvider::Cpu
+    }
 }
 
 /// Adapter: every shared `trusty_common::embedder::Embedder` automatically implements
@@ -56,5 +69,9 @@ where
 
     fn dimension(&self) -> usize {
         trusty_common::embedder::Embedder::dimension(self)
+    }
+
+    fn provider(&self) -> trusty_common::embedder::ExecutionProvider {
+        trusty_common::embedder::Embedder::provider(self)
     }
 }

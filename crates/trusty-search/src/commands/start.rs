@@ -139,11 +139,26 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
 fn tune_batch_size_for_provider(provider: trusty_common::embedder::ExecutionProvider) {
     const GPU_BATCH_DEFAULT: usize = 512;
 
-    let is_gpu = matches!(
-        provider,
-        trusty_common::embedder::ExecutionProvider::Cuda
-            | trusty_common::embedder::ExecutionProvider::CoreML
-    );
+    // CoreML is intentionally excluded from the GPU batch-size bump.
+    //
+    // Why: unlike CUDA (whose ORT arena lives in device memory), CoreML on
+    // Apple Silicon pre-allocates GPU/ANE buffers in the *unified* memory
+    // pool and those buffers stack between calls. Bumping TRUSTY_MAX_BATCH_SIZE
+    // to 512 on CoreML reliably inflates process RSS by ~70 GB in seconds
+    // and triggers macOS jetsam SIGKILL. The reindex pipeline now uses
+    // `TRUSTY_COREML_BATCH_SIZE` (default 32) when CoreML is active —
+    // see `core::indexer::ingest::embed_chunks_in_batches`. Leaving
+    // `TRUSTY_MAX_BATCH_SIZE` at its tier default is the safe answer.
+    if matches!(provider, trusty_common::embedder::ExecutionProvider::CoreML) {
+        let coreml_bs = crate::core::resolve_coreml_batch_size();
+        tracing::info!(
+            "gpu_batch_tuning: provider=CoreML → using TRUSTY_COREML_BATCH_SIZE={coreml_bs} for \
+             indexing batches (unified-memory pool would inflate with TRUSTY_MAX_BATCH_SIZE bump)"
+        );
+        return;
+    }
+
+    let is_gpu = matches!(provider, trusty_common::embedder::ExecutionProvider::Cuda);
     if !is_gpu {
         return;
     }

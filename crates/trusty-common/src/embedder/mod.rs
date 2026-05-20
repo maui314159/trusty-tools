@@ -83,6 +83,24 @@ pub trait Embedder: Send + Sync {
 
     /// Output dimension of the produced embeddings.
     fn dimension(&self) -> usize;
+
+    /// Active ONNX execution provider for this embedder.
+    ///
+    /// Why: callers (e.g. the trusty-search reindex pipeline) need to pick
+    /// provider-appropriate batch sizes — CoreML pre-allocates large GPU/ANE
+    /// buffers sized to the full batch tensor shape, so a 512-chunk batch can
+    /// inflate unified-memory RSS to 70 GB+ and stack between calls. Exposing
+    /// the active provider through the trait lets callers throttle batch size
+    /// without re-reading env vars or duplicating provider-detection logic.
+    /// What: default impl returns `ExecutionProvider::Cpu`, which is the
+    /// correct conservative answer for embedders that do not advertise a
+    /// provider (e.g. `MockEmbedder` and any external implementation). The
+    /// `FastEmbedder` impl overrides this to return its actual provider.
+    /// Test: covered by the public-surface compile check and `MockEmbedder`
+    /// trait usage (defaults to `Cpu`).
+    fn provider(&self) -> ExecutionProvider {
+        ExecutionProvider::Cpu
+    }
 }
 
 /// Convenience helper: embed a single text via `embed_batch` and return the
@@ -416,6 +434,10 @@ impl Embedder for FastEmbedder {
 
     fn dimension(&self) -> usize {
         self.dim
+    }
+
+    fn provider(&self) -> ExecutionProvider {
+        self.provider
     }
 }
 
