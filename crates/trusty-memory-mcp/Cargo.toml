@@ -5,6 +5,8 @@ edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
 
+exclude = [".fastembed_cache/"]
+
 [lib]
 # Why: Explicit `rlib` keeps the crate linkable as a Rust library from
 #      host processes (open-mpm) that want to register `MemoryMcpService`
