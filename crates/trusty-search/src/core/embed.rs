@@ -64,14 +64,14 @@ where
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|s| (*s).to_owned()).collect();
-        trusty_common::embedder::Embedder::embed_batch(self, &owned).await
+        <E as trusty_common::embedder::Embedder>::embed_batch(self, &owned).await
     }
 
     fn dimension(&self) -> usize {
-        trusty_common::embedder::Embedder::dimension(self)
+        <E as trusty_common::embedder::Embedder>::dimension(self)
     }
 
     fn provider(&self) -> trusty_common::embedder::ExecutionProvider {
-        trusty_common::embedder::Embedder::provider(self)
+        <E as trusty_common::embedder::Embedder>::provider(self)
     }
 }
