@@ -75,6 +75,29 @@ impl CodeIndexer {
     /// Add (or replace) a chunk in the corpus. If an embedder + store are
     /// attached, the chunk is also embedded and upserted into the HNSW index.
     pub async fn add_chunk(&self, chunk: RawChunk) -> Result<()> {
+        self.add_chunk_inner(chunk).await?;
+        self.rebuild_symbol_graph().await;
+        Ok(())
+    }
+
+    /// Internal helper: do every side effect of `add_chunk` **except** the
+    /// trailing symbol graph rebuild.
+    ///
+    /// Why: `index_file` ingests N chunks from one file via this code path.
+    /// Calling the public `add_chunk` in that loop triggers N symbol graph
+    /// rebuilds (each `O(corpus)`), producing an `O(N · corpus)` regression on
+    /// any non-trivial file — a single 10-chunk file forced 11 rebuilds. By
+    /// splitting the corpus-mutation work from the graph rebuild, `index_file`
+    /// can run the rebuild **once** at the end of the file, restoring the
+    /// intended `O(corpus)` cost per file.
+    /// What: embeds + HNSW-upserts (when wired), maintains BM25, applies the
+    /// per-index chunk cap (#75), and inserts into the corpus map. Does **not**
+    /// touch the symbol graph — callers are responsible for rebuilding it
+    /// after their batch of inserts.
+    /// Test: covered transitively by every test that calls `add_chunk` or
+    /// `index_file` in `indexer::tests`; the public `add_chunk` path still
+    /// guarantees a fresh symbol graph on return.
+    pub(super) async fn add_chunk_inner(&self, chunk: RawChunk) -> Result<()> {
         let id = chunk.id.clone();
 
         // Issue #75: hard cap per-index chunk count to bound RAM growth.
@@ -115,7 +138,6 @@ impl CodeIndexer {
         self.bm25.write().await.upsert_document(&id, &bm25_text);
 
         self.chunks.write().await.insert(id, chunk);
-        self.rebuild_symbol_graph().await;
         Ok(())
     }
 
@@ -134,7 +156,7 @@ impl CodeIndexer {
         let chunk_contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
         for chunk in chunks {
-            self.add_chunk(chunk).await?;
+            self.add_chunk_inner(chunk).await?;
         }
 
         let all_entities = self
@@ -145,8 +167,9 @@ impl CodeIndexer {
             .write()
             .await
             .insert(file_path.to_string(), all_entities);
-        // `add_chunk` already rebuilds, but we also rebuild once more here so a
-        // partial failure mid-file doesn't leave a stale graph; this is cheap.
+        // Single symbol graph rebuild for the entire file. `add_chunk_inner`
+        // intentionally skips the rebuild so a 10-chunk file pays 1 rebuild
+        // instead of 11 — the previous loop made this `O(N · corpus)`.
         self.rebuild_symbol_graph().await;
         Ok(())
     }
