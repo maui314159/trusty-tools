@@ -111,9 +111,9 @@ See [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md) for
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Three Flagship Services (User-Facing)                       │
-│  trusty-search  |  trusty-memory  |  (trusty-analyze)       │
-│  (search)       |  (storage)      |  (future: quality)      │
+│  Flagship Services (User-Facing)                             │
+│  trusty-search  |  trusty-memory                             │
+│  (search)       |  (storage)                                 │
 └──────────────────────────────────────────────────────────────┘
          │                  │
 ┌────────▼──────────────────▼──────────────────────────────────┐
@@ -175,3 +175,17 @@ cargo fmt
 - **I want to search code:** Read [crates/trusty-search/README.md](crates/trusty-search/README.md)
 - **I want persistent memory:** Read [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md)
 - **I want the full platform:** Read [crates/open-mpm/README.md](crates/open-mpm/README.md)
+
+---
+
+## Planned Components
+
+### trusty-analyze (In Development)
+
+Code analysis daemon providing:
+- Cyclomatic complexity calculation
+- Code smell detection
+- Quality metrics and anti-pattern identification
+- MCP server for integration with Claude Code and other tools
+
+Coming soon to `crates/trusty-analyze/`.
