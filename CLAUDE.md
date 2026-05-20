@@ -24,7 +24,7 @@ dance for cross-crate development. The authoritative crate list is the
 Key consumers of the shared libraries:
 - **open-mpm** — MPM orchestration platform (lives in `crates/open-mpm`)
 - **trusty-search** — hybrid code search daemon + MCP server
-- **trusty-memory-core / trusty-memory-mcp** — memory palace storage + MCP frontend
+- **trusty-memory-core / trusty-memory** — memory palace storage + MCP frontend
 - **trusty-analyze** — code analysis daemon (complexity, smells, quality metrics)
 
 Work touching a shared crate (e.g. `trusty-common`, `trusty-mcp-core`) may
@@ -102,7 +102,7 @@ trusty-tools/               # workspace root
 │   ├── tc-services/        # service-layer adapters: CTO DB, Granola, GWorkspace
 │   ├── trusty-search/      # hybrid BM25 + vector + KG search daemon + MCP server
 │   ├── trusty-memory-core/ # memory storage engine (usearch + SQLite + fastembed)
-│   ├── trusty-memory-mcp/  # MCP server frontend for memory (includes Svelte UI)
+│   ├── trusty-memory-mcp/  # MCP server frontend for memory (includes Svelte UI); published as trusty-memory
 │   ├── trusty-analyze/     # code analysis daemon + MCP server
 │   ├── trusty-mpm-core/    # MPM core domain types and traits
 │   ├── trusty-mpm-mcp/     # MCP server for MPM
@@ -238,10 +238,10 @@ When publishing a crate to crates.io:
 2. `TraceLayer` — HTTP request spans
 3. `CompressionLayer` — gzip, with `text/event-stream` excluded (SSE compat)
 
-### trusty-memory-core / trusty-memory-mcp
+### trusty-memory-core / trusty-memory
 - Licensed **MIT** (not Elastic-2.0). Check before assuming the workspace
   default license applies.
-- `trusty-memory-mcp` embeds a compiled Svelte UI via `rust-embed`.
+- `trusty-memory` (directory: `trusty-memory-mcp`) embeds a compiled Svelte UI via `rust-embed`.
 
 ### trusty-mpm-gui
 - Tauri-based desktop GUI. Its `src-tauri/` subdirectory contains a nested
@@ -260,7 +260,7 @@ When publishing a crate to crates.io:
 - **Rust**: `rustup` with the toolchain pinned to MSRV `1.88` or later.
   Install: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node / pnpm**: only needed if working on the Svelte UIs embedded in
-  `trusty-search` or `trusty-memory-mcp`. Install pnpm via `npm i -g pnpm`.
+  `trusty-search` or `trusty-memory`. Install pnpm via `npm i -g pnpm`.
 - **Git**: standard; the workspace uses git tags for per-crate releases.
 
 ### Environment Variables
@@ -312,8 +312,8 @@ RUST_LOG=info cargo run -p trusty-mpm-daemon --bin trusty-mpmd
 # MPM CLI (tm / trusty-mpm)
 cargo run -p trusty-mpm-cli -- --help
 
-# trusty-memory-mcp (MCP server + embedded Svelte UI)
-RUST_LOG=info cargo run -p trusty-memory-mcp
+# trusty-memory (MCP server + embedded Svelte UI)
+RUST_LOG=info cargo run -p trusty-memory
 
 # Build a specific binary in release mode
 cargo build --release -p trusty-search
@@ -373,7 +373,7 @@ PRs, issues, or commit messages that reference the former repo names.
 |---|---|
 | `bobmatnyc/trusty-common` | `crates/trusty-common` + 8 library crates |
 | `bobmatnyc/trusty-search` | `crates/trusty-search` |
-| `bobmatnyc/trusty-memory` | `crates/trusty-memory-core`, `crates/trusty-memory-mcp` |
+| `bobmatnyc/trusty-memory` | `crates/trusty-memory-core`, `crates/trusty-memory-mcp` (published as `trusty-memory`) |
 | `bobmatnyc/trusty-analyze` | `crates/trusty-analyze` |
 | `bobmatnyc/trusty-git-analytics` | `crates/trusty-git-analytics` |
 | `bobmatnyc/trusty-mpm` | `crates/trusty-mpm-{core,mcp,daemon,client,cli,tui,telegram,gui}` |
