@@ -16,6 +16,17 @@ exclude = [".fastembed_cache/"]
 #      trusty-* ecosystem (see trusty-mcp-core) for consistency.
 crate-type = ["rlib"]
 
+[[bin]]
+# Why: Ship a CLI binary so users can install via `cargo install trusty-memory`
+#      and invoke `trusty-memory serve` (MCP stdio) or `trusty-memory migrate
+#      kuzu-memory` to rewrite Claude settings files that reference the
+#      legacy kuzu-memory MCP server.
+# What: Thin clap-to-handler shim; all logic lives in the library + the
+#      `commands` module.
+# Test: `cargo run -p trusty-memory -- --help` lists `serve` and `migrate`.
+name = "trusty-memory"
+path = "src/main.rs"
+
 [dependencies]
 trusty-common = { path = "../trusty-common", version = "0.4.0", features = ["axum-server", "mcp", "memory-core"] }
 tokio = { workspace = true }
@@ -38,6 +49,7 @@ toml = { workspace = true }
 dirs = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
+colored = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

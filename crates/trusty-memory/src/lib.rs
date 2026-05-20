@@ -20,6 +20,7 @@ use trusty_common::memory_core::store::ChatSessionStore;
 use trusty_common::memory_core::PalaceRegistry;
 use trusty_common::ChatProvider;
 
+pub mod commands;
 pub mod openrpc;
 pub mod service;
 pub mod tools;
