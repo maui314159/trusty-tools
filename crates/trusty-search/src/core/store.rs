@@ -453,16 +453,36 @@ impl VectorStore for UsearchStore {
         self.save(path).await
     }
 
-    /// Single-lock-pass override. Two phases:
-    /// 1. Resolve/assign every chunk's `u64` key under one write-lock pair
-    ///    (`id_to_key` + `key_to_id`).
-    /// 2. Insert every vector under one HNSW write lock.
-    /// This drops 6N lock acquisitions to 6 for a batch of N items.
+    /// Bulk-upsert override that minimises the time the HNSW write lock is held.
+    ///
+    /// Why: per-vector `upsert` acquires three write locks (`id_to_key`,
+    /// `key_to_id`, `index`) for each call, and the original batch path held
+    /// the HNSW write lock while calling `index.contains()` on every key —
+    /// blocking concurrent searches for the entire batch. For a 640-vector
+    /// batch on a hot daemon that was ~640 sequential C FFI calls (plus the
+    /// pre-existence probe) under exclusive lock, which serialised all
+    /// concurrent queries behind the indexer. usearch 2.25's Rust API exposes
+    /// no multi-vector batch insert, so the wins come from (a) doing the
+    /// `contains` probe under a read lock so the write lock only does work,
+    /// and (b) decoupling the id-map locks from the HNSW write lock so the
+    /// hot loop never touches `id_to_key`.
+    /// What: four phases —
+    /// 1. Validate dims (no locks). 2. Allocate keys for any new IDs under a
+    /// single id-map write-lock pair, then drop those locks. 3. Snapshot
+    /// `(key, &embedding)` pairs and pre-compute the existing-key set under a
+    /// **read** lock on the HNSW index. 4. Acquire the HNSW write lock once,
+    /// reserve capacity, remove pre-existing keys, then add every vector.
+    /// Search results are identical to the previous implementation because
+    /// the same `(key, vector)` pairs are inserted in the same order; only
+    /// lock-hold duration changes.
+    /// Test: `tests::test_upsert_and_search`, `test_upsert_replaces_existing`,
+    /// and `test_concurrent_reads` cover ordering, idempotent overwrite, and
+    /// reader parallelism.
     async fn upsert_batch(&self, items: &[(String, Vec<f32>)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        // Validate dims up front so we don't half-commit on a bad batch.
+        // Phase 1: validate dims up front so we don't half-commit on a bad batch.
         for (_, v) in items {
             if v.len() != self.dim {
                 return Err(anyhow!(
@@ -473,25 +493,44 @@ impl VectorStore for UsearchStore {
             }
         }
 
-        // Phase 1: assign keys for any new IDs under a single write-lock pair.
-        {
+        // Phase 2: assign keys for any new IDs under a single id-map write-lock
+        // pair, then drop the locks before touching the HNSW index. Snapshot the
+        // resolved keys so phases 3 and 4 don't re-acquire `id_to_key`.
+        let resolved_keys: Vec<u64> = {
             let mut id_map = self.id_to_key.write().await;
             let mut key_map = self.key_to_id.write().await;
+            let mut out = Vec::with_capacity(items.len());
             for (id, _) in items {
-                if !id_map.contains_key(id.as_str()) {
+                let key = if let Some(&k) = id_map.get(id.as_str()) {
+                    k
+                } else {
                     let k = self.next_key.fetch_add(1, Ordering::Relaxed);
                     id_map.insert(id.clone(), k);
                     key_map.insert(k, id.clone());
-                }
+                    k
+                };
+                out.push(key);
             }
-        }
+            out
+        };
 
-        // Phase 2: insert every vector under one HNSW write lock.
-        let id_map = self.id_to_key.read().await;
+        // Phase 3: under a READ lock, determine which keys already exist in the
+        // HNSW so the write lock only has to do the actual mutation. Concurrent
+        // searches can still run during this probe.
+        let existing: std::collections::HashSet<u64> = {
+            let index = self.index.read().await;
+            resolved_keys
+                .iter()
+                .copied()
+                .filter(|k| index.contains(*k))
+                .collect()
+        };
+
+        // Phase 4: acquire the HNSW write lock once. Reserve capacity, remove
+        // pre-existing keys, then add every vector. The write lock now only
+        // does the work that actually requires exclusive access — no
+        // `contains` probes inside the hot loop.
         let index = self.index.write().await;
-        // Reserve once for the worst case (every item is new) so we don't
-        // re-enter the reserve path inside the hot loop.
-        let want = index.size() + items.len();
         let max_elem = hnsw_max_elements();
         if index.size() >= max_elem {
             return Err(anyhow!(
@@ -499,6 +538,10 @@ impl VectorStore for UsearchStore {
                 max_elem
             ));
         }
+        // Reserve once for the worst case (every item is new). `existing.len()`
+        // items will be removed first, but reserving for the full batch size
+        // is a safe upper bound and avoids re-entering reserve mid-loop.
+        let want = index.size().saturating_add(items.len());
         if want > index.capacity() {
             let mut new_cap = index.capacity().max(1);
             while new_cap < want {
@@ -511,17 +554,15 @@ impl VectorStore for UsearchStore {
                 .reserve(new_cap)
                 .map_err(|e| anyhow!("usearch reserve grow failed: {e}"))?;
         }
-        for (id, embedding) in items {
-            if let Some(&key) = id_map.get(id.as_str()) {
-                if index.contains(key) {
-                    index
-                        .remove(key)
-                        .map_err(|e| anyhow!("usearch remove (for upsert) failed: {e}"))?;
-                }
-                index
-                    .add(key, embedding)
-                    .map_err(|e| anyhow!("usearch add failed: {e}"))?;
-            }
+        for &key in &existing {
+            index
+                .remove(key)
+                .map_err(|e| anyhow!("usearch remove (for upsert) failed: {e}"))?;
+        }
+        for (key, (_, embedding)) in resolved_keys.iter().zip(items.iter()) {
+            index
+                .add(*key, embedding)
+                .map_err(|e| anyhow!("usearch add failed: {e}"))?;
         }
         Ok(())
     }
