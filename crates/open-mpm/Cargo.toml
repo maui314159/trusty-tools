@@ -27,14 +27,15 @@ include = [
 ]
 
 [dependencies]
-trusty-symgraph = { path = "../trusty-symgraph", version = "0.2.2", features = ["parser"] }
 trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 # Why: issue #460 unified rpc.discover — host needs the ServiceDescriptor
 #      trait + OpenRpcBuilder, plus the in-process MemoryMcpService and
 #      SearchMcpService impls. trusty-search now aligns on tree-sitter 0.26
-#      (matches trusty-symgraph) so the previous `links = "tree-sitter"`
+#      (matches the symgraph parser) so the previous `links = "tree-sitter"`
 #      single-copy conflict is resolved and we link it directly.
-trusty-common = { workspace = true, features = ["mcp"] }
+# The `symgraph-parser` feature pulls in the full symbol-graph engine
+# (absorbed from the former `trusty-symgraph` crate in #5 phase 2c).
+trusty-common = { workspace = true, features = ["mcp", "symgraph-parser"] }
 trusty-memory = { path = "../trusty-memory-mcp", version = "0.1.19" }
 trusty-search = { path = "../trusty-search", version = "0.3.45" }
 tokio = { version = "1", features = ["full"] }

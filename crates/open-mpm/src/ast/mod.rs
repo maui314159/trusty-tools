@@ -10,10 +10,10 @@
 //! Test: `cargo test ast::` still works because the re-exports preserve
 //! the legacy paths; the canonical tests now live in `crates/symgraph/`.
 
-pub use trusty_symgraph::{editor, emitter, graph as kg, parser, registry, symbol};
+pub use trusty_common::symgraph::{editor, emitter, graph as kg, parser, registry, symbol};
 
-pub use trusty_symgraph::parser::{Language, file_to_module_path};
-pub use trusty_symgraph::{
+pub use trusty_common::symgraph::parser::{Language, file_to_module_path};
+pub use trusty_common::symgraph::{
     Edge, EdgeKind, LayoutRules, Patch, Symbol, SymbolEntry, SymbolGraph, SymbolId, SymbolKind,
     SymbolNode, SymbolRegistry, add_import, apply_emit, apply_patch, assign_file, detect_language,
     emit, emit_diff, extract_symbols, get_symbol, insert_after_symbol, list_symbols,
@@ -21,7 +21,7 @@ pub use trusty_symgraph::{
 };
 
 // Re-export strategy types added in #362.
-pub use trusty_symgraph::{
+pub use trusty_common::symgraph::{
     EmitStrategy, LocalityStrategy, ModulePathStrategy, TestColocationStrategy,
 };
 
@@ -103,14 +103,14 @@ pub fn pre_index_directory(
     let mut registry = SymbolRegistry::new(project_root.to_path_buf());
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if !path.is_file() || trusty_symgraph::parser::detect_language(path).is_none() {
+        if !path.is_file() || trusty_common::symgraph::parser::detect_language(path).is_none() {
             continue;
         }
         let path_str = path.to_string_lossy();
         if path_str.contains("/target/") || path_str.contains("/.git/") {
             continue;
         }
-        match trusty_symgraph::parser::parse_file(path, project_root) {
+        match trusty_common::symgraph::parser::parse_file(path, project_root) {
             Ok(entries) => {
                 for mut e in entries {
                     e.assigned_file = Some(path.to_path_buf());
@@ -168,7 +168,7 @@ mod tests {
         let mut reg = SymbolRegistry::new(dir.path().to_path_buf());
         reg.insert(SymbolEntry::new(
             SymbolId::new("test", "preindex_marker"),
-            trusty_symgraph::registry::SymbolKind::Function,
+            trusty_common::symgraph::registry::SymbolKind::Function,
             "fn preindex_marker() {}".into(),
             "rust",
         ));

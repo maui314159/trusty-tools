@@ -37,6 +37,32 @@ fastembed = { workspace = true, features = ["hf-hub-native-tls"], optional = tru
 lru = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 
+# Optional: enabled by the `symgraph` / `symgraph-parser` features (formerly
+# the `trusty-symgraph` crate). The `symgraph` feature pulls in only the
+# pure-data contracts surface (`thiserror`, `sha2`) — no tree-sitter, no
+# `links` conflict. The `symgraph-parser` feature additionally pulls in
+# tree-sitter and all grammar crates plus the emitter / editor stack.
+thiserror = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+indexmap = { version = "2", features = ["serde"], optional = true }
+similar = { version = "2", features = ["text"], optional = true }
+walkdir = { workspace = true, optional = true }
+petgraph = { version = "0.8", features = ["serde-1"], optional = true }
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-c = { workspace = true, optional = true }
+tree-sitter-cpp = { workspace = true, optional = true }
+syn = { version = "2.0", features = ["full"], optional = true }
+prettyplease = { version = "0.2", optional = true }
+proc-macro2 = { version = "1.0", optional = true }
+quote = { version = "1.0", optional = true }
+genco = { version = "0.19", optional = true }
+
 # launchd module is macOS-only and needs getuid(2) for the gui/<uid> domain.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
@@ -62,6 +88,7 @@ optional = true
 
 [dev-dependencies]
 toml = "0.8"
+tempfile = { workspace = true }
 
 [features]
 default = []
@@ -102,3 +129,41 @@ embedder-coreml = ["embedder"]
 # Exposes the `MockEmbedder` test double outside `cfg(test)` so downstream
 # integration tests can reuse it.
 embedder-test-support = ["embedder"]
+# Enables the `symgraph` module's contracts surface (formerly the
+# `trusty-symgraph` crate's default surface): pure data types
+# (`EntityType` / `RawEntity` / `EdgeKind` / `fact_hash_str` / tables).
+# Pulls in `thiserror` and `sha2` only — no tree-sitter, no `links`
+# conflict. Downstream crates that only need the knowledge-graph data
+# shapes (trusty-search, trusty-analyze) enable this feature and stop.
+symgraph = ["dep:thiserror", "dep:sha2"]
+# Enables the full symgraph parser + emitter + graph stack: tree-sitter
+# grammars (Rust, Python, JavaScript, Go, Java, TypeScript, C, C++), the
+# `IndexMap`-based `SymbolRegistry`, the deterministic emitter, the
+# `SymbolGraph`, editor primitives, and the strategy/locality/
+# test-colocation modules. Pulls in the `links = "tree-sitter"` constraint
+# — only enable in one crate per build graph (typically `open-mpm`).
+symgraph-parser = [
+    "symgraph",
+    "dep:uuid",
+    "dep:indexmap",
+    "dep:similar",
+    "dep:walkdir",
+    "dep:petgraph",
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:syn",
+    "dep:prettyplease",
+    "dep:proc-macro2",
+    "dep:quote",
+    "dep:genco",
+]
+# Enables the symgraph HTTP server module (axum + tokio). Implies the
+# full parser stack.
+symgraph-server = ["symgraph-parser", "axum-server"]

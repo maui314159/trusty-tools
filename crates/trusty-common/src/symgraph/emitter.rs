@@ -244,28 +244,29 @@ pub fn apply_emit(outputs: &HashMap<PathBuf, String>, output_dir: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategy::ModulePathStrategy;
+    use crate::symgraph::strategy::ModulePathStrategy;
 
     #[test]
     fn test_assign_file_with_module() {
-        let id = crate::registry::SymbolId::new("api::handlers", "process");
+        let id = crate::symgraph::registry::SymbolId::new("api::handlers", "process");
         let path = assign_file(&id, "src");
         assert_eq!(path, std::path::PathBuf::from("src/api/handlers.rs"));
     }
 
     #[test]
     fn test_assign_file_root() {
-        let id = crate::registry::SymbolId::new("", "main");
+        let id = crate::symgraph::registry::SymbolId::new("", "main");
         let path = assign_file(&id, "src");
         assert_eq!(path, std::path::PathBuf::from("src/main.rs"));
     }
 
     #[test]
     fn test_emit_is_deterministic() {
-        let mut reg = crate::registry::SymbolRegistry::new(std::path::PathBuf::from("/tmp"));
-        reg.insert(crate::registry::SymbolEntry::new(
-            crate::registry::SymbolId::new("utils", "helper"),
-            crate::registry::SymbolKind::Function,
+        let mut reg =
+            crate::symgraph::registry::SymbolRegistry::new(std::path::PathBuf::from("/tmp"));
+        reg.insert(crate::symgraph::registry::SymbolEntry::new(
+            crate::symgraph::registry::SymbolId::new("utils", "helper"),
+            crate::symgraph::registry::SymbolKind::Function,
             "fn helper() {}".into(),
             "rust",
         ));

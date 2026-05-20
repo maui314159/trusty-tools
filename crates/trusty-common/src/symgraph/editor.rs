@@ -21,7 +21,7 @@ use similar::TextDiff;
 use tree_sitter::{Language, Node, Parser};
 use uuid::Uuid;
 
-use crate::symbol::{detect_language, extract_symbols};
+use crate::symgraph::symbol::{detect_language, extract_symbols};
 
 /// One pending edit produced by an AST tool.
 ///

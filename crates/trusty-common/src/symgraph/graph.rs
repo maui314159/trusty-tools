@@ -22,8 +22,8 @@ use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
-use crate::registry::SymbolRegistry;
-use crate::symbol::{SymbolKind, detect_language, extract_symbols};
+use crate::symgraph::registry::SymbolRegistry;
+use crate::symgraph::symbol::{SymbolKind, detect_language, extract_symbols};
 
 /// Lightweight node record — one per symbol the graph knows about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,8 +405,8 @@ impl SymbolGraph {
 /// conversion folds those into `Function`.
 /// What: Total mapping — every `registry::SymbolKind` variant has an answer.
 /// Test: Indirect, via `build_from_registry_smoke`.
-fn registry_kind_to_symbol_kind(k: &crate::registry::SymbolKind) -> SymbolKind {
-    use crate::registry::SymbolKind as R;
+fn registry_kind_to_symbol_kind(k: &crate::symgraph::registry::SymbolKind) -> SymbolKind {
+    use crate::symgraph::registry::SymbolKind as R;
     match k {
         R::Function | R::Test | R::TestSuite => SymbolKind::Function,
         R::Method => SymbolKind::Method,
@@ -489,7 +489,9 @@ mod tests {
         // `callee` in its dependencies. Asserts both nodes appear and the
         // `caller -> callee` Calls edge is present.
         // Test: this test.
-        use crate::registry::{SymbolEntry, SymbolId, SymbolKind as RKind, SymbolRegistry};
+        use crate::symgraph::registry::{
+            SymbolEntry, SymbolId, SymbolKind as RKind, SymbolRegistry,
+        };
         use std::collections::BTreeSet;
 
         let tmp = tempfile::TempDir::new().unwrap();

@@ -11,13 +11,13 @@
 //! Test: `entity_type_round_trips` exercises serde round-tripping through the
 //! re-exported types.
 
-pub use trusty_symgraph::contracts::EdgeKind;
-pub use trusty_symgraph::{fact_hash_str, EntityType, RawEntity};
+pub use trusty_common::symgraph::contracts::EdgeKind;
+pub use trusty_common::symgraph::{fact_hash_str, EntityType, RawEntity};
 
 /// redb table name constants for entity storage, re-exported from
-/// `trusty_symgraph::contracts::tables`.
+/// `trusty_common::symgraph::contracts::tables`.
 pub mod tables {
-    pub use trusty_symgraph::contracts::tables::*;
+    pub use trusty_common::symgraph::contracts::tables::*;
 }
 
 #[cfg(test)]

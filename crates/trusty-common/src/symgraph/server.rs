@@ -24,12 +24,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::editor::{Patch, replace_symbol};
-use crate::emitter::{LayoutRules, apply_emit, emit};
-use crate::graph::SymbolGraph;
-use crate::parser::parse_directory;
-use crate::registry::{SymbolEntry, SymbolId, SymbolRegistry};
-use crate::strategy::ModulePathStrategy;
+use crate::symgraph::editor::{Patch, replace_symbol};
+use crate::symgraph::emitter::{LayoutRules, apply_emit, emit};
+use crate::symgraph::graph::SymbolGraph;
+use crate::symgraph::parser::parse_directory;
+use crate::symgraph::registry::{SymbolEntry, SymbolId, SymbolRegistry};
+use crate::symgraph::strategy::ModulePathStrategy;
 
 /// Default bind port.
 pub const DEFAULT_PORT: u16 = 7700;

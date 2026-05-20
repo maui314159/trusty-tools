@@ -757,7 +757,7 @@ impl CodeIndexer {
         classified: &ClassifiedQuery,
     ) -> Vec<CodeChunk> {
         use std::collections::{HashMap, HashSet};
-        use trusty_symgraph::graph::SymbolGraph;
+        use trusty_common::symgraph::graph::SymbolGraph;
 
         // Cache per-file graphs to avoid rebuilding when multiple top-K
         // hits live in the same file.
@@ -790,7 +790,7 @@ impl CodeIndexer {
                 continue;
             };
 
-            let mut neighbours: Vec<&trusty_symgraph::graph::SymbolNode> = Vec::new();
+            let mut neighbours: Vec<&trusty_common::symgraph::graph::SymbolNode> = Vec::new();
             neighbours.extend(graph.callers_of(fn_name));
             neighbours.extend(graph.callees_of(fn_name));
 

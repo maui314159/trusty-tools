@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use super::analyze_project::collect_source_files;
 use crate::tools::traits::{ToolExecutor, ToolResult};
 
-use trusty_symgraph::symbol::{SymbolKind, detect_language, extract_symbols};
+use trusty_common::symgraph::symbol::{SymbolKind, detect_language, extract_symbols};
 
 pub struct CheckCircularDependenciesTool;
 

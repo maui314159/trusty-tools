@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
-use crate::graph::SymbolGraph;
-use crate::registry::{SymbolId, SymbolKind, SymbolRegistry};
-use crate::strategy::EmitStrategy;
+use crate::symgraph::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
+use crate::symgraph::graph::SymbolGraph;
+use crate::symgraph::registry::{SymbolId, SymbolKind, SymbolRegistry};
+use crate::symgraph::strategy::EmitStrategy;
 
 /// Strategy that clusters symbols with high mutual call-edge density into the
 /// same file using Tarjan's strongly-connected-components algorithm.
@@ -127,7 +127,7 @@ fn pick_cluster_file(ids: &[SymbolId], src_root: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
+    use crate::symgraph::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
 
     fn make_cycle_registry() -> SymbolRegistry {
         let mut reg = SymbolRegistry::new(PathBuf::from("/tmp"));

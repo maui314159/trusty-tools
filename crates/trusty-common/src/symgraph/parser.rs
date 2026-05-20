@@ -403,7 +403,7 @@ public class LruCache<K, V> {
         )
         .unwrap();
         let kinds: Vec<_> = entries.iter().map(|e| e.kind.clone()).collect();
-        assert!(kinds.contains(&crate::registry::SymbolKind::Class));
+        assert!(kinds.contains(&crate::symgraph::registry::SymbolKind::Class));
     }
 
     #[test]
@@ -425,8 +425,8 @@ function validate(u: unknown): UserSchema {
         )
         .unwrap();
         let kinds: Vec<_> = entries.iter().map(|e| e.kind.clone()).collect();
-        assert!(kinds.contains(&crate::registry::SymbolKind::Trait));
-        assert!(kinds.contains(&crate::registry::SymbolKind::Function));
+        assert!(kinds.contains(&crate::symgraph::registry::SymbolKind::Trait));
+        assert!(kinds.contains(&crate::symgraph::registry::SymbolKind::Function));
     }
 
     #[test]

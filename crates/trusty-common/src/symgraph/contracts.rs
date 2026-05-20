@@ -71,7 +71,7 @@ impl EntityType {
 }
 
 /// Edge kinds for the entity knowledge graph (distinct from the
-/// `SymbolGraph` structural edges in `crate::graph::EdgeKind`, which is
+/// `SymbolGraph` structural edges in `crate::symgraph::graph::EdgeKind`, which is
 /// only present when the `parser` feature is enabled).
 ///
 /// Phase A = structural (tree-sitter derived)

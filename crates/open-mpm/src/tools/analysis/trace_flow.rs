@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use super::analyze_project::collect_source_files;
 use crate::tools::traits::{ToolExecutor, ToolResult};
 
-use trusty_symgraph::graph::{SymbolGraph, SymbolNode};
-use trusty_symgraph::registry::SymbolRegistry;
+use trusty_common::symgraph::graph::{SymbolGraph, SymbolNode};
+use trusty_common::symgraph::registry::SymbolRegistry;
 
 pub struct TraceExecutionFlowTool;
 
@@ -93,7 +93,7 @@ fn build_graph() -> SymbolGraph {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut reg = SymbolRegistry::new(root.clone());
     for path in collect_source_files(&root) {
-        if let Ok(entries) = trusty_symgraph::parser::parse_file(&path, &root) {
+        if let Ok(entries) = trusty_common::symgraph::parser::parse_file(&path, &root) {
             for mut e in entries {
                 e.assigned_file = Some(path.clone());
                 reg.insert(e);

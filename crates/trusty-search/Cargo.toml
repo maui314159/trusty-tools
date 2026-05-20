@@ -38,8 +38,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Shared trusty-common crates ────────────────────────────────────────────
-trusty-common = { version = "0.3.3", default-features = false, features = ["axum-server", "mcp", "embedder", "embedder-test-support"] }
-trusty-symgraph = { version = "0.2.2", default-features = false }  # contracts surface only — no tree-sitter
+trusty-common = { version = "0.3.3", default-features = false, features = ["axum-server", "mcp", "embedder", "embedder-test-support", "symgraph"] }  # `symgraph` enables only the contracts surface — no tree-sitter, no `links` conflict
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

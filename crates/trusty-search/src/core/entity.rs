@@ -22,15 +22,15 @@ use tree_sitter::{Node, Tree};
 // trusty-symgraph is depended on with `default-features = false` so only the
 // pure-data contracts surface is linked (no tree-sitter, no parser deps).
 // Tree-sitter–driven extraction stays here.
-pub use trusty_symgraph::contracts::EdgeKind;
-pub use trusty_symgraph::{fact_hash_str, EntityType, RawEntity};
+pub use trusty_common::symgraph::contracts::EdgeKind;
+pub use trusty_common::symgraph::{fact_hash_str, EntityType, RawEntity};
 
 /// redb table name constants for entity storage.
 ///
-/// Re-exported from `trusty_symgraph::contracts::tables` for backward
+/// Re-exported from `trusty_common::symgraph::contracts::tables` for backward
 /// compatibility with existing `crate::core::entity::tables::*` call sites.
 pub mod tables {
-    pub use trusty_symgraph::contracts::tables::*;
+    pub use trusty_common::symgraph::contracts::tables::*;
 }
 
 /// Slice the source text for a node and return it as an owned string.

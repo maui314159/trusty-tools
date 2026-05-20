@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
-use crate::registry::{SymbolId, SymbolKind, SymbolRegistry};
-use crate::strategy::EmitStrategy;
+use crate::symgraph::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
+use crate::symgraph::registry::{SymbolId, SymbolKind, SymbolRegistry};
+use crate::symgraph::strategy::EmitStrategy;
 
 /// Strategy that co-locates test symbols with their production targets.
 pub struct TestColocationStrategy {
@@ -121,7 +121,7 @@ impl EmitStrategy for TestColocationStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
+    use crate::symgraph::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
 
     fn make_registry_with_test() -> SymbolRegistry {
         let mut reg = SymbolRegistry::new(PathBuf::from("/tmp"));

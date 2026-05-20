@@ -6,8 +6,8 @@
 //! and one infallible name accessor. `ModulePathStrategy` wraps the existing
 //! `assign_file()` + `topological_sort()` logic for full backward compatibility.
 
-use crate::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
-use crate::registry::{SymbolId, SymbolKind, SymbolRegistry};
+use crate::symgraph::emitter::{EmitError, LayoutRules, assign_file, topological_sort};
+use crate::symgraph::registry::{SymbolId, SymbolKind, SymbolRegistry};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -103,7 +103,7 @@ impl EmitStrategy for ModulePathStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
+    use crate::symgraph::registry::{SymbolEntry, SymbolId, SymbolKind, SymbolRegistry};
     use std::path::PathBuf;
 
     fn make_registry() -> SymbolRegistry {

@@ -637,7 +637,7 @@ mod tests {
         let mut reg = SymbolRegistry::new(dir.path().to_path_buf());
         let mut entry = SymbolEntry::new(
             SymbolId::new("phantom_mod", "preindex_only_symbol"),
-            trusty_symgraph::registry::SymbolKind::Function,
+            trusty_common::symgraph::registry::SymbolKind::Function,
             "fn preindex_only_symbol() -> i32 { 7 }".into(),
             "rust",
         );

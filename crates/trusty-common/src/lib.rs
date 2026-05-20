@@ -84,6 +84,24 @@ pub mod rpc;
 #[cfg(feature = "embedder")]
 pub mod embedder;
 
+/// Symbol-graph engine (formerly the `trusty-symgraph` crate).
+///
+/// Why: All trusty-* tools that touch source code (open-mpm, trusty-search,
+/// trusty-analyze) want the same `EntityType` / `RawEntity` / `EdgeKind`
+/// data shapes and (for orchestrators) the same tree-sitter pipeline. Living
+/// here lets the workspace ship one tree-sitter `links =` slot instead of
+/// juggling two crates that both claim it.
+/// What: Gated behind two features. `symgraph` exposes only the contracts
+/// surface (`EntityType`, `RawEntity`, `EdgeKind`, `fact_hash_str`, tables)
+/// — no tree-sitter, no `links` conflict. `symgraph-parser` additionally
+/// pulls in tree-sitter and the full parse → registry → emit stack.
+/// `symgraph-server` enables the HTTP server frontend.
+/// Test: `cargo test -p trusty-common --features symgraph` exercises the
+/// contracts surface; `cargo test -p trusty-symgraph` covers the parser
+/// path through the thin re-export shim.
+#[cfg(feature = "symgraph")]
+pub mod symgraph;
+
 pub use chat::{
     ChatEvent, ChatProvider, LocalModelConfig, OllamaProvider, OpenRouterProvider, ToolCall,
     ToolDef, auto_detect_local_provider,

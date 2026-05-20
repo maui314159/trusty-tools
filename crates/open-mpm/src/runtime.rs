@@ -1028,7 +1028,7 @@ pub async fn run() -> Result<()> {
         let outputs = ast::emit(
             &registry,
             &rules,
-            &trusty_symgraph::ModulePathStrategy::default(),
+            &trusty_common::symgraph::ModulePathStrategy::default(),
         )?;
         let written = ast::apply_emit(&outputs, &root)?;
         println!("Emitted {} files", written.len());

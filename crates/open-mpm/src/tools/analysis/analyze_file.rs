@@ -20,7 +20,7 @@ use super::ast_walker::{compute_function_complexity, count_parameters_for_functi
 use super::metrics::{FileMetrics, FunctionMetrics, SmellType, complexity_grade};
 use crate::tools::traits::{ToolExecutor, ToolResult};
 
-use trusty_symgraph::symbol::{Symbol, SymbolKind, detect_language, extract_symbols};
+use trusty_common::symgraph::symbol::{Symbol, SymbolKind, detect_language, extract_symbols};
 
 /// Combined per-file analysis result reused by the other analysis tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
