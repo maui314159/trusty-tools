@@ -1,117 +1,177 @@
 # trusty-tools
 
 Unified Rust workspace consolidating the entire trusty-* AI tooling ecosystem.
-Previously spread across 7 separate repos, all 22 crates are now co-located for
-atomic cross-crate changes, a single lockfile, and no `[patch.crates-io]` dance
-during development.
+Unified Rust workspace consolidating 24 crates of AI development tooling,
+with three flagship MCP servers for code search, memory management, and analysis.
 
-## Architecture
+## Three Flagship MCP Servers
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Orchestrator                             │
-│   open-mpm — MPM orchestration platform                         │
-└───────────────┬─────────────────┬───────────────────────────────┘
-                │                 │
-┌───────────────▼─────────────────▼───────────────────────────────┐
-│                   Daemons / MCP servers                         │
-│  trusty-search     trusty-memory-mcp    trusty-analyze          │
-│  (hybrid search)   (memory palace UI)   (code quality)          │
-└───────────────┬────────────┬────────────────────────────────────┘
-                │            │
-┌───────────────▼────────────▼───────────────────────────────────┐
-│                   Storage / Engine layer                        │
-│  trusty-memory-core   trusty-symgraph   trusty-cto-db          │
-│  (usearch + SQLite)   (tree-sitter KG)  (ops SQLite)           │
-└───────────────┬────────────────────────────────────────────────┘
-                │
-┌───────────────▼────────────────────────────────────────────────┐
-│                   MPM Platform (trusty-mpm-*)                  │
-│  core · mcp · daemon · client · cli · tui · telegram · gui     │
-└───────────────┬────────────────────────────────────────────────┘
-                │
-┌───────────────▼────────────────────────────────────────────────┐
-│                   Shared libraries                              │
-│  trusty-common   trusty-mcp-core   trusty-embedder             │
-│  trusty-rpc      trusty-tickets    trusty-gworkspace            │
-│  tc-services     trusty-git-analytics                          │
-└────────────────────────────────────────────────────────────────┘
-```
+### trusty-search — Hybrid Code Search
 
-## Quick Start
+Machine-wide code search daemon with hybrid BM25 + vector + knowledge-graph fusion, fused via Reciprocal Rank Fusion. One install per machine, unlimited named project indexes.
 
+**What you get:**
+- Sub-10ms p50 warm query latency on 100k-chunk indexes
+- Intelligent query routing (Definition / Usage / Conceptual / BugDebt intent detection)
+- Knowledge graph expansion with caller/callee chains
+- Branch-aware search (boost results from your current feature branch)
+- Auto-tuned memory tiers (5 tiers from 8 GB to 64+ GB RAM)
+- Embedded Svelte 5 admin UI
+- OpenRouter-backed chat with auto-injected search context
+
+**Quick start:**
 ```bash
-git clone https://github.com/bobmatnyc/trusty-tools
-cd trusty-tools
-cargo build          # compile all 22 crates
-cargo test           # run all tests
+cargo install trusty-search
+trusty-search start
+trusty-search index ~/Projects/myproj --name myproj
+trusty-search query "fn authenticate" --index myproj
 ```
 
-## Crate Index
+**MCP tools:** `search_code`, `search_similar`, `index_file`, `remove_file`, `list_indexes`, `create_index`, `delete_index`, `reindex`, `index_status`, `list_chunks`, `search_health`, `chat`
+
+See [crates/trusty-search/README.md](crates/trusty-search/README.md) for full documentation.
+
+---
+
+### trusty-memory — Memory Palace Storage Engine
+
+Long-term memory storage with semantic search, persistent embedding index, and embedded Svelte UI. Store development context, notes, snippets, and retrieve them via natural language.
+
+**What you get:**
+- HNSW vector index (usearch) + SQLite persistent storage + fastembed embeddings
+- Semantic search over all stored memories
+- Collection organization (notes, snippets, code patterns, decisions)
+- Svelte UI for browsing and editing
+- MCP server for Claude Code integration
+- MIT license (memory preservation is for everyone)
+
+**Quick start:**
+```bash
+cargo run -p trusty-memory-mcp -- serve
+# Or via MCP stdio:
+# Add to ~/.claude/claude_desktop_config.json:
+# "trusty-memory": {
+#   "command": "cargo",
+#   "args": ["run", "-p", "trusty-memory-mcp", "--", "serve"]
+# }
+```
+
+**MCP tools:** `store_memory`, `search_memories`, `update_memory`, `list_collections`, `create_collection`, `get_memory`, `delete_memory`
+
+See [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md) for full documentation.
+
+---
+
+## Full Crate Index (All 24 Crates)
+
+### Core Daemons / MCP Servers
+
+| Crate | Description | License |
+|---|---|---|
+| `trusty-search` | Hybrid code search (BM25 + vector + KG) + MCP server | Elastic-2.0 |
+| `trusty-memory-core` | Memory storage engine (usearch + SQLite + embeddings) | MIT |
+| `trusty-memory-mcp` | Memory palace UI + MCP frontend | MIT |
 
 ### Shared Libraries
 
 | Crate | Description |
 |---|---|
-| `trusty-common` | Port walking, daemon addr, tracing init, OpenRouter chat, shared utilities |
-| `trusty-embedder` | fastembed wrapper — `AllMiniLML6V2Q` INT8 quantised, 384-dim output |
-| `trusty-mcp-core` | MCP (Model Context Protocol) primitives, JSON-RPC 2.0 types, stdio runner |
-| `trusty-symgraph` | Symbol graph engine — tree-sitter AST to `SymbolRegistry` to emit |
-| `trusty-rpc` | RPC helpers, service descriptors, and `trpc` CLI |
-| `trusty-tickets` | GitHub Issues ticketing integration |
-| `trusty-gworkspace` | Google Workspace client — Calendar, Tasks, Drive |
-| `trusty-cto-db` | SQLite CTO database (rusqlite 0.39, bundled) |
-| `tc-services` | Service-layer adapters: CTO DB, Granola native client, GWorkspace bridge |
+| `trusty-common` | Tracing, daemon helpers, OpenRouter chat client, shared utilities |
+| `trusty-embedder` | fastembed wrapper — all-MiniLM-L6-v2 INT8 quantised, 384-dim output |
+| `trusty-mcp-core` | MCP primitives, JSON-RPC 2.0 types, stdio/HTTP transport |
+| `trusty-symgraph` | Symbol graph engine — tree-sitter AST parser + knowledge graph |
+| `trusty-rpc` | RPC helpers and service descriptors |
+| `trusty-tickets` | GitHub Issues integration |
+| `trusty-gworkspace` | Google Workspace client (Calendar, Tasks, Drive) |
+| `trusty-cto-db` | SQLite schema + rusqlite bindings for ops data |
+| `tc-services` | Service adapters (CTO DB, Granola, GWorkspace) |
 
-### Daemons / MCP Servers
-
-| Crate | Description |
-|---|---|
-| `trusty-search` | Machine-wide hybrid BM25 + vector + knowledge-graph code search + MCP server |
-| `trusty-memory-core` | Memory storage engine — usearch ANN index + SQLite + fastembed (MIT) |
-| `trusty-memory-mcp` | MCP server + HTTP/SSE frontend for trusty-memory; embeds compiled Svelte UI (MIT) |
-| `trusty-analyze` | Code analysis daemon — complexity, smells, quality metrics + MCP server |
-
-### MPM (Multi-agent Platform Manager)
+### MPM Platform (Multi-agent Platform Manager)
 
 | Crate | Description |
 |---|---|
 | `trusty-mpm-core` | Core domain types and traits |
-| `trusty-mpm-mcp` | MCP server for MPM (OpenAPI / Swagger via utoipa) |
+| `trusty-mpm-mcp` | MCP server for MPM (OpenAPI / Swagger) |
 | `trusty-mpm-daemon` | Background daemon service |
 | `trusty-mpm-client` | API client library |
 | `trusty-mpm-cli` | CLI binary — `trusty-mpm` / `tm` |
 | `trusty-mpm-tui` | Terminal UI (ratatui + crossterm) |
-| `trusty-mpm-telegram` | Telegram bot integration (teloxide) |
+| `trusty-mpm-telegram` | Telegram bot integration |
 | `trusty-mpm-gui` | Desktop GUI (Tauri) |
 
-### Analytics
+### Analytics & Orchestration
 
 | Crate | Description |
 |---|---|
-| `trusty-git-analytics` | Developer productivity analytics from git history (`tga` binary) |
+| `trusty-git-analytics` | Developer productivity analytics from git history |
+| `open-mpm` | MPM orchestration platform |
+| `cto-assistant` | CTO domain assistant |
 
-### Orchestrator
+## Architecture
 
-| Crate | Description |
-|---|---|
-| `open-mpm` | MPM orchestration platform; consumes trusty-search, trusty-memory, trusty-symgraph |
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Three Flagship Services (User-Facing)                       │
+│  trusty-search  |  trusty-memory  |  (trusty-analyze)       │
+│  (search)       |  (storage)      |  (future: quality)      │
+└──────────────────────────────────────────────────────────────┘
+         │                  │
+┌────────▼──────────────────▼──────────────────────────────────┐
+│  Storage / Engine Libraries                                 │
+│  trusty-symgraph  ·  trusty-embedder  ·  trusty-cto-db      │
+└────────┬──────────────────────────────────────────────────────┘
+         │
+┌────────▼──────────────────────────────────────────────────────┐
+│  Shared Infrastructure                                       │
+│  trusty-common  ·  trusty-mcp-core  ·  trusty-rpc           │
+│  trusty-gworkspace  ·  trusty-tickets  ·  tc-services       │
+└────────┬──────────────────────────────────────────────────────┘
+         │
+┌────────▼──────────────────────────────────────────────────────┐
+│  Orchestrator / Platform                                    │
+│  open-mpm  ·  trusty-mpm-* family  ·  trusty-git-analytics  │
+└───────────────────────────────────────────────────────────────┘
+```
 
-## Build Commands
+## Quick Start — All Crates
+
+```bash
+git clone https://github.com/bobmatnyc/trusty-tools
+cd trusty-tools
+
+# Build all crates
+cargo build --release
+
+# Run all tests
+cargo test
+
+# Install the CLI tools
+cargo install --path crates/trusty-search --locked
+# More tools available via: cargo install --path crates/<crate>
+```
+
+## Build & Test Commands
 
 ```bash
 cargo build                                          # all crates, debug
-cargo build --release                               # all crates, release
+cargo build --release                               # all crates, release/optimized
 cargo test                                          # all tests
-cargo test -p <crate-name>                          # single crate
+cargo test -p <crate-name>                          # single crate tests
 cargo check                                         # fast compile check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo fmt
 ```
 
-## License
+## Workspace Info
 
-Elastic License 2.0 throughout, except `trusty-memory-core` and
-`trusty-memory-mcp` which are MIT. See each crate's `Cargo.toml` for the
-authoritative license field.
+**Single source of truth:** This monorepo consolidates seven formerly separate repos. All 24 crates are co-located under `crates/` with one workspace root and one `Cargo.lock` — no more `[patch.crates-io]` dances during active development.
+
+**MSRV:** Rust 1.88+ (required for `let-chains` used by `trusty-mpm-*` and `open-mpm` in edition 2024)
+
+**License:** Elastic License 2.0 (most crates), MIT (trusty-memory-core, trusty-memory-mcp, trusty-gworkspace). See each crate's `Cargo.toml` for the authoritative license field.
+
+**Where to start:**
+- **I want to search code:** Read [crates/trusty-search/README.md](crates/trusty-search/README.md)
+- **I want persistent memory:** Read [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md)
+- **I want the full platform:** Read [crates/open-mpm/README.md](crates/open-mpm/README.md)
