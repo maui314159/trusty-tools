@@ -89,10 +89,10 @@ on port 7879 via both an axum HTTP API and an MCP stdio/SSE server.
 cargo run -p trusty-search -- start
 
 # 2. start the analyze sidecar
-cargo run -p trusty-analyzer --bin trusty-analyze -- serve --search-url http://127.0.0.1:7878
+cargo run -p trusty-analyze -- serve --search-url http://127.0.0.1:7878
 
 # 3. analyze a named index
-cargo run -p trusty-analyzer --bin trusty-analyze -- analyze <index-id> --top-k 20
+cargo run -p trusty-analyze -- analyze <index-id> --top-k 20
 ```
 
 **MCP tools:** `analyzer_health`, `complexity_hotspots`, `find_smells`,

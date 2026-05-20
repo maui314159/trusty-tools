@@ -1,4 +1,4 @@
-# trusty-analyzer
+# trusty-analyze
 
 Sidecar code-analysis daemon for trusty-search. Reads chunk corpora from
 trusty-search via HTTP, runs static analysis, and exposes results on port 7879
@@ -8,7 +8,7 @@ via HTTP API and MCP stdio server.
 
 ## Project History
 
-trusty-analyzer is the third generation of code analysis tooling in this lineage.
+trusty-analyze is the third generation of code analysis tooling in this lineage.
 Understanding the lineage helps clarify what to preserve, what to discard, and why
 certain design decisions were made.
 
@@ -34,9 +34,9 @@ certain design decisions were made.
   zero-touch migration from mcp-vector-search
 - Analysis features (complexity, smells, git blame, facts) were initially absorbed
   into trusty-search as part of its search layer
-- **v0.1.37**: analysis layer extracted into this project (trusty-analyzer)
+- **v0.1.37**: analysis layer extracted into this project (trusty-analyze)
 
-### Generation 3: trusty-analyzer (Rust, analysis sidecar daemon) — this project
+### Generation 3: trusty-analyze (Rust, analysis sidecar daemon) — this project
 
 - Sidecar to trusty-search: fetches chunk corpus via `GET /indexes/:id/chunks`,
   runs analysis, serves results on port 7879
@@ -45,7 +45,7 @@ certain design decisions were made.
   mutation testing scores)
 
 **GitHub issues tracking this extraction (in `bobmatnyc/trusty-search`):**
-- `#40` feat: extract code analysis into sibling project trusty-analyzer
+- `#40` feat: extract code analysis into sibling project trusty-analyze
 - `#38` refactor: extract trusty-mcp-core (shared JSON-RPC transport)
 - `#39` refactor: extract trusty-embedder (shared FastEmbedder crate)
 - `#41` refactor: extract trusty-common utilities (shared port binding, registry)
@@ -186,7 +186,7 @@ score = w_text   × text_relevance
       + w_dep    × dependency_risk_score
 ```
 
-This transforms trusty-analyzer from a complexity reporter into a full
+This transforms trusty-analyze from a complexity reporter into a full
 **code intelligence** layer: "find the slowest functions in checkout that call
 external services" becomes a single query.
 
@@ -261,20 +261,20 @@ C, C++
 ## Architecture
 
 ```
-trusty-search daemon (port 7878)          trusty-analyzer daemon (port 7879)
-  GET /indexes/:id/chunks  ─────────────► trusty-analyzer-core
+trusty-search daemon (port 7878)          trusty-analyze daemon (port 7879)
+  GET /indexes/:id/chunks  ─────────────► trusty-analyze-core
   (bulk corpus export)                      complexity.rs   — cyclomatic/cognitive
                                             blame.rs        — git temporal decay
                                             quality.rs      — grade aggregation
                                             facts.rs        — FactStore (redb)
                                             client.rs       — HTTP client to trusty-search
-                                          trusty-analyzer-service (axum HTTP API)
-                                          trusty-analyzer-mcp   (MCP stdio + SSE)
+                                          trusty-analyze-service (axum HTTP API)
+                                          trusty-analyze-mcp   (MCP stdio + SSE)
 ```
 
 ### trusty-common — Shared Type Crate
 
-Lives at `crates/trusty-common`. Path-depended on by both trusty-analyzer and
+Lives at `crates/trusty-common`. Path-depended on by both trusty-analyze and
 trusty-search (once trusty-search migrates its internal types to the shared crate).
 
 Key types:
@@ -284,7 +284,7 @@ Key types:
 pub struct CodeChunk { ... }          // canonical search result. Carries id, file,
                                       // line range, content, function_name, score,
                                       // compact_snippet, match_reason. Does NOT
-                                      // carry complexity or blame — trusty-analyzer
+                                      // carry complexity or blame — trusty-analyze
                                       // computes those independently via
                                       // `compute_complexity_for()` and the blame
                                       // module. The carrier fields were removed in
@@ -326,12 +326,12 @@ pub struct FactRecord { subject, predicate, object, provenance, ... }
 ## Workspace Layout
 
 ```
-trusty-analyzer/
+trusty-analyze/
 ├── Cargo.toml                          workspace + bin manifest
 ├── CLAUDE.md                           this file
 ├── README.md
 ├── src/
-│   └── main.rs                         CLI: trusty-analyzer serve/analyze/facts/health
+│   └── main.rs                         CLI: trusty-analyze serve/analyze/facts/health
 ├── crates/
 │   ├── trusty-common/                  shared types (also used by trusty-search)
 │   │   └── src/
@@ -341,7 +341,7 @@ trusty-analyzer/
 │   │       ├── blame.rs                ChunkBlame
 │   │       ├── entity.rs               EntityType, EdgeKind, RawEntity
 │   │       └── facts.rs                FactRecord
-│   ├── trusty-analyzer-core/           analysis engines
+│   ├── trusty-analyze-core/           analysis engines
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── complexity.rs           cyclomatic + cognitive analysis
@@ -349,13 +349,13 @@ trusty-analyzer/
 │   │       ├── quality.rs              grade aggregation
 │   │       ├── facts.rs                FactStore (redb persistence)
 │   │       └── client.rs               HTTP client to trusty-search daemon
-│   ├── trusty-analyzer-service/        axum HTTP sidecar (port 7879)
+│   ├── trusty-analyze-service/        axum HTTP sidecar (port 7879)
 │   │   └── src/
 │   │       └── lib.rs
 │   ├── trusty-embedder/                 FastEmbedder wrapper (dir name differs from
-│   │   └── src/                         package name: `trusty-analyzer-embedder`)
+│   │   └── src/                         package name: `trusty-analyze-embedder`)
 │   │       └── lib.rs
-│   └── trusty-analyzer-mcp/            MCP stdio + SSE server
+│   └── trusty-analyze-mcp/            MCP stdio + SSE server
 │       └── src/
 │           └── lib.rs
 └── docs/
@@ -424,9 +424,9 @@ Parity rule: every HTTP endpoint has an MCP tool equivalent.
 
 The MCP server supports two transports:
 
-- **stdio**: `trusty-analyzer serve --mcp` — JSON-RPC 2.0 over stdin/stdout,
+- **stdio**: `trusty-analyze serve --mcp` — JSON-RPC 2.0 over stdin/stdout,
   used by Claude Code and other clients that spawn the server as a subprocess.
-- **HTTP/SSE**: `trusty-analyzer serve --mcp-port 7880` — exposes
+- **HTTP/SSE**: `trusty-analyze serve --mcp-port 7880` — exposes
   `POST /mcp` for synchronous JSON-RPC and `GET /mcp/sse` for a long-lived
   Server-Sent Events stream with 15s keep-alive pings. Useful for remote
   integrations and browser-based clients.
@@ -442,8 +442,8 @@ analyzer's stdio transport with Claude Code:
 ```json
 {
   "mcpServers": {
-    "trusty-analyzer": {
-      "command": "trusty-analyzer",
+    "trusty-analyze": {
+      "command": "trusty-analyze",
       "args": ["serve", "--mcp"],
       "env": {}
     }
@@ -451,7 +451,7 @@ analyzer's stdio transport with Claude Code:
 }
 ```
 
-Claude Code auto-discovers this file on project open. The `trusty-analyzer`
+Claude Code auto-discovers this file on project open. The `trusty-analyze`
 binary must be on `PATH` (e.g. via `cargo install --path .`).
 
 ---
@@ -492,18 +492,18 @@ Matches trusty-search conventions where applicable for consistency.
 
 ```
 trusty-search  ──path dep──►  trusty-common  (types only)
-trusty-analyzer──path dep──►  trusty-common  (types only)
-trusty-analyzer──HTTP──────►  trusty-search  (chunk corpus at runtime)
+trusty-analyze──path dep──►  trusty-common  (types only)
+trusty-analyze──HTTP──────►  trusty-search  (chunk corpus at runtime)
 ```
 
-trusty-common must never depend on trusty-search or trusty-analyzer.
+trusty-common must never depend on trusty-search or trusty-analyze.
 
 ---
 
 ## Development Workflow
 
 > **trusty-search MUST always be running before the analyzer starts.**
-> `trusty-analyzer serve` performs a startup health check and will exit with
+> `trusty-analyze serve` performs a startup health check and will exit with
 > code 1 if the search daemon is unreachable.
 
 ```bash
@@ -563,17 +563,17 @@ Trigger paths:
 
 | Crate | Published to crates.io? | Why |
 |-------|------------------------|-----|
-| `trusty-analyzer-types` | ✅ Yes | Pure types, no internal deps |
-| `trusty-analyzer-lang`  | ✅ Yes | Tree-sitter adapters; depends on `-types` |
-| `trusty-analyzer-core`  | ✅ Yes | Analysis primitives; depends on `-types` + `-lang` |
-| `trusty-analyzer-mcp`   | ✅ Yes | MCP server; depends on `-types` + `-core` |
-| `trusty-analyzer-embedder` | ✅ Yes | Renamed from `trusty-embedder` (commit 0abfdaf); name free on crates.io |
-| `trusty-analyzer-service`  | ✅ Yes | Depends on `trusty-analyzer-embedder` |
-| `trusty-analyzer` (bin)    | ✅ Yes | `cargo install trusty-analyzer` works from crates.io |
+| `trusty-analyze-types` | ✅ Yes | Pure types, no internal deps |
+| `trusty-analyze-lang`  | ✅ Yes | Tree-sitter adapters; depends on `-types` |
+| `trusty-analyze-core`  | ✅ Yes | Analysis primitives; depends on `-types` + `-lang` |
+| `trusty-analyze-mcp`   | ✅ Yes | MCP server; depends on `-types` + `-core` |
+| `trusty-analyze-embedder` | ✅ Yes | Renamed from `trusty-embedder` (commit 0abfdaf); name free on crates.io |
+| `trusty-analyze-service`  | ✅ Yes | Depends on `trusty-analyze-embedder` |
+| `trusty-analyze` (bin)    | ✅ Yes | `cargo install trusty-analyze` works from crates.io |
 
-> **`trusty-analyzer-embedder` rename:** the crate was originally named
+> **`trusty-analyze-embedder` rename:** the crate was originally named
 > `trusty-embedder`, which collided with an unrelated published crate. It was
-> renamed to `trusty-analyzer-embedder` in commit `0abfdaf`, resolving the
+> renamed to `trusty-analyze-embedder` in commit `0abfdaf`, resolving the
 > collision. All seven workspace crates are now publishable to crates.io.
 
 ### Pre-publish validation
@@ -583,13 +583,13 @@ publish-clean:
 
 ```bash
 # Dry-run each publishable crate (no upload). Run in dependency order.
-cargo publish -p trusty-analyzer-types     --dry-run
-cargo publish -p trusty-analyzer-lang      --dry-run
-cargo publish -p trusty-analyzer-core      --dry-run
-cargo publish -p trusty-analyzer-mcp       --dry-run
-cargo publish -p trusty-analyzer-embedder  --dry-run
-cargo publish -p trusty-analyzer-service   --dry-run
-cargo publish -p trusty-analyzer           --dry-run
+cargo publish -p trusty-analyze-types     --dry-run
+cargo publish -p trusty-analyze-lang      --dry-run
+cargo publish -p trusty-analyze-core      --dry-run
+cargo publish -p trusty-analyze-mcp       --dry-run
+cargo publish -p trusty-analyze-embedder  --dry-run
+cargo publish -p trusty-analyze-service   --dry-run
+cargo publish -p trusty-analyze           --dry-run
 ```
 
 Note: dry-runs require dependencies to already be published on crates.io at
@@ -616,10 +616,10 @@ tree-sitter adapters are all functional.
 **Working:**
 - Workspace builds and all 107 tests pass (`cargo test --workspace`)
 - trusty-common type definitions (chunk, complexity, blame, entity, facts)
-- trusty-analyzer-core fully wired: `client.rs`, `complexity.rs`, `blame.rs`,
+- trusty-analyze-core fully wired: `client.rs`, `complexity.rs`, `blame.rs`,
   `quality.rs`, `facts.rs`
-- axum HTTP sidecar (`trusty-analyzer-service`) — 8 endpoints live on port 7879
-- MCP stdio server (`trusty-analyzer-mcp`) — 9 tools (HTTP parity maintained)
+- axum HTTP sidecar (`trusty-analyze-service`) — 8 endpoints live on port 7879
+- MCP stdio server (`trusty-analyze-mcp`) — 9 tools (HTTP parity maintained)
 - CLI subcommands: `serve`, `analyze`, `facts list/upsert`, `health`
 - Daemon PID lockfile (fs4), graceful shutdown, `--search-url` flag
 - `LanguageAnalyzer` trait + tree-sitter adapters for Python, Java, Go (complete);

@@ -1,6 +1,6 @@
-# trusty-analyzer
+# trusty-analyze
 
-[![crates.io](https://img.shields.io/crates/v/trusty-analyzer.svg)](https://crates.io/crates/trusty-analyzer)
+[![crates.io](https://img.shields.io/crates/v/trusty-analyze.svg)](https://crates.io/crates/trusty-analyze)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Sidecar code-analysis daemon for [trusty-search](../trusty-search). Fetches chunk
@@ -10,11 +10,11 @@ HTTP (port 7879) and MCP stdio.
 ## Installation
 
 ```bash
-cargo install trusty-analyzer
+cargo install trusty-analyze
 ```
 
 The installed binary is named `trusty-analyze`. The crate name on crates.io is
-`trusty-analyzer`.
+`trusty-analyze`.
 
 ## Quick Start
 
@@ -109,13 +109,13 @@ POST /indexes/:id/scip
 
 ## Architecture
 
-The crate is a single `trusty-analyzer` package containing the CLI binary
+The crate is a single `trusty-analyze` package containing the CLI binary
 (`trusty-analyze`) and a library. All analysis engines, the HTTP server, and the
 MCP stdio server live within this one crate. Shared types (complexity metrics,
 code smells, knowledge-graph entities, facts) come from `trusty-common`.
 
 ```
-trusty-search (port 7878)                trusty-analyzer (port 7879)
+trusty-search (port 7878)                trusty-analyze (port 7879)
   GET /indexes/:id/chunks  ──────────►   complexity analysis (tree-sitter)
   (bulk corpus export)                   blame + temporal decay
                                          quality grade aggregation
@@ -128,13 +128,13 @@ trusty-search (port 7878)                trusty-analyzer (port 7879)
 
 ```bash
 # Build
-cargo build -p trusty-analyzer
+cargo build -p trusty-analyze
 
 # Test
-cargo test -p trusty-analyzer
+cargo test -p trusty-analyze
 
 # Lint
-cargo clippy -p trusty-analyzer --all-targets -- -D warnings
+cargo clippy -p trusty-analyze --all-targets -- -D warnings
 ```
 
 See [CLAUDE.md](./CLAUDE.md) for full architecture, API reference, and project history.

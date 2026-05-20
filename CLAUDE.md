@@ -285,9 +285,9 @@ When publishing a crate to crates.io:
 - Uses edition 2024 and let-chains extensively.
 
 ### trusty-analyze
-- Directory `crates/trusty-analyze/`, **package name `trusty-analyzer`**, binary
-  `trusty-analyze`. Use `cargo run -p trusty-analyzer -- ...` or
-  `cargo check -p trusty-analyzer`.
+- Directory `crates/trusty-analyze/`, package name `trusty-analyze`, binary
+  `trusty-analyze`. Use `cargo run -p trusty-analyze -- ...` or
+  `cargo check -p trusty-analyze`.
 - Licensed **MIT** (not Elastic-2.0).
 - Edition 2021. Uses tree-sitter 0.26 to share the `links = "tree-sitter"` slot
   with `open-mpm` and `trusty-symgraph`. Do not pin tree-sitter 0.24 here — it

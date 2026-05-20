@@ -1,5 +1,5 @@
 [package]
-name        = "trusty-analyzer"
+name        = "trusty-analyze"
 version     = "0.1.4"
 edition     = "2021"
 license     = "MIT"
@@ -17,7 +17,7 @@ name = "trusty-analyze"
 path = "src/main.rs"
 
 [lib]
-name = "trusty_analyzer"
+name = "trusty_analyze"
 path = "src/lib.rs"
 
 [dependencies]

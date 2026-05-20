@@ -97,7 +97,7 @@ fn ensure_dist_placeholder(dist_dir: &Path) {
     let _ = std::fs::create_dir_all(dist_dir);
     let _ = std::fs::write(
         dist_dir.join("index.html"),
-        "<!doctype html><html><body><p>trusty-analyzer: UI assets not built. \
+        "<!doctype html><html><body><p>trusty-analyze: UI assets not built. \
          Run <code>pnpm --dir ui install &amp;&amp; pnpm --dir ui build</code> \
          and rebuild.</p></body></html>",
     );

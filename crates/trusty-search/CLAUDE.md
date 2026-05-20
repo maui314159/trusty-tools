@@ -325,10 +325,10 @@ Paginated enumeration of all chunks in stable `(file, start_line)` order.
 
 ##### Complexity / smells / quality endpoints
 
-> **Moved to trusty-analyzer (issue #71).** As of v0.2.0, `CodeChunk` no longer
+> **Moved to trusty-analyze (issue #71).** As of v0.2.0, `CodeChunk` no longer
 > carries `complexity_score`, `complexity`, or `blame` fields. Complexity
 > hotspots, code-smell findings, and aggregate quality grades are now served by
-> the standalone **trusty-analyzer** service, which owns the canonical
+> the standalone **trusty-analyze** service, which owns the canonical
 > cyclomatic / Halstead / cognitive metrics and git-blame integration. The
 > previous `GET /indexes/:id/complexity_hotspots`, `GET /indexes/:id/smells`,
 > and `GET /indexes/:id/quality` endpoints are not implemented in

@@ -1,4 +1,4 @@
-//! `trusty-analyzer` CLI: sidecar daemon + ad-hoc analysis commands.
+//! `trusty-analyze` CLI: sidecar daemon + ad-hoc analysis commands.
 //!
 //! Subcommands:
 //! - `serve`        run HTTP daemon (and, with `--mcp`, an MCP stdio loop)
@@ -12,10 +12,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use trusty_analyzer::core::{facts::new_fact, AnalyzerRegistry, FactStore, TrustySearchClient};
-use trusty_analyzer::embedder::{BowEmbedder, Embedder, NeuralEmbedder};
-use trusty_analyzer::mcp::AnalyzerMcpServer;
-use trusty_analyzer::service::{serve, AnalyzerAppState, DEFAULT_PORT};
+use trusty_analyze::core::{facts::new_fact, AnalyzerRegistry, FactStore, TrustySearchClient};
+use trusty_analyze::embedder::{BowEmbedder, Embedder, NeuralEmbedder};
+use trusty_analyze::mcp::AnalyzerMcpServer;
+use trusty_analyze::service::{serve, AnalyzerAppState, DEFAULT_PORT};
 
 mod commands;
 use commands::daemon as daemon_cmds;
@@ -390,7 +390,7 @@ async fn main() -> Result<()> {
                 let mcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", mcp_port)).await?;
                 tracing::info!("MCP HTTP/SSE server listening on port {mcp_port}");
                 tokio::spawn(async move {
-                    axum::serve(mcp_listener, trusty_analyzer::mcp::sse::router(mcp_srv))
+                    axum::serve(mcp_listener, trusty_analyze::mcp::sse::router(mcp_srv))
                         .await
                         .ok();
                 });
@@ -405,7 +405,7 @@ async fn main() -> Result<()> {
                     }
                 });
                 let mcp_server = AnalyzerMcpServer::new(format!("http://127.0.0.1:{port_for_url}"));
-                trusty_analyzer::mcp::stdio::run(mcp_server).await?;
+                trusty_analyze::mcp::stdio::run(mcp_server).await?;
                 http.abort();
                 Ok(())
             } else {
@@ -417,7 +417,7 @@ async fn main() -> Result<()> {
                 .get_chunks(&index_id)
                 .await
                 .with_context(|| format!("fetch chunks for {index_id}"))?;
-            let report = trusty_analyzer::core::quality::aggregate_quality(&chunks);
+            let report = trusty_analyze::core::quality::aggregate_quality(&chunks);
             println!(
                 "Index: {} | chunks: {} | avg cyclomatic: {:.2} | %A: {:.1}% | smells: {}",
                 index_id,
@@ -448,11 +448,11 @@ async fn main() -> Result<()> {
                 println!("  {lang}: {nodes} nodes, {edges} edges");
             }
 
-            let hotspots = trusty_analyzer::core::quality::complexity_hotspots(&chunks, top_k);
+            let hotspots = trusty_analyze::core::quality::complexity_hotspots(&chunks, top_k);
             println!("\nTop {top_k} complexity hotspots:");
             for (i, c) in hotspots.iter().enumerate() {
                 let cyclo =
-                    trusty_analyzer::core::complexity::compute_complexity(&c.content).cyclomatic;
+                    trusty_analyze::core::complexity::compute_complexity(&c.content).cyclomatic;
                 println!(
                     "  {:>3}. cyclo={:>3} {}:{}-{} ({})",
                     i + 1,
@@ -495,7 +495,7 @@ async fn main() -> Result<()> {
                 std::fs::read_to_string(&diff).with_context(|| format!("read diff file {diff}"))?
             };
             let report =
-                trusty_analyzer::core::analyze_diff_with_client(&diff_text, &search, &index_id)
+                trusty_analyze::core::analyze_diff_with_client(&diff_text, &search, &index_id)
                     .await
                     .context("analyze diff")?;
             match format {
@@ -506,7 +506,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 OutputFormat::Text => {
-                    print!("{}", trusty_analyzer::core::render_review_text(&report));
+                    print!("{}", trusty_analyze::core::render_review_text(&report));
                 }
             }
             Ok(())
@@ -577,7 +577,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Mcp { analyzer_url } => {
             let server = AnalyzerMcpServer::new(analyzer_url);
-            trusty_analyzer::mcp::stdio::run(server).await
+            trusty_analyze::mcp::stdio::run(server).await
         }
         Cmd::Dashboard { port } => {
             use std::net::{SocketAddr, TcpStream};
@@ -663,7 +663,7 @@ async fn run_deep(
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("deep analysis request failed: HTTP {status}: {body}");
     }
-    let report: trusty_analyzer::core::DeepAnalysisReport = resp
+    let report: trusty_analyze::core::DeepAnalysisReport = resp
         .json()
         .await
         .with_context(|| format!("decode response from {url}"))?;
@@ -677,7 +677,7 @@ async fn run_deep(
         OutputFormat::Text => {
             print!(
                 "{}",
-                trusty_analyzer::core::render_deep_analysis_text(&report)
+                trusty_analyze::core::render_deep_analysis_text(&report)
             );
         }
     }
@@ -722,10 +722,10 @@ async fn run_review_pr(
     }
 
     let client = reqwest::Client::new();
-    let diff = trusty_analyzer::core::fetch_pr_diff(&client, owner, repo_name, pr, &token)
+    let diff = trusty_analyze::core::fetch_pr_diff(&client, owner, repo_name, pr, &token)
         .await
         .with_context(|| format!("fetch diff for {owner}/{repo_name}#{pr}"))?;
-    let report = trusty_analyzer::core::analyze_diff_with_client(&diff, &search, &index_id)
+    let report = trusty_analyze::core::analyze_diff_with_client(&diff, &search, &index_id)
         .await
         .context("analyze PR diff")?;
 
@@ -737,13 +737,13 @@ async fn run_review_pr(
             );
         }
         OutputFormat::Text => {
-            print!("{}", trusty_analyzer::core::render_review_text(&report));
+            print!("{}", trusty_analyze::core::render_review_text(&report));
         }
     }
 
     if post_comment {
-        let markdown = trusty_analyzer::core::format_review_as_markdown(&report);
-        trusty_analyzer::core::post_pr_comment(&client, owner, repo_name, pr, &markdown, &token)
+        let markdown = trusty_analyze::core::format_review_as_markdown(&report);
+        trusty_analyze::core::post_pr_comment(&client, owner, repo_name, pr, &markdown, &token)
             .await
             .with_context(|| format!("post review comment to {owner}/{repo_name}#{pr}"))?;
         println!("Posted review comment to {owner}/{repo_name}#{pr}");

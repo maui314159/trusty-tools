@@ -175,7 +175,7 @@ Once connected, Claude Code can call `search_code`, `index_file`, `list_indexes`
   configs and re-registers each project as a named index
 
 > **Code quality analysis:** Complexity hotspots, smell detection, and quality grades
-> have moved to [trusty-analyzer](https://github.com/bobmatnyc/trusty-analyzer).
+> have moved to [trusty-analyze](../trusty-analyze).
 > The `complexity_hotspots`, `smells`, and `quality` HTTP endpoints are not served
 > from this binary as of v0.2.0.
 

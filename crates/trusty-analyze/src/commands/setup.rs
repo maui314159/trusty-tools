@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 
-use trusty_analyzer::service::DEFAULT_PORT;
+use trusty_analyze::service::DEFAULT_PORT;
 
 /// Targets for `trusty-analyze setup`.
 ///
