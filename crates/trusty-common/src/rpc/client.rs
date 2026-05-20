@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::transport::Transport;
+use crate::rpc::transport::Transport;
 
 /// Generate a fresh JSON-RPC request id (UUID v4).
 /// Why: JSON-RPC servers correlate requests/responses by id; we just need uniqueness per call.

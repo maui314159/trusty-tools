@@ -15,7 +15,7 @@
 //! Test: see `tests` below — verifies `name`, `tools().len() == 13`, and
 //! that scope mappings match for both read and write tools.
 
-use trusty_mcp_core::ServiceDescriptor;
+use trusty_common::mcp::ServiceDescriptor;
 
 /// Why: implements `ServiceDescriptor` so open-mpm can link trusty-search
 /// directly and include its tools in a unified `rpc.discover` document.

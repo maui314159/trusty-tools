@@ -162,7 +162,7 @@ async fn reap_loop(state: Arc<DaemonState>) {
 pub async fn run_mcp(state: Arc<DaemonState>) -> anyhow::Result<()> {
     info!("trusty-mpm MCP server starting on stdio");
     let backend = mcp_backend::StateBackend::new(state);
-    trusty_mcp_core::run_stdio_loop(move |req| {
+    trusty_common::mcp::run_stdio_loop(move |req| {
         let backend = backend.clone();
         async move { trusty_mpm_mcp::dispatch(&backend, req).await }
     })

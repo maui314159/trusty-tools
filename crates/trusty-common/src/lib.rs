@@ -42,6 +42,33 @@ pub mod launchd;
 #[cfg(feature = "axum-server")]
 pub mod server;
 
+/// Shared JSON-RPC 2.0 / MCP primitives (formerly the `trusty-mcp-core` crate).
+///
+/// Why: Centralises `Request`/`Response`/`JsonRpcError` envelopes, the
+/// `initialize` response builder, an async stdio dispatch loop, and the
+/// OpenRPC `rpc.discover` helpers so every MCP server in the workspace
+/// imports the same types.
+/// What: Gated behind the `mcp` feature; pulls in no extra dependencies
+/// beyond `serde` / `tokio`, both of which are already required.
+/// Test: `cargo test -p trusty-common --features mcp` runs the module's
+/// own unit tests (envelope round-trips, stdio loop dispatch, OpenRPC
+/// builder shape).
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
+/// General-purpose JSON-RPC client + transports (formerly the library half
+/// of the `trusty-rpc` crate).
+///
+/// Why: Both `trpc` (the CLI) and any future library consumer want one
+/// place that owns the JSON-RPC envelope construction, stdio-subprocess
+/// transport, HTTP transport, and pretty-printers.
+/// What: Gated behind the `rpc` feature; requires `uuid` for request id
+/// generation. The HTTP transport reuses the workspace `reqwest`.
+/// Test: `cargo test -p trusty-common --features rpc` runs the module's
+/// own unit tests (envelope extraction, pretty-print smoke tests).
+#[cfg(feature = "rpc")]
+pub mod rpc;
+
 pub use chat::{
     ChatEvent, ChatProvider, LocalModelConfig, OllamaProvider, OpenRouterProvider, ToolCall,
     ToolDef, auto_detect_local_provider,

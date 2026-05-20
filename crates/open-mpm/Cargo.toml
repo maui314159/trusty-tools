@@ -34,7 +34,7 @@ trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 #      SearchMcpService impls. trusty-search now aligns on tree-sitter 0.26
 #      (matches trusty-symgraph) so the previous `links = "tree-sitter"`
 #      single-copy conflict is resolved and we link it directly.
-trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
+trusty-common = { workspace = true, features = ["mcp"] }
 trusty-memory = { path = "../trusty-memory-mcp", version = "0.1.19" }
 trusty-search = { path = "../trusty-search", version = "0.3.45" }
 tokio = { version = "1", features = ["full"] }

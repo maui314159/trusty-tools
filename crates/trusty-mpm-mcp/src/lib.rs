@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use trusty_mcp_core::{Request, Response, error_codes};
+use trusty_common::mcp::{Request, Response, error_codes};
 
 pub mod tools;
 
@@ -93,7 +93,7 @@ pub async fn dispatch<B: OrchestratorBackend>(backend: &B, req: Request) -> Resp
     match req.method.as_str() {
         "initialize" => Response::ok(
             id,
-            trusty_mcp_core::initialize_response(SERVER_NAME, SERVER_VERSION, None),
+            trusty_common::mcp::initialize_response(SERVER_NAME, SERVER_VERSION, None),
         ),
         "tools/list" => Response::ok(id, json!({ "tools": tool_catalog() })),
         "tools/call" => dispatch_tool_call(backend, id, req.params).await,

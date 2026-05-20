@@ -31,7 +31,7 @@ use serde_json::Value;
 // JSON-RPC 2.0 primitives moved to the shared `trusty-mcp-core` crate so
 // trusty-memory and trusty-search agree on the wire shape. Re-exported here
 // to keep `pub use` consumers (and `crate::mcp::tools::error_codes` etc.) working.
-pub use trusty_mcp_core::{error_codes, initialize_response, JsonRpcError, Request, Response};
+pub use trusty_common::mcp::{error_codes, initialize_response, JsonRpcError, Request, Response};
 
 /// Tool dispatcher backed by an HTTP client targeting the daemon.
 #[derive(Clone)]

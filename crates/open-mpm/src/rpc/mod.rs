@@ -23,8 +23,8 @@
 
 use axum::Json;
 use serde_json::{Value, json};
-use trusty_mcp_core::ServiceDescriptor;
-use trusty_mcp_core::openrpc::OpenRpcBuilder;
+use trusty_common::mcp::ServiceDescriptor;
+use trusty_common::mcp::openrpc::OpenRpcBuilder;
 use trusty_memory::MemoryMcpService;
 use trusty_search::SearchMcpService;
 

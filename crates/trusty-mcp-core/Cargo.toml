@@ -5,18 +5,20 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared JSON-RPC 2.0 / MCP types and stdio runner for trusty-* projects"
+description = "Deprecated: absorbed into `trusty-common` behind the `mcp` feature (issue #5 phase 2a). Use `trusty-common` instead."
 readme = "README.md"
 keywords = ["mcp", "jsonrpc", "mcp-protocol", "stdio"]
 categories = ["network-programming"]
 homepage = "https://github.com/bobmatnyc/trusty-tools"
+# Why: contents have been absorbed into `trusty-common`'s `mcp` module.
+# Keeping the crate source in-tree as a thin re-export shim for any
+# out-of-tree code still pinning the published version, but we don't want
+# `cargo publish` to upload a duplicate library.
+publish = false
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+# Re-export shim only — pull in `trusty-common` with the `mcp` feature.
+trusty-common = { workspace = true, features = ["mcp"] }

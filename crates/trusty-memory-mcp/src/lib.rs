@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, OnceCell};
 use tracing::info;
+use trusty_common::mcp::{error_codes, initialize_response, Request, Response};
 use trusty_common::ChatProvider;
-use trusty_mcp_core::{error_codes, initialize_response, Request, Response};
 use trusty_memory_core::embed::FastEmbedder;
 use trusty_memory_core::store::ChatSessionStore;
 use trusty_memory_core::PalaceRegistry;
@@ -335,7 +335,7 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
 pub async fn run_stdio(state: AppState) -> Result<()> {
     info!("trusty-memory MCP stdio server starting");
     let state = Arc::new(state);
-    trusty_mcp_core::run_stdio_loop(move |req: Request| {
+    trusty_common::mcp::run_stdio_loop(move |req: Request| {
         let state = state.clone();
         async move {
             // Re-serialise the Request into the JSON shape handle_message expects.

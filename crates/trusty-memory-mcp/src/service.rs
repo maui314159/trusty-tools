@@ -20,7 +20,7 @@
 //! for representative tools (`memory_recall` → `memory.read`,
 //! `memory_remember` → `memory.write`).
 
-use trusty_mcp_core::ServiceDescriptor;
+use trusty_common::mcp::ServiceDescriptor;
 
 use crate::openrpc::scopes_for_tool;
 use crate::tools::tool_definitions_with;

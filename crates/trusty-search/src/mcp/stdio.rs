@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// and write responses to stdout. Returns when stdin reaches EOF.
 pub async fn run(server: McpServer) -> Result<()> {
     let server = Arc::new(server);
-    trusty_mcp_core::run_stdio_loop(move |req| {
+    trusty_common::mcp::run_stdio_loop(move |req| {
         let server = server.clone();
         async move { server.dispatch(req).await }
     })

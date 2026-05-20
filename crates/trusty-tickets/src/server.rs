@@ -17,7 +17,7 @@ use crate::api::backends::{
     UpdateIssueParams,
 };
 use crate::api::client::BackendClient;
-use trusty_mcp_core::{Request, Response, error_codes, initialize_response, run_stdio_loop};
+use trusty_common::mcp::{Request, Response, error_codes, initialize_response, run_stdio_loop};
 
 /// Shared state passed to every dispatcher invocation.
 ///

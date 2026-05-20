@@ -23,7 +23,7 @@
 //! the `x-scopes` extension, and a representative tool with required
 //! params being flattened into the OpenRPC `params` array.
 
-use crate::service::ServiceDescriptor;
+use crate::mcp::service::ServiceDescriptor;
 use serde_json::{Map, Value, json};
 
 /// Fluent builder for an OpenRPC 1.3.2 service-description document.

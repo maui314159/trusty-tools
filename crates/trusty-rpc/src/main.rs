@@ -1,5 +1,11 @@
 //! `trpc` — general-purpose CLI for JSON-RPC services (stdio + HTTP).
 //!
+//! **Deprecated as a library:** the library half of this crate has been
+//! absorbed into `trusty-common` behind the `rpc` feature (issue #5 phase 2a).
+//! The `trpc` binary lives on here, but downstream code should depend on
+//! `trusty-common = { features = ["rpc"] }` and import from
+//! `trusty_common::rpc` directly.
+//!
 //! Why: across the trusty-* ecosystem we frequently need to poke MCP servers
 //! and other JSON-RPC endpoints by hand. Shelling out `printf '{...}' | server`
 //! is fiddly and error-prone; `trpc` provides a uniform interface with sane
@@ -8,7 +14,7 @@
 //! an `HttpTransport` (`--url`), wraps it in `RpcClient`, dispatches the
 //! subcommand, and pretty-prints the response.
 //! Test: argument parsing has unit tests below; transports and client logic
-//! are covered in their own modules.
+//! are covered by tests in `trusty_common::rpc`.
 
 use std::sync::Arc;
 
@@ -16,12 +22,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-mod client;
-mod output;
-mod transport;
-
-use client::RpcClient;
-use transport::{HttpTransport, StdioTransport, Transport};
+use trusty_common::rpc::client::RpcClient;
+use trusty_common::rpc::output;
+use trusty_common::rpc::transport::{HttpTransport, StdioTransport, Transport};
 
 #[derive(Parser, Debug)]
 #[command(name = "trpc", version, about = "JSON-RPC service CLI (stdio + HTTP)")]

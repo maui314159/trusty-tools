@@ -290,6 +290,7 @@ struct Cli {
 //       deliberately small.
 // Test: The binary continues to build and run end-to-end via `cargo build`
 //       and the existing tmux/REPL tests.
+use crate::default_bundled_config_dir;
 use crate::{
     adapters, agents, api, ast, build_info, bus, cli, compress, context, ctrl, ctrl_session,
     debugger, docs_index, eval, events, git, identity, init, inspection, intent, interaction_log,
@@ -298,7 +299,6 @@ use crate::{
     session_registry, skills, slack, state_writer, subprocess, telegram, ticketing, tm, tmux,
     tools, update, usage, workflow,
 };
-use crate::default_bundled_config_dir;
 
 use memory::{CodeStore, FastEmbedder};
 use search::{CodeIndexer, FileWatcher};
