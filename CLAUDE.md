@@ -285,6 +285,21 @@ When publishing a crate to crates.io:
   `trusty-memory-core`, and `trusty-symgraph`.
 - Uses edition 2024 and let-chains extensively.
 
+### trusty-analyze
+- Directory `crates/trusty-analyze/`, **package name `trusty-analyzer`**, binary
+  `trusty-analyze`. Use `cargo run -p trusty-analyzer -- ...` or
+  `cargo check -p trusty-analyzer`.
+- Licensed **MIT** (not Elastic-2.0).
+- Edition 2021. Uses tree-sitter 0.26 to share the `links = "tree-sitter"` slot
+  with `open-mpm` and `trusty-symgraph`. Do not pin tree-sitter 0.24 here — it
+  will collide with the rest of the workspace.
+- Hard runtime dependency on `trusty-search`: the daemon performs a startup
+  health check against `GET <search-url>/health` (default
+  `http://127.0.0.1:7878`) and exits 1 if unreachable. There is no offline mode.
+- Listens on port 7879 (HTTP API + MCP). Optional ONNX-backed NER lives behind
+  the `ner` feature flag (`--features ner`).
+- Facts store persisted via redb at the daemon's working directory.
+
 ## Development Environment
 
 ### Required Tools

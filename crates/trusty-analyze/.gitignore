@@ -1,0 +1,13 @@
+/target
+**/target
+*.redb
+*.redb-*
+.DS_Store
+.claude-mpm/
+.fastembed_cache/
+.claude/
+.trusty-search
+
+# UI: ui/dist/ contains the hand-authored vanilla JS dashboard (committed).
+# node_modules is local-only (no build step required).
+ui/node_modules/

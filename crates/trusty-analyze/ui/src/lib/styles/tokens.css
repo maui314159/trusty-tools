@@ -1,0 +1,158 @@
+/*
+ * trusty-analyzer dashboard design tokens — Catppuccin Latte (light) +
+ * Catppuccin Mocha (dark), switched via [data-theme] on <html>.
+ *
+ * Why: Operators want parity with editor themes. Light mode improves use
+ * on high-ambient-light displays; system mode tracks OS preference.
+ * What: Raw palette per theme attribute, plus the shared --trusty-* alias
+ * layer (typography, spacing, radii) on :root so component CSS keeps working.
+ * Test: Toggle the topbar theme switcher; --bg and --text resolve to the
+ * matching Catppuccin value in DevTools.
+ */
+
+/* ── Catppuccin Mocha (dark) — default when no data-theme set ─ */
+:root,
+[data-theme="dark"] {
+  --bg:       #1e1e2e;
+  --mantle:   #181825;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --surface2: #585b70;
+  --text:     #cdd6f4;
+  --subtext1: #bac2de;
+  --subtext0: #a6adc8;
+  --overlay2: #9399b2;
+  --blue:     #89b4fa;
+  --lavender: #b4befe;
+  --green:    #a6e3a1;
+  --teal:     #94e2d5;
+  --yellow:   #f9e2af;
+  --peach:    #fab387;
+  --red:      #f38ba8;
+  --mauve:    #cba6f7;
+  --border:   #45475a;
+  --shadow:   rgba(0, 0, 0, 0.4);
+
+  /* Compatibility aliases for code that referenced the old palette names */
+  --surface:       var(--surface0);
+  --surface-hover: var(--surface1);
+  --subtext:       var(--subtext0);
+  --muted:         var(--overlay2);
+  --orange:        var(--peach);
+  --text-inverse:  #11111b;
+
+  --sidebar-bg:     var(--mantle);
+  --sidebar-border: #11111b;
+}
+
+/* ── Catppuccin Latte (light) ────────────────────────────── */
+[data-theme="light"] {
+  --bg:       #eff1f5;
+  --mantle:   #e6e9ef;
+  --surface0: #ccd0da;
+  --surface1: #bcc0cc;
+  --surface2: #acb0be;
+  --text:     #4c4f69;
+  --subtext1: #5c5f77;
+  --subtext0: #6c6f85;
+  --overlay2: #7c7f93;
+  --blue:     #1e66f5;
+  --lavender: #7287fd;
+  --green:    #40a02b;
+  --teal:     #179299;
+  --yellow:   #df8e1d;
+  --peach:    #fe640b;
+  --red:      #d20f39;
+  --mauve:    #8839ef;
+  --border:   #bcc0cc;
+  --shadow:   rgba(0, 0, 0, 0.1);
+
+  /* Compatibility aliases */
+  --surface:       var(--surface0);
+  --surface-hover: var(--surface1);
+  --subtext:       var(--subtext0);
+  --muted:         var(--overlay2);
+  --orange:        var(--peach);
+  --text-inverse:  #eff1f5;
+
+  --sidebar-bg:     var(--mantle);
+  --sidebar-border: var(--surface1);
+}
+
+/*
+ * Shared aliases, typography, spacing — theme-agnostic.
+ * Grade colors map to semantic palette entries so they recolor with theme.
+ */
+:root {
+  /* Grade colors (semantic, theme-aware via palette vars) */
+  --grade-a: var(--green);
+  --grade-b: var(--teal);
+  --grade-c: var(--yellow);
+  --grade-d: var(--peach);
+  --grade-f: var(--red);
+
+  /* Trusty shell alias mapping (used by global.css) */
+  --trusty-sidebar-bg: var(--sidebar-bg);
+  --trusty-sidebar-text: var(--text);
+  --trusty-sidebar-muted: var(--muted);
+  --trusty-sidebar-accent: var(--blue);
+  --trusty-sidebar-active: var(--surface);
+  --trusty-sidebar-border: var(--sidebar-border);
+
+  --trusty-content-bg: var(--bg);
+  --trusty-card-bg: var(--surface);
+  --trusty-border: var(--border);
+  --trusty-border-strong: var(--surface-hover);
+
+  --trusty-text-primary: var(--text);
+  --trusty-text-secondary: var(--subtext);
+  --trusty-text-muted: var(--muted);
+  --trusty-text-inverse: var(--text-inverse);
+
+  --trusty-accent: var(--blue);
+  --trusty-accent-hover: var(--lavender);
+  --trusty-accent-soft: color-mix(in srgb, var(--blue) 15%, transparent);
+  --trusty-success: var(--green);
+  --trusty-success-soft: color-mix(in srgb, var(--green) 15%, transparent);
+  --trusty-warning: var(--yellow);
+  --trusty-warning-soft: color-mix(in srgb, var(--yellow) 15%, transparent);
+  --trusty-danger: var(--red);
+  --trusty-danger-soft: color-mix(in srgb, var(--red) 15%, transparent);
+  --trusty-info: var(--teal);
+  --trusty-info-soft: color-mix(in srgb, var(--teal) 15%, transparent);
+
+  /* Typography */
+  --trusty-font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --trusty-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, Menlo, monospace;
+  --trusty-fs-xs: 0.75rem;
+  --trusty-fs-sm: 0.875rem;
+  --trusty-fs-md: 1rem;
+  --trusty-fs-lg: 1.125rem;
+  --trusty-fs-xl: 1.5rem;
+  --trusty-fs-2xl: 2rem;
+
+  /* Surface */
+  --trusty-radius-sm: 4px;
+  --trusty-radius: 8px;
+  --trusty-radius-lg: 12px;
+  --trusty-shadow-sm: 0 1px 2px var(--shadow);
+  --trusty-shadow: 0 1px 3px var(--shadow), 0 1px 2px var(--shadow);
+  --trusty-shadow-lg: 0 10px 25px var(--shadow);
+
+  /* Layout */
+  --trusty-sidebar-width: 240px;
+  --trusty-topbar-height: 60px;
+  --trusty-space-1: 4px;
+  --trusty-space-2: 8px;
+  --trusty-space-3: 12px;
+  --trusty-space-4: 16px;
+  --trusty-space-5: 24px;
+  --trusty-space-6: 32px;
+}
+
+/* Default to dark until JS resolves the user preference (no FOUC). */
+:root:not([data-theme]) {
+  color-scheme: dark;
+}
+[data-theme="dark"] { color-scheme: dark; }
+[data-theme="light"] { color-scheme: light; }

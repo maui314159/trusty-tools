@@ -1,7 +1,7 @@
 # trusty-tools
 
 Unified Rust workspace consolidating the entire trusty-* AI tooling ecosystem.
-Unified Rust workspace consolidating 24 crates of AI development tooling,
+Unified Rust workspace consolidating 25 crates of AI development tooling,
 with three flagship MCP servers for code search, memory management, and analysis.
 
 ## Three Flagship MCP Servers
@@ -62,7 +62,49 @@ See [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md) for
 
 ---
 
-## Full Crate Index (All 24 Crates)
+### trusty-analyze — Code Analysis Sidecar
+
+Static code-analysis daemon (sidecar to trusty-search): cyclomatic and cognitive
+complexity, code smells, quality grading, git temporal decay, concept clustering,
+SCIP protobuf ingest, and a `(subject, predicate, object)` facts store backed by
+redb. Reads its chunk corpus from trusty-search over HTTP, then serves results
+on port 7879 via both an axum HTTP API and an MCP stdio/SSE server.
+
+**What you get:**
+- Cyclomatic + cognitive complexity per chunk / file / index
+- Configurable code-smell categories with named thresholds
+- A–F quality grade aggregation
+- Git blame–driven temporal decay scoring (stale high-complexity code)
+- k-means concept clustering (BoW or neural embeddings)
+- Facts store: typed knowledge triples with provenance, persisted in redb
+- SCIP protobuf ingest for LSP-quality symbol data
+- Optional ONNX-backed NER over doc comments (feature-gated: `--features ner`)
+- Tree-sitter adapters for Rust, TypeScript, JavaScript, Python, Java, Go, Ruby,
+  PHP, C, C++, C#, Kotlin, Swift, Scala
+- HTTP API + MCP parity (every endpoint has a tool equivalent)
+
+**Quick start:**
+```bash
+# 1. trusty-search must be running first — it is a hard runtime dependency
+cargo run -p trusty-search -- start
+
+# 2. start the analyze sidecar
+cargo run -p trusty-analyzer --bin trusty-analyze -- serve --search-url http://127.0.0.1:7878
+
+# 3. analyze a named index
+cargo run -p trusty-analyzer --bin trusty-analyze -- analyze <index-id> --top-k 20
+```
+
+**MCP tools:** `analyzer_health`, `complexity_hotspots`, `find_smells`,
+`analyze_quality`, `list_facts`, `upsert_fact`, `delete_fact`, `ingest_scip`,
+`cluster_concepts`
+
+See [crates/trusty-analyze/README.md](crates/trusty-analyze/README.md) for full
+documentation.
+
+---
+
+## Full Crate Index (All 25 Crates)
 
 ### Core Daemons / MCP Servers
 
@@ -71,6 +113,7 @@ See [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md) for
 | `trusty-search` | Hybrid code search (BM25 + vector + KG) + MCP server | Elastic-2.0 |
 | `trusty-memory-core` | Memory storage engine (usearch + SQLite + embeddings) | MIT |
 | `trusty-memory-mcp` | Memory palace UI + MCP frontend | MIT |
+| `trusty-analyze` | Code-analysis sidecar daemon (complexity, smells, facts) + MCP server | MIT |
 
 ### Shared Libraries
 
@@ -176,16 +219,3 @@ cargo fmt
 - **I want persistent memory:** Read [crates/trusty-memory-mcp/README.md](crates/trusty-memory-mcp/README.md)
 - **I want the full platform:** Read [crates/open-mpm/README.md](crates/open-mpm/README.md)
 
----
-
-## Planned Components
-
-### trusty-analyze (In Development)
-
-Code analysis daemon providing:
-- Cyclomatic complexity calculation
-- Code smell detection
-- Quality metrics and anti-pattern identification
-- MCP server for integration with Claude Code and other tools
-
-Coming soon to `crates/trusty-analyze/`.

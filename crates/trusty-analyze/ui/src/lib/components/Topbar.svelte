@@ -1,0 +1,208 @@
+<script>
+  /*
+   * Why: Sticky header providing route breadcrumbs, the global index picker,
+   * and the daemon-health pill (status dot + search-reachable + version).
+   * What: Renders crumbs derived from the current route on the left; on the
+   * right, a <select> for choosing the active index (persisted via state) and
+   * a colored health pill.
+   * Test: Stop trusty-search, refresh /health, confirm pill turns red.
+   */
+  import {
+    getHealth,
+    getIndexes,
+    getSelectedIndex,
+    setSelectedIndex,
+    refreshQuality,
+    refreshHotspots,
+    refreshSmells,
+    refreshRefactors,
+    refreshClusters,
+    getSseConnected,
+    getTheme,
+    setTheme
+  } from '../state.svelte.js';
+
+  const themes = [
+    { value: 'light', label: '☀', title: 'Light' },
+    { value: 'system', label: '⬡', title: 'System' },
+    { value: 'dark', label: '☽', title: 'Dark' }
+  ];
+  let theme = $derived(getTheme());
+  import { getRoute } from '../router.svelte.js';
+
+  let health = $derived(getHealth());
+  let indexes = $derived(getIndexes());
+  let selected = $derived(getSelectedIndex());
+  let route = $derived(getRoute());
+  let sseOn = $derived(getSseConnected());
+
+  let crumbs = $derived.by(() => {
+    const segs = route.segments;
+    if (segs.length === 0) return ['Dashboard'];
+    const head = segs[0];
+    const map = {
+      complexity: 'Complexity',
+      smells: 'Smells',
+      refactors: 'Refactors',
+      clusters: 'Clusters',
+      facts: 'Facts'
+    };
+    return [map[head] || 'Dashboard'];
+  });
+
+  let healthy = $derived(!!health && health.status === 'ok');
+  let searchReachable = $derived(!!health && health.search_reachable === true);
+
+  function onPickIndex(e) {
+    const id = e.target.value;
+    setSelectedIndex(id);
+    if (!id) return;
+    // Eagerly refresh the slices most views care about.
+    refreshQuality(id).catch(() => {});
+    refreshHotspots(id).catch(() => {});
+    refreshSmells(id).catch(() => {});
+    refreshRefactors(id).catch(() => {});
+    refreshClusters(id).catch(() => {});
+  }
+</script>
+
+<header class="topbar">
+  <div class="crumbs">
+    {#each crumbs as crumb, i}
+      {#if i > 0}<span class="sep">/</span>{/if}
+      <span class="crumb">{crumb}</span>
+    {/each}
+  </div>
+  <div class="actions">
+    <select
+      class="select index-picker"
+      value={selected}
+      onchange={onPickIndex}
+      disabled={indexes.length === 0}
+      title={indexes.length === 0
+        ? 'No indexes — run: trusty-search index <path>'
+        : 'Select an index to analyze'}
+    >
+      {#if indexes.length === 0}
+        <option value="">No indexes — run: trusty-search index &lt;path&gt;</option>
+      {:else}
+        <option value="" disabled>— select index —</option>
+        {#each indexes as idx}
+          {@const id = typeof idx === 'string' ? idx : idx.id}
+          {@const label = typeof idx === 'string' ? idx : idx.name || idx.id}
+          <option value={id}>{label}</option>
+        {/each}
+      {/if}
+    </select>
+
+    <div class="theme-switcher" role="group" aria-label="Theme">
+      {#each themes as t}
+        <button
+          type="button"
+          class:active={theme === t.value}
+          title={t.title}
+          aria-label={t.title}
+          aria-pressed={theme === t.value}
+          onclick={() => setTheme(t.value)}
+        >{t.label}</button>
+      {/each}
+    </div>
+
+    <span class="pill" title="Server-Sent Events stream">
+      <span class="dot" class:ok={sseOn}></span>
+      sse
+    </span>
+
+    <span
+      class="pill"
+      title={searchReachable ? 'trusty-search reachable' : 'trusty-search unreachable'}
+    >
+      <span class="dot" class:ok={searchReachable} class:err={health && !searchReachable}></span>
+      search
+    </span>
+
+    {#if health && healthy}
+      <span class="badge badge-success">v{health.version || 'ok'}</span>
+    {:else if health}
+      <span class="badge badge-danger">unreachable</span>
+    {:else}
+      <span class="badge badge-muted">connecting…</span>
+    {/if}
+  </div>
+</header>
+
+<style>
+  .topbar {
+    height: var(--trusty-topbar-height);
+    background: var(--trusty-card-bg);
+    border-bottom: 1px solid var(--trusty-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 var(--trusty-space-6);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .crumbs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--trusty-fs-sm);
+    color: var(--trusty-text-secondary);
+  }
+  .crumb {
+    font-weight: 500;
+  }
+  .crumb:last-child {
+    color: var(--trusty-text-primary);
+    font-weight: 600;
+  }
+  .sep {
+    color: var(--trusty-text-muted);
+  }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .index-picker {
+    width: auto;
+    min-width: 200px;
+    max-width: 320px;
+    padding: 6px 10px;
+    font-size: var(--trusty-fs-sm);
+  }
+  .theme-switcher {
+    display: inline-flex;
+    align-items: center;
+    gap: 0;
+    padding: 2px;
+    border: 1px solid var(--trusty-border);
+    border-radius: 999px;
+    background: var(--trusty-content-bg);
+  }
+  .theme-switcher button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--trusty-text-muted);
+    width: 26px;
+    height: 24px;
+    padding: 0;
+    line-height: 1;
+    border-radius: 999px;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .theme-switcher button:hover {
+    color: var(--trusty-text-primary);
+  }
+  .theme-switcher button.active {
+    background: var(--trusty-accent);
+    color: var(--trusty-text-inverse);
+  }
+</style>

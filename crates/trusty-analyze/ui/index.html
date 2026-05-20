@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>trusty-analyzer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <!-- Injected by daemon at serve time. Defaults are dev-friendly. -->
+    <script>
+      window.__DAEMON_PORT__ = window.__DAEMON_PORT__ || 7879;
+      window.__SEARCH_URL__ = window.__SEARCH_URL__ || 'http://127.0.0.1:7878';
+    </script>
+    <!-- Apply theme before first paint to avoid flash of wrong palette. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('trusty-analyzer.theme') || 'system';
+          var resolved = t === 'system'
+            ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+            : t;
+          document.documentElement.setAttribute('data-theme', resolved);
+        } catch (_e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

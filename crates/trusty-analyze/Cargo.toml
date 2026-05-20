@@ -1,0 +1,87 @@
+[package]
+name        = "trusty-analyzer"
+version     = "0.1.4"
+edition     = "2021"
+license     = "MIT"
+authors.workspace    = true
+repository.workspace = true
+homepage             = "https://github.com/bobmatnyc/trusty-tools"
+readme               = "README.md"
+description = "Sidecar code-analysis daemon for trusty-search: complexity, smells, quality, facts"
+keywords    = ["code-analysis", "complexity", "code-smells", "mcp", "daemon"]
+categories  = ["development-tools", "command-line-utilities"]
+build       = "build.rs"
+
+[[bin]]
+name = "trusty-analyze"
+path = "src/main.rs"
+
+[lib]
+name = "trusty_analyzer"
+path = "src/lib.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+axum               = { workspace = true }
+tower-http         = { workspace = true }
+reqwest            = { workspace = true, features = ["http2"] }
+futures-util       = { workspace = true }
+futures            = { workspace = true }
+tokio-stream       = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono             = { workspace = true }
+async-trait        = { workspace = true }
+clap               = { workspace = true }
+clap_complete      = { workspace = true }
+colored            = { workspace = true }
+dirs               = { workspace = true }
+libc               = { workspace = true }
+which              = { workspace = true }
+tempfile           = { workspace = true }
+open               = { workspace = true }
+redb               = { workspace = true }
+dashmap            = { workspace = true }
+rust-embed         = { workspace = true }
+mime_guess         = { workspace = true }
+trusty-common      = { workspace = true, features = ["axum-server"] }
+trusty-symgraph    = { workspace = true }
+tree-sitter            = { workspace = true }
+tree-sitter-rust       = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-python     = { workspace = true }
+tree-sitter-java       = { workspace = true }
+tree-sitter-go         = { workspace = true }
+tree-sitter-ruby       = { workspace = true }
+tree-sitter-php        = { workspace = true }
+tree-sitter-c          = { workspace = true }
+tree-sitter-cpp        = { workspace = true }
+tree-sitter-c-sharp    = { workspace = true }
+tree-sitter-kotlin-ng  = { workspace = true }
+tree-sitter-swift      = { workspace = true }
+tree-sitter-scala      = { workspace = true }
+ndarray            = { workspace = true }
+scip               = { workspace = true }
+protobuf           = { workspace = true }
+xxhash-rust        = { workspace = true }
+base64             = { workspace = true }
+hmac               = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }
+fastembed          = { workspace = true, features = ["hf-hub-rustls-tls", "ort-download-binaries"] }
+ort        = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+[features]
+default = []
+ner     = ["dep:ort", "dep:tokenizers"]
+
+[dev-dependencies]
+tempfile       = { workspace = true }
+tower          = { workspace = true }
+http-body-util = { workspace = true }
