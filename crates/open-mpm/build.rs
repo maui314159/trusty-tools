@@ -27,9 +27,13 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/package.json");
 
     // Build the Vite frontend so ui/dist/ exists for rust-embed to inline.
-    // Skip gracefully when pnpm is not available (CI environments that only
-    // need the API binary without the web UI).
-    if std::process::Command::new("pnpm")
+    // Skip when SKIP_UI_BUILD=1 (cargo publish --dry-run / CI publish flows)
+    // or when pnpm is not available (CI environments that only need the API
+    // binary without the web UI).
+    let skip_ui = std::env::var("SKIP_UI_BUILD").as_deref() == Ok("1");
+    if skip_ui {
+        println!("cargo:warning=SKIP_UI_BUILD=1 — web UI build skipped");
+    } else if std::process::Command::new("pnpm")
         .arg("--version")
         .output()
         .is_err()
@@ -37,8 +41,17 @@ fn main() {
         println!("cargo:warning=pnpm not found — web UI will not be embedded");
     } else {
         if !std::path::Path::new("ui/node_modules").exists() {
+            // Use --no-frozen-lockfile when pnpm-lock.yaml is absent (e.g.
+            // inside a cargo publish verification sandbox where only
+            // git-tracked files are present).
+            let lockfile_exists = std::path::Path::new("ui/pnpm-lock.yaml").exists();
+            let install_args: &[&str] = if lockfile_exists {
+                &["install", "--frozen-lockfile"]
+            } else {
+                &["install", "--no-frozen-lockfile"]
+            };
             let s = std::process::Command::new("pnpm")
-                .args(["install", "--frozen-lockfile"])
+                .args(install_args)
                 .current_dir("ui")
                 .status()
                 .unwrap();
