@@ -105,17 +105,33 @@ enum Cmd {
         /// Output format: json (default, machine-readable) or text.
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
-        /// Generate an LLM prose narrative explaining the review.
-        ///
-        /// Why: deterministic metrics tell you *what* is wrong; prose
-        /// explains *why it matters* and *what to do*. Opt-in via this flag
-        /// keeps the default review path fast and free.
-        /// What: when set, calls OpenRouter (if `OPENROUTER_API_KEY` is set)
-        /// or a local Ollama server (`TRUSTY_LLM_MODEL` URL) with a grounded
-        /// prompt and prints the narrative after the JSON/text output.
-        /// Test: `trusty-analyze review --explain ...` prints the narrative.
+    },
+    /// Run an LLM-augmented deep analysis pass against an index.
+    ///
+    /// Why: deterministic `review` metrics tell you *what* is wrong; this
+    /// subcommand adds an LLM prose narrative that explains *why it matters*
+    /// and *what to do*, framework-aware. Separated from `review` so the
+    /// deterministic path stays cheap and reproducible.
+    /// What: hits `POST /analyze/deep` on the daemon (so trusty-search +
+    /// trusty-analyze must both be running). Resolves the OpenRouter key from
+    /// `OPENROUTER_API_KEY` on the daemon side and the model from
+    /// `TRUSTY_LLM_MODEL` (override with `--model`). Prints the
+    /// `DeepAnalysisReport` as JSON or text.
+    /// Test: `trusty-analyze deep my-index` against a running daemon with a
+    /// configured API key prints a narrative; without a key the daemon
+    /// returns 400 and the CLI exits non-zero with a clear error.
+    Deep {
+        /// Index ID to analyse (required).
+        index_id: String,
+        /// Optional OpenRouter model id (e.g. `openai/gpt-4o-mini`).
         #[arg(long)]
-        explain: bool,
+        model: Option<String>,
+        /// Output format: json (default) or text.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        /// Port the analyzer daemon is bound to.
+        #[arg(long, default_value_t = DEFAULT_PORT, env = "TRUSTY_ANALYZER_PORT")]
+        port: u16,
     },
     /// Facts subcommands.
     Facts {
@@ -256,10 +272,6 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
-        /// Generate an LLM prose narrative explaining the review. See
-        /// `Review::explain` for environment variables consulted.
-        #[arg(long)]
-        explain: bool,
     },
 }
 
@@ -457,7 +469,6 @@ async fn main() -> Result<()> {
             diff,
             format,
             index_id,
-            explain,
         } => {
             // Hard dependency: review pulls the index corpus from trusty-search,
             // so refuse to run if the search daemon is unreachable.
@@ -483,15 +494,10 @@ async fn main() -> Result<()> {
             } else {
                 std::fs::read_to_string(&diff).with_context(|| format!("read diff file {diff}"))?
             };
-            let mut report =
+            let report =
                 trusty_analyzer::core::analyze_diff_with_client(&diff_text, &search, &index_id)
                     .await
                     .context("analyze diff")?;
-            if explain {
-                if let Some(narrative) = run_explain(&report).await {
-                    report.narrative = Some(narrative);
-                }
-            }
             match format {
                 OutputFormat::Json => {
                     println!(
@@ -503,11 +509,14 @@ async fn main() -> Result<()> {
                     print!("{}", trusty_analyzer::core::render_review_text(&report));
                 }
             }
-            if let Some(narrative) = report.narrative.as_deref() {
-                println!("\n=== Explanation ===\n{narrative}");
-            }
             Ok(())
         }
+        Cmd::Deep {
+            index_id,
+            model,
+            format,
+            port,
+        } => run_deep(index_id, model, format, port).await,
         Cmd::Facts { op } => {
             let facts = FactStore::open(&cli.facts_path)?;
             match op {
@@ -619,47 +628,60 @@ async fn main() -> Result<()> {
             index_id,
             post_comment,
             format,
-            explain,
-        } => run_review_pr(repo, pr, index_id, post_comment, format, explain).await,
+        } => run_review_pr(repo, pr, index_id, post_comment, format).await,
     }
 }
 
-/// Build a `ChatProvider` from environment configuration and run
-/// [`trusty_analyzer::core::explain_report`] against `report`.
+/// Handle `trusty-analyze deep <index_id>`.
 ///
-/// Why: both `review` and `review-pr` share the same opt-in `--explain`
-/// behaviour, so the provider construction lives in one helper.
-/// What: prefers `OPENROUTER_API_KEY` (cloud) and falls back to a local
-/// Ollama server on the URL declared in `TRUSTY_LLM_URL` (or the Ollama
-/// default at `http://localhost:11434`). The model id comes from
-/// `TRUSTY_LLM_MODEL` (defaulting to `openai/gpt-4o-mini` for OpenRouter and
-/// `qwen3:30b` for Ollama). Returns `None` (with a warning) when no provider
-/// is configured or the call fails — explanation is best-effort, never a
-/// hard error.
-/// Test: covered by the explain unit tests in `core::explain`; this helper
-/// is a thin glue layer.
-async fn run_explain(report: &trusty_analyzer::core::ReviewReport) -> Option<String> {
-    use trusty_common::chat::{ChatProvider, OllamaProvider, OpenRouterProvider};
-
-    let model = std::env::var("TRUSTY_LLM_MODEL").ok();
-
-    let provider: Box<dyn ChatProvider> = if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-        let model = model.unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        Box::new(OpenRouterProvider::new(key, model))
-    } else {
-        let url = std::env::var("TRUSTY_LLM_URL")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string());
-        let model = model.unwrap_or_else(|| "qwen3:30b".to_string());
-        Box::new(OllamaProvider::new(url, model))
-    };
-
-    match trusty_analyzer::core::explain_report(report, provider.as_ref()).await {
-        Ok(narrative) => Some(narrative),
-        Err(e) => {
-            eprintln!("warning: --explain failed ({e:#}); continuing without narrative");
-            None
+/// Why: deep analysis is a thin wrapper over `POST /analyze/deep`. Keeping it
+/// HTTP-only (rather than re-implementing in-process) means the CLI uses the
+/// same code path as MCP clients and external tooling.
+/// What: POSTs `{ "index_id": ..., "model": ... }` to the daemon and prints
+/// the [`DeepAnalysisReport`] as JSON or text.
+/// Test: with the daemon down → exits non-zero with a clear error.
+async fn run_deep(
+    index_id: String,
+    model: Option<String>,
+    format: OutputFormat,
+    port: u16,
+) -> Result<()> {
+    let url = format!("http://127.0.0.1:{port}/analyze/deep");
+    let mut body = serde_json::json!({ "index_id": index_id });
+    if let Some(m) = model.as_deref() {
+        body["model"] = serde_json::Value::String(m.to_string());
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("deep analysis request failed: HTTP {status}: {body}");
+    }
+    let report: trusty_analyzer::core::DeepAnalysisReport = resp
+        .json()
+        .await
+        .with_context(|| format!("decode response from {url}"))?;
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).context("serialize deep report")?
+            );
+        }
+        OutputFormat::Text => {
+            print!(
+                "{}",
+                trusty_analyzer::core::render_deep_analysis_text(&report)
+            );
         }
     }
+    Ok(())
 }
 
 /// Handle `trusty-analyze review-pr <owner/repo> <pr>`.
@@ -678,7 +700,6 @@ async fn run_review_pr(
     index_id: Option<String>,
     post_comment: bool,
     format: OutputFormat,
-    explain: bool,
 ) -> Result<()> {
     let (owner, repo_name) = repo
         .split_once('/')
@@ -704,14 +725,9 @@ async fn run_review_pr(
     let diff = trusty_analyzer::core::fetch_pr_diff(&client, owner, repo_name, pr, &token)
         .await
         .with_context(|| format!("fetch diff for {owner}/{repo_name}#{pr}"))?;
-    let mut report = trusty_analyzer::core::analyze_diff_with_client(&diff, &search, &index_id)
+    let report = trusty_analyzer::core::analyze_diff_with_client(&diff, &search, &index_id)
         .await
         .context("analyze PR diff")?;
-    if explain {
-        if let Some(narrative) = run_explain(&report).await {
-            report.narrative = Some(narrative);
-        }
-    }
 
     match format {
         OutputFormat::Json => {
@@ -723,9 +739,6 @@ async fn run_review_pr(
         OutputFormat::Text => {
             print!("{}", trusty_analyzer::core::render_review_text(&report));
         }
-    }
-    if let Some(narrative) = report.narrative.as_deref() {
-        println!("\n=== Explanation ===\n{narrative}");
     }
 
     if post_comment {

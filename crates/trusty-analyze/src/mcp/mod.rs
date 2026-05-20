@@ -283,6 +283,7 @@ impl AnalyzerMcpServer {
             "suggest_refactors" => self.handle_suggest_refactors(args).await,
             "review_diff" => self.handle_review_diff(args).await,
             "review_github_pr" => self.handle_review_github_pr(args).await,
+            "deep_analysis" => self.handle_deep_analysis(args).await,
             _ => Err(DispatchError::UnknownTool),
         }
     }
@@ -428,15 +429,32 @@ impl AnalyzerMcpServer {
     async fn handle_review_diff(&self, args: &Value) -> Result<Value, DispatchError> {
         let diff = require_str(args, "diff")?;
         let index_id = require_str(args, "index_id")?;
-        let explain = args
-            .get("explain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let mut path = format!("/review?index_id={}", urlencode(index_id));
-        if explain {
-            path.push_str("&explain=true");
-        }
+        let path = format!("/review?index_id={}", urlencode(index_id));
         self.post_text(&path, diff).await
+    }
+
+    /// Handle the `deep_analysis` MCP tool: forward to `POST /analyze/deep`.
+    ///
+    /// Why: pairs with the [`POST /analyze/deep`] HTTP endpoint so MCP clients
+    /// can opt into the LLM-augmented analysis without going through the
+    /// deterministic `review_diff` path. Keeps the two surfaces separate so
+    /// `review_diff` remains cheap and deterministic.
+    /// What: requires `index_id`; optional `model` overrides the daemon
+    /// default. POSTs a JSON body shaped like [`DeepAnalyzeRequest`] and
+    /// returns the [`DeepAnalysisReport`] JSON.
+    /// Test: `deep_analysis_requires_index_id` and
+    /// `deep_analysis_posts_to_endpoint` cover param + URL construction.
+    async fn handle_deep_analysis(&self, args: &Value) -> Result<Value, DispatchError> {
+        let index_id = require_str(args, "index_id")?;
+        let mut body = serde_json::json!({ "index_id": index_id });
+        if let Some(model) = args.get("model").and_then(Value::as_str) {
+            body["model"] = Value::from(model);
+        }
+        // The HTTP endpoint accepts an optional pre-computed `report`; the MCP
+        // tool surface deliberately keeps the schema minimal (index_id +
+        // model) — re-running the synthesis on the daemon is the simpler
+        // ergonomics for AI clients.
+        self.post("/analyze/deep", &body).await
     }
 
     /// Handle the `review_github_pr` tool: forward to `POST /review/github-pr`.
@@ -822,14 +840,25 @@ pub fn tool_descriptors() -> Value {
         },
         {
             "name": "review_diff",
-            "description": "Review a unified git diff and return a structured quality report (per-file complexity, code smells, grade A-F, recommendations). Cross-references the diff against the trusty-search index corpus, so trusty-search must be running. Set explain=true to also attach an LLM-generated prose narrative (requires OPENROUTER_API_KEY on the daemon).",
+            "description": "Review a unified git diff and return a structured quality report (per-file complexity, code smells, grade A-F, recommendations). Cross-references the diff against the trusty-search index corpus, so trusty-search must be running. Deterministic and LLM-free — use the deep_analysis tool for LLM-augmented narrative.",
             "inputSchema": {
                 "type": "object",
                 "required": ["diff", "index_id"],
                 "properties": {
                     "diff":     { "type": "string", "description": "Unified git diff text to review" },
-                    "index_id": { "type": "string", "description": "Index ID to cross-reference the diff against in trusty-search" },
-                    "explain":  { "type": "boolean", "description": "Attach an LLM prose narrative to the report (default false)", "default": false }
+                    "index_id": { "type": "string", "description": "Index ID to cross-reference the diff against in trusty-search" }
+                }
+            }
+        },
+        {
+            "name": "deep_analysis",
+            "description": "Run an LLM-augmented deep analysis pass over an index: synthesises a deterministic review report from the indexed corpus, looks up detected frameworks, and asks an OpenRouter model for a prose narrative plus framework-aware recommendations. Requires OPENROUTER_API_KEY configured on the daemon.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id"],
+                "properties": {
+                    "index_id": { "type": "string", "description": "trusty-search index ID to analyse" },
+                    "model":    { "type": "string", "description": "Optional OpenRouter model id (e.g. 'openai/gpt-4o-mini'); falls back to TRUSTY_LLM_MODEL on the daemon" }
                 }
             }
         },
@@ -1023,6 +1052,49 @@ mod tests {
         match err {
             DispatchError::Transport(msg) => {
                 assert!(msg.contains("/review/github-pr"), "got {msg}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_deep_analysis() {
+        let server = AnalyzerMcpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"deep_analysis"), "got {names:?}");
+    }
+
+    #[tokio::test]
+    async fn deep_analysis_requires_index_id() {
+        let server = AnalyzerMcpServer::new("http://127.0.0.1:1");
+        let err = server
+            .handle_deep_analysis(&serde_json::json!({}))
+            .await
+            .expect_err("missing index_id should fail");
+        assert!(matches!(err, DispatchError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn deep_analysis_posts_to_endpoint() {
+        // Daemon unreachable — a Transport error referencing /analyze/deep
+        // proves the handler built the right URL after parsing index_id.
+        let server = AnalyzerMcpServer::new("http://127.0.0.1:1");
+        let err = server
+            .handle_deep_analysis(&serde_json::json!({ "index_id": "i", "model": "m" }))
+            .await
+            .expect_err("daemon unreachable");
+        match err {
+            DispatchError::Transport(msg) => {
+                assert!(msg.contains("/analyze/deep"), "got {msg}");
             }
             other => panic!("expected Transport, got {other:?}"),
         }

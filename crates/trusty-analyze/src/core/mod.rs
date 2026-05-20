@@ -36,7 +36,10 @@ pub mod tools;
 pub use client::{IndexSummary, TrustySearchClient};
 pub use complexity::compute_complexity_for;
 pub use concept_cluster::{bow_embedding, cluster, ClusterResult, ConceptCluster};
-pub use explain::{build_explain_prompt, explain_report};
+pub use explain::{
+    build_explain_prompt, deep_analysis, explain_report, render_text as render_deep_analysis_text,
+    DeepAnalysisError, DeepAnalysisReport,
+};
 pub use facts::FactStore;
 pub use github::{
     fetch_pr_diff, format_review_as_markdown, post_pr_comment, verify_webhook_signature,

@@ -248,8 +248,6 @@ mod tests {
             changed_lines: 143,
             smell_count: 1,
             summary: "1 file analyzed".into(),
-            narrative: None,
-            frameworks: Vec::new(),
         }
     }
 
@@ -294,8 +292,6 @@ mod tests {
             changed_lines: 0,
             smell_count: 0,
             summary: "nothing".into(),
-            narrative: None,
-            frameworks: Vec::new(),
         };
         let md = format_review_as_markdown(&report);
         assert!(md.contains("Overall grade: A"));

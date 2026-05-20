@@ -131,9 +131,10 @@ impl Default for AnalyzerRegistry {
 
 /// Why: framework detection is the natural sibling to the language-adapter
 /// pipeline — both run after indexing completes and both surface project-level
-/// metadata that downstream tooling (the `--explain` LLM prompt, dashboards)
-/// needs to tailor advice. Storing each detected framework as a FactStore
-/// triple makes the data queryable alongside every other static fact.
+/// metadata that downstream tooling (the `POST /analyze/deep` LLM prompt,
+/// dashboards) needs to tailor advice. Storing each detected framework as a
+/// FactStore triple makes the data queryable alongside every other static
+/// fact.
 /// What: runs [`detect_frameworks`] against `project_root` and upserts one
 /// `(<index_id>, "uses_framework", <name>)` fact per detected framework.
 /// Returns the detected framework names so callers can echo them into a
