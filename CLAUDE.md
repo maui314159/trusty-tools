@@ -36,6 +36,8 @@ then propagate changes to all crates that depend on it before committing.
 
 🔴 **Single-path workflows — use exactly these commands.**
 
+### Workspace-wide Commands
+
 ```bash
 # Build all crates (development)
 cargo build
@@ -45,12 +47,6 @@ cargo build --release
 
 # Run all tests
 cargo test
-
-# Test a specific crate  (replace <crate-name> with the directory name under crates/)
-cargo test -p <crate-name>
-
-# Test with a feature flag
-cargo test -p trusty-common --features axum-server
 
 # Check (fast compile check, no codegen)
 cargo check
@@ -67,22 +63,58 @@ cargo fmt
 # Run ONNX-backed integration tests (slow; skipped in CI)
 cargo test -- --include-ignored
 
-# Build and run a specific binary (development)
-cargo run -p trusty-search -- start
-cargo run -p trusty-mpm-cli -- --help
-
-# Build a specific binary in release mode
-cargo build --release -p trusty-search
-
-# Check only a specific crate (faster than workspace check)
-cargo check -p trusty-common
-
 # Update dependencies (review Cargo.lock diff before committing)
 cargo update
 
 # Audit dependencies for known vulnerabilities
 cargo audit   # requires: cargo install cargo-audit
 ```
+
+### Individual Crate Commands
+
+```bash
+# Build a single crate (dev)
+cargo build -p trusty-search
+
+# Build a single crate (release)
+cargo build --release -p trusty-search
+
+# Check a single crate (fastest — no codegen)
+cargo check -p trusty-search
+
+# Test a single crate
+cargo test -p trusty-search
+
+# Test a single crate with a specific feature
+cargo test -p trusty-common --features axum-server
+
+# Test a single test by name within a crate
+cargo test -p trusty-search -- my_test_name
+
+# Run a binary from a specific crate
+cargo run -p trusty-search -- start
+cargo run -p trusty-mpm-cli -- --help
+
+# Build only the binary, not the whole workspace
+cargo build --release -p trusty-mpm-cli
+
+# Lint a single crate
+cargo clippy -p trusty-search -- -D warnings
+
+# Test a single crate with ignored tests
+cargo test -p trusty-embedder -- --include-ignored
+```
+
+### Important: Crate Names vs. Directory Names
+
+**Crate names** match the `name` field in each crate's `Cargo.toml`, not necessarily the directory name.
+Most match (e.g. `crates/trusty-search/` → `-p trusty-search`) but note these exceptions:
+
+- `crates/trusty-memory-mcp/` → `-p trusty-memory` (package renamed in Cargo.toml)
+- `crates/trusty-git-analytics/` → `-p tga` (short name)
+- `crates/open-mpm/` → `-p open-mpm`
+
+Always verify the `name` field in the crate's `Cargo.toml` if you get a "package not found" error.
 
 ## Code Structure
 
