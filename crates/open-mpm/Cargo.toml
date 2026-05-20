@@ -1,6 +1,7 @@
 [package]
 name = "open-mpm"
 version = "0.38.3"
+publish = false
 edition = "2024"
 description = "MPM orchestration platform: AI agent harness with multi-model routing, tool execution, and subprocess delegation."
 license.workspace = true

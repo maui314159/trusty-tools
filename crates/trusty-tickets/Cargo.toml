@@ -1,6 +1,7 @@
 [package]
 name = "trusty-tickets"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 description = "Unified ticketing MCP server (GitHub/JIRA/Linear)"
 license = "Elastic-2.0"

@@ -1,6 +1,7 @@
 [package]
 name = "trusty-gworkspace"
 version = "0.1.0"
+publish = false
 edition = "2024"
 description = "Google Workspace MCP server for the Trusty suite"
 license = "Elastic-2.0"
