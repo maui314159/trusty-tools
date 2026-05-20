@@ -6149,7 +6149,6 @@ dependencies = [
  "clap",
  "comrak",
  "crossterm",
- "cto-assistant",
  "dirs 5.0.1",
  "dotenvy",
  "fastembed",
@@ -6184,6 +6183,7 @@ dependencies = [
  "similar",
  "stop-words",
  "strip-ansi-escapes",
+ "tc-services",
  "teloxide 0.17.0",
  "tempfile",
  "thiserror 1.0.69",
@@ -6207,6 +6207,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "trusty-cto-db",
  "trusty-mcp-core",
  "trusty-memory",
  "trusty-memory-core",
@@ -6224,6 +6225,16 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "open-mpm-local"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cto-assistant",
+ "open-mpm",
+ "tokio",
 ]
 
 [[package]]

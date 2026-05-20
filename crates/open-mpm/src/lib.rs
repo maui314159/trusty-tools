@@ -75,6 +75,25 @@ pub mod workflow;
 #[cfg(test)]
 pub mod test_env;
 
+pub mod runtime;
+
+/// Re-export `install_plugins` so external launchers can register agent
+/// plugins (e.g. `cto-assistant`) before calling `run()`.
+///
+/// Why: The published `open-mpm` crate cannot depend on `publish = false`
+///      agent crates. A private workspace binary (`open-mpm-local`) wires
+///      the plugin registry at startup via this re-export, keeping the
+///      published surface free of those crates.
+/// What: Forwards to `tools::agent_plugin::install_plugins`. The underlying
+///       store is a OnceLock — call exactly once before `run()`.
+/// Test: Exercised by `open-mpm-local`'s startup; locally by the existing
+///       agent_plugin unit tests.
+pub use tools::agent_plugin::install_plugins;
+
+/// Re-export `run` at the crate root so launchers can call
+/// `open_mpm::run().await` without referencing the `runtime` module.
+pub use runtime::run;
+
 /// Re-exports of items that internal modules historically referenced as
 /// `crate::AgentConfig` and `crate::default_bundled_config_dir`.
 ///

@@ -92,14 +92,16 @@ petgraph = { version = "0.8", features = ["serde-1"] }
 libc = "0.2"
 lru = "0.12"
 
-# cto-assistant agent crate (#484 follow-on). Lives in this workspace; loaded
-# at startup in main.rs and threaded into the ctrl loop as an AgentPlugin
-# (replaces the hard-coded `if persona == "cto-assistant"` branch).
-cto-assistant = { path = "../cto-assistant" }
 # Stable plugin surface shared with external agent crates. Defined in its own
-# crate (rather than in open-mpm/lib.rs) to break the open-mpm ↔ cto-assistant
-# cargo cycle: both crates depend on this small lib, neither depends on the
+# crate (rather than in open-mpm/lib.rs) to break the open-mpm ↔ agent-plugin
+# cargo cycle: both sides depend on this small lib, neither depends on the
 # other through it.
+#
+# Why: The published `open-mpm` crate must NOT depend on `publish = false`
+#      agent crates (e.g. `cto-assistant`). Private launchers like
+#      `open-mpm-local` depend on both `open-mpm` and the agent crate, and
+#      wire them at startup via `open_mpm::install_plugins(...)` before
+#      calling `open_mpm::run()`.
 open-mpm-agent-api = { path = "../open-mpm-agent-api" }
 
 # [patch.crates-io] moved to workspace root Cargo.toml (Cargo requires
