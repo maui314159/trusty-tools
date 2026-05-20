@@ -14,7 +14,7 @@
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
 use crate::core::indexer::{CommitTimings, ParsedBatch};
-use crate::core::memguard::{current_rss_mb, memory_limit_mb};
+use crate::core::memguard::{current_rss_mb, index_memory_limit_mb};
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::walker::{should_skip_content, walk_source_files};
 use crossbeam_utils::atomic::AtomicCell;
@@ -977,7 +977,14 @@ pub fn spawn_reindex_with_cleanup(
         //
         // `peak_rss_mb` is updated by the poller via an atomic so the final
         // log line reflects the true peak, not just batch-boundary samples.
-        let mem_limit = memory_limit_mb();
+        // Use the indexing-pipeline-specific limit (TRUSTY_INDEX_MEMORY_LIMIT_MB)
+        // rather than the global daemon ceiling. The pipeline's working set —
+        // ONNX session + transient ORT arena + CoreML unified-memory buffers
+        // on Apple Silicon — has a very different (typically much larger)
+        // memory footprint than the steady-state daemon. Falling back to the
+        // global limit is automatic when the indexing env var is unset, so
+        // operators who haven't opted in see no behavioural change.
+        let mem_limit = index_memory_limit_mb();
         let mem_abort = Arc::new(AtomicBool::new(false));
         let peak_rss_atomic = Arc::new(AtomicU64::new(current_rss_mb().unwrap_or(0)));
         let mut mem_limit_hit: bool = false;

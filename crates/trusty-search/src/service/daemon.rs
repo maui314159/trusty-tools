@@ -471,7 +471,7 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // are in effect (especially important for launchd-managed restarts where
     // env vars come from daemon.env rather than the user's shell).
     {
-        use crate::core::memguard::memory_limit_mb;
+        use crate::core::memguard::{index_memory_limit_mb, memory_limit_mb};
         let max_chunks = std::env::var("TRUSTY_MAX_CHUNKS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -480,14 +480,16 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1_000);
-        match memory_limit_mb() {
-            Some(mb) => tracing::info!(
-                "memory limits: max_chunks={max_chunks} embedding_cache={emb_cache} memory_limit_mb={mb}"
-            ),
-            None => tracing::info!(
-                "memory limits: max_chunks={max_chunks} embedding_cache={emb_cache} memory_limit_mb=unlimited"
-            ),
-        }
+        let fmt = |v: Option<u64>| match v {
+            Some(mb) => format!("{mb}"),
+            None => "unlimited".to_string(),
+        };
+        tracing::info!(
+            "memory limits: max_chunks={max_chunks} embedding_cache={emb_cache} \
+             memory_limit_mb={} index_memory_limit_mb={}",
+            fmt(memory_limit_mb()),
+            fmt(index_memory_limit_mb()),
+        );
     }
 
     let serve_result = axum::serve(listener, router)

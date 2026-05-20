@@ -57,6 +57,37 @@ const EMBED_ARENA_BUDGET_DEN: u64 = 100;
 const MEMORY_LIMIT_FRACTION_NUM: u64 = 25;
 const MEMORY_LIMIT_FRACTION_DEN: u64 = 100;
 
+/// Fraction of total system RAM allocated to `index_memory_limit_mb` — the
+/// separate soft cap on the indexing pipeline's working set. Why a higher
+/// fraction (40%) than the global daemon limit (25%): the indexing pipeline
+/// is a *transient* workload that runs intermittently and on Apple Silicon
+/// briefly spikes virtual RSS via the CoreML unified-memory pool. The global
+/// 25% limit is sized for the steady-state daemon (HNSW arenas + warm-boot
+/// state + query serving); applying that same ceiling to the indexing
+/// pipeline forces operators either to under-provision indexing or to raise
+/// the global ceiling and risk OOM-kill cascades on the rest of the host.
+/// 40% gives the pipeline enough headroom for a CoreML spike on a 128 GB
+/// box (~50 GB) while still leaving 60% of host RAM for the OS, editor,
+/// language servers, and other dev daemons. See issue: CoreML 70 GB RSS
+/// spike during reindex on a 128 GB workstation.
+const INDEX_MEMORY_LIMIT_FRACTION_NUM: u64 = 40;
+const INDEX_MEMORY_LIMIT_FRACTION_DEN: u64 = 100;
+
+/// Absolute minimum `index_memory_limit_mb` (2 GB). The indexing pipeline
+/// loads at minimum the ONNX session (~100 MB), an ORT transient arena
+/// (≈32 MB × batch slots), the chunk corpus for the in-flight batch, and
+/// the HNSW arena being grown — 2 GB is the smallest budget where this
+/// remains viable.
+const INDEX_MEMORY_LIMIT_FLOOR_MB: u64 = 2_048;
+
+/// Absolute maximum `index_memory_limit_mb` (96 GB). Higher than the global
+/// ceiling (64 GB) because a CoreML spike on a 128–256 GB box can briefly
+/// claim 50–80 GB of unified memory while still being safe. Beyond 96 GB
+/// the bottleneck stops being RAM (the daemon stalls on HNSW serialisation
+/// long before then) and large limits encourage configurations that are
+/// hard to reason about.
+const INDEX_MEMORY_LIMIT_CEIL_MB: u64 = 98_304;
+
 /// Absolute minimum `memory_limit_mb` (1 GB). On hosts smaller than 4 GB the
 /// 25% rule would otherwise drop below where the indexer can meaningfully run.
 const MEMORY_LIMIT_FLOOR_MB: u64 = 1_024;
@@ -93,6 +124,24 @@ const MAX_CHUNKS_CEIL: usize = 800_000;
 fn compute_memory_limit_mb(total_ram_mb: u64) -> usize {
     let raw = total_ram_mb * MEMORY_LIMIT_FRACTION_NUM / MEMORY_LIMIT_FRACTION_DEN;
     raw.clamp(MEMORY_LIMIT_FLOOR_MB, MEMORY_LIMIT_CEIL_MB) as usize
+}
+
+/// Compute `index_memory_limit_mb` proportional to detected system RAM.
+///
+/// Why: the indexing pipeline (embedding + HNSW commit + redb writes) has a
+/// different memory profile from the steady-state daemon. On Apple Silicon
+/// the CoreML execution provider briefly inflates virtual RSS to 60–100 GB
+/// while pre-allocating unified-memory buffers — far above the 25% global
+/// ceiling. Giving the pipeline its own (typically larger) budget lets
+/// operators index large repos without raising the global ceiling and
+/// risking cascading OOM-kills on other workloads sharing the host.
+/// What: `clamp(total_ram_mb * 0.40, 2 GB, 96 GB)`. Examples: 16 GB → 6.4 GB,
+/// 32 GB → 12.8 GB, 64 GB → 25.6 GB, 128 GB → 51.2 GB, 256 GB → 96 GB
+/// (ceiling). Always >= the global `compute_memory_limit_mb` value (40% > 25%).
+/// Test: `test_compute_index_memory_limit_from_ram` covers the table and clamps.
+fn compute_index_memory_limit_mb(total_ram_mb: u64) -> usize {
+    let raw = total_ram_mb * INDEX_MEMORY_LIMIT_FRACTION_NUM / INDEX_MEMORY_LIMIT_FRACTION_DEN;
+    raw.clamp(INDEX_MEMORY_LIMIT_FLOOR_MB, INDEX_MEMORY_LIMIT_CEIL_MB) as usize
 }
 
 /// Compute `max_chunks` proportional to `memory_limit_mb`.
@@ -230,17 +279,21 @@ impl MemoryTier {
     /// buckets (issue #120). The remaining fields (`embedding_cache`,
     /// `bm25_corpus_cap`, `max_kg_nodes`) keep their tier-based defaults since
     /// they're driven more by index size than absolute RAM.
-    fn defaults(self, memory_limit_mb: usize) -> TierDefaults {
+    fn defaults(self, memory_limit_mb: usize, index_memory_limit_mb: usize) -> TierDefaults {
         let (embedding_cache, bm25_corpus_cap, max_kg_nodes) = match self {
             MemoryTier::Medium => (5_000, 100_000, 150_000),
             MemoryTier::Large => (10_000, 200_000, 300_000),
             MemoryTier::XLarge => (20_000, 400_000, 500_000),
         };
+        // Batch size scales with the indexing-pipeline budget (not the global
+        // daemon budget), since the ORT transient arena is sized by what the
+        // pipeline can afford at peak, not by what the idle daemon should hold.
         TierDefaults {
             memory_limit_mb,
+            index_memory_limit_mb,
             max_chunks: compute_max_chunks(memory_limit_mb),
             embedding_cache,
-            max_batch_size: compute_max_batch_size(memory_limit_mb),
+            max_batch_size: compute_max_batch_size(index_memory_limit_mb),
             bm25_corpus_cap,
             max_kg_nodes,
         }
@@ -250,6 +303,7 @@ impl MemoryTier {
 #[derive(Debug, Clone, Copy)]
 struct TierDefaults {
     memory_limit_mb: usize,
+    index_memory_limit_mb: usize,
     max_chunks: usize,
     embedding_cache: usize,
     max_batch_size: usize,
@@ -264,6 +318,12 @@ pub struct MemoryPolicy {
     pub total_ram_mb: u64,
     pub tier: MemoryTier,
     pub memory_limit_mb: usize,
+    /// Separate soft cap applied *only* while the indexing pipeline is running
+    /// (see [`compute_index_memory_limit_mb`] and `core::memguard`).
+    /// Always at least as large as `memory_limit_mb`. Lets the reindex
+    /// orchestrator absorb CoreML unified-memory spikes without OOM-aborting
+    /// under the global daemon ceiling.
+    pub index_memory_limit_mb: usize,
     pub max_chunks: usize,
     pub embedding_cache: usize,
     pub max_batch_size: usize,
@@ -303,16 +363,35 @@ impl MemoryPolicy {
         // scale with the actual host RAM rather than a fixed tier bucket.
         // See issue #120 (104 GB reindex on a 128 GB host).
         let proportional_limit_mb = compute_memory_limit_mb(total_ram_mb);
-        let d = tier.defaults(proportional_limit_mb);
+        let proportional_index_limit_mb = compute_index_memory_limit_mb(total_ram_mb);
+        let d = tier.defaults(proportional_limit_mb, proportional_index_limit_mb);
 
         // Resolve memory limit first so the derived max_batch_size default
         // tracks any TRUSTY_MEMORY_LIMIT_MB override. TRUSTY_MAX_BATCH_SIZE
         // still wins when explicitly set. See issue #95.
         let memory_limit_mb = env_override_usize("TRUSTY_MEMORY_LIMIT_MB", d.memory_limit_mb);
-        let derived_batch_size = if memory_limit_mb == d.memory_limit_mb {
+        // Resolve the indexing-pipeline limit. When operator overrides the
+        // global limit without overriding the indexing limit, we want the
+        // indexing limit to remain >= the global limit (the global limit is
+        // the steady-state floor; the indexing limit is the transient peak).
+        // If neither is overridden, both come from the proportional defaults.
+        let index_memory_limit_mb = {
+            let raw = env_override_usize("TRUSTY_INDEX_MEMORY_LIMIT_MB", d.index_memory_limit_mb);
+            // Guarantee `index_memory_limit_mb >= memory_limit_mb` so an
+            // accidental low override doesn't leave the pipeline tighter than
+            // the daemon floor. Operators who explicitly want a smaller index
+            // limit than the global limit are blocked here — this is by
+            // design; a smaller-than-global index limit is almost always a
+            // misconfiguration.
+            raw.max(memory_limit_mb)
+        };
+        // Batch size derivation now follows the *indexing* limit because the
+        // ORT transient arena cost is incurred by the pipeline, not the idle
+        // daemon. The TRUSTY_MAX_BATCH_SIZE env override still wins below.
+        let derived_batch_size = if index_memory_limit_mb == d.index_memory_limit_mb {
             d.max_batch_size
         } else {
-            compute_max_batch_size(memory_limit_mb)
+            compute_max_batch_size(index_memory_limit_mb)
         };
         // Recompute max_chunks if the operator overrode the memory limit so
         // chunk capacity tracks the actual configured limit (env var for
@@ -370,6 +449,7 @@ impl MemoryPolicy {
             total_ram_mb,
             tier,
             memory_limit_mb,
+            index_memory_limit_mb,
             max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", derived_max_chunks),
             embedding_cache: env_override_usize("TRUSTY_EMBEDDING_CACHE", d.embedding_cache),
             max_batch_size,
@@ -397,6 +477,10 @@ impl MemoryPolicy {
         // SAFETY: see doc comment — caller must invoke before threading begins.
         unsafe {
             std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", self.memory_limit_mb.to_string());
+            std::env::set_var(
+                "TRUSTY_INDEX_MEMORY_LIMIT_MB",
+                self.index_memory_limit_mb.to_string(),
+            );
             std::env::set_var("TRUSTY_MAX_CHUNKS", self.max_chunks.to_string());
             std::env::set_var("TRUSTY_EMBEDDING_CACHE", self.embedding_cache.to_string());
             std::env::set_var("TRUSTY_MAX_BATCH_SIZE", self.max_batch_size.to_string());
@@ -410,18 +494,26 @@ impl MemoryPolicy {
     pub fn log_summary(&self) {
         let gb = self.total_ram_mb / 1024;
         let proportional = compute_memory_limit_mb(self.total_ram_mb);
+        let proportional_index = compute_index_memory_limit_mb(self.total_ram_mb);
         tracing::info!(
-            "trusty-search: detected {} GB RAM → tier={} (proportional memory_limit_mb={}, 25% of RAM clamped to [{}, {}])",
+            "trusty-search: detected {} GB RAM → tier={} \
+             (daemon memory_limit_mb={}, 25% of RAM clamped to [{}, {}]; \
+              index memory_limit_mb={}, 40% of RAM clamped to [{}, {}])",
             gb,
             self.tier,
             proportional,
             MEMORY_LIMIT_FLOOR_MB,
             MEMORY_LIMIT_CEIL_MB,
+            proportional_index,
+            INDEX_MEMORY_LIMIT_FLOOR_MB,
+            INDEX_MEMORY_LIMIT_CEIL_MB,
         );
         tracing::info!(
-            "  MEMORY_LIMIT_MB={}  MAX_CHUNKS={}  EMBEDDING_CACHE={}  \
-             MAX_BATCH_SIZE={}  BM25_CORPUS_CAP={}  MAX_KG_NODES={}",
+            "  MEMORY_LIMIT_MB={}  INDEX_MEMORY_LIMIT_MB={}  MAX_CHUNKS={}  \
+             EMBEDDING_CACHE={}  MAX_BATCH_SIZE={}  BM25_CORPUS_CAP={}  \
+             MAX_KG_NODES={}",
             self.memory_limit_mb,
+            self.index_memory_limit_mb,
             self.max_chunks,
             self.embedding_cache,
             self.max_batch_size,
@@ -547,41 +639,132 @@ mod tests {
         // (25% of host RAM, clamped). We feed each tier its representative
         // host size and assert the derived caps match the table.
 
-        // 16 GB host → Medium → proportional limit = 4 GB.
-        let medium = MemoryTier::Medium.defaults(compute_memory_limit_mb(16 * 1024));
+        // Helper to call defaults with both proportional limits for a host
+        // size. Note: max_batch_size is now derived from the *index* memory
+        // limit (40% of RAM), not the global daemon limit (25%).
+        let d = |ram_mb: u64, tier: MemoryTier| {
+            tier.defaults(
+                compute_memory_limit_mb(ram_mb),
+                compute_index_memory_limit_mb(ram_mb),
+            )
+        };
+
+        // 16 GB host → Medium → daemon limit = 4 GB, index limit = 6.4 GB.
+        let medium = d(16 * 1024, MemoryTier::Medium);
         assert_eq!(medium.memory_limit_mb, 4_096);
-        // max_chunks = clamp(4096 * 50, 50_000, 800_000) = 204_800
+        assert_eq!(medium.index_memory_limit_mb, 6_553);
+        // max_chunks tracks daemon limit: clamp(4096 * 50, 50_000, 800_000) = 204_800
         assert_eq!(medium.max_chunks, 204_800);
-        // max_batch_size = floor(4096 * 0.75 / 32) = floor(96.0) = 96
-        assert_eq!(medium.max_batch_size, 96);
+        // max_batch_size tracks INDEX limit: floor(6553 * 0.75 / 32) = floor(153.5) = 153
+        assert_eq!(medium.max_batch_size, 153);
         assert_eq!(medium.embedding_cache, 5_000);
 
-        // 32 GB host → Large → proportional limit = 8 GB.
-        let large = MemoryTier::Large.defaults(compute_memory_limit_mb(32 * 1024));
+        // 32 GB host → Large → daemon limit = 8 GB, index limit = 12.8 GB.
+        let large = d(32 * 1024, MemoryTier::Large);
         assert_eq!(large.memory_limit_mb, 8_192);
+        assert_eq!(large.index_memory_limit_mb, 13_107);
         // max_chunks = clamp(8192 * 50, 50_000, 800_000) = 409_600
         assert_eq!(large.max_chunks, 409_600);
-        // max_batch_size = floor(8192 * 0.75 / 32) = floor(192.0) = 192
-        assert_eq!(large.max_batch_size, 192);
+        // max_batch_size = floor(13107 * 0.75 / 32) → clamped to 307 then
+        // hard-capped to 256 by tier in resolution; here we test raw default
+        // which is just clamp(_, 32, 512) = 307
+        assert_eq!(large.max_batch_size, 307);
 
-        // 64 GB host → XLarge → proportional limit = 16 GB.
-        let xl = MemoryTier::XLarge.defaults(compute_memory_limit_mb(64 * 1024));
+        // 64 GB host → XLarge → daemon limit = 16 GB, index limit = 25.6 GB.
+        let xl = d(64 * 1024, MemoryTier::XLarge);
         assert_eq!(xl.memory_limit_mb, 16_384);
+        assert_eq!(xl.index_memory_limit_mb, 26_214);
         // max_chunks = clamp(16384 * 50, 50_000, 800_000) = 800_000 (ceiling)
         assert_eq!(xl.max_chunks, 800_000);
         assert_eq!(xl.embedding_cache, 20_000);
         assert_eq!(xl.max_kg_nodes, 500_000);
-        // max_batch_size = floor(16384 * 0.75 / 32) = floor(384.0) = 384
-        assert_eq!(xl.max_batch_size, 384);
+        // max_batch_size = floor(26214 * 0.75 / 32) = 614 → clamped to 512
+        assert_eq!(xl.max_batch_size, 512);
 
-        // 128 GB host → XLarge → proportional limit = 32 GB (previously
-        // capped at 16 GB regardless of host size — issue #120).
-        let huge = MemoryTier::XLarge.defaults(compute_memory_limit_mb(128 * 1024));
+        // 128 GB host → XLarge → daemon limit = 32 GB, index limit = 51.2 GB.
+        let huge = d(128 * 1024, MemoryTier::XLarge);
         assert_eq!(huge.memory_limit_mb, 32 * 1024);
+        assert_eq!(huge.index_memory_limit_mb, 52_428);
 
-        // 256 GB host → XLarge → proportional limit = 64 GB (ceiling).
-        let max_host = MemoryTier::XLarge.defaults(compute_memory_limit_mb(256 * 1024));
+        // 256 GB host → XLarge → daemon limit = 64 GB (ceiling),
+        // index limit = 96 GB (ceiling).
+        let max_host = d(256 * 1024, MemoryTier::XLarge);
         assert_eq!(max_host.memory_limit_mb, MEMORY_LIMIT_CEIL_MB as usize);
+        assert_eq!(
+            max_host.index_memory_limit_mb,
+            INDEX_MEMORY_LIMIT_CEIL_MB as usize
+        );
+    }
+
+    #[test]
+    fn test_compute_index_memory_limit_from_ram() {
+        // Index memory limit = 40% of system RAM, clamped to [2 GB, 96 GB].
+        assert_eq!(compute_index_memory_limit_mb(16 * 1024), 6_553); // 16 GB → 6.4 GB
+        assert_eq!(compute_index_memory_limit_mb(32 * 1024), 13_107); // 32 GB → 12.8 GB
+        assert_eq!(compute_index_memory_limit_mb(64 * 1024), 26_214); // 64 GB → 25.6 GB
+        assert_eq!(compute_index_memory_limit_mb(128 * 1024), 52_428); // 128 GB → 51.2 GB
+
+        // Ceiling clamp at 96 GB.
+        assert_eq!(
+            compute_index_memory_limit_mb(256 * 1024),
+            INDEX_MEMORY_LIMIT_CEIL_MB as usize
+        );
+        assert_eq!(
+            compute_index_memory_limit_mb(1024 * 1024),
+            INDEX_MEMORY_LIMIT_CEIL_MB as usize
+        );
+
+        // Floor clamp at 2 GB.
+        assert_eq!(
+            compute_index_memory_limit_mb(0),
+            INDEX_MEMORY_LIMIT_FLOOR_MB as usize
+        );
+        assert_eq!(
+            compute_index_memory_limit_mb(4 * 1024),
+            INDEX_MEMORY_LIMIT_FLOOR_MB as usize // 40% of 4 GB = 1.6 GB → floored
+        );
+
+        // Invariant: index limit is always >= global daemon limit (40% >= 25%).
+        for ram_gb in [16u64, 32, 64, 128, 192, 256] {
+            let ram = ram_gb * 1024;
+            assert!(
+                compute_index_memory_limit_mb(ram) >= compute_memory_limit_mb(ram),
+                "index limit must be >= daemon limit at {ram_gb} GB"
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_memory_limit_resolution_floors_at_global() {
+        // When TRUSTY_INDEX_MEMORY_LIMIT_MB is set below TRUSTY_MEMORY_LIMIT_MB,
+        // MemoryPolicy must clamp it back up to at least the global limit.
+        // Otherwise the indexing pipeline would run with a tighter ceiling
+        // than the steady-state daemon — almost certainly a misconfiguration.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_idx = std::env::var("TRUSTY_INDEX_MEMORY_LIMIT_MB").ok();
+        let prior_mem = std::env::var("TRUSTY_MEMORY_LIMIT_MB").ok();
+        // SAFETY: serialized via ENV_LOCK within this module.
+        unsafe {
+            std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", "8192");
+            std::env::set_var("TRUSTY_INDEX_MEMORY_LIMIT_MB", "2048"); // < global
+        }
+        let policy = MemoryPolicy::from_total_ram_mb(32 * 1024);
+        assert_eq!(policy.memory_limit_mb, 8_192);
+        // Indexing limit must be floored at the global limit, not the
+        // operator's smaller value.
+        assert_eq!(policy.index_memory_limit_mb, 8_192);
+
+        // SAFETY: same.
+        unsafe {
+            match prior_idx {
+                Some(v) => std::env::set_var("TRUSTY_INDEX_MEMORY_LIMIT_MB", v),
+                None => std::env::remove_var("TRUSTY_INDEX_MEMORY_LIMIT_MB"),
+            }
+            match prior_mem {
+                Some(v) => std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", v),
+                None => std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB"),
+            }
+        }
     }
 
     #[test]

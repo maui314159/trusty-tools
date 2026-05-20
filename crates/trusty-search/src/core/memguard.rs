@@ -34,6 +34,14 @@ const DEFAULT_MEMORY_LIMIT_MB: u64 = 8_192;
 /// `Some(mb)` => soft RSS ceiling in megabytes.
 static MEMORY_LIMIT_MB: OnceLock<Option<u64>> = OnceLock::new();
 
+/// Cached snapshot of `TRUSTY_INDEX_MEMORY_LIMIT_MB` parsed at first read.
+///
+/// `None` => no separate indexing-pipeline limit configured; callers should
+/// fall back to `memory_limit_mb()`.
+/// `Some(mb)` => soft RSS ceiling, in megabytes, that applies *only* while the
+/// indexing pipeline (reindex / embedding / commit) is running.
+static INDEX_MEMORY_LIMIT_MB: OnceLock<Option<u64>> = OnceLock::new();
+
 /// Read `TRUSTY_MEMORY_LIMIT_MB`, caching the result.
 ///
 /// Priority: env var > `daemon.env` (already sourced into env by
@@ -66,6 +74,70 @@ pub fn memory_limit_mb() -> Option<u64> {
             Err(_) => Some(DEFAULT_MEMORY_LIMIT_MB),
         }
     })
+}
+
+/// Read `TRUSTY_INDEX_MEMORY_LIMIT_MB`, caching the result. Falls back to the
+/// global `memory_limit_mb()` when the indexing-specific env var is unset.
+///
+/// Why: the indexing pipeline (embedding, HNSW commit, redb write) has a very
+/// different memory profile from the steady-state daemon. With the CoreML
+/// execution provider on Apple Silicon, virtual RSS can briefly spike to
+/// 60–100 GB while ONNX allocates unified-memory buffers — yet the
+/// steady-state daemon (HNSW arenas + warm-boot indexes) only needs a few GB.
+/// Forcing both to share a single `TRUSTY_MEMORY_LIMIT_MB` ceiling means
+/// either: (a) the global limit is set too low and reindex trips it
+/// immediately, or (b) the global limit is set high enough for reindex and
+/// the daemon will OOM-kill any other workload on the host. This separate
+/// limit lets operators give the indexing pipeline its own (typically larger)
+/// budget without raising the steady-state ceiling.
+///
+/// What: priority is `TRUSTY_INDEX_MEMORY_LIMIT_MB` env var > daemon.env
+/// (already sourced into env by `load_daemon_env`) > fall back to
+/// `memory_limit_mb()`. A value of `0` explicitly disables the limit for the
+/// indexing pipeline; any non-numeric value falls through to the global limit
+/// with a warning.
+///
+/// Test: `tests::test_index_memory_limit_falls_back_to_global` and
+/// `tests::test_index_memory_limit_env_parse`.
+pub fn index_memory_limit_mb() -> Option<u64> {
+    let explicit = INDEX_MEMORY_LIMIT_MB.get_or_init(|| {
+        match std::env::var("TRUSTY_INDEX_MEMORY_LIMIT_MB") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => Some(0), // sentinel: explicitly disabled
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        "TRUSTY_INDEX_MEMORY_LIMIT_MB={v:?} is not a valid u64; \
+                         falling back to TRUSTY_MEMORY_LIMIT_MB"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    });
+    match explicit {
+        Some(0) => None,           // explicitly disabled
+        Some(n) => Some(*n),       // explicit value
+        None => memory_limit_mb(), // fall back to the global daemon limit
+    }
+}
+
+/// Convenience helper for the reindex orchestrator: returns `true` when an
+/// indexing-pipeline memory limit is configured AND current RSS is at or
+/// above it.
+///
+/// Why: parallels [`over_memory_limit`] but consults the indexing-specific
+/// limit. Used by the reindex memory poller and post-commit RSS check.
+/// What: combines `index_memory_limit_mb()` with `current_rss_mb()` and
+/// returns true iff both are available and RSS meets/exceeds the limit.
+/// Test: covered transitively by `tests::test_over_memory_limit_false_when_unset`
+/// — when neither env var is set, both helpers return false.
+pub fn over_index_memory_limit() -> bool {
+    match (index_memory_limit_mb(), current_rss_mb()) {
+        (Some(limit), Some(rss)) => rss >= limit,
+        _ => false,
+    }
 }
 
 /// Current process Resident Set Size in megabytes. Returns `None` if sysinfo
@@ -122,6 +194,37 @@ mod tests {
         // helper must return false regardless of current RSS.
         if memory_limit_mb().is_none() {
             assert!(!over_memory_limit());
+        }
+    }
+
+    #[test]
+    fn test_index_memory_limit_falls_back_to_global() {
+        // When TRUSTY_INDEX_MEMORY_LIMIT_MB is unset (the default in this
+        // test binary's environment) `index_memory_limit_mb()` must mirror
+        // `memory_limit_mb()`. We can't reliably mutate the env here because
+        // both getters cache via OnceLock, but we can assert the invariant
+        // holds for whatever the cached pair happens to be.
+        let global = memory_limit_mb();
+        let indexing = index_memory_limit_mb();
+        // If the operator didn't set TRUSTY_INDEX_MEMORY_LIMIT_MB before this
+        // test binary launched, the indexing limit equals the global one.
+        if std::env::var("TRUSTY_INDEX_MEMORY_LIMIT_MB").is_err() {
+            assert_eq!(indexing, global);
+        }
+    }
+
+    #[test]
+    fn test_index_memory_limit_env_parse() {
+        // Smoke test: the getter never panics regardless of env state.
+        let _ = index_memory_limit_mb();
+    }
+
+    #[test]
+    fn test_over_index_memory_limit_false_when_unset() {
+        // Mirrors `test_over_memory_limit_false_when_unset` — when no
+        // limit is configured anywhere, the helper must return false.
+        if index_memory_limit_mb().is_none() {
+            assert!(!over_index_memory_limit());
         }
     }
 }
