@@ -224,6 +224,10 @@ Release workflow:
 5. Create the tag: `git tag <crate-name>-v<version>`.
 6. Push the tag: `git push origin <crate-name>-v<version>`.
 7. Publish: `cargo publish -p <crate-name>`.
+8. Build the release binary (if not already fresh): `cargo build --release -p <crate-name>`.
+9. Install the binary locally: `cp target/release/<binary-name> ~/.cargo/bin/<binary-name>`
+   (for crates with binaries, e.g. trusty-search, trusty-mpm-cli). This ensures the binary on PATH
+   is always the version that was just released.
 
 The `trusty-mpm-*` family shares a single workspace version (declared under
 `[workspace.package]`) and is bumped together.
