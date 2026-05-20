@@ -13,8 +13,8 @@ name = "tickets-mcp"
 path = "src/bin/tickets-mcp.rs"
 
 [dependencies]
-trusty-mcp-core = { path = "../trusty-mcp-core" }
-trusty-common = { path = "../trusty-common" }
+trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
+trusty-common = { path = "../trusty-common", version = "0.3.3" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

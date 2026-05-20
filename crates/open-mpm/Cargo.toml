@@ -4,22 +4,22 @@ version = "0.38.3"
 edition = "2024"
 
 [dependencies]
-trusty-symgraph = { path = "../trusty-symgraph", features = ["parser"] }
-trusty-memory-core = { path = "../trusty-memory-core" }
+trusty-symgraph = { path = "../trusty-symgraph", version = "0.2.1", features = ["parser"] }
+trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 # Why: issue #460 unified rpc.discover — host needs the ServiceDescriptor
 #      trait + OpenRpcBuilder, plus the in-process MemoryMcpService and
 #      SearchMcpService impls. trusty-search now aligns on tree-sitter 0.26
 #      (matches trusty-symgraph) so the previous `links = "tree-sitter"`
 #      single-copy conflict is resolved and we link it directly.
-trusty-mcp-core = { path = "../trusty-mcp-core" }
-trusty-memory-mcp = { path = "../trusty-memory-mcp" }
-trusty-search = { path = "../trusty-search" }
+trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
+trusty-memory-mcp = { path = "../trusty-memory-mcp", version = "0.1.19" }
+trusty-search = { path = "../trusty-search", version = "0.3.45" }
 # #484: Shared service layer. `tc-services::cto_db` owns the CTO DB service
 # adapter (schema emission + dispatch); `src/tools/cto_db.rs` is now a thin
 # `ToolExecutor` wrapper over it. `trusty-cto-db` is still a direct dep because
 # the wrapper test references `trusty_cto_db::ENV_CTO_DB_PATH`.
-tc-services = { path = "../tc-services" }
-trusty-cto-db = { path = "../trusty-cto-db" }
+tc-services = { path = "../tc-services", version = "0.1.1" }
+trusty-cto-db = { path = "../trusty-cto-db", version = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 async-openai = "0.30"
 serde = { version = "1", features = ["derive"] }

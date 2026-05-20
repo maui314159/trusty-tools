@@ -14,7 +14,7 @@ name = "trpc"
 path = "src/main.rs"
 
 [dependencies]
-trusty-mcp-core = { path = "../trusty-mcp-core" }
+trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
