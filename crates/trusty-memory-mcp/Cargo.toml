@@ -1,6 +1,6 @@
 [package]
 name = "trusty-memory"
-version = "0.1.19"
+version = "0.1.49"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"

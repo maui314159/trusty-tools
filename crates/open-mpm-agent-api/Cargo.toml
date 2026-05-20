@@ -7,7 +7,6 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Stable agent-plugin surface (ToolExecutor, AgentPlugin, ToolResult) shared by open-mpm and external agent crates."
-publish = false
 
 [dependencies]
 async-trait = { workspace = true }

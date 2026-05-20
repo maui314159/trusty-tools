@@ -39,3 +39,7 @@
 
 !CLAUDE.md
 !README.md
+
+# trusty-search runtime artifacts
+crates/trusty-search/.claude-mpm/
+crates/trusty-search/ui/node_modules/
