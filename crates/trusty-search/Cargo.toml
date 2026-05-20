@@ -41,7 +41,7 @@ path = "src/main.rs"
 trusty-common = { version = "0.3.3", features = ["axum-server"] }
 trusty-mcp-core = { version = "0.1.2" }
 trusty-embedder = { version = "0.1.5", default-features = false, features = ["test-support"] }
-trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts surface only — no tree-sitter
+trusty-symgraph = { version = "0.2.2", default-features = false }  # contracts surface only — no tree-sitter
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

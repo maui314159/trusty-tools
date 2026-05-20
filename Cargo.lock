@@ -6183,7 +6183,6 @@ dependencies = [
  "similar",
  "stop-words",
  "strip-ansi-escapes",
- "tc-services",
  "teloxide 0.17.0",
  "tempfile",
  "thiserror 1.0.69",
@@ -6207,7 +6206,6 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
- "trusty-cto-db",
  "trusty-mcp-core",
  "trusty-memory",
  "trusty-memory-core",
@@ -10682,7 +10680,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-symgraph"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum 0.8.9",

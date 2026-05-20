@@ -1,6 +1,6 @@
 [package]
 name = "trusty-symgraph"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 authors.workspace = true
 description = "Standalone symbol-graph engine: AST -> SymbolRegistry -> emit, with knowledge-graph queries."

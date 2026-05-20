@@ -7,8 +7,26 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+include = [
+    "src/**/*",
+    "ui/dist/**/*",
+    "ui/src/**/*",
+    "ui/index.html",
+    "ui/package.json",
+    "ui/pnpm-lock.yaml",
+    "ui/svelte.config.*",
+    "ui/tsconfig.*",
+    "ui/vite.config.*",
+    "ui/tailwind.config.*",
+    "ui/postcss.config.*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+
 [dependencies]
-trusty-symgraph = { path = "../trusty-symgraph", version = "0.2.1", features = ["parser"] }
+trusty-symgraph = { path = "../trusty-symgraph", version = "0.2.2", features = ["parser"] }
 trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 # Why: issue #460 unified rpc.discover — host needs the ServiceDescriptor
 #      trait + OpenRpcBuilder, plus the in-process MemoryMcpService and
