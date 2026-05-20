@@ -143,6 +143,19 @@ impl CodeIndexer {
 
     /// Parse a file with `chunk_ast`, store every chunk in the corpus, and
     /// retain the per-file entity list for later KG/entity-search phases.
+    ///
+    /// Why: previously this routine called `add_chunk_inner` once per chunk,
+    /// which issues a single-chunk ONNX `embed` call apiece. For a 10-chunk
+    /// file that's 10 sequential ONNX dispatches vs. the bulk path's single
+    /// batched call. This rewrite collects every chunk first, embeds them
+    /// in one batched ONNX call (matching `index_files_batch`), then commits
+    /// BM25, HNSW, the embeddings cache, and the corpus under the same
+    /// lock-window-minimizing path used by the bulk reindex.
+    /// What: chunk the file, batch-embed all chunks, commit vectors / BM25 /
+    /// corpus, then enrich entities via the NLP helper and rebuild the
+    /// symbol graph once.
+    /// Test: covered by every `index_file`-based test in `indexer::tests`
+    /// plus the live indexing path exercised by integration tests.
     pub async fn index_file(&self, file_path: &str, content: &str) -> Result<()> {
         let (mut chunks, entities) = chunk_ast(file_path, content);
 
@@ -151,12 +164,29 @@ impl CodeIndexer {
         populate_virtual_terms(&mut chunks, &entities);
 
         // Snapshot chunk contents before move so we can run the ConceptCluster
-        // pass below. Borrowing into the for-loop would hold the slice across
-        // `await`, which `add_chunk` doesn't allow.
+        // pass below. Borrowing into the commit pipeline would hold the slice
+        // across `await`.
         let chunk_contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
-        for chunk in chunks {
-            self.add_chunk_inner(chunk).await?;
+        if !chunks.is_empty() {
+            // Batch embed every chunk in one ONNX call (instead of N sequential
+            // single-chunk calls). Mirrors the bulk-path `parse_and_embed_files`
+            // → `commit_parsed_batch` flow.
+            let embeddings = self.embed_chunks_in_batches(&chunks).await?;
+            let parsed = ParsedBatch {
+                chunks,
+                embeddings,
+                // index_file owns its own entity write below, so don't double-insert
+                // via commit_parsed_batch.
+                entities_by_file: Vec::new(),
+                parse_ms: 0,
+                embed_ms: 0,
+                vector_count: 0,
+            };
+            // `defer_graph_rebuild = true` — we rebuild the graph once at the
+            // tail of this function after entity enrichment, matching the
+            // previous behaviour.
+            self.commit_parsed_batch(parsed, true).await?;
         }
 
         let all_entities = self
@@ -167,9 +197,7 @@ impl CodeIndexer {
             .write()
             .await
             .insert(file_path.to_string(), all_entities);
-        // Single symbol graph rebuild for the entire file. `add_chunk_inner`
-        // intentionally skips the rebuild so a 10-chunk file pays 1 rebuild
-        // instead of 11 — the previous loop made this `O(N · corpus)`.
+        // Single symbol graph rebuild for the entire file.
         self.rebuild_symbol_graph().await;
         Ok(())
     }

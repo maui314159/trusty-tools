@@ -148,8 +148,16 @@ pub struct Bm25Index {
     doc_lengths: Vec<Option<usize>>,
     /// Per-term posting list: `(slot, term_count_in_doc)`.
     inverted: HashMap<String, Vec<(usize, usize)>>,
-    /// Cached avg doc length over live slots only.
-    avg_doc_len: f32,
+    /// Running total of live-slot doc lengths. Maintained incrementally on
+    /// every upsert/remove so `avg_doc_len()` is O(1) instead of O(slots).
+    ///
+    /// Why: `commit_bm25_batch` calls `upsert_document` in a loop. The old
+    /// implementation refreshed `avg_doc_len` by scanning every slot inside
+    /// `remove_document` (and again at the tail of `upsert_document`), so a
+    /// 640-chunk batch on a 50k-doc index performed ~32M iterations of pure
+    /// bookkeeping. Tracking the total length incrementally turns that into
+    /// a constant-time `u64` add/subtract per chunk.
+    total_doc_length: u64,
     /// chunk_id → slot. Used by upsert/remove to find an existing slot.
     id_to_slot: HashMap<String, usize>,
     /// slot → chunk_id. Used by `score_query_all` to materialize results.
@@ -171,7 +179,7 @@ impl Bm25Index {
             doc_freqs: HashMap::new(),
             doc_lengths: Vec::new(),
             inverted: HashMap::new(),
-            avg_doc_len: 0.0,
+            total_doc_length: 0,
             id_to_slot: HashMap::new(),
             slot_to_id: Vec::new(),
             free_slots: Vec::new(),
@@ -189,14 +197,24 @@ impl Bm25Index {
         self.live_docs == 0
     }
 
-    /// Recompute average doc length over live slots only. O(slots).
-    fn refresh_avg_doc_len(&mut self) {
+    /// Average doc length over live slots. O(1) — read from the running
+    /// `total_doc_length` sum maintained by `upsert_document` and
+    /// `remove_document`.
+    ///
+    /// Why: BM25 scoring needs avg doc length per query, and the bulk
+    /// ingest path does N upsert/remove operations per batch. Computing
+    /// the average from the running total avoids the full-corpus scan
+    /// that previously dominated batch commits.
+    /// What: returns `total_doc_length / live_docs`, or `0.0` when the
+    /// index is empty (avoids division by zero).
+    /// Test: covered by every BM25 ranking test in this module — the
+    /// observed score values depend on this value being correct.
+    fn avg_doc_len(&self) -> f32 {
         if self.live_docs == 0 {
-            self.avg_doc_len = 0.0;
-            return;
+            0.0
+        } else {
+            self.total_doc_length as f32 / self.live_docs as f32
         }
-        let total: usize = self.doc_lengths.iter().filter_map(|x| *x).sum();
-        self.avg_doc_len = total as f32 / self.live_docs as f32;
     }
 
     /// Allocate a slot for a new chunk_id, reusing a freed slot when possible.
@@ -246,7 +264,10 @@ impl Bm25Index {
         self.live_docs += 1;
 
         let tokens = tokenize(text);
-        self.doc_lengths[slot] = Some(tokens.len());
+        let doc_len = tokens.len();
+        self.doc_lengths[slot] = Some(doc_len);
+        // Maintain the running sum so `avg_doc_len()` stays O(1).
+        self.total_doc_length = self.total_doc_length.saturating_add(doc_len as u64);
 
         // Per-doc term counts.
         let mut term_counts: HashMap<&str, usize> = HashMap::new();
@@ -261,7 +282,6 @@ impl Bm25Index {
                 .push((slot, count));
         }
         self.doc_terms[slot] = Some(tokens);
-        self.refresh_avg_doc_len();
     }
 
     /// Legacy slot-based add. Retained so the in-tree `score(query, doc_id)`
@@ -301,11 +321,15 @@ impl Bm25Index {
                 }
             }
         }
+        // Subtract this slot's length from the running sum before clearing it
+        // so `avg_doc_len()` stays consistent with the live-slot population.
+        if let Some(old_len) = self.doc_lengths[slot] {
+            self.total_doc_length = self.total_doc_length.saturating_sub(old_len as u64);
+        }
         self.doc_lengths[slot] = None;
         self.slot_to_id[slot] = None;
         self.free_slots.push(slot);
         self.live_docs = self.live_docs.saturating_sub(1);
-        self.refresh_avg_doc_len();
     }
 
     /// Score every document that contains at least one query term, returning
@@ -319,7 +343,7 @@ impl Bm25Index {
             return Vec::new();
         }
         let n = self.live_docs as f32;
-        let avg = self.avg_doc_len.max(1.0);
+        let avg = self.avg_doc_len().max(1.0);
 
         // Accumulate score per slot. HashMap is fine — the touched-slot set is
         // bounded by the union of postings for the query terms, not by N.
@@ -387,7 +411,7 @@ impl Bm25Index {
                 .unwrap_or(0.0);
 
             let tf_norm = tf * (self.k1 + 1.0)
-                / (tf + self.k1 * (1.0 - self.b + self.b * dl / self.avg_doc_len.max(1.0)));
+                / (tf + self.k1 * (1.0 - self.b + self.b * dl / self.avg_doc_len().max(1.0)));
 
             score += idf * tf_norm;
         }
