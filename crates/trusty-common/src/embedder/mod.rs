@@ -308,10 +308,17 @@ impl FastEmbedder {
                 // flag even when CoreML handles most ops, which keeps the
                 // residual CPU work from re-allocating the arena.
                 let providers: Vec<ExecutionProviderDispatch> = vec![coreml, cpu_no_arena];
+                // Use units_tag for logging since ComputeUnits::as_str is pub(crate) in ort.
+                let units_str = match units {
+                    ComputeUnits::All => "all",
+                    ComputeUnits::CPUAndGPU => "cpu_gpu",
+                    ComputeUnits::CPUOnly => "cpu_only",
+                    ComputeUnits::CPUAndNeuralEngine => "cpu_ane",
+                };
                 tracing::info!(
                     "trusty-embedder: registering CoreML (compute_units={}, static_shapes=true, \
                      cache={}) + CPU(no-arena) execution providers (Apple Silicon)",
-                    units.as_str(),
+                    units_str,
                     cache_dir,
                 );
                 return (opts.with_execution_providers(providers), units_tag);
