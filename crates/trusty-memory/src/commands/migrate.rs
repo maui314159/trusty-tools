@@ -98,10 +98,7 @@ pub fn handle_migrate(target: MigrateTarget, dry_run: bool, _config_only: bool) 
     }
 
     if dry_run {
-        println!(
-            "{} Dry run — no files will be modified.\n",
-            "·".dimmed()
-        );
+        println!("{} Dry run — no files will be modified.\n", "·".dimmed());
     }
 
     run_config_phase(dry_run)
@@ -302,8 +299,7 @@ mod tests {
                 "other-server": { "command": "other" }
             }
         });
-        std::fs::write(&path, serde_json::to_string_pretty(&input).unwrap())
-            .expect("write input");
+        std::fs::write(&path, serde_json::to_string_pretty(&input).unwrap()).expect("write input");
 
         let result = migrate_config_file(&path, false);
         assert_eq!(result.status, ConfigMigrateStatus::Migrated);
@@ -344,8 +340,7 @@ mod tests {
                 "kuzu_memory": { "command": "kuzu-memory", "args": ["serve"] }
             }
         });
-        std::fs::write(&path, serde_json::to_string_pretty(&input).unwrap())
-            .expect("write input");
+        std::fs::write(&path, serde_json::to_string_pretty(&input).unwrap()).expect("write input");
 
         let result = migrate_config_file(&path, false);
         assert_eq!(result.status, ConfigMigrateStatus::Migrated);

@@ -86,11 +86,10 @@ pub fn handle_setup() -> Result<()> {
 /// Test: `setup_creates_data_dir_under_override` exercises the happy path
 /// with a tempdir-based override of `dirs::data_dir`.
 fn ensure_data_dir() -> Result<PathBuf> {
-    let base = dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
+    let base =
+        dirs::data_dir().ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
     let dir = base.join("trusty-memory");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create data dir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create data dir {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -114,8 +113,7 @@ fn install_service_phase() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
         let log_dir = launchd_log_dir()?;
         let cfg = build_launchd_config(exe, log_dir.clone());
-        cfg.install()
-            .context("install LaunchAgent plist")?;
+        cfg.install().context("install LaunchAgent plist")?;
         println!(
             "{} Installed LaunchAgent: {}",
             "✓".green(),
@@ -269,7 +267,11 @@ mod tests {
         assert_eq!(patch_one(&path, &entry).unwrap(), 1, "first patch writes");
         let after_first = std::fs::read_to_string(&path).unwrap();
 
-        assert_eq!(patch_one(&path, &entry).unwrap(), 0, "second patch is no-op");
+        assert_eq!(
+            patch_one(&path, &entry).unwrap(),
+            0,
+            "second patch is no-op"
+        );
         let after_second = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(after_first, after_second, "file must not change on no-op");

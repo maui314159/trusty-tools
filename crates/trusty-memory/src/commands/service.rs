@@ -88,8 +88,8 @@ pub fn handle_service(action: &ServiceAction) -> Result<()> {
 /// Test: covered indirectly by `service install` integration runs.
 #[cfg(target_os = "macos")]
 pub(crate) fn launchd_log_dir() -> Result<std::path::PathBuf> {
-    let data = dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
+    let data =
+        dirs::data_dir().ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
     let dir = data.join("trusty-memory").join("logs");
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("create log dir {}: {e}", dir.display()))?;
