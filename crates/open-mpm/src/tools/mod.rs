@@ -10,10 +10,10 @@
 //! `dispatch("fake", args)` returns the fake's output and `schemas()`
 //! contains the fake's schema.
 
+pub mod agent_plugin;
 pub mod always_on;
 pub mod analysis;
 pub mod ast_tools;
-pub mod cto_db;
 pub mod delegate;
 pub mod file_filter;
 pub mod finish_task;

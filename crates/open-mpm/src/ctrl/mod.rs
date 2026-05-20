@@ -1683,15 +1683,18 @@ pub async fn run_pm_task_with_persona(
                 crate::tools::web_search::BraveSearchTool::from_env(),
             ));
 
-            // #472: CTO DB tools — sensitive HR/budget data. ONLY register
-            // for the `cto-assistant` persona to keep the surface area
-            // tight; other personas (izzie, ctrl, personal-assistant, etc.)
-            // have no business calling into `cto.db`. The allow-list glob
-            // gate still applies on top of this, so the persona must also
-            // declare these names in its TOML.
-            if persona_name == "cto-assistant" {
-                for tool in crate::tools::cto_db::cto_db_tools() {
-                    registry.register(tool);
+            // #472 / agent-crate extraction: Persona-scoped tools (e.g. the
+            // CTO DB HR/budget surface) are no longer hard-coded here. Each
+            // external agent crate (cto-assistant, …) builds an `AgentPlugin`
+            // bundling its `ToolExecutor`s and the target persona name, then
+            // `main.rs` installs the plugin list at process startup. The
+            // ctrl loop looks the active persona up at session-build time
+            // and registers whatever tools were injected. This keeps the
+            // sensitive-tool gating (one persona only) intact while letting
+            // open-mpm stay agnostic of any specific agent's tool list.
+            for plugin in crate::tools::agent_plugin::plugins_for_persona(persona_name) {
+                for tool in &plugin.tools {
+                    registry.register(std::sync::Arc::clone(tool));
                 }
             }
 

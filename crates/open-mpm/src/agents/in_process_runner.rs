@@ -60,13 +60,19 @@ use crate::tools::write_file::WriteFileTool;
 /// drop, restores. Safe for our use: each agent call sets values before
 /// awaiting the LLM and the guard outlives that await.
 /// Test: Indirectly via `bedrock_smoke_test` (manual).
-pub(crate) struct BedrockEnvGuard {
+// Why: Widened from `pub(crate)` to `pub` so the `open-mpm` binary (now a
+//      separate crate consuming `open-mpm` as a library) can construct one
+//      via `open_mpm::agents::in_process_runner::BedrockEnvGuard::install`.
+// What: Public struct with a `pub` install constructor; Drop is automatically
+//       reachable.
+// Test: Existing call sites in `main.rs` (bin) and `ctrl/mod.rs` (lib).
+pub struct BedrockEnvGuard {
     prev_profile: Option<String>,
     prev_region: Option<String>,
 }
 
 impl BedrockEnvGuard {
-    pub(crate) fn install(profile: Option<&str>, region: Option<&str>) -> Self {
+    pub fn install(profile: Option<&str>, region: Option<&str>) -> Self {
         let prev_profile = std::env::var("OPEN_MPM_AWS_PROFILE").ok();
         let prev_region = std::env::var("OPEN_MPM_AWS_REGION").ok();
         // SAFETY: env mutation is process-global; documented above.

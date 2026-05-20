@@ -12,7 +12,7 @@ trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.19" }
 #      (matches trusty-symgraph) so the previous `links = "tree-sitter"`
 #      single-copy conflict is resolved and we link it directly.
 trusty-mcp-core = { path = "../trusty-mcp-core", version = "0.1.2" }
-trusty-memory-mcp = { path = "../trusty-memory-mcp", version = "0.1.19" }
+trusty-memory = { path = "../trusty-memory-mcp", version = "0.1.19" }
 trusty-search = { path = "../trusty-search", version = "0.3.45" }
 # #484: Shared service layer. `tc-services::cto_db` owns the CTO DB service
 # adapter (schema emission + dispatch); `src/tools/cto_db.rs` is now a thin
@@ -92,8 +92,22 @@ petgraph = { version = "0.8", features = ["serde-1"] }
 libc = "0.2"
 lru = "0.12"
 
+# cto-assistant agent crate (#484 follow-on). Lives in this workspace; loaded
+# at startup in main.rs and threaded into the ctrl loop as an AgentPlugin
+# (replaces the hard-coded `if persona == "cto-assistant"` branch).
+cto-assistant = { path = "../cto-assistant" }
+# Stable plugin surface shared with external agent crates. Defined in its own
+# crate (rather than in open-mpm/lib.rs) to break the open-mpm ↔ cto-assistant
+# cargo cycle: both crates depend on this small lib, neither depends on the
+# other through it.
+open-mpm-agent-api = { path = "../open-mpm-agent-api" }
+
 # [patch.crates-io] moved to workspace root Cargo.toml (Cargo requires
 # [patch] tables to live in the workspace root; see #460 for context).
+
+[lib]
+name = "open_mpm"
+path = "src/lib.rs"
 
 [[bin]]
 name = "open-mpm"

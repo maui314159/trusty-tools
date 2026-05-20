@@ -19,35 +19,17 @@ use serde::{Deserialize, Serialize};
 
 /// Access tier assigned to a `UserIdentity`.
 ///
-/// Why: A small, closed enum keeps the privilege ladder visible at every
-/// callsite — adding a new tier is a deliberate, type-checked change rather
-/// than a free-form string that drifts across transports. `All` is the
-/// "no restriction" tier (matches every tool); `Analytics` and `ReadOnly`
-/// are progressively narrower buckets that tools can opt into via
-/// `restricted_tiers` (an inverted list — tools name which tiers may NOT
-/// call them).
-/// What: Serializes as `snake_case` so TOML/JSON authors can write
-/// `tier = "read_only"` rather than the variant name. `Default` is `All`
-/// so that callsites which forget to set a tier degrade open at the
-/// controller (unauthenticated transports MUST set a stricter default —
-/// see `AgentConfig::rbac.unauthenticated_tier`).
-/// Test: `service_tier_serializes_snake_case`, `default_is_all`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceTier {
-    /// Full access — the controller / authenticated operator.
-    All,
-    /// Analytics-only tier — read + analytical queries, no mutations.
-    Analytics,
-    /// Read-only tier — passive observation only. The strictest tier.
-    ReadOnly,
-}
-
-impl Default for ServiceTier {
-    fn default() -> Self {
-        Self::All
-    }
-}
+/// Why: Re-exported from `open-mpm-agent-api` (which had to own the type so
+///      external agent crates can implement `ToolExecutor::restricted_tiers`
+///      without depending on this crate). The original definition lived here;
+///      consolidating into the agent-api crate broke the cargo cycle between
+///      `open-mpm` and `cto-assistant`. Internal call sites still write
+///      `crate::rbac::ServiceTier` and get the same type.
+/// What: Re-export of `open_mpm_agent_api::ServiceTier`. Variants, serde
+///       conventions (`snake_case`), and `Default = All` are unchanged.
+/// Test: `service_tier_serializes_snake_case`, `default_is_all` still pass
+///       because the type is the same one.
+pub use open_mpm_agent_api::ServiceTier;
 
 /// Per-request principal carried from transport into tool dispatch.
 ///

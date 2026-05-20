@@ -1,0 +1,24 @@
+[package]
+name = "cto-assistant"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CTO assistant agent for open-mpm — provides HR, budget, and operational database tools."
+publish = false
+
+[dependencies]
+# Note: depends on `open-mpm-agent-api`, NOT `open-mpm` itself. Depending on
+# the host crate would create a cargo dependency cycle (open-mpm injects this
+# crate's AgentPlugin at startup, so open-mpm depends on cto-assistant). The
+# tiny agent-api crate exposes the stable trait surface to both sides.
+open-mpm-agent-api = { path = "../open-mpm-agent-api" }
+tc-services = { path = "../tc-services" }
+trusty-cto-db = { path = "../trusty-cto-db" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

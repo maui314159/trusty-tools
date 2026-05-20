@@ -279,64 +279,25 @@ struct Cli {
     rest: Vec<String>,
 }
 
-mod adapters;
-mod agents;
-mod api;
-mod ast;
-mod build_info;
-mod bus;
-mod cli;
-#[allow(dead_code)]
-mod compress;
-mod context;
-mod ctrl;
-mod ctrl_session;
-mod debugger;
-mod docs_index;
-mod eval;
-mod events;
-mod git;
-mod identity;
-mod init;
-mod inspection;
-mod intent;
-mod interaction_log;
-mod ipc;
-mod llm;
-mod local_inference;
-mod logging;
-mod mcp;
-mod memory;
-mod mistake_log; // #186
-mod perf;
-mod plugins;
-mod process_tracker;
-mod progress;
-mod rbac;
-mod recap;
-mod registry;
-mod repl;
-mod rpc;
-mod search;
-mod service;
-mod session;
-mod session_record;
-mod session_registry;
-mod skills;
-mod slack;
-mod state_writer;
-mod subprocess;
-mod telegram;
-mod ticketing;
-mod tm;
-mod tmux;
-mod tools;
-mod update;
-mod usage;
-mod workflow;
-
-#[cfg(test)]
-mod test_env;
+// Why: Modules are owned by the `open_mpm` library crate (see src/lib.rs); this
+//      binary re-exports them under `crate::` so existing `crate::foo::*` paths
+//      throughout this file (and the integration tests) keep resolving without
+//      a large sweep. This also gives external agent crates (cto-assistant) a
+//      stable library handle to the same `ToolExecutor` / `AgentPlugin` types
+//      this binary uses for injection.
+// What: One `use open_mpm::foo as foo;` per top-level module. The `pub use`
+//       re-export pattern would also work but keeps the binary's surface
+//       deliberately small.
+// Test: The binary continues to build and run end-to-end via `cargo build`
+//       and the existing tmux/REPL tests.
+use open_mpm::{
+    adapters, agents, api, ast, build_info, bus, cli, compress, context, ctrl, ctrl_session,
+    debugger, docs_index, eval, events, git, identity, init, inspection, intent, interaction_log,
+    ipc, llm, local_inference, logging, mcp, memory, mistake_log, perf, plugins, process_tracker,
+    progress, rbac, recap, registry, repl, rpc, search, service, session, session_record,
+    session_registry, skills, slack, state_writer, subprocess, telegram, ticketing, tm, tmux,
+    tools, update, usage, workflow,
+};
 
 use memory::{CodeStore, FastEmbedder};
 use search::{CodeIndexer, FileWatcher};
@@ -375,7 +336,7 @@ async fn main() -> Result<()> {
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
         // Resolve project dir so `.open-mpm/state` lands in the project root
         // even when invoked from a subdirectory.
-        let state_dir = crate::ctrl::detect_self_project()
+        let state_dir = ctrl::detect_self_project()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .join(".open-mpm")
             .join("state");
@@ -396,12 +357,26 @@ async fn main() -> Result<()> {
     // by default, so cwd-local `.env.local` still wins when both exist.
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
-    if let Some(project_dir) = crate::ctrl::detect_self_project() {
+    if let Some(project_dir) = ctrl::detect_self_project() {
         let project_env = project_dir.join(".env.local");
         if project_env.is_file() {
             dotenvy::from_path(&project_env).ok();
         }
     }
+
+    // Why: Install external agent plugins (cto-assistant, …) into the
+    //      process-wide registry before any ctrl task spins up. The ctrl
+    //      loop reads the registry when building a persona's tool surface;
+    //      doing this once at startup avoids cascading new parameters
+    //      through every public ctrl entry point.
+    // What: One entry per extracted agent crate. The cto-assistant crate
+    //       supplies its CTO DB tool surface bound to the `cto-assistant`
+    //       persona name. Errors are swallowed: a duplicate install
+    //       (only possible in tests that re-enter `main`) is a no-op.
+    // Test: Indirectly covered by the cto-assistant integration — when the
+    //       cto-assistant persona is active, the four CTO DB tools appear
+    //       in the registry.
+    let _ = tools::agent_plugin::install_plugins(vec![cto_assistant::agent_plugin()]);
 
     // #366: Credential onboarding banner. After env loading is the right time
     // to check — both `.env.local` files and the host environment have been
@@ -554,7 +529,7 @@ async fn main() -> Result<()> {
     // invocation (PM, sub-agent, workflow, --reindex, etc.) is tagged.
     // Resolve project dir so `.open-mpm/state` lands in the project root
     // even when invoked from a subdirectory.
-    let state_dir = crate::ctrl::detect_self_project()
+    let state_dir = ctrl::detect_self_project()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(".open-mpm")
         .join("state");
@@ -1234,32 +1209,32 @@ async fn main() -> Result<()> {
     // Why: Lets users drive open-mpm from a phone via @openmpm_bot. Each
     // chat gets its own ChatSession + ConversationTurn history.
     if cli.telegram {
-        let project_path = crate::ctrl::detect_self_project()
+        let project_path = ctrl::detect_self_project()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         // #334: Standalone --telegram mode has no REPL; create a fresh
         // (orphan) pending map. New chats will be told to run /telegram pair
         // in the REPL — which won't exist in this mode. This path is
         // intentionally for ops-only usage; pairing requires the REPL.
-        let pending = crate::telegram::new_pending_pairs();
-        return crate::telegram::run_telegram_bot(project_path, pending).await;
+        let pending = telegram::new_pending_pairs();
+        return telegram::run_telegram_bot(project_path, pending).await;
     }
 
     // --slack flag: run the Slack Socket Mode bot gateway (#418).
     // Why: Same shape as --telegram — each channel gets its own ChatSession +
     // ConversationTurn history, dispatched through ctrl::run_pm_task_with_history.
     if cli.slack {
-        let project_path = crate::ctrl::detect_self_project()
+        let project_path = ctrl::detect_self_project()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         // Standalone --slack mode has no REPL; create a fresh (orphan)
         // pending map. Pairing requires shell access to the host running
         // the REPL, so this path is ops-only.
-        let pending = crate::slack::new_pending_pairs();
+        let pending = slack::new_pending_pairs();
         // #480/#481: Parse per-user RBAC + default-persona config from env so
         // the bot routes to `cto-assistant` and enforces tier gating.
-        let rbac = std::sync::Arc::new(crate::slack::SlackRbacConfig::from_env());
-        return crate::slack::run_slack_bot(project_path, pending, rbac).await;
+        let rbac = std::sync::Arc::new(slack::SlackRbacConfig::from_env());
+        return slack::run_slack_bot(project_path, pending, rbac).await;
     }
 
     // #372: Auto-start the file watcher in the background so the code index
@@ -1352,13 +1327,12 @@ async fn main() -> Result<()> {
         // #334: Share the REPL's pending-pairs map so /telegram pair codes
         // issued in the REPL are validatable by the bot's /pair handler.
         let _telegram_handle = if std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
-            let tg_project_path = crate::ctrl::detect_self_project()
+            let tg_project_path = ctrl::detect_self_project()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
             let tg_pending = repl.telegram_pairing_handle();
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::telegram::run_telegram_bot(tg_project_path, tg_pending).await
-                {
+                if let Err(e) = telegram::run_telegram_bot(tg_project_path, tg_pending).await {
                     tracing::warn!(error = %e, "telegram bot exited with error");
                 }
             }))
@@ -1616,20 +1590,11 @@ mod main_tests {
 /// lives at `.open-mpm/` now (formerly `config/`); runtime state is in
 /// `.open-mpm/state/` (gitignored).
 pub(crate) fn default_bundled_config_dir() -> PathBuf {
-    match std::env::var("OPEN_MPM_CONFIG_DIR") {
-        // `OPEN_MPM_CONFIG_DIR` is documented to already include the
-        // `/agents` suffix (legacy behavior). Strip it so the registry,
-        // which re-appends `/agents`, ends up pointing at the same dir.
-        Ok(s) if !s.is_empty() => {
-            let p = PathBuf::from(s);
-            if p.file_name().and_then(|n| n.to_str()) == Some("agents") {
-                p.parent().map(Path::to_path_buf).unwrap_or(p)
-            } else {
-                p
-            }
-        }
-        _ => PathBuf::from(".open-mpm"),
-    }
+    // Why: One canonical implementation in the library; binary delegates so
+    //      lib and bin can't drift.
+    // What: Delegates to `open_mpm::default_bundled_config_dir`.
+    // Test: Covered by lib tests / inspection tests that exercise the lookup.
+    open_mpm::default_bundled_config_dir()
 }
 
 /// Persist post-run skill effectiveness + usage to `~/.open-mpm/skills/index.json`
@@ -3248,7 +3213,7 @@ async fn run_workflow(
     // #128: Discover claude-mpm agents for dynamic loading. This populates
     // diagnostics only; the actual fallback happens inside
     // `AgentConfig::by_name_async` when a TOML is not found.
-    let _claude_mpm_agents = crate::agents::claude_mpm_loader::discover_agents(&cwd_for_skills)
+    let _claude_mpm_agents = agents::claude_mpm_loader::discover_agents(&cwd_for_skills)
         .await
         .unwrap_or_default();
     tracing::info!(
@@ -4663,8 +4628,8 @@ fn build_registry_for_agent(
     /// agent benefits from being able to back off or wait for an external
     /// signal. Per-agent TOML allowlists still gate actual usage.
     fn register_timer_tools(reg: &mut ToolRegistry) {
-        reg.register(Arc::new(crate::tools::timer::WaitMsTool::new()));
-        reg.register(Arc::new(crate::tools::timer::PollUntilTool::new()));
+        reg.register(Arc::new(tools::timer::WaitMsTool::new()));
+        reg.register(Arc::new(tools::timer::PollUntilTool::new()));
     }
 
     // #53: `memory_recall` and `vector_search` are research aids and are
@@ -4678,9 +4643,7 @@ fn build_registry_for_agent(
     fn register_memory_tools(reg: &mut ToolRegistry) {
         reg.register(Arc::new(MemoryRecallTool::new()));
         reg.register(Arc::new(VectorSearchTool::new()));
-        reg.register(Arc::new(
-            crate::tools::memory_search::MemorySearchTool::from_env(),
-        ));
+        reg.register(Arc::new(tools::memory_search::MemorySearchTool::from_env()));
     }
 
     match name {
@@ -4699,7 +4662,7 @@ fn build_registry_for_agent(
             reg.register(Arc::new(ListDirTool::new()));
             reg.register(Arc::new(GrepFilesTool::new()));
             // #373: research benefits from structural analysis tools.
-            for t in crate::tools::analysis::analysis_tools() {
+            for t in tools::analysis::analysis_tools() {
                 reg.register(t);
             }
             if let Some(dir) = out_dir {
@@ -4718,7 +4681,7 @@ fn build_registry_for_agent(
             reg.register(Arc::new(ReadFileTool::new()));
             reg.register(Arc::new(ListDirTool::new()));
             reg.register(Arc::new(GrepFilesTool::new()));
-            for t in crate::tools::analysis::analysis_tools() {
+            for t in tools::analysis::analysis_tools() {
                 reg.register(t);
             }
             if let Some(dir) = out_dir {
@@ -4862,7 +4825,7 @@ fn build_registry_for_agent(
 /// file path, and prints the resulting agent output to stderr.
 /// Test: Manual; covered indirectly by the auto-trigger end-to-end flow.
 async fn trigger_postmortem(project_root: &Path, session_id: &str) -> Result<()> {
-    use crate::tools::AgentRunner;
+    use tools::AgentRunner;
     let agents_config_dir = project_root.join(".open-mpm").join("agents");
     let log_path = project_root
         .join(".open-mpm")
@@ -4930,7 +4893,7 @@ async fn run_postmortem_subcommand(args: &[String]) -> Result<()> {
         recent.len(),
         payload
     );
-    use crate::tools::AgentRunner;
+    use tools::AgentRunner;
     let agents_config_dir = project_root.join(".open-mpm").join("agents");
     let runner = subprocess::SubprocessAgentRunner::new().with_config_dir(Some(agents_config_dir));
     let output = runner.run("postmortem-agent", &task).await?;

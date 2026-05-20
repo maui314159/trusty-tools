@@ -35,7 +35,12 @@ impl OpenMpmRepl {
     ///   through `Some(Err(_))` for the caller to surface.
     /// Test: `try_handle_slash_*` unit tests verify return shape; tmux e2e
     ///   verifies `/help` renders cleanly inside ratatui.
-    pub(crate) async fn try_handle_slash(&mut self, input: &str) -> Option<Result<(bool, String)>> {
+    // Why: Widened from `pub(crate)` to `pub` so the `open-mpm` binary
+    //      (now a separate crate consuming `open-mpm` as a library) can
+    //      invoke `repl.try_handle_slash(...)` from `main.rs`.
+    // What: Public async method; signature otherwise unchanged.
+    // Test: Existing slash-command unit tests + tmux e2e cover behaviour.
+    pub async fn try_handle_slash(&mut self, input: &str) -> Option<Result<(bool, String)>> {
         if !input.starts_with('/') {
             return None;
         }

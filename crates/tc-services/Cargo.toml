@@ -6,6 +6,7 @@ license.workspace = true
 description = "Shared service-layer implementations for the Trusty ecosystem (CTO DB, Granola, Google Workspace)."
 authors.workspace = true
 repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["rlib"]

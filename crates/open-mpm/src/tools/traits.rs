@@ -14,7 +14,15 @@ use std::path::PathBuf;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
+// Why: `ToolExecutor`, `ToolResult`, and `ToolExecutionTier` were extracted
+//      to `open-mpm-agent-api` so external agent crates (e.g. `cto-assistant`)
+//      can implement them without a cargo cycle through `open-mpm`. Re-exports
+//      here preserve every existing `crate::tools::traits::ToolExecutor`
+//      import in the workspace — internal call sites are unchanged.
+// What: Re-exports the trait + result + tier from the shared crate.
+// Test: All existing tool tests still resolve these names and pass.
+pub use open_mpm_agent_api::{ToolExecutionTier, ToolExecutor, ToolResult};
 
 /// Per-invocation context threaded from orchestrator to agent runner.
 ///
@@ -65,149 +73,6 @@ pub struct RunContext {
     /// engine populates it from `phase.model` in both the non-wave
     /// and wave-loop paths.
     pub model: Option<String>,
-}
-
-/// Structured result of a tool execution.
-///
-/// Why: Hard-failing the LLM loop on every tool error is brittle — the model
-/// often can recover (retry with different args, fall back to another tool,
-/// or explain the failure in its final answer). Returning a structured
-/// `Error { recoverable }` lets us surface the failure back to the LLM as a
-/// `tool_result` with `is_error: true` while keeping the loop running, unless
-/// `recoverable = false` in which case callers may choose to stop.
-/// What: `Success(String)` carries a successful textual result; `Error`
-/// carries a message plus a `recoverable` flag.
-/// Test: `ToolResult::err(...).is_error()` is true; `ok(...).content()` returns
-/// the success string.
-#[derive(Debug)]
-pub enum ToolResult {
-    Success(String),
-    Error { message: String, recoverable: bool },
-}
-
-impl ToolResult {
-    /// Success with a textual payload.
-    pub fn ok(s: impl Into<String>) -> Self {
-        ToolResult::Success(s.into())
-    }
-
-    /// Recoverable error: loop continues, LLM sees `is_error: true`.
-    pub fn err(msg: impl Into<String>) -> Self {
-        ToolResult::Error {
-            message: msg.into(),
-            recoverable: true,
-        }
-    }
-
-    /// Fatal (non-recoverable) error: callers may choose to stop the loop.
-    #[allow(dead_code)]
-    pub fn fatal(msg: impl Into<String>) -> Self {
-        ToolResult::Error {
-            message: msg.into(),
-            recoverable: false,
-        }
-    }
-
-    pub fn is_error(&self) -> bool {
-        matches!(self, ToolResult::Error { .. })
-    }
-
-    /// Whether this error is fatal (not recoverable). `false` for Success.
-    pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            ToolResult::Error {
-                recoverable: false,
-                ..
-            }
-        )
-    }
-
-    /// Access the inner textual content (success body or error message).
-    pub fn content(&self) -> &str {
-        match self {
-            Self::Success(s) => s,
-            Self::Error { message, .. } => message,
-        }
-    }
-}
-
-/// A tool invocable by an LLM through function calling.
-///
-/// Why: Replaces hardcoded string-match dispatch with polymorphic execution.
-/// What: Supplies OpenAI-compatible JSON schema via `schema()` and executes
-/// parsed arguments in `execute()`. Returns a structured `ToolResult` so
-/// failures can be surfaced back to the LLM without tearing down the loop.
-/// Test: See unit tests in `tools/mod.rs` for `ToolRegistry`.
-#[async_trait]
-pub trait ToolExecutor: Send + Sync {
-    /// Tool name — must match `function.name` in the schema and the LLM's
-    /// `tool_call.name`.
-    fn name(&self) -> &str;
-
-    /// Full OpenAI-compatible tool schema object (`{"type":"function", ...}`).
-    fn schema(&self) -> Value;
-
-    /// Execute the tool with already-parsed JSON arguments.
-    ///
-    /// Why: Returning `ToolResult` rather than `Result<String>` means
-    /// transient / user-visible failures (missing arg, HTTP 500, refused
-    /// command) flow back to the LLM as structured errors instead of
-    /// aborting the whole turn.
-    /// What: Returns `ToolResult::Success` on success or `ToolResult::Error`
-    /// on failure.
-    /// Test: Each concrete impl has tests; registry dispatches through this.
-    async fn execute(&self, args: Value) -> ToolResult;
-
-    /// Tiers that are NOT permitted to invoke this tool (#445).
-    ///
-    /// Why: Different transports (Slack, Telegram, HTTP) expose the same
-    /// tool registry to users with different trust levels. Tools opt into
-    /// RBAC by listing the tiers that must be denied access; an empty list
-    /// (the default) means "no restriction" so adding RBAC to the harness
-    /// is a no-op for existing tools.
-    /// What: Returns a slice of `ServiceTier` values. The trait default
-    /// returns an empty slice. Concrete tools that want to gate themselves
-    /// override this with a `&'static [ServiceTier]` literal.
-    /// Test: `tools/mod.rs::filter_tools_for_user_*`.
-    fn restricted_tiers(&self) -> &[crate::rbac::ServiceTier] {
-        &[]
-    }
-
-    /// Whether this tool is `AlwaysOn` (context injected before every LLM
-    /// call) or `OnDemand` (offered as a callable tool) (#447).
-    ///
-    /// Why: Some tools produce short, deterministic context the LLM would
-    /// always benefit from having pre-loaded; making the model issue a tool
-    /// call to fetch them wastes a turn. `AlwaysOn` tools are run
-    /// concurrently before each LLM request and their output prepended as a
-    /// `## Live Context` block. Everything else stays `OnDemand`.
-    /// What: Returns a `ToolExecutionTier`; default is `OnDemand` so
-    /// existing tools are unaffected. Always-on tools should be fast and
-    /// side-effect-free.
-    /// Test: `tools/always_on::build_live_context_*`.
-    fn execution_tier(&self) -> ToolExecutionTier {
-        ToolExecutionTier::OnDemand
-    }
-}
-
-/// Two-tier tool execution model (#447).
-///
-/// Why: The dispatch path treats always-on tools fundamentally differently
-/// from on-demand tools — they run automatically, their output becomes
-/// context rather than a `tool_result`, and they must not appear in the
-/// LLM's tool list. Encoding the distinction as an enum on the trait makes
-/// it impossible to accidentally schedule an `AlwaysOn` tool as
-/// `OnDemand` or vice-versa.
-/// What: `OnDemand` is the default (current behavior); `AlwaysOn` opts the
-/// tool into the pre-LLM context-building pipeline.
-/// Test: Default exercised by every existing tool; `AlwaysOn` exercised by
-/// `tools/always_on::build_live_context_*`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToolExecutionTier {
-    #[default]
-    OnDemand,
-    AlwaysOn,
 }
 
 /// Structured output returned by an `AgentRunner`.

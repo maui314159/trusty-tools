@@ -6,6 +6,7 @@ license.workspace = true
 description = "Read-only SQLite query tools over the CTO ops database (~/Duetto/cto/data/cto.db)"
 authors.workspace = true
 repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["rlib"]

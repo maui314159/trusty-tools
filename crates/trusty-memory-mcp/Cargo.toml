@@ -1,5 +1,5 @@
 [package]
-name = "trusty-memory-mcp"
+name = "trusty-memory"
 version = "0.1.19"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
