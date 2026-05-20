@@ -30,10 +30,35 @@ axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 # Optional: enabled by the `rpc` feature for UUID-v4 JSON-RPC request ids.
 uuid = { workspace = true, optional = true }
+# Optional: enabled by the `embedder` feature (formerly the `trusty-embedder`
+# crate). fastembed-rs provides the ONNX-runtime text-embedding pipeline;
+# `hf-hub-native-tls` is required so it can fetch the model on first run.
+fastembed = { workspace = true, features = ["hf-hub-native-tls"], optional = true }
+lru = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 
 # launchd module is macOS-only and needs getuid(2) for the gui/<uid> domain.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
+
+# Cross-platform direct ort dep for the `embedder` feature. Pinned to the
+# exact version fastembed-rs requires (`=2.0.0-rc.12`). We need ort as a
+# direct dep so we can register execution providers at runtime (CoreML on
+# Apple Silicon, CUDA when the `embedder-cuda` feature is enabled).
+[dependencies.ort]
+version = "=2.0.0-rc.12"
+default-features = false
+features = ["std", "api-24"]
+optional = true
+
+# macOS-specific: add the `coreml` feature so the runtime can build a
+# CoreML EP on Apple Silicon. Only takes effect when the `embedder`
+# feature is enabled (ort is optional).
+[target.'cfg(target_os = "macos")'.dependencies.ort]
+version = "=2.0.0-rc.12"
+default-features = false
+features = ["coreml", "std", "api-24"]
+optional = true
 
 [dev-dependencies]
 toml = "0.8"
@@ -52,3 +77,28 @@ mcp = []
 # `trusty-rpc` crate). Requires `uuid` for request id generation and reuses
 # the workspace `reqwest` for HTTP transport.
 rpc = ["dep:uuid"]
+# Enables the `embedder` module: shared text-embedding abstraction
+# (Embedder trait + FastEmbedder + MockEmbedder), formerly the
+# `trusty-embedder` crate. Pulls in fastembed-rs, lru, parking_lot, and
+# the ort direct dep. Defaults to bundled ORT linking — see the
+# `embedder-*` sub-features for AL2023 / CUDA / load-dynamic variants.
+embedder = ["dep:fastembed", "dep:lru", "dep:parking_lot", "dep:ort"]
+# Bundle the ONNX Runtime static libs via fastembed's
+# `ort-download-binaries-native-tls`. Right choice for macOS and modern
+# Linux (glibc ≥ 2.38). Mutually exclusive with `embedder-load-dynamic`
+# and `embedder-cuda` at the `ort-sys` level.
+embedder-bundled-ort = ["embedder", "fastembed/ort-download-binaries-native-tls"]
+# GPU-accelerated embedding via ort's CUDA execution provider. Pairs with
+# `fastembed/ort-load-dynamic` so no glibc-2.38-bound static ORT binaries
+# are bundled. Operators provide a host-compatible `libonnxruntime.so` and
+# point to it with `ORT_DYLIB_PATH=/path/to/lib` at runtime.
+embedder-cuda = ["embedder", "fastembed/cuda", "fastembed/ort-load-dynamic", "ort/cuda", "ort/load-dynamic"]
+# Dynamic ORT loading without CUDA — for AL2023 (glibc 2.34) CPU-only
+# builds. Set `ORT_DYLIB_PATH` at runtime.
+embedder-load-dynamic = ["embedder", "fastembed/ort-load-dynamic", "ort/load-dynamic"]
+# Deprecated: CoreML is now auto-detected at runtime on macOS. Kept as a
+# no-op alias for backward compatibility.
+embedder-coreml = ["embedder"]
+# Exposes the `MockEmbedder` test double outside `cfg(test)` so downstream
+# integration tests can reuse it.
+embedder-test-support = ["embedder"]

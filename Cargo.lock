@@ -10286,8 +10286,12 @@ dependencies = [
  "axum 0.8.9",
  "colored 2.2.0",
  "dirs 5.0.1",
+ "fastembed",
  "futures-util",
  "libc",
+ "lru",
+ "ort",
+ "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -10317,14 +10321,7 @@ dependencies = [
 name = "trusty-embedder"
 version = "0.1.5"
 dependencies = [
- "anyhow",
- "async-trait",
- "fastembed",
- "lru",
- "ort",
- "parking_lot",
- "tokio",
- "tracing",
+ "trusty-common",
 ]
 
 [[package]]
@@ -10408,7 +10405,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tracing",
- "trusty-embedder",
+ "trusty-common",
  "usearch",
  "uuid",
 ]
@@ -10659,7 +10656,6 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "trusty-common",
- "trusty-embedder",
  "trusty-symgraph",
  "usearch",
  "uuid",

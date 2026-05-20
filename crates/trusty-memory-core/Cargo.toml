@@ -34,8 +34,10 @@ rusqlite = { workspace = true }
 r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }
 
-# embedding (extracted to shared crate)
-trusty-embedder = { workspace = true }
+# embedding (absorbed into trusty-common behind the `embedder` feature;
+# pull in the default `embedder-bundled-ort` sub-feature for the bundled
+# ORT linking path).
+trusty-common = { workspace = true, features = ["embedder", "embedder-bundled-ort"] }
 
 # utils
 tiktoken-rs = { workspace = true }

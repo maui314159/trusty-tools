@@ -38,8 +38,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Shared trusty-common crates ────────────────────────────────────────────
-trusty-common = { version = "0.3.3", features = ["axum-server", "mcp"] }
-trusty-embedder = { version = "0.1.5", default-features = false, features = ["test-support"] }
+trusty-common = { version = "0.3.3", default-features = false, features = ["axum-server", "mcp", "embedder", "embedder-test-support"] }
 trusty-symgraph = { version = "0.2.2", default-features = false }  # contracts surface only — no tree-sitter
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
@@ -153,7 +152,7 @@ default = ["bundled-ort"]
 # Forwards `trusty-embedder/bundled-ort`. Enables static linking of the
 # fastembed-downloaded ORT 1.24.x libraries. Mutually exclusive with the
 # load-dynamic path that `cuda` activates (see below).
-bundled-ort = ["trusty-embedder/bundled-ort"]
+bundled-ort = ["trusty-common/embedder-bundled-ort"]
 # Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so
 # downstream integration tests can reuse them. Kept for parity with the
 # previous trusty-search-core feature surface.
@@ -173,17 +172,17 @@ ner = ["dep:ort", "dep:tokenizers"]
 # supported — Cargo will compile but the resulting binary will fail to
 # link ORT correctly. Always pair `--features cuda` with
 # `--no-default-features`.
-cuda = ["trusty-embedder/cuda"]
+cuda = ["trusty-common/embedder-cuda"]
 # Dynamic ORT loading without CUDA — for AL2023 (glibc 2.34) CPU-only cross-compilation.
 # Enables fastembed/ort-load-dynamic so no glibc-2.38-bound static ORT binaries are bundled.
 # Build: cargo build --no-default-features --features load-dynamic
 # Runtime: set ORT_DYLIB_PATH=/path/to/libonnxruntime.so
-load-dynamic = ["trusty-embedder/load-dynamic"]
+load-dynamic = ["trusty-common/embedder-load-dynamic"]
 # Deprecated: CoreML / Metal GPU acceleration is now auto-detected at runtime
 # on Apple Silicon and requires no opt-in. The `coreml` feature is kept as a
 # no-op alias for backward compatibility so `cargo install --features coreml`
 # still works.
-coreml = ["trusty-embedder/coreml"]
+coreml = ["trusty-common/embedder-coreml"]
 # ConceptCluster entities via k-means over doc-comment embeddings (issue #108).
 # Off by default — pulls in linfa, linfa-clustering, ndarray, and
 # ndarray-rand, which materially extend cold compile time. Enable with

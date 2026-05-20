@@ -69,6 +69,21 @@ pub mod mcp;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 
+/// Shared text-embedding abstraction (formerly the `trusty-embedder` crate).
+///
+/// Why: trusty-memory and trusty-search both ship near-identical `Embedder`
+/// traits and `FastEmbedder` implementations; centralising the surface here
+/// keeps them aligned and lets future consumers pick up embedding for free
+/// without a separate published crate.
+/// What: Gated behind the `embedder` feature. Exposes the `Embedder` trait,
+/// `FastEmbedder` (fastembed-rs, all-MiniLM-L6-v2, 384-d) with LRU caching
+/// and ORT warmup, and (under `embedder-test-support`) the `MockEmbedder`
+/// test double.
+/// Test: `cargo test -p trusty-common --features embedder,embedder-test-support`
+/// covers the mock embedder and ONNX-backed `#[ignore]`d integration tests.
+#[cfg(feature = "embedder")]
+pub mod embedder;
+
 pub use chat::{
     ChatEvent, ChatProvider, LocalModelConfig, OllamaProvider, OpenRouterProvider, ToolCall,
     ToolDef, auto_detect_local_provider,

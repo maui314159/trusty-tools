@@ -108,9 +108,9 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
     let dim = <crate::core::FastEmbedder as crate::core::Embedder>::dimension(&embedder);
     let provider = embedder.provider();
     let metal_hint = match provider {
-        trusty_embedder::ExecutionProvider::CoreML => " (Metal GPU / ANE)",
-        trusty_embedder::ExecutionProvider::Cuda => " (CUDA GPU)",
-        trusty_embedder::ExecutionProvider::Cpu => "",
+        trusty_common::embedder::ExecutionProvider::CoreML => " (Metal GPU / ANE)",
+        trusty_common::embedder::ExecutionProvider::Cuda => " (CUDA GPU)",
+        trusty_common::embedder::ExecutionProvider::Cpu => "",
     };
     tracing::info!(
         "embedder initialized: model=AllMiniLML6V2(Q) dim={dim} provider={provider}{metal_hint}"
@@ -136,12 +136,13 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
 /// `gpu_batch_tuning: TRUSTY_MAX_BATCH_SIZE=512 (was N)`; running with
 /// `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 TRUSTY_MAX_BATCH_SIZE=256 trusty-search start`
 /// keeps 256.
-fn tune_batch_size_for_provider(provider: trusty_embedder::ExecutionProvider) {
+fn tune_batch_size_for_provider(provider: trusty_common::embedder::ExecutionProvider) {
     const GPU_BATCH_DEFAULT: usize = 512;
 
     let is_gpu = matches!(
         provider,
-        trusty_embedder::ExecutionProvider::Cuda | trusty_embedder::ExecutionProvider::CoreML
+        trusty_common::embedder::ExecutionProvider::Cuda
+            | trusty_common::embedder::ExecutionProvider::CoreML
     );
     if !is_gpu {
         return;
