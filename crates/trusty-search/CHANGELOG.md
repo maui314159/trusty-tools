@@ -13,6 +13,14 @@ _(no unreleased changes)_
 
 ---
 
+## [0.3.56] — 2026-05-21
+
+### Fixed
+- **#127** `TRUSTY_INDEX_MEMORY_LIMIT_MB` auto-tune raised from 40% to 75% of system RAM. The old 40% fraction yielded only a ~52 GB ceiling on a 128 GB host, but large repos (e.g. 114k chunks) peak at ~76 GB RSS during reindex on Apple Silicon — the pipeline hit the limit and skipped batches, leaving the index incomplete. 75% of RAM gives the transient indexing pipeline enough headroom while still reserving 25% for the OS and other processes. The `TRUSTY_INDEX_MEMORY_LIMIT_MB` env override is unchanged; the startup log now reports "75% of RAM".
+- **#128** Batch HNSW upsert no longer silently drops a whole 128-file batch when one embedding fails. `UsearchStore::upsert_batch` now screens each vector for NaN / infinity / all-zero (degenerate-for-cosine) components and isolates per-item `add` failures: the offending chunk id is logged at `warn`, its key-map entry is rolled back, and the remaining vectors index normally. The call only returns `Err` when *every* vector fails (a systemic problem).
+
+---
+
 ## [0.3.36] — 2026-05-15
 
 ### Added

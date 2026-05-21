@@ -48,6 +48,36 @@ fn hnsw_max_elements() -> usize {
         .unwrap_or(DEFAULT_HNSW_MAX_ELEMENTS)
 }
 
+/// Classify an embedding vector as safe to insert into a cosine-metric HNSW.
+///
+/// Why (issue #128): the CoreML execution provider intermittently emits NaN
+/// or all-zero embedding vectors for a small fraction of chunks. usearch's
+/// cosine metric divides by the vector norm, so an all-zero vector yields
+/// `NaN` distances that poison every subsequent nearest-neighbour query, and
+/// a NaN component does the same. Neither is reliably rejected by usearch's
+/// `add`, so the batch-upsert path must screen vectors itself rather than
+/// trusting the backend to fail loudly.
+/// What: returns `Err(reason)` when the vector contains a non-finite
+/// component (NaN / ±Inf) or has an effectively-zero L2 norm; otherwise
+/// `Ok(())`. The reason string is suitable for a `warn` log.
+/// Test: `tests::test_upsert_batch_isolates_bad_vector` feeds a NaN and a
+/// zero vector through `upsert_batch` and asserts the good vectors survive.
+fn validate_embedding(v: &[f32]) -> std::result::Result<(), &'static str> {
+    let mut sum_sq = 0.0f32;
+    for &x in v {
+        if !x.is_finite() {
+            return Err("contains a non-finite component (NaN or infinity)");
+        }
+        sum_sq += x * x;
+    }
+    // A cosine-metric index cannot normalise a zero vector; treat anything
+    // below this tiny threshold as degenerate.
+    if sum_sq < 1e-12 {
+        return Err("is an all-zero (degenerate) vector");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorHit {
     pub chunk_id: String,
@@ -475,9 +505,21 @@ impl VectorStore for UsearchStore {
     /// Search results are identical to the previous implementation because
     /// the same `(key, vector)` pairs are inserted in the same order; only
     /// lock-hold duration changes.
+    ///
+    /// Per-item error isolation (issue #128): a single bad embedding — most
+    /// commonly a NaN or all-zero vector emitted by the CoreML execution
+    /// provider — used to make `index.add` fail and abort the whole call,
+    /// silently dropping every other vector in a 128-file batch. Phase 4 now
+    /// isolates failures: each `add` is attempted independently, the bad
+    /// chunk id is logged at `warn`, and the offending item's key map entry
+    /// is rolled back so it isn't left orphaned. The remaining vectors are
+    /// committed normally. The call only returns `Err` when **every** add
+    /// failed, which indicates a systemic problem (corrupt index, dim drift)
+    /// rather than one stray vector.
     /// Test: `tests::test_upsert_and_search`, `test_upsert_replaces_existing`,
-    /// and `test_concurrent_reads` cover ordering, idempotent overwrite, and
-    /// reader parallelism.
+    /// `test_concurrent_reads`, and `test_upsert_batch_isolates_bad_vector`
+    /// cover ordering, idempotent overwrite, reader parallelism, and the
+    /// per-item isolation path.
     async fn upsert_batch(&self, items: &[(String, Vec<f32>)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -559,11 +601,86 @@ impl VectorStore for UsearchStore {
                 .remove(key)
                 .map_err(|e| anyhow!("usearch remove (for upsert) failed: {e}"))?;
         }
-        for (key, (_, embedding)) in resolved_keys.iter().zip(items.iter()) {
-            index
-                .add(*key, embedding)
-                .map_err(|e| anyhow!("usearch add failed: {e}"))?;
+
+        // Per-item error isolation (issue #128). Each vector is screened and
+        // added independently: a single bad embedding (NaN / zero vector from
+        // CoreML) must not abort the whole batch. We collect the chunk ids
+        // of any failures, then roll their key-map entries back (below)
+        // after releasing the HNSW write lock, so a failed chunk leaves no
+        // orphaned `id_to_key` / `key_to_id` entry that a later search would
+        // try (and fail) to resolve.
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (key, (id, embedding)) in resolved_keys.iter().zip(items.iter()) {
+            // Screen the vector first: a NaN/zero vector is not reliably
+            // rejected by usearch's `add`, but it poisons cosine search if it
+            // lands in the graph. Catching it here keeps the index clean.
+            if let Err(reason) = validate_embedding(embedding) {
+                failed.push((id.clone(), format!("embedding {reason}")));
+                continue;
+            }
+            if let Err(e) = index.add(*key, embedding) {
+                failed.push((id.clone(), e.to_string()));
+            }
         }
+        // Drop the HNSW write lock before touching the id maps so we don't
+        // hold two write locks at once.
+        drop(index);
+
+        if failed.is_empty() {
+            return Ok(());
+        }
+
+        // Roll back the key-map entries for the failed items so they don't
+        // dangle. We only remove an `id_to_key` entry when it still points at
+        // the key we allocated in phase 2 — an entry that already existed
+        // (and whose old vector was removed above) is left as-is rather than
+        // silently deleted, since its previous state was already lost and
+        // re-removing the mapping wouldn't help.
+        {
+            let failed_ids: std::collections::HashSet<&str> =
+                failed.iter().map(|(id, _)| id.as_str()).collect();
+            let mut id_map = self.id_to_key.write().await;
+            let mut key_map = self.key_to_id.write().await;
+            for (id, key) in resolved_keys
+                .iter()
+                .zip(items.iter())
+                .filter(|(_, (id, _))| failed_ids.contains(id.as_str()))
+                .map(|(key, (id, _))| (id, key))
+            {
+                if !existing.contains(key) && id_map.get(id.as_str()) == Some(key) {
+                    id_map.remove(id.as_str());
+                    key_map.remove(key);
+                }
+            }
+        }
+
+        let succeeded = items.len() - failed.len();
+        for (id, err) in &failed {
+            tracing::warn!(
+                "usearch upsert_batch: skipped chunk '{id}' — add failed ({err}); \
+                 likely a NaN or zero embedding vector. The rest of the batch was indexed."
+            );
+        }
+
+        if succeeded == 0 {
+            // Every add failed — this is a systemic problem (corrupt index,
+            // dimension drift), not one stray vector. Surface it so the
+            // reindex orchestrator can abort rather than silently produce an
+            // empty index.
+            return Err(anyhow!(
+                "usearch upsert_batch: all {} vectors failed to add — \
+                 systemic failure, not isolated bad input (first error: {})",
+                items.len(),
+                failed.first().map(|(_, e)| e.as_str()).unwrap_or("<none>")
+            ));
+        }
+
+        tracing::warn!(
+            "usearch upsert_batch: {succeeded}/{} vectors indexed; {} skipped due to \
+             add failures (see warnings above)",
+            items.len(),
+            failed.len()
+        );
         Ok(())
     }
 }
@@ -690,6 +807,73 @@ mod tests {
         let store = UsearchStore::new(4).expect("store init");
         let items = vec![("bad".to_string(), vec![1.0, 0.0])];
         assert!(store.upsert_batch(&items).await.is_err());
+    }
+
+    #[test]
+    fn test_validate_embedding() {
+        // Healthy vector passes.
+        assert!(validate_embedding(&[1.0, 0.0, 0.0, 0.0]).is_ok());
+        // NaN component is rejected.
+        assert!(validate_embedding(&[1.0, f32::NAN, 0.0, 0.0]).is_err());
+        // Infinity is rejected.
+        assert!(validate_embedding(&[f32::INFINITY, 0.0, 0.0, 0.0]).is_err());
+        // All-zero (degenerate for cosine) is rejected.
+        assert!(validate_embedding(&[0.0, 0.0, 0.0, 0.0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_batch_isolates_bad_vector() {
+        // Issue #128: a single NaN / zero embedding in a batch must not drop
+        // the whole batch. The good vectors must still be indexed and the
+        // bad chunk ids must be skipped (not left as orphaned key entries).
+        let store = UsearchStore::new(4).expect("store init");
+        let items: Vec<(String, Vec<f32>)> = vec![
+            ("good-a".to_string(), vec![1.0, 0.0, 0.0, 0.0]),
+            ("nan-vec".to_string(), vec![f32::NAN, 0.0, 0.0, 0.0]),
+            ("good-b".to_string(), vec![0.0, 1.0, 0.0, 0.0]),
+            ("zero-vec".to_string(), vec![0.0, 0.0, 0.0, 0.0]),
+            ("good-c".to_string(), vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        // Batch must succeed: the two bad vectors are isolated, not fatal.
+        store
+            .upsert_batch(&items)
+            .await
+            .expect("batch with isolated bad vectors must still succeed");
+        // Exactly the three good vectors are in the index.
+        assert_eq!(store.len().await.unwrap(), 3);
+        // Each good vector is searchable and ranks itself first.
+        for (id, dir) in [
+            ("good-a", [1.0f32, 0.0, 0.0, 0.0]),
+            ("good-b", [0.0, 1.0, 0.0, 0.0]),
+            ("good-c", [0.0, 0.0, 1.0, 0.0]),
+        ] {
+            let hits = store.search(&dir, 1).await.unwrap();
+            assert_eq!(hits[0].chunk_id, id, "good vector {id} must round-trip");
+        }
+        // The bad chunk ids must not resolve to anything — their key-map
+        // entries were rolled back, so re-upserting them later is clean.
+        store
+            .upsert("nan-vec", vec![0.0, 0.0, 0.0, 1.0])
+            .await
+            .expect("a now-healthy 'nan-vec' must upsert without a key collision");
+        assert_eq!(store.len().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_batch_all_bad_vectors_errors() {
+        // When *every* vector is bad it's a systemic failure, not isolated
+        // bad input — the call must return Err so the orchestrator aborts
+        // rather than silently producing an empty index.
+        let store = UsearchStore::new(4).expect("store init");
+        let items: Vec<(String, Vec<f32>)> = vec![
+            ("nan-1".to_string(), vec![f32::NAN, 0.0, 0.0, 0.0]),
+            ("zero-2".to_string(), vec![0.0, 0.0, 0.0, 0.0]),
+        ];
+        assert!(
+            store.upsert_batch(&items).await.is_err(),
+            "an all-bad batch must surface an error"
+        );
+        assert_eq!(store.len().await.unwrap(), 0);
     }
 
     #[tokio::test]
