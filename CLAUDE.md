@@ -225,9 +225,21 @@ Release workflow:
 6. Push the tag: `git push origin <crate-name>-v<version>`.
 7. Publish: `cargo publish -p <crate-name>`.
 8. Build the release binary (if not already fresh): `cargo build --release -p <crate-name>`.
-9. Install the binary locally: `cp target/release/<binary-name> ~/.cargo/bin/<binary-name>`
-   (for crates with binaries, e.g. trusty-search, trusty-mpm-cli). This ensures the binary on PATH
-   is always the version that was just released.
+9. Install the binary locally with `cargo install --path crates/<dir> --locked`
+   (for crates with binaries, e.g. trusty-search, trusty-mpm-cli). This ensures the
+   binary on PATH is always the version that was just released.
+
+   🔴 **Never `cp target/release/<binary> ~/.cargo/bin/<binary>` on macOS.**
+   `cargo build` ad-hoc ("linker-signed") signs every release binary, and the
+   kernel's code-signing cache is keyed by the executable's `cdhash`. A plain
+   `cp` over an existing on-PATH binary can leave the kernel with a stale
+   cached identity, so the next exec is SIGKILL'd with
+   `EXC_CRASH / CODESIGNING — Taskgated Invalid Signature` **before any code
+   runs** — the process dies with `zsh: killed` and zero output, which looks
+   exactly like an OOM kill but is not. `cargo install` writes to a temp path
+   and renames atomically, which keeps the cache consistent. If you must copy
+   manually, follow it with `codesign --force --sign - ~/.cargo/bin/<binary>`
+   to regenerate the ad-hoc signature against the final file.
 
 The `trusty-mpm-*` family shares a single workspace version (declared under
 `[workspace.package]`) and is bumped together.
