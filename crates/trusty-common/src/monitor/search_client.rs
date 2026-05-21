@@ -230,6 +230,253 @@ impl SearchClient {
             .error_for_status()?;
         Ok(())
     }
+
+    /// Run a hybrid search against index `id` and return the top results.
+    ///
+    /// Why: the search TUI's input bar runs a query against the selected index
+    /// and folds the hits into the activity log; this is the transport for
+    /// that action.
+    /// What: POSTs `{ "text": <query>, "top_k": <top_k> }` to
+    /// `/indexes/:id/search`, then projects each result object into a
+    /// [`SearchHit`]. A non-2xx response or malformed payload yields an error.
+    /// Test: live behaviour is covered by the trusty-search daemon suite; the
+    /// projection of result objects is unit-tested via `parse_search_hits`.
+    pub async fn search(
+        &self,
+        id: &str,
+        query: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        let raw: serde_json::Value = self
+            .http
+            .post(format!("{}/indexes/{id}/search", self.base))
+            .json(&serde_json::json!({ "text": query, "top_k": top_k }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_search_hits(&raw))
+    }
+
+    /// Kick off a reindex and stream progress events into `tx`.
+    ///
+    /// Why: the search TUI's `[r]` key fires this on a background task so the
+    /// synchronous event loop can drain [`ReindexEvent`]s via `try_recv` and
+    /// append them to the activity log without blocking on the network.
+    /// What: POSTs to `/indexes/:id/reindex`, follows the `stream_url`, and
+    /// parses each `data:` SSE frame into a [`ReindexEvent`], sending each
+    /// through `tx`. A transport failure is sent as a final
+    /// [`ReindexEvent::Failed`]. The SSE client uses an unbounded read timeout
+    /// since a large-repo reindex can run for minutes.
+    /// Test: event parsing is unit-tested via `parse_reindex_event`; the live
+    /// stream is covered by the trusty-search daemon suite.
+    pub async fn reindex_stream(&self, id: &str, tx: tokio::sync::mpsc::Sender<ReindexEvent>) {
+        if let Err(e) = self.reindex_stream_inner(id, &tx).await {
+            let _ = tx.send(ReindexEvent::Failed(e.to_string())).await;
+        }
+    }
+
+    /// Inner body of [`Self::reindex_stream`] returning a `Result` for `?`.
+    ///
+    /// Why: keeps the public method's error handling (sending a `Failed`
+    /// event) in one place while the happy path uses `?`.
+    /// What: POSTs the reindex kickoff, opens the SSE stream, and forwards
+    /// parsed events; returns the first transport error encountered.
+    /// Test: covered indirectly by `reindex_stream` and the daemon suite.
+    async fn reindex_stream_inner(
+        &self,
+        id: &str,
+        tx: &tokio::sync::mpsc::Sender<ReindexEvent>,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+
+        let kickoff: serde_json::Value = self
+            .http
+            .post(format!("{}/indexes/{id}/reindex", self.base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let stream_path = kickoff
+            .get("stream_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("/indexes/{id}/reindex/stream"));
+
+        // SSE streams must outlive the short probe timeout — a large reindex
+        // runs for minutes. A dedicated client bounds only the connect phase.
+        let sse = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        let resp = sse
+            .get(format!("{}{stream_path}", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut bytes = resp.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // SSE frames are separated by a blank line; `data:` carries JSON.
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_string();
+                buf.drain(..=nl);
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let event = parse_reindex_event(&value);
+                    let terminal = matches!(event, ReindexEvent::Complete { .. });
+                    if tx.send(event).await.is_err() {
+                        return Ok(()); // receiver gone — stop quietly.
+                    }
+                    if terminal {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One result row from a trusty-search query, projected for the activity log.
+///
+/// Why: the search TUI renders a compact `path:line  snippet` line per hit; a
+/// small typed struct keeps the renderer free of raw JSON.
+/// What: the source file path, the 1-based start line, and a short snippet.
+/// Test: `parse_search_hits_projects_fields`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SearchHit {
+    /// Source file path of the matched chunk.
+    pub file: String,
+    /// 1-based start line of the matched chunk.
+    pub line: usize,
+    /// A short, single-line snippet of the matched content.
+    pub snippet: String,
+}
+
+/// Project a `/indexes/:id/search` JSON payload into [`SearchHit`]s.
+///
+/// Why: the search response wraps a `results` array of `CodeChunk` objects;
+/// centralising the projection keeps the client testable without a daemon and
+/// resilient to absent optional fields.
+/// What: reads `results`, and for each entry takes `file`, `start_line`, and a
+/// snippet (preferring `compact_snippet`, falling back to the first line of
+/// `content`). A non-object or missing `results` yields an empty list.
+/// Test: `parse_search_hits_projects_fields`.
+pub fn parse_search_hits(raw: &serde_json::Value) -> Vec<SearchHit> {
+    let Some(results) = raw.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .map(|item| {
+            let file = item
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let line = item.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let snippet = item
+                .get("compact_snippet")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            SearchHit {
+                file,
+                line,
+                snippet,
+            }
+        })
+        .collect()
+}
+
+/// One progress event from the reindex SSE stream.
+///
+/// Why: the search TUI shows live reindex progress in its activity log; a
+/// typed enum lets the renderer format each event distinctly without parsing
+/// raw JSON in the event loop.
+/// What: `Started` with the file count, `Progress` with the current file and
+/// percent-complete, `Complete` with the final chunk count, or `Failed` with
+/// an error string.
+/// Test: `parse_reindex_event_maps_event_field`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReindexEvent {
+    /// The reindex walk finished; carries the total file count.
+    Started {
+        /// Total files the reindex will process.
+        total_files: u64,
+    },
+    /// A batch completed; carries progress toward completion.
+    Progress {
+        /// Files indexed so far.
+        indexed: u64,
+        /// Total files in this reindex.
+        total_files: u64,
+    },
+    /// The reindex finished; carries the final chunk count and status.
+    Complete {
+        /// Total chunks in the index after the reindex.
+        total_chunks: u64,
+        /// Terminal status string (`"complete"` or `"aborted_memory"`).
+        status: String,
+    },
+    /// The reindex (or its stream) failed; carries an error message.
+    Failed(String),
+}
+
+/// Parse one reindex SSE `data:` JSON object into a [`ReindexEvent`].
+///
+/// Why: the daemon emits `start` / `batch` / `skip` / `error` / `complete`
+/// frames; the TUI only needs three of them plus a failure signal, so this
+/// folds the wire shapes into the [`ReindexEvent`] the renderer expects.
+/// What: dispatches on the `event` field — `start` → `Started`, `batch` /
+/// `skip` → `Progress`, `complete` → `Complete`, `error` → `Failed`. Any other
+/// value falls back to a `Progress` event with whatever counters are present.
+/// Test: `parse_reindex_event_maps_event_field`.
+pub fn parse_reindex_event(value: &serde_json::Value) -> ReindexEvent {
+    let kind = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let u64_of = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    match kind {
+        "start" => ReindexEvent::Started {
+            total_files: u64_of("total_files"),
+        },
+        "complete" => ReindexEvent::Complete {
+            total_chunks: u64_of("total_chunks"),
+            status: value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("complete")
+                .to_string(),
+        },
+        "error" => ReindexEvent::Failed(
+            value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reindex error")
+                .to_string(),
+        ),
+        _ => ReindexEvent::Progress {
+            indexed: u64_of("indexed"),
+            total_files: u64_of("total_files"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +518,74 @@ mod tests {
         // or the documented default — both are non-empty and HTTP-schemed.
         let url = resolve_search_url();
         assert!(url.starts_with("http://") || url.starts_with("https://"));
+    }
+
+    #[test]
+    fn parse_search_hits_projects_fields() {
+        // The search response wraps a `results` array; each hit projects
+        // file, start_line, and a one-line snippet (compact_snippet preferred).
+        let raw = serde_json::json!({
+            "results": [
+                {
+                    "file": "src/lib.rs",
+                    "start_line": 42,
+                    "compact_snippet": "fn embed() {\n  ...\n}",
+                    "content": "ignored when compact present",
+                },
+                {
+                    "file": "src/main.rs",
+                    "start_line": 7,
+                    "content": "  fn main() {}\nmore",
+                },
+            ],
+            "intent": "Code",
+        });
+        let hits = parse_search_hits(&raw);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].file, "src/lib.rs");
+        assert_eq!(hits[0].line, 42);
+        assert_eq!(hits[0].snippet, "fn embed() {");
+        // The second hit falls back to content's first (trimmed) line.
+        assert_eq!(hits[1].snippet, "fn main() {}");
+        // A payload with no `results` array yields no hits.
+        assert!(parse_search_hits(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_reindex_event_maps_event_field() {
+        let started = parse_reindex_event(&serde_json::json!({
+            "event": "start", "total_files": 1200,
+        }));
+        assert_eq!(started, ReindexEvent::Started { total_files: 1200 });
+
+        let progress = parse_reindex_event(&serde_json::json!({
+            "event": "batch", "indexed": 500, "total_files": 1200,
+        }));
+        assert_eq!(
+            progress,
+            ReindexEvent::Progress {
+                indexed: 500,
+                total_files: 1200,
+            }
+        );
+
+        let complete = parse_reindex_event(&serde_json::json!({
+            "event": "complete", "total_chunks": 19012, "status": "complete",
+        }));
+        assert_eq!(
+            complete,
+            ReindexEvent::Complete {
+                total_chunks: 19012,
+                status: "complete".into(),
+            }
+        );
+
+        let failed = parse_reindex_event(&serde_json::json!({
+            "event": "error", "message": "read: permission denied",
+        }));
+        assert_eq!(
+            failed,
+            ReindexEvent::Failed("read: permission denied".into())
+        );
     }
 }

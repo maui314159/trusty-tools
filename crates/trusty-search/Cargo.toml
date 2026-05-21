@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search"
-version = "0.3.65"
+version = "0.3.66"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 readme = "README.md"
@@ -39,7 +39,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Shared trusty-common crates ────────────────────────────────────────────
-trusty-common = { version = "0.4.4", default-features = false, features = ["axum-server", "mcp", "embedder", "embedder-test-support", "symgraph", "monitor-tui"] }  # `symgraph` enables only the contracts surface — no tree-sitter, no `links` conflict; `monitor-tui` powers `trusty-search monitor tui`
+trusty-common = { version = "0.4.5", default-features = false, features = ["axum-server", "mcp", "embedder", "embedder-test-support", "symgraph", "monitor-tui"] }  # `symgraph` enables only the contracts surface — no tree-sitter, no `links` conflict; `monitor-tui` powers `trusty-search monitor tui`
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

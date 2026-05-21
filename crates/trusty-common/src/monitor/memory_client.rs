@@ -207,6 +207,279 @@ impl MemoryClient {
             .await?;
         Ok(parse_palaces(&raw))
     }
+
+    /// Recall memories matching `query` from `GET /api/v1/recall`.
+    ///
+    /// Why: the memory TUI's input bar runs a cross-palace recall and folds the
+    /// hits into the activity log; this is the transport for that action.
+    /// What: GETs `/api/v1/recall?q=<query>&top_k=<top_k>`, then projects each
+    /// result object into a [`RecallHit`]. A non-2xx response or malformed
+    /// payload yields an error.
+    /// Test: live behaviour is covered by the trusty-memory daemon suite; the
+    /// projection is unit-tested via `parse_recall_hits`.
+    pub async fn recall(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<RecallHit>> {
+        let raw: serde_json::Value = self
+            .http
+            .get(format!("{}/api/v1/recall", self.base))
+            .query(&[("q", query), ("top_k", &top_k.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_recall_hits(&raw))
+    }
+
+    /// Trigger a dream cycle via `POST /api/v1/dream/run`.
+    ///
+    /// Why: the memory TUI's `[d]` key runs a dream cycle (merge / prune /
+    /// compact) across every palace and shows the resulting counts.
+    /// What: POSTs an empty body to `/api/v1/dream/run` and projects the
+    /// response into a [`DreamStats`]. A non-2xx response yields an error.
+    /// Test: live behaviour is covered by the trusty-memory daemon suite; the
+    /// projection is unit-tested via `parse_dream_stats`.
+    pub async fn dream_run(&self) -> anyhow::Result<DreamStats> {
+        let raw: serde_json::Value = self
+            .http
+            .post(format!("{}/api/v1/dream/run", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_dream_stats(&raw))
+    }
+
+    /// Subscribe to the daemon's `/sse` stream and forward events into `tx`.
+    ///
+    /// Why: the memory TUI subscribes once at startup so palace / drawer /
+    /// dream events appear in the activity log without polling; the background
+    /// task drives this while the synchronous event loop drains `tx`.
+    /// What: GETs `/sse`, parses each `data:` frame's `type`-tagged JSON into a
+    /// [`MemoryEvent`], and sends each through `tx`. Returns quietly when the
+    /// stream ends, the receiver is dropped, or a transport error occurs — the
+    /// caller treats SSE as best-effort and keeps polling regardless.
+    /// Test: event parsing is unit-tested via `parse_memory_event`.
+    pub async fn sse_stream(&self, tx: tokio::sync::mpsc::Sender<MemoryEvent>) {
+        let _ = self.sse_stream_inner(&tx).await;
+    }
+
+    /// Inner body of [`Self::sse_stream`] returning a `Result` for `?`.
+    ///
+    /// Why: keeps the public method's best-effort error swallowing in one
+    /// place while the happy path uses `?`.
+    /// What: opens the SSE stream and forwards parsed [`MemoryEvent`]s; returns
+    /// the first transport error.
+    /// Test: covered indirectly by `sse_stream` and the daemon suite.
+    async fn sse_stream_inner(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<MemoryEvent>,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+
+        // SSE is long-lived — bound only the connect phase, not the read.
+        let sse = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        let resp = sse
+            .get(format!("{}/sse", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut bytes = resp.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_string();
+                buf.drain(..=nl);
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+                    && let Some(event) = parse_memory_event(&value)
+                    && tx.send(event).await.is_err()
+                {
+                    return Ok(()); // receiver gone — stop quietly.
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One recalled memory from a trusty-memory query, projected for the log.
+///
+/// Why: the memory TUI renders a compact one-line summary per recall hit; a
+/// small typed struct keeps the renderer free of raw JSON.
+/// What: the source palace id and a short content snippet with its score.
+/// Test: `parse_recall_hits_projects_fields`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecallHit {
+    /// The palace the memory was recalled from.
+    pub palace_id: String,
+    /// A short, single-line snippet of the recalled content.
+    pub snippet: String,
+    /// The relevance score of the recall (higher is closer).
+    pub score: f32,
+}
+
+/// Project a `/api/v1/recall` JSON payload into [`RecallHit`]s.
+///
+/// Why: the recall endpoint returns a bare array of result objects;
+/// centralising the projection keeps the client testable and resilient to
+/// absent optional fields.
+/// What: accepts a JSON array, and for each entry takes `palace_id`, the first
+/// line of `content`, and `score`. Any other shape yields an empty list.
+/// Test: `parse_recall_hits_projects_fields`.
+pub fn parse_recall_hits(raw: &serde_json::Value) -> Vec<RecallHit> {
+    let serde_json::Value::Array(items) = raw else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            let palace_id = item
+                .get("palace_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let snippet = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            RecallHit {
+                palace_id,
+                snippet,
+                score,
+            }
+        })
+        .collect()
+}
+
+/// Aggregate counts returned by a `POST /api/v1/dream/run` cycle.
+///
+/// Why: the memory TUI shows what a dream cycle changed; a typed struct keeps
+/// the renderer free of raw JSON.
+/// What: the merged / pruned / compacted memory counts.
+/// Test: `parse_dream_stats_reads_counts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DreamStats {
+    /// Memories merged into existing ones during the cycle.
+    pub merged: u64,
+    /// Memories pruned (forgotten) during the cycle.
+    pub pruned: u64,
+    /// Memories compacted during the cycle.
+    pub compacted: u64,
+}
+
+/// Project a `/api/v1/dream/run` JSON payload into a [`DreamStats`].
+///
+/// Why: the dream endpoint returns an object with several aggregate counters;
+/// the TUI surfaces three of them.
+/// What: reads `merged`, `pruned`, and `compacted`, defaulting absent fields
+/// to zero.
+/// Test: `parse_dream_stats_reads_counts`.
+pub fn parse_dream_stats(raw: &serde_json::Value) -> DreamStats {
+    let u64_of = |key: &str| raw.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    DreamStats {
+        merged: u64_of("merged"),
+        pruned: u64_of("pruned"),
+        compacted: u64_of("compacted"),
+    }
+}
+
+/// One live event from the trusty-memory `/sse` stream.
+///
+/// Why: the memory TUI reacts to push events (dream cycles, drawer changes,
+/// palace creation) in its activity log; a typed enum lets the renderer format
+/// each distinctly without parsing raw JSON in the event loop.
+/// What: mirrors the daemon's `DaemonEvent` — the `type`-tagged variants the
+/// TUI displays. Unknown / housekeeping frames (`connected`, `lag`) are
+/// dropped by [`parse_memory_event`].
+/// Test: `parse_memory_event_maps_type_tag`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryEvent {
+    /// A new palace was created.
+    PalaceCreated {
+        /// The new palace's friendly name.
+        name: String,
+    },
+    /// A drawer was added to a palace.
+    DrawerAdded {
+        /// The palace the drawer belongs to.
+        palace_id: String,
+        /// The palace's drawer count after the addition.
+        drawer_count: u64,
+    },
+    /// A drawer was deleted from a palace.
+    DrawerDeleted {
+        /// The palace the drawer belonged to.
+        palace_id: String,
+        /// The palace's drawer count after the deletion.
+        drawer_count: u64,
+    },
+    /// A dream cycle completed.
+    DreamCompleted {
+        /// Memories merged during the cycle.
+        merged: u64,
+        /// Memories pruned during the cycle.
+        pruned: u64,
+        /// Memories compacted during the cycle.
+        compacted: u64,
+    },
+}
+
+/// Parse one `/sse` `data:` JSON object into a [`MemoryEvent`].
+///
+/// Why: the daemon serializes `DaemonEvent` as `{"type": "...", ...fields}`;
+/// the TUI needs the four user-facing variants and ignores housekeeping
+/// frames, so this folds the wire shape into [`MemoryEvent`].
+/// What: dispatches on the `type` tag — `palace_created`, `drawer_added`,
+/// `drawer_deleted`, `dream_completed`. Returns `None` for `connected`, `lag`,
+/// `status_changed`, or any unrecognised tag.
+/// Test: `parse_memory_event_maps_type_tag`.
+pub fn parse_memory_event(value: &serde_json::Value) -> Option<MemoryEvent> {
+    let tag = value.get("type").and_then(|v| v.as_str())?;
+    let str_of = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let u64_of = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    match tag {
+        "palace_created" => Some(MemoryEvent::PalaceCreated {
+            name: str_of("name"),
+        }),
+        "drawer_added" => Some(MemoryEvent::DrawerAdded {
+            palace_id: str_of("palace_id"),
+            drawer_count: u64_of("drawer_count"),
+        }),
+        "drawer_deleted" => Some(MemoryEvent::DrawerDeleted {
+            palace_id: str_of("palace_id"),
+            drawer_count: u64_of("drawer_count"),
+        }),
+        "dream_completed" => Some(MemoryEvent::DreamCompleted {
+            merged: u64_of("merged"),
+            pruned: u64_of("pruned"),
+            compacted: u64_of("compacted"),
+        }),
+        _ => None,
+    }
 }
 
 /// Project a palace-list JSON payload into [`PalaceRow`]s.
@@ -299,5 +572,87 @@ mod tests {
 
         // An unexpected shape yields no rows rather than panicking.
         assert!(parse_palaces(&serde_json::json!("nonsense")).is_empty());
+    }
+
+    #[test]
+    fn parse_recall_hits_projects_fields() {
+        // The recall endpoint returns a bare array; each hit projects
+        // palace_id, a one-line snippet, and the score.
+        let raw = serde_json::json!([
+            {
+                "palace_id": "default",
+                "content": "JWT middleware added to auth flow\nmore detail",
+                "score": 0.83,
+            },
+            {
+                "palace_id": "work",
+                "content": "  single line  ",
+                "score": 0.5,
+            },
+        ]);
+        let hits = parse_recall_hits(&raw);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].palace_id, "default");
+        assert_eq!(hits[0].snippet, "JWT middleware added to auth flow");
+        assert!((hits[0].score - 0.83).abs() < 1e-6);
+        assert_eq!(hits[1].snippet, "single line");
+        // A non-array payload yields no hits.
+        assert!(parse_recall_hits(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_dream_stats_reads_counts() {
+        let raw = serde_json::json!({
+            "merged": 3, "pruned": 1, "compacted": 0,
+            "closets_updated": 5, "duration_ms": 42,
+        });
+        assert_eq!(
+            parse_dream_stats(&raw),
+            DreamStats {
+                merged: 3,
+                pruned: 1,
+                compacted: 0,
+            }
+        );
+        // Absent fields default to zero.
+        assert_eq!(
+            parse_dream_stats(&serde_json::json!({})),
+            DreamStats::default()
+        );
+    }
+
+    #[test]
+    fn parse_memory_event_maps_type_tag() {
+        assert_eq!(
+            parse_memory_event(&serde_json::json!({
+                "type": "palace_created", "id": "p1", "name": "notes",
+            })),
+            Some(MemoryEvent::PalaceCreated {
+                name: "notes".into(),
+            })
+        );
+        assert_eq!(
+            parse_memory_event(&serde_json::json!({
+                "type": "drawer_added", "palace_id": "default", "drawer_count": 14,
+            })),
+            Some(MemoryEvent::DrawerAdded {
+                palace_id: "default".into(),
+                drawer_count: 14,
+            })
+        );
+        assert_eq!(
+            parse_memory_event(&serde_json::json!({
+                "type": "dream_completed", "merged": 3, "pruned": 1, "compacted": 0,
+            })),
+            Some(MemoryEvent::DreamCompleted {
+                merged: 3,
+                pruned: 1,
+                compacted: 0,
+            })
+        );
+        // Housekeeping and unmodelled frames are dropped.
+        assert!(parse_memory_event(&serde_json::json!({"type": "connected"})).is_none());
+        assert!(parse_memory_event(&serde_json::json!({"type": "lag", "skipped": 2})).is_none());
+        assert!(parse_memory_event(&serde_json::json!({"no": "type"})).is_none());
     }
 }

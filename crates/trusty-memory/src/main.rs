@@ -88,8 +88,8 @@ enum Command {
     /// Monitor the trusty-memory daemon via web UI or terminal dashboard.
     ///
     /// `monitor web` prints the daemon's admin-panel URL; `monitor tui`
-    /// launches the unified ratatui dashboard shared with `trusty-search`,
-    /// showing the trusty-search AND trusty-memory daemons side by side.
+    /// launches the trusty-memory-specific ratatui dashboard: a palace list,
+    /// a live dream/recall activity log, and a recall query bar.
     #[command(subcommand_required = true)]
     Monitor {
         #[command(subcommand)]
@@ -99,18 +99,18 @@ enum Command {
 
 /// Target surface for the `monitor` subcommand.
 ///
-/// Why: operators want a quick link to the daemon's web UI, the full unified
-/// terminal dashboard, OR the same dashboard data as plain text / JSON so
-/// scripts and CI can read it without a TUI (issue #33).
-/// What: `Web` prints the daemon's `/ui` URL; `Tui` launches the shared
-/// `trusty_common::monitor` ratatui dashboard; `Status` and `Palaces` print
-/// scriptable health and per-palace stats.
+/// Why: operators want a quick link to the daemon's web UI, the
+/// memory-specific terminal UI, OR the same dashboard data as plain text /
+/// JSON so scripts and CI can read it without a TUI (issues #33, #34).
+/// What: `Web` prints the daemon's `/ui` URL; `Tui` launches the
+/// trusty-memory-specific `trusty_common::monitor::memory_tui` dashboard;
+/// `Status` and `Palaces` print scriptable health and per-palace stats.
 /// Test: `cargo run -p trusty-memory -- monitor --help` lists every variant.
 #[derive(Debug, Subcommand)]
 enum MonitorTarget {
     /// Open the web dashboard URL in the terminal (or browser).
     Web,
-    /// Launch the unified terminal UI dashboard (trusty-search + trusty-memory).
+    /// Launch the trusty-memory terminal UI: palaces, recall, and dream monitor.
     Tui,
     /// Print daemon status: version and aggregate palace/drawer/vector counts.
     ///
@@ -161,9 +161,9 @@ async fn main() -> Result<()> {
 /// discovery and dashboard launch in one place.
 /// What: `Web` resolves the live daemon address from the lock file and prints
 /// its `/ui` URL (exiting non-zero when no daemon is running); `Tui` launches
-/// the shared `trusty_common::monitor` ratatui dashboard; `Status` and
-/// `Palaces` print scriptable health and per-palace stats via the
-/// `commands::monitor` handlers.
+/// the trusty-memory-specific `trusty_common::monitor::memory_tui` ratatui
+/// dashboard; `Status` and `Palaces` print scriptable health and per-palace
+/// stats via the `commands::monitor` handlers.
 /// Test: not unit-tested (process-level entry point); `cargo run -p
 /// trusty-memory -- monitor --help` lists every target.
 async fn run_monitor(target: MonitorTarget) -> Result<()> {
@@ -179,7 +179,7 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
                 std::process::exit(1);
             }
         },
-        MonitorTarget::Tui => trusty_common::monitor::run().await,
+        MonitorTarget::Tui => trusty_common::monitor::memory_tui::run().await,
         MonitorTarget::Status { json } => monitor::handle_status(json).await,
         MonitorTarget::Palaces { id, json } => monitor::handle_palaces(id, json).await,
     }

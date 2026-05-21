@@ -10228,7 +10228,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10334,7 +10334,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10547,7 +10547,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.3.65"
+version = "0.3.66"
 dependencies = [
  "anyhow",
  "async-trait",
