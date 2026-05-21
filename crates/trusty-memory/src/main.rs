@@ -99,17 +99,42 @@ enum Command {
 
 /// Target surface for the `monitor` subcommand.
 ///
-/// Why: operators want either a quick link to the daemon's web UI or the
-/// full unified terminal dashboard; this enum names the two.
+/// Why: operators want a quick link to the daemon's web UI, the full unified
+/// terminal dashboard, OR the same dashboard data as plain text / JSON so
+/// scripts and CI can read it without a TUI (issue #33).
 /// What: `Web` prints the daemon's `/ui` URL; `Tui` launches the shared
-/// `trusty_common::monitor` ratatui dashboard.
-/// Test: `cargo run -p trusty-memory -- monitor --help` lists both variants.
+/// `trusty_common::monitor` ratatui dashboard; `Status` and `Palaces` print
+/// scriptable health and per-palace stats.
+/// Test: `cargo run -p trusty-memory -- monitor --help` lists every variant.
 #[derive(Debug, Subcommand)]
 enum MonitorTarget {
     /// Open the web dashboard URL in the terminal (or browser).
     Web,
     /// Launch the unified terminal UI dashboard (trusty-search + trusty-memory).
     Tui,
+    /// Print daemon status: version and aggregate palace/drawer/vector counts.
+    ///
+    /// Examples:
+    ///   trusty-memory monitor status
+    ///   trusty-memory monitor status --json
+    Status {
+        /// Emit the status as a JSON object instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every palace, or show one palace's detail when an ID is given.
+    ///
+    /// Examples:
+    ///   trusty-memory monitor palaces
+    ///   trusty-memory monitor palaces default
+    ///   trusty-memory monitor palaces --json
+    Palaces {
+        /// Optional palace ID to show detail for (omit to list all).
+        id: Option<String>,
+        /// Emit the result as JSON instead of a plain-text table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -136,10 +161,13 @@ async fn main() -> Result<()> {
 /// discovery and dashboard launch in one place.
 /// What: `Web` resolves the live daemon address from the lock file and prints
 /// its `/ui` URL (exiting non-zero when no daemon is running); `Tui` launches
-/// the shared `trusty_common::monitor` ratatui dashboard.
+/// the shared `trusty_common::monitor` ratatui dashboard; `Status` and
+/// `Palaces` print scriptable health and per-palace stats via the
+/// `commands::monitor` handlers.
 /// Test: not unit-tested (process-level entry point); `cargo run -p
-/// trusty-memory -- monitor --help` lists both targets.
+/// trusty-memory -- monitor --help` lists every target.
 async fn run_monitor(target: MonitorTarget) -> Result<()> {
+    use trusty_memory::commands::monitor;
     match target {
         MonitorTarget::Web => match trusty_common::read_daemon_addr("trusty-memory")? {
             Some(addr) => {
@@ -152,6 +180,8 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
             }
         },
         MonitorTarget::Tui => trusty_common::monitor::run().await,
+        MonitorTarget::Status { json } => monitor::handle_status(json).await,
+        MonitorTarget::Palaces { id, json } => monitor::handle_palaces(id, json).await,
     }
 }
 

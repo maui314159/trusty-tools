@@ -38,6 +38,7 @@ pub mod init;
 pub mod integrate;
 pub mod list;
 pub mod migrate;
+pub mod monitor;
 pub mod query;
 pub mod reindex;
 pub mod remove;
