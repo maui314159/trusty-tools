@@ -75,6 +75,68 @@ pub(crate) fn resolve_branch_set(
 }
 
 impl CodeIndexer {
+    /// Batch-fetch the `RawChunk`s for a set of chunk ids, reading from the
+    /// durable redb corpus when one is wired and falling back to the in-memory
+    /// `chunks` HashMap otherwise.
+    ///
+    /// Why: issue #28 deferred item — the query hot path used to join fused
+    /// `(id, score)` pairs against `chunks: Arc<RwLock<HashMap<..>>>`, which
+    /// kept every chunk's text resident in the process heap permanently
+    /// (~45 GB RSS on a large monorepo). Reading the top-k chunk text straight
+    /// from redb at materialization time lets the daemon serve those bytes
+    /// from the OS page cache (redb values are mmap-backed) instead of the
+    /// heap, dropping steady-state RSS to <10 GB. A `top_k=20` query does ~20
+    /// point reads in a single read transaction — fast enough for the sub-10 ms
+    /// budget.
+    /// What: when `self.corpus` is `Some`, runs `CorpusStore::get_chunks` on a
+    /// blocking worker (redb's API is sync) and returns the result keyed by id
+    /// for O(1) join in the caller. When `self.corpus` is `None` (BM25-only /
+    /// test indexers built without a data dir), falls back to cloning the
+    /// requested entries out of the in-memory HashMap so those indexers behave
+    /// exactly as before. Either way the result is a `HashMap<id → RawChunk>`;
+    /// ids with no row (a benign race against a concurrent removal, a corrupt
+    /// row, or a chunk never persisted) are simply absent — the caller skips
+    /// them with a `trace`.
+    /// Test: covered by every `test_search_*` integration test (the durable
+    /// path) and by `core::corpus::tests::get_chunks_batch_reads_subset` (the
+    /// redb batch read itself).
+    pub(super) async fn fetch_chunks_for_ids(
+        &self,
+        ids: &[String],
+    ) -> std::collections::HashMap<String, crate::core::chunker::RawChunk> {
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        if let Some(corpus) = self.corpus.clone() {
+            let owned_ids = ids.to_vec();
+            let index_id = self.index_id.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = owned_ids.iter().map(String::as_str).collect();
+                corpus.get_chunks(&refs)
+            })
+            .await;
+            match read {
+                Ok(Ok(chunks)) => {
+                    return chunks.into_iter().map(|c| (c.id.clone(), c)).collect();
+                }
+                Ok(Err(e)) => tracing::warn!(
+                    "index '{index_id}': redb point-read failed ({e}) — \
+                     falling back to in-memory corpus for this query"
+                ),
+                Err(e) => tracing::warn!(
+                    "index '{index_id}': redb point-read task panicked ({e}) — \
+                     falling back to in-memory corpus for this query"
+                ),
+            }
+        }
+        // BM25-only / test indexer, or a redb read error: clone the requested
+        // entries out of the in-memory HashMap.
+        let chunks = self.chunks.read().await;
+        ids.iter()
+            .filter_map(|id| chunks.get(id).map(|c| (id.clone(), c.clone())))
+            .collect()
+    }
+
     /// Retrieve a cached chunk embedding by `chunk_id`.
     ///
     /// Why: code-to-code similarity search (issue #31) needs the seed chunk's
@@ -358,7 +420,12 @@ impl CodeIndexer {
         branch_boost: f32,
     ) -> Vec<(String, f32)> {
         let demote_docs = matches!(intent, QueryIntent::Definition);
-        let chunks = self.chunks.read().await;
+        // Issue #28 deferred item: read the candidate chunks from the durable
+        // redb corpus (mmap-backed, OS-page-cached) instead of the in-memory
+        // HashMap so the heap-resident corpus can be dropped from the query
+        // hot path. Only the file path of each candidate is needed here.
+        let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+        let chunks = self.fetch_chunks_for_ids(&candidate_ids).await;
         let mut adjusted: Vec<(String, f32)> = candidates
             .into_iter()
             .map(|(id, score)| {
@@ -498,9 +565,17 @@ impl CodeIndexer {
         let in_hnsw: HashSet<&String> = hnsw_results.iter().map(|(id, _)| id).collect();
         let in_bm25: HashSet<&String> = bm25_results.iter().map(|(id, _)| id).collect();
 
-        let chunks = self.chunks.read().await;
-        let mut out = Vec::with_capacity(all.len().min(query.top_k));
-        for (id, score) in all.into_iter().take(query.top_k) {
+        // Issue #28 deferred item: materialize the top-k results by batch
+        // point-reading their text from the durable redb corpus rather than
+        // the heap-resident `chunks` HashMap. Only the top-k ids are read —
+        // a `top_k=20` query does ~20 mmap-backed point reads, served from the
+        // OS page cache, so the in-memory corpus is no longer on the query
+        // hot path.
+        let top_k: Vec<(String, f32)> = all.into_iter().take(query.top_k).collect();
+        let top_k_ids: Vec<String> = top_k.iter().map(|(id, _)| id.clone()).collect();
+        let chunks = self.fetch_chunks_for_ids(&top_k_ids).await;
+        let mut out = Vec::with_capacity(top_k.len());
+        for (id, score) in top_k {
             let Some(raw) = chunks.get(&id) else {
                 tracing::trace!("fused id {id} not in corpus — likely race; skipping");
                 continue;

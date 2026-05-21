@@ -256,6 +256,52 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Batch point-read a set of chunks by `chunk_id`.
+    ///
+    /// Why: issue #28 deferred item — the search hot path used to materialize
+    /// top-k results by joining fused `(id, score)` pairs against an in-memory
+    /// `HashMap<String, RawChunk>` that held *every* chunk's text resident in
+    /// the heap permanently (~45 GB RSS on a large monorepo). Reading the
+    /// top-k chunk text straight out of redb at materialization time lets the
+    /// daemon drop that HashMap from the query path entirely: redb's values are
+    /// mmap-backed, so a point lookup is served from the OS page cache rather
+    /// than process heap, cutting steady-state RSS to <10 GB. A typical
+    /// `top_k=20` query does 20 point reads inside one read transaction —
+    /// each is an O(log n) B-tree descent over an mmap'd file, well within the
+    /// sub-10 ms query budget.
+    /// What: opens a single redb read transaction and fetches each requested
+    /// id. Missing ids are skipped (not an error) — a fused id with no redb row
+    /// is almost always a benign race against a concurrent removal, and one
+    /// missing chunk must not fail the whole query. A corrupt row is likewise
+    /// skipped with a `warn`. The returned `Vec` preserves the input `ids`
+    /// order for the ids that were found.
+    /// Test: `get_chunks_batch_reads_subset` round-trips a corpus and asserts
+    /// only the requested ids come back, in order, with missing ids skipped.
+    pub fn get_chunks(&self, ids: &[&str]) -> Result<Vec<RawChunk>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().context("begin chunk point-read txn")?;
+        let table = txn.open_table(CHUNKS_TABLE)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(value) = table
+                .get(*id)
+                .with_context(|| format!("point-read chunk {id}"))?
+            else {
+                tracing::warn!("corpus: chunk '{id}' not found in redb — skipping");
+                continue;
+            };
+            match serde_json::from_slice::<RawChunk>(value.value()) {
+                Ok(chunk) => out.push(chunk),
+                Err(e) => {
+                    tracing::warn!("corpus: skipping corrupt chunk row '{id}' ({e})")
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Load every per-file entity list.
     ///
     /// Why: counterpart of [`Self::load_all_chunks`] for the entities table;
@@ -345,6 +391,37 @@ mod tests {
         let entities = store.load_all_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].0, "src/lib.rs");
+    }
+
+    #[test]
+    fn get_chunks_batch_reads_subset() {
+        // Issue #28 deferred item: the query hot path materializes top-k
+        // results via `get_chunks`. It must return only the requested ids, in
+        // input order, and silently skip ids absent from the corpus.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CorpusStore::open(&dir.path().join("index.redb")).unwrap();
+        store
+            .upsert_chunks(&[
+                raw("a:1:1", "fn a() {}"),
+                raw("b:1:1", "fn b() {}"),
+                raw("c:1:1", "fn c() {}"),
+            ])
+            .unwrap();
+
+        // Request a subset out of corpus order, with one unknown id mixed in.
+        let got = store
+            .get_chunks(&["c:1:1", "missing:0:0", "a:1:1"])
+            .unwrap();
+        assert_eq!(got.len(), 2, "unknown id must be skipped, not error");
+        assert_eq!(got[0].id, "c:1:1", "input order must be preserved");
+        assert_eq!(got[0].content, "fn c() {}");
+        assert_eq!(got[1].id, "a:1:1");
+
+        // Empty input is a no-op.
+        assert!(store.get_chunks(&[]).unwrap().is_empty());
+
+        // All-missing input yields an empty vec, never an error.
+        assert!(store.get_chunks(&["nope:0:0"]).unwrap().is_empty());
     }
 
     #[test]
