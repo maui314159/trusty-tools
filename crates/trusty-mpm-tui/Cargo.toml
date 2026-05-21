@@ -26,3 +26,10 @@ crossterm.workspace = true
 clap.workspace = true
 # The coordinator-context poll parses session UUID strings back into SessionId.
 uuid.workspace = true
+# The health screen ([2]) polls trusty-search and trusty-memory `/health`
+# endpoints directly over HTTP and deserializes the JSON payloads.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Service start/stop actions log their outcome to stderr via tracing.
+tracing.workspace = true

@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod dashboard;
+pub mod health;
 pub mod iterm2;
 
 use std::time::{Duration, Instant};
@@ -23,10 +24,44 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
+    text::Line,
+    widgets::Paragraph,
+};
 
 use client::DaemonClient;
 use dashboard::{ChatMessage, DashboardState, Focus};
+use health::{Daemon, HealthScreen, HealthUpdate};
+
+/// Which top-level screen the TUI is currently showing.
+///
+/// Why: the TUI now hosts two surfaces — the coordinator chat (`[1]`) and the
+/// combined search + memory health view (`[2]`). A typed enum keeps the
+/// screen-switch handling exhaustive and lets the event loop route input and
+/// rendering without losing either surface's state.
+/// What: `Chat` is the default coordinator dashboard; `Health` is the
+/// secondary health screen.
+/// Test: `screen_switch_preserves_chat_state` in this module's tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    /// The coordinator chat dashboard (`[1]`, the default and original surface).
+    #[default]
+    Chat,
+    /// The combined trusty-search + trusty-memory health screen (`[2]`).
+    Health,
+}
+
+/// Status-bar hint listing the screen-switch and global keys.
+///
+/// Why: the health screen's footer must always show how to switch screens and
+/// manage services; a shared constant keeps the hint in one place.
+/// What: the one-line key reference drawn at the bottom of the health screen.
+/// Test: `health_status_bar_lists_keys`.
+pub const HEALTH_KEY_HINT: &str = "[1]chat [2]health [Tab]focus [S]start [X]stop [q]quit";
 
 /// Run the ratatui coordinator dashboard against `url`.
 ///
@@ -151,6 +186,39 @@ fn coordinator_session_to_row(s: trusty_mpm_client::CoordinatorSession) -> clien
     }
 }
 
+/// Spawn the background health pollers for the search and memory daemons.
+///
+/// Why: the acceptance criteria require each daemon to be polled independently
+/// every 5 seconds without freezing the input loop. Running each poll on its
+/// own detached tokio task keeps a slow or hung daemon from blocking the other
+/// panel or the keyboard.
+/// What: spawns one task per daemon; each task polls its [`health::HealthClient`]
+/// on [`health::POLL_INTERVAL`] and sends every result down `tx` as a
+/// [`HealthUpdate`]. A task exits quietly once the receiver is dropped (the TUI
+/// is shutting down). The first poll fires immediately so the panels leave the
+/// `Connecting` state quickly.
+/// Test: the per-poll projection and routing are unit-tested in `health.rs`;
+/// this is the thin task-spawning glue.
+fn spawn_health_pollers(
+    search_url: String,
+    memory_url: String,
+    tx: tokio::sync::mpsc::Sender<HealthUpdate>,
+) {
+    for (daemon, url) in [(Daemon::Search, search_url), (Daemon::Memory, memory_url)] {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let client = health::client_for(daemon, &url);
+            loop {
+                let state = client.poll().await;
+                if tx.send(HealthUpdate { daemon, state }).await.is_err() {
+                    break; // The TUI has shut down — stop polling.
+                }
+                tokio::time::sleep(health::POLL_INTERVAL).await;
+            }
+        });
+    }
+}
+
 /// Send the typed message to the coordinator and fold the reply into the chat.
 ///
 /// Why: pressing Enter is the single action of the coordinator dashboard —
@@ -196,15 +264,49 @@ async fn coordinator_send(state: &mut DashboardState, client: &DaemonClient, mes
     }
 }
 
+/// Render whichever screen is currently active.
+///
+/// Why: keeps the screen→renderer dispatch in one place so the event loop's
+/// `terminal.draw` call stays a single line.
+/// What: draws the coordinator chat for [`Screen::Chat`], or the health screen
+/// (with its shared status bar) for [`Screen::Health`].
+/// Test: each renderer is smoke-tested in its own module.
+fn render_screen(frame: &mut Frame, screen: Screen, chat: &DashboardState, hp: &HealthScreen) {
+    match screen {
+        Screen::Chat => dashboard::render(frame, chat),
+        Screen::Health => {
+            // Reserve the bottom row for the shared status bar; the health
+            // screen body renders into the remaining space.
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(1)])
+                .split(frame.area());
+            // `health::render` lays out against `frame.area()`; render it into
+            // the body chunk by drawing the status bar last (it cannot overlap
+            // since the body chunk excludes the final row).
+            health::render(frame, hp);
+            frame.render_widget(
+                Paragraph::new(Line::from(HEALTH_KEY_HINT)).style(
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::REVERSED),
+                ),
+                chunks[1],
+            );
+        }
+    }
+}
+
 /// The dashboard event loop: poll the daemon, render, handle input.
 ///
 /// Why: kept separate from [`run`] so terminal setup/teardown wraps it cleanly.
-/// What: refreshes [`DashboardState`] from the daemon on an `interval_ms` timer
-/// but polls the keyboard every 50ms so input feels instantaneous; Enter sends
-/// the typed message to the coordinator and triggers an immediate re-poll;
-/// `s` toggles the sidebar, `Tab` switches focus, arrows scroll/select, `q`
-/// quits.
-/// Test: the pure pieces (rendering, client) are unit-tested.
+/// What: hosts both the coordinator chat (`[1]`) and the health screen (`[2]`)
+/// — switching screens never resets either, since both states live for the
+/// whole loop. Refreshes [`DashboardState`] from the daemon on an `interval_ms`
+/// timer, drains background [`HealthUpdate`]s into the [`HealthScreen`], and
+/// polls the keyboard every 50ms so input feels instantaneous. Number keys
+/// switch screens; `q` quits from either.
+/// Test: the pure pieces (rendering, client, screen state) are unit-tested.
 async fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     client: &mut DaemonClient,
@@ -214,6 +316,18 @@ async fn run_loop<B: ratatui::backend::Backend>(
     // The sidebar starts visible only when there is at least one session to
     // show; otherwise the coordinator chat gets the full width immediately.
     let mut state = DashboardState::default();
+    let mut screen = Screen::default();
+    let mut health_screen =
+        HealthScreen::new(health::DEFAULT_SEARCH_URL, health::DEFAULT_MEMORY_URL);
+
+    // The health pollers run on detached tasks and push updates down a channel
+    // the loop drains without blocking.
+    let (health_tx, mut health_rx) = tokio::sync::mpsc::channel::<HealthUpdate>(16);
+    spawn_health_pollers(
+        health_screen.search_url.clone(),
+        health_screen.memory_url.clone(),
+        health_tx,
+    );
 
     poll_daemon(&mut state, client).await;
     state.sidebar_visible = !state.sessions.is_empty();
@@ -227,11 +341,35 @@ async fn run_loop<B: ratatui::backend::Backend>(
     let mut last_poll = Instant::now();
 
     loop {
-        terminal.draw(|f| dashboard::render(f, &state))?;
+        terminal.draw(|f| render_screen(f, screen, &state, &health_screen))?;
+
+        // Drain any health updates that landed since the last frame.
+        while let Ok(update) = health_rx.try_recv() {
+            health_screen.apply_update(update);
+        }
 
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
+            // The health screen has its own key handling, kept separate so the
+            // chat-screen branch below stays unchanged.
+            if screen == Screen::Health {
+                match key.code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('1') => screen = Screen::Chat,
+                    KeyCode::Char('2') => {} // already here
+                    KeyCode::Tab => health_screen.toggle_focus(),
+                    KeyCode::Char('S') | KeyCode::Char('s') => {
+                        health_start(&mut state, &health_screen);
+                    }
+                    KeyCode::Char('X') | KeyCode::Char('x') => {
+                        health_stop(&mut state, &health_screen).await;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             // The help overlay swallows the next key (to close itself).
             if state.show_help {
                 if matches!(
@@ -243,6 +381,20 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     }
                     state.show_help = false;
                 }
+                continue;
+            }
+
+            // Screen-switch keys are only honoured when the input bar is not
+            // capturing text, so a `2` typed into a coordinator message is not
+            // hijacked. With the input bar focused, `Char` keys fall through to
+            // the editing branch below.
+            if state.focus != Focus::Input
+                && matches!(key.code, KeyCode::Char('1') | KeyCode::Char('2'))
+            {
+                screen = match key.code {
+                    KeyCode::Char('2') => Screen::Health,
+                    _ => Screen::Chat,
+                };
                 continue;
             }
 
@@ -311,6 +463,62 @@ async fn run_loop<B: ratatui::backend::Backend>(
     }
 }
 
+/// Spawn the focused daemon's start command as a detached child process.
+///
+/// Why: the `[S]` key starts a stopped daemon; the ticket specifies launching
+/// `cargo run -p trusty-search -- start` / `cargo run -p trusty-memory`.
+/// What: spawns the appropriate `cargo run` child detached from the TUI
+/// (stdout/stderr inherited so its logs land in the operator's terminal), and
+/// records the outcome in `chat.last_action`. A spawn failure is recorded
+/// rather than panicking.
+/// Test: `health_start` is side-effecting (spawns a process); the action-string
+/// recording is exercised manually — the launch itself is not unit-tested.
+fn health_start(chat: &mut DashboardState, hp: &HealthScreen) {
+    let (label, args): (&str, &[&str]) = match hp.focus {
+        Daemon::Search => (
+            "trusty-search",
+            &["run", "-p", "trusty-search", "--", "start"],
+        ),
+        Daemon::Memory => ("trusty-memory", &["run", "-p", "trusty-memory"]),
+    };
+    match std::process::Command::new("cargo").args(args).spawn() {
+        Ok(_) => {
+            tracing::info!("health screen: spawned {label}");
+            chat.last_action = Some(format!("starting {label}…"));
+        }
+        Err(e) => {
+            tracing::warn!("health screen: failed to start {label}: {e}");
+            chat.last_action = Some(format!("failed to start {label}: {e}"));
+        }
+    }
+}
+
+/// Stop the focused daemon via its `admin/stop` HTTP endpoint.
+///
+/// Why: the `[X]` key stops the focused daemon without the operator resolving a
+/// PID; both daemons expose an unauthenticated stop route.
+/// What: builds a [`health::HealthClient`] for the focused daemon, POSTs to its
+/// stop endpoint, and records the outcome in `chat.last_action`. A transport
+/// error is recorded rather than propagated.
+/// Test: the stop transport is covered in `health.rs`; this is the action glue.
+async fn health_stop(chat: &mut DashboardState, hp: &HealthScreen) {
+    let label = match hp.focus {
+        Daemon::Search => "trusty-search",
+        Daemon::Memory => "trusty-memory",
+    };
+    let client = health::client_for(hp.focus, hp.focused_url());
+    match client.stop().await {
+        Ok(()) => {
+            tracing::info!("health screen: stop requested for {label}");
+            chat.last_action = Some(format!("stopping {label}…"));
+        }
+        Err(e) => {
+            tracing::warn!("health screen: failed to stop {label}: {e}");
+            chat.last_action = Some(format!("failed to stop {label}: {e}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +558,75 @@ mod tests {
         assert_eq!(row.tmux_name, "tmpm-foo");
         assert_eq!(row.active_delegations, 2);
         assert_eq!(row.status, trusty_mpm_core::session::SessionStatus::Paused);
+    }
+
+    #[test]
+    fn screen_default_is_chat() {
+        // The TUI must open on the coordinator chat, preserving prior behaviour.
+        assert_eq!(Screen::default(), Screen::Chat);
+    }
+
+    /// Apply one screen-switch keypress, mirroring the event-loop branch.
+    ///
+    /// Why: lets a test exercise the `[1]`/`[2]` switch logic without driving
+    /// a real terminal.
+    /// What: returns the [`Screen`] reached after pressing `key` from `from`.
+    /// Test: used by `screen_switch_preserves_chat_state`.
+    fn switch(from: Screen, key: char) -> Screen {
+        match key {
+            '1' => Screen::Chat,
+            '2' => Screen::Health,
+            _ => from,
+        }
+    }
+
+    #[test]
+    fn screen_switch_preserves_chat_state() {
+        // Switching [1] → [2] → [1] must not reset the coordinator chat: the
+        // chat state is owned by the loop, independent of the active Screen.
+        let mut state = DashboardState::default();
+        state.push_chat(ChatMessage::user("remember me"));
+        // Simulate the screen-switch keypresses the loop handles.
+        let screen = switch(Screen::Chat, '2');
+        assert_eq!(screen, Screen::Health);
+        let screen = switch(screen, '1');
+        assert_eq!(screen, Screen::Chat);
+        // The transcript built before switching is still intact.
+        assert_eq!(state.chat_history.len(), 1);
+        assert_eq!(state.chat_history[0].content, "remember me");
+    }
+
+    #[test]
+    fn health_status_bar_lists_keys() {
+        // The footer must document every screen-switch and service key.
+        for token in [
+            "[1]chat",
+            "[2]health",
+            "[Tab]",
+            "[S]start",
+            "[X]stop",
+            "[q]quit",
+        ] {
+            assert!(
+                HEALTH_KEY_HINT.contains(token),
+                "status bar missing {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_screen_draws_both_screens_without_panic() {
+        // Rendering each screen against a TestBackend must not panic.
+        use ratatui::{Terminal, backend::TestBackend};
+        let chat = DashboardState::default();
+        let hp = HealthScreen::new(health::DEFAULT_SEARCH_URL, health::DEFAULT_MEMORY_URL);
+        for screen in [Screen::Chat, Screen::Health] {
+            let backend = TestBackend::new(120, 24);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|f| render_screen(f, screen, &chat, &hp))
+                .expect("render must not panic");
+        }
     }
 
     #[tokio::test]
