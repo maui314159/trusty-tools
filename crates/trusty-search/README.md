@@ -192,9 +192,28 @@ Once connected, Claude Code can call `search_code`, `index_file`, `list_indexes`
 | XLarge | ≥ 64 GB    | 25% of RAM (≤ 64 GB)  | 800 000      | 20 000            | 512              | 400 000           | 500 000        |
 
 Env vars (`TRUSTY_MAX_CHUNKS`, `TRUSTY_EMBEDDING_CACHE`, `TRUSTY_MAX_BATCH_SIZE`,
-`TRUSTY_BM25_CORPUS_CAP`, `TRUSTY_MAX_KG_NODES`, `TRUSTY_MEMORY_LIMIT_MB`)
+`TRUSTY_BM25_CORPUS_CAP`, `TRUSTY_MAX_KG_NODES`, `TRUSTY_MEMORY_LIMIT_MB`,
+`TRUSTY_COREML_BATCH_SIZE`, `TRUSTY_COREML_TRIPWIRE_MB`)
 always override the tier default. Precedence: shell env > `daemon.env` >
 tier default. The resolved tier and all limits are logged at daemon startup.
+
+### Apple Silicon CoreML batch sizing
+
+On Apple Silicon (M1–M4), the ONNX Runtime CoreML execution provider batches
+are optimised separately from CPU and GPU tiers:
+
+- **`DEFAULT_COREML_BATCH_SIZE = 32`** — optimal for Apple Neural Engine (ANE).
+  Benchmark results on a 19k-chunk corpus show that larger batches (64, 128)
+  consume 7–10% more time and 1.2–9.7 GB additional peak RSS with zero
+  throughput gain. The ANE has a fixed dispatch budget; batch size scales
+  unified-memory allocation but not per-call throughput.
+- **`TRUSTY_COREML_TRIPWIRE_MB = 4096`** — safety net for RSS spikes. If a single
+  CoreML embedding batch increases RSS by >4 GB, the batch size is automatically
+  halved (floor: 1) and a warning is logged. Fires once per reindex.
+  Override with `TRUSTY_COREML_TRIPWIRE_MB` env var if your host has different
+  memory pressure characteristics.
+- Non-fatal RSS probes: failure to read `/proc/self/status` returns 0, disabling
+  the tripwire gracefully rather than crashing.
 
 ## Query intent → routing weights
 
