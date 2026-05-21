@@ -227,10 +227,10 @@ impl CodeIndexer {
         }
         let total = chunks.len();
         let index_id = self.index_id.clone();
+        // Issue #29: write chunks + entities in one atomic redb transaction so
+        // a crash mid-migration never leaves the two tables inconsistent.
         let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            corpus.upsert_chunks(&chunks)?;
-            corpus.upsert_entities(&entities)?;
-            Ok(())
+            corpus.upsert_batch(&chunks, &entities)
         })
         .await;
         match result {
@@ -257,7 +257,8 @@ impl CodeIndexer {
     /// memory-explosion. A legacy index (no `CorpusStore`) still needs the
     /// JSON snapshot at `path`.
     /// What: when a `CorpusStore` is wired, snapshots the in-memory corpus and
-    /// upserts it into redb; otherwise delegates to `save_chunks_to_disk`.
+    /// upserts it into redb in a single atomic transaction (issue #29);
+    /// otherwise delegates to `save_chunks_to_disk`.
     /// Test: covered by the corpus roundtrip integration test plus the
     /// existing shutdown integration test.
     pub async fn flush_corpus_to_disk(&self, path: &std::path::Path) -> Result<()> {
@@ -273,10 +274,10 @@ impl CodeIndexer {
             let g = self.entities.read().await;
             g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        // Issue #29: one atomic transaction covering both tables so a crash
+        // during the shutdown flush never leaves chunks and entities torn.
         tokio::task::spawn_blocking(move || -> Result<()> {
-            corpus.upsert_chunks(&chunks)?;
-            corpus.upsert_entities(&entities)?;
-            Ok(())
+            corpus.upsert_batch(&chunks, &entities)
         })
         .await
         .context("redb corpus shutdown-flush task panicked")?
@@ -323,6 +324,23 @@ impl CodeIndexer {
         }
     }
 
+    /// Force an HNSW snapshot now, bypassing the per-batch throttle
+    /// ([`crate::core::indexer::HNSW_SNAPSHOT_BATCH_INTERVAL`], issue #29).
+    ///
+    /// Why: `commit_parsed_batch` only triggers the (expensive) background
+    /// HNSW snapshot every 16 batches. After the reindex orchestrator's batch
+    /// loop ends, the most recent ≤15 batches' vectors may not yet be on disk.
+    /// Calling this once after the loop guarantees the final HNSW state is
+    /// persisted so a crash before the next reindex doesn't lose those
+    /// vectors. (The chunk corpus is already durable per-batch via redb.)
+    /// What: delegates to `spawn_incremental_persist(true)`, which always
+    /// spawns the persist task regardless of the batch counter.
+    /// Test: `tests::test_incremental_persist_throttles_to_interval` asserts a
+    /// forced call persists even when the throttle would otherwise skip.
+    pub fn force_incremental_persist(&self) {
+        self.spawn_incremental_persist(true);
+    }
+
     /// Spawn a background task that snapshots the HNSW graph + chunk corpus
     /// for this index to disk. Best-effort: a failure is logged but never
     /// returned to the caller — persistence is a "backup", not the source of
@@ -330,14 +348,38 @@ impl CodeIndexer {
     ///
     /// Why: called from `commit_parsed_batch` so incremental progress is
     /// preserved across crashes. The actual save runs on a detached task so
-    /// the commit path returns immediately.
-    /// What: skips when the daemon's data dir is unresolvable (tests, broken
-    /// HOME env). Snapshots HNSW (via `VectorStore::save_to`) and chunks (via
-    /// `save_chunks_to_disk`) concurrently with regular search traffic — both
-    /// snapshot under read locks before doing I/O.
-    /// Test: covered by integration tests that mutate an index then assert
-    /// the on-disk file appears within a short timeout.
-    pub(super) fn spawn_incremental_persist(&self) {
+    /// the commit path returns immediately. Issue #29: a full `Index::save`
+    /// costs hundreds of ms on a large HNSW graph and the chunk corpus is
+    /// already persisted transactionally per batch by `commit_corpus_to_redb`,
+    /// so a non-`force` call only proceeds once every
+    /// [`crate::core::indexer::HNSW_SNAPSHOT_BATCH_INTERVAL`] batches. The
+    /// reindex orchestrator calls [`Self::force_incremental_persist`] after
+    /// its batch loop so the final state is always durable.
+    /// What: when `force` is false, increments the per-index batch counter and
+    /// returns early unless the counter is a multiple of the snapshot interval.
+    /// Otherwise skips when the daemon's data dir is unresolvable (tests,
+    /// broken HOME env), then snapshots HNSW (via `VectorStore::save_to`) and
+    /// chunks (via `save_chunks_to_disk`) concurrently with regular search
+    /// traffic — both snapshot under read locks before doing I/O.
+    /// Test: `tests::test_incremental_persist_throttles_to_interval` plus the
+    /// integration tests that mutate an index then assert the on-disk file
+    /// appears within a short timeout.
+    pub(super) fn spawn_incremental_persist(&self, force: bool) {
+        // Issue #29: throttle the per-batch HNSW snapshot. A non-forced caller
+        // (every committed batch) bumps the counter; only every Nth batch
+        // actually spawns the save. `fetch_add` returns the *previous* value,
+        // so the first batch is index 1 — the modulo is checked against that
+        // post-increment value so batch 16, 32, … trigger a snapshot.
+        if !force {
+            let n = self
+                .persist_state
+                .batch_counter
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            if n % crate::core::indexer::HNSW_SNAPSHOT_BATCH_INTERVAL != 0 {
+                return;
+            }
+        }
         // Memory-explosion fix: coalesce concurrent calls so at most ONE
         // persist task is alive per index. Each task allocates ~1× the corpus
         // footprint (clone all RawChunks + serialize to JSON bytes); without

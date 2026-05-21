@@ -116,8 +116,11 @@ async fn test_persist_coalesces_concurrent_calls() {
     // can't directly observe spawns, but we CAN observe that after the
     // burst completes, the flag eventually returns to `false` and stays
     // there, proving the loop terminates cleanly.
+    // Issue #29: use `force = true` so every call bypasses the per-batch
+    // throttle and actually exercises the coalescing protocol — the throttle
+    // itself is covered by `test_incremental_persist_throttles_to_interval`.
     for _ in 0..64 {
-        idx.spawn_incremental_persist();
+        idx.spawn_incremental_persist(true);
     }
 
     // The flag MUST be observably true at least briefly (we just spawned
@@ -154,7 +157,7 @@ async fn test_persist_coalesces_concurrent_calls() {
     // (i.e. the CAS must succeed). We verify by observing the
     // in_flight flag flips to true at least once within a short window.
     idx.persist_state.dirty.store(false, Ordering::Release);
-    idx.spawn_incremental_persist();
+    idx.spawn_incremental_persist(true);
     // Either the flag is true now (task running), OR the task already
     // finished a single iteration and released. Both are correct
     // post-fix behaviors. The buggy pre-fix code would have spawned a
@@ -163,6 +166,67 @@ async fn test_persist_coalesces_concurrent_calls() {
     // `MAX_COALESCED_ITERATIONS` cap and the single shared
     // `persist_state`.
     let _ = idx.persist_state.in_flight.load(Ordering::Acquire);
+}
+
+/// Issue #29: a non-forced `spawn_incremental_persist` must increment the
+/// per-index batch counter on every call, and only the calls whose
+/// post-increment count is a multiple of `HNSW_SNAPSHOT_BATCH_INTERVAL`
+/// actually proceed past the throttle. A forced call bypasses the throttle
+/// entirely and never touches the counter.
+///
+/// Why: the throttle is what reclaims ~15 s of redundant `Index::save` I/O on
+/// a large reindex. Without this test a regression that drops the modulo (or
+/// the early return) silently reverts to a save-per-batch, and the only
+/// symptom would be slow reindexes — easy to miss.
+/// What: fires `HNSW_SNAPSHOT_BATCH_INTERVAL` non-forced calls and asserts the
+/// counter lands exactly on the interval; fires one more and asserts it kept
+/// counting; then fires a forced call and asserts the counter is untouched.
+/// Test: this test.
+#[tokio::test]
+async fn test_incremental_persist_throttles_to_interval() {
+    let idx = make_indexer();
+
+    // Counter starts at zero.
+    assert_eq!(idx.persist_state.batch_counter.load(Ordering::Acquire), 0);
+
+    // Fire exactly one interval's worth of non-forced calls. After the Nth
+    // call the counter must equal the interval — the Nth call is the one that
+    // passes the `n % INTERVAL == 0` gate.
+    for _ in 0..HNSW_SNAPSHOT_BATCH_INTERVAL {
+        idx.spawn_incremental_persist(false);
+    }
+    assert_eq!(
+        idx.persist_state.batch_counter.load(Ordering::Acquire),
+        HNSW_SNAPSHOT_BATCH_INTERVAL,
+        "every non-forced call must increment the batch counter"
+    );
+
+    // One more non-forced call keeps counting (no reset).
+    idx.spawn_incremental_persist(false);
+    assert_eq!(
+        idx.persist_state.batch_counter.load(Ordering::Acquire),
+        HNSW_SNAPSHOT_BATCH_INTERVAL + 1
+    );
+
+    // A forced call bypasses the throttle and must NOT touch the counter.
+    let before = idx.persist_state.batch_counter.load(Ordering::Acquire);
+    idx.force_incremental_persist();
+    assert_eq!(
+        idx.persist_state.batch_counter.load(Ordering::Acquire),
+        before,
+        "force_incremental_persist must not increment the batch counter"
+    );
+
+    // Let any spawned persist tasks drain so the test doesn't leak them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while idx.persist_state.in_flight.load(Ordering::Acquire)
+        || idx.persist_state.dirty.load(Ordering::Acquire)
+    {
+        if std::time::Instant::now() >= deadline {
+            panic!("persist tasks did not drain within 15s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]

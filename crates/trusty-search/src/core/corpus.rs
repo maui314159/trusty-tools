@@ -29,6 +29,22 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use crate::core::chunker::RawChunk;
 use crate::core::entity::RawEntity;
 
+/// Application-level page cache size for the redb corpus database.
+///
+/// Why (issue #29): redb's default application cache is 1 GiB. On a host
+/// indexing a large monorepo the on-disk `index.redb` corpus reaches ~14 GB,
+/// so the default cache holds well under 10% of the file — every search
+/// query that point-reads chunk text outside that window pays a disk read.
+/// trusty-search's `start` command already hard-requires ≥16 GB RAM, and the
+/// reference deployment host has 128 GB, so a 16 GiB cache keeps the hot
+/// working set resident without risking memory pressure. redb treats this as
+/// a ceiling, not a reservation — pages are only cached as they are touched,
+/// so smaller corpora never pay the full 16 GiB.
+/// What: 16 GiB expressed in bytes, passed to `Database::builder().set_cache_size`.
+/// Test: side-effect-only tuning of the redb cache; correctness is unaffected
+/// (covered by the existing `tests` submodule round-trips).
+const REDB_CACHE_SIZE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
 /// redb table holding the serialized chunk corpus, keyed by `chunk_id`.
 ///
 /// Why: `chunk_id` (`"{path}:{start}:{end}"`) is the corpus's natural primary
@@ -68,17 +84,23 @@ impl CorpusStore {
     /// Why: the daemon resolves one `index.redb` per index under its data dir;
     /// opening here is the single entry point so table-creation and the
     /// create-if-missing semantics live in one place.
-    /// What: opens the database, then runs a no-op write transaction that
-    /// `open_table`s both tables so they exist before any reader runs (redb
-    /// requires a table to have been created in a committed write txn before
-    /// it can be opened read-only).
+    /// What: opens the database via `Database::builder()` with a 16 GiB
+    /// application cache ([`REDB_CACHE_SIZE_BYTES`], issue #29), then runs a
+    /// no-op write transaction that `open_table`s both tables so they exist
+    /// before any reader runs (redb requires a table to have been created in a
+    /// committed write txn before it can be opened read-only). This single
+    /// builder call is the only place a corpus `redb::Database` is opened, so
+    /// the cache size applies to the live `index.redb` and the `--force`
+    /// staging `index.redb.tmp` alike (`open_fresh` delegates here).
     /// Test: `roundtrip` and `missing_db_is_empty` both exercise `open`.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create parent of {}", path.display()))?;
         }
-        let db = Database::create(path)
+        let db = Database::builder()
+            .set_cache_size(REDB_CACHE_SIZE_BYTES)
+            .create(path)
             .with_context(|| format!("open redb corpus at {}", path.display()))?;
         // Materialize both tables in a committed write txn so later read-only
         // transactions can `open_table` them even on a brand-new database.
@@ -184,6 +206,63 @@ impl CorpusStore {
             }
         }
         txn.commit().context("commit entity upsert txn")?;
+        Ok(())
+    }
+
+    /// Upsert a batch of chunks **and** their per-file entity lists in a
+    /// single redb write transaction (issue #29).
+    ///
+    /// Why: `upsert_chunks` and `upsert_entities` each opened their own
+    /// `begin_write()` transaction. A crash (or SIGTERM) landing between the
+    /// two commits left the chunk corpus and the symbol-graph entity table
+    /// inconsistent — a warm-boot would rehydrate chunks that the entity table
+    /// no longer described, or vice versa. Folding both tables into one
+    /// transaction makes the whole batch (chunks + entities) atomic: a crash
+    /// either rolls back the entire batch or commits all of it.
+    /// What: opens one write transaction, inserts every [`RawChunk`] into
+    /// `CHUNKS_TABLE` and every per-file `Vec<RawEntity>` into `ENTITIES_TABLE`
+    /// under that transaction, then commits once. Both table handles are
+    /// dropped (inner scope closed) before `commit()` — redb requires every
+    /// table opened in a write txn to be dropped before the txn can commit.
+    /// Empty inputs on **both** sides are a no-op (no transaction opened); a
+    /// non-empty input on either side still writes the other table even when
+    /// it is empty, so callers get one consistent commit point.
+    /// Test: `batch_upsert_is_atomic_roundtrip` writes chunks + entities via
+    /// this method and reads them back from a reopened store.
+    pub fn upsert_batch(
+        &self,
+        chunks: &[RawChunk],
+        entities: &[(String, Vec<RawEntity>)],
+    ) -> Result<()> {
+        if chunks.is_empty() && entities.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write().context("begin batch upsert txn")?;
+        {
+            // Single atomic transaction covering both tables. Table handles
+            // live only inside this scope so they are dropped before commit.
+            let mut chunks_tbl = txn
+                .open_table(CHUNKS_TABLE)
+                .context("open chunks table for batch upsert")?;
+            for chunk in chunks {
+                let bytes = serde_json::to_vec(chunk)
+                    .with_context(|| format!("serialize chunk {}", chunk.id))?;
+                chunks_tbl
+                    .insert(chunk.id.as_str(), bytes.as_slice())
+                    .with_context(|| format!("insert chunk {}", chunk.id))?;
+            }
+            let mut entities_tbl = txn
+                .open_table(ENTITIES_TABLE)
+                .context("open entities table for batch upsert")?;
+            for (file, ents) in entities {
+                let bytes = serde_json::to_vec(ents)
+                    .with_context(|| format!("serialize entities for {file}"))?;
+                entities_tbl
+                    .insert(file.as_str(), bytes.as_slice())
+                    .with_context(|| format!("insert entities for {file}"))?;
+            }
+        }
+        txn.commit().context("commit batch upsert txn")?;
         Ok(())
     }
 
@@ -391,6 +470,51 @@ mod tests {
         let entities = store.load_all_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].0, "src/lib.rs");
+    }
+
+    #[test]
+    fn batch_upsert_is_atomic_roundtrip() {
+        // Issue #29: `upsert_batch` writes chunks + entities in one redb
+        // transaction. A reopened store must see both, exactly as the
+        // separate-call `roundtrip` test asserts for `upsert_chunks` /
+        // `upsert_entities`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.redb");
+        {
+            let store = CorpusStore::open(&path).unwrap();
+            store
+                .upsert_batch(
+                    &[raw("a:1:1", "fn a() {}"), raw("b:1:1", "fn b() {}")],
+                    &[("src/lib.rs".to_string(), Vec::new())],
+                )
+                .unwrap();
+            assert_eq!(store.chunk_count().unwrap(), 2);
+        }
+        // Reopen to simulate a daemon restart — both tables must be intact.
+        let store = CorpusStore::open(&path).unwrap();
+        let mut loaded = store.load_all_chunks().unwrap();
+        loaded.sort_by(|x, y| x.id.cmp(&y.id));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "a:1:1");
+        let entities = store.load_all_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].0, "src/lib.rs");
+
+        // A batch with only chunks still writes the chunks table.
+        store
+            .upsert_batch(&[raw("c:1:1", "fn c() {}")], &[])
+            .unwrap();
+        assert_eq!(store.chunk_count().unwrap(), 3);
+
+        // A batch with only entities still writes the entities table.
+        store
+            .upsert_batch(&[], &[("src/other.rs".to_string(), Vec::new())])
+            .unwrap();
+        assert_eq!(store.load_all_entities().unwrap().len(), 2);
+
+        // A fully-empty batch is a silent no-op.
+        store.upsert_batch(&[], &[]).unwrap();
+        assert_eq!(store.chunk_count().unwrap(), 3);
     }
 
     #[test]

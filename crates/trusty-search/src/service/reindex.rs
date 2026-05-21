@@ -1327,6 +1327,17 @@ pub fn spawn_reindex_with_cleanup(
         // receiver being closed). Awaiting it surfaces panics for tracing.
         let _ = producer.await;
 
+        // Issue #29: the per-batch HNSW snapshot is throttled to one every
+        // `HNSW_SNAPSHOT_BATCH_INTERVAL` batches, so the most recent ≤15
+        // batches' vectors may not be on disk yet. Force one final snapshot
+        // now — while the live HNSW store is still wired and before the
+        // `--force` corpus swap drops the durable corpus handle — so a crash
+        // before the next reindex never loses the tail of the rebuild.
+        {
+            let indexer = handle.indexer.read().await;
+            indexer.force_incremental_persist();
+        }
+
         // Issue #28, Phase 4: finalize the atomic corpus swap. Every batch
         // committed above wrote to `index.redb.tmp`; now that the batch loop
         // is done we either atomically rename it over the live `index.redb`

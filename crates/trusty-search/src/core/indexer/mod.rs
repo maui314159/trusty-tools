@@ -20,7 +20,7 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
@@ -142,6 +142,23 @@ pub(crate) fn embed_batch_size() -> usize {
 pub(crate) const KG_EXPAND_SCORE_FACTOR: f32 = 0.7;
 /// Default BFS depth for KG expansion (1 hop = direct callers/callees only).
 pub(crate) const KG_EXPAND_HOPS: usize = 1;
+
+/// How many committed batches must elapse between background HNSW snapshots
+/// (issue #29).
+///
+/// Why: `spawn_incremental_persist` used to fire after *every* committed
+/// batch. The chunk corpus is already persisted transactionally per batch by
+/// `commit_corpus_to_redb`, so the per-batch work that actually mattered for
+/// crash-safety was the redb write — the HNSW `Index::save` is a pure backup
+/// that takes hundreds of ms on a large graph. On a 14k-file reindex (128
+/// files/batch → ~110 batches) that was ~110 full graph saves; throttling to
+/// one every 16 batches cuts that to ~7 (plus one forced save at reindex
+/// completion), reclaiming ~15+ seconds of redundant I/O without weakening
+/// durability — a crash loses at most the last 16 batches' HNSW vectors,
+/// which the next reindex re-embeds anyway, and the redb corpus is intact.
+/// What: the batch-count modulus used by `spawn_incremental_persist`.
+/// Test: `tests::test_incremental_persist_throttles_to_interval`.
+pub(crate) const HNSW_SNAPSHOT_BATCH_INTERVAL: u32 = 16;
 
 /// A search result returned to callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +567,15 @@ pub(crate) struct PersistState {
     /// the task loops once more so the final on-disk file reflects the latest
     /// committed state.
     pub(crate) dirty: AtomicBool,
+    /// Monotonic count of committed batches that have requested a persist
+    /// (issue #29). `spawn_incremental_persist` increments this and only
+    /// actually spawns the (expensive) HNSW snapshot every
+    /// [`HNSW_SNAPSHOT_BATCH_INTERVAL`] batches — redb already gives per-batch
+    /// chunk durability, so a full `Index::save` after *every* 128-file batch
+    /// (~110 saves on a 14k-file reindex, each hundreds of ms) is wasted I/O.
+    /// A `force` persist (reindex completion, shutdown flush) bypasses the
+    /// throttle so final state is always durable.
+    pub(crate) batch_counter: AtomicU32,
 }
 
 impl CodeIndexer {

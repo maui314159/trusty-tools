@@ -585,16 +585,21 @@ impl CodeIndexer {
             kg_start.elapsed().as_millis() as u64
         };
 
-        // Issue #85 — fire-and-forget incremental persistence. After every
-        // committed batch we snapshot the HNSW graph + chunk corpus to disk
-        // so a daemon crash mid-reindex preserves whatever was committed
-        // (no progress is lost beyond the in-flight batch).
+        // Issue #85 — fire-and-forget incremental persistence. Issue #29:
+        // throttled — `spawn_incremental_persist(false)` only actually spawns
+        // the HNSW snapshot every `HNSW_SNAPSHOT_BATCH_INTERVAL` batches. The
+        // chunk corpus is already persisted transactionally per batch by
+        // `commit_corpus_to_redb`, so a crash between snapshots loses only the
+        // last ≤15 batches' HNSW vectors (re-embedded by the next reindex),
+        // never committed chunks. The reindex orchestrator calls
+        // `force_incremental_persist` after its batch loop to guarantee the
+        // final HNSW state is durable.
         //
         // Why background: `Index::save` can take 100s of ms on a large
         // corpus and we don't want the commit path (which is on the hot
         // reindex loop) to wait on filesystem I/O. We don't hold any locks
         // while spawning — the clones are cheap (Arc bumps + a path string).
-        self.spawn_incremental_persist();
+        self.spawn_incremental_persist(false);
 
         Ok(CommitTimings {
             chunks: chunk_total,
@@ -713,13 +718,16 @@ impl CodeIndexer {
     /// always crash-consistent and the write cost is O(batch) rather than
     /// O(corpus). The redb write runs on `spawn_blocking` because redb's
     /// transaction API is synchronous and a large batch's `serde_json` encode
-    /// plus fsync would otherwise pin a tokio worker thread.
+    /// plus fsync would otherwise pin a tokio worker thread. Issue #29: chunks
+    /// and entities are now written via `CorpusStore::upsert_batch` in a
+    /// **single** redb transaction, so a crash between the two never leaves the
+    /// chunk corpus and the entity table inconsistent.
     /// What: clones the chunks plus entities (cheap relative to the JSON
-    /// encode), moves them onto a blocking worker, and writes both tables.
-    /// Failures are logged at `warn` and swallowed — persistence is a
-    /// durability backup, so a transient I/O error must not abort the
-    /// in-memory commit (the next batch's write, or shutdown flush, will
-    /// re-converge the on-disk state).
+    /// encode), moves them onto a blocking worker, and writes both tables in
+    /// one atomic transaction. Failures are logged at `warn` and swallowed —
+    /// persistence is a durability backup, so a transient I/O error must not
+    /// abort the in-memory commit (the next batch's write, or shutdown flush,
+    /// will re-converge the on-disk state).
     /// Test: `tests::test_corpus_store_roundtrip`.
     async fn commit_corpus_to_redb(
         &self,
@@ -733,9 +741,7 @@ impl CodeIndexer {
         let entities = entities_by_file.to_vec();
         let index_id = self.index_id.clone();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            corpus.upsert_chunks(&chunks)?;
-            corpus.upsert_entities(&entities)?;
-            Ok(())
+            corpus.upsert_batch(&chunks, &entities)
         })
         .await;
         match result {
