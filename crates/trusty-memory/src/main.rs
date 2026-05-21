@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use trusty_memory::commands::migrate::{handle_migrate, MigrateTarget};
 use trusty_memory::commands::service::{handle_service, ServiceAction};
 use trusty_memory::commands::setup::handle_setup;
-use trusty_memory::{run_http, run_stdio, AppState};
+use trusty_memory::{resolve_palace_registry_dir, run_http, run_stdio, AppState};
 
 /// Top-level CLI for `trusty-memory`.
 #[derive(Debug, Parser)]
@@ -198,10 +198,13 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
 ///
 /// Why: keeps `main` focused on parsing while putting the `AppState`
 /// construction in one place.
-/// What: builds an `AppState` rooted at the standard data dir, applies the
-/// `--palace` default if any, and — on the HTTP path — wires the issue-#35
-/// `LogBuffer` so `GET /api/v1/logs/tail` serves captured logs. The stdio
-/// path does not need the buffer (no HTTP surface), so it is dropped there.
+/// What: resolves the palace registry directory (descending into the legacy
+/// `palaces/` subdirectory when present — see `resolve_palace_registry_dir`),
+/// builds an `AppState` rooted there, applies the `--palace` default if any,
+/// re-hydrates every persisted palace, and — on the HTTP path — wires the
+/// issue-#35 `LogBuffer` so `GET /api/v1/logs/tail` serves captured logs. The
+/// stdio path does not need the buffer (no HTTP surface), so it is dropped
+/// there.
 /// Test: not unit-tested (process-level entry point); exercised manually via
 /// `cargo run -p trusty-memory -- serve` and the parent integration tests.
 async fn run_serve(
@@ -209,7 +212,12 @@ async fn run_serve(
     palace: Option<String>,
     log_buffer: trusty_common::log_buffer::LogBuffer,
 ) -> Result<()> {
-    let data_root = trusty_common::resolve_data_dir("trusty-memory")?;
+    // Resolve the standard data dir, then descend into `palaces/` if that
+    // legacy-layout subdirectory exists. Using the resolved directory as
+    // `data_root` keeps every call site (status, palace_list, open_palace,
+    // palace_create, load_palaces_from_disk) pointed at the same place.
+    let data_dir = trusty_common::resolve_data_dir("trusty-memory")?;
+    let data_root = resolve_palace_registry_dir(data_dir);
 
     if let Some(addr) = http {
         let state = AppState::new(data_root)

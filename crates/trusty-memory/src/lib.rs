@@ -29,6 +29,34 @@ pub mod web;
 pub use service::MemoryMcpService;
 pub use tools::MemoryMcpServer;
 
+/// Resolve the directory that actually holds the per-palace subdirectories.
+///
+/// Why: there are two on-disk layouts in the wild. The current monorepo code
+/// treats the registry directory *itself* as the parent of per-palace dirs
+/// (`<dir>/<id>/palace.json`). The legacy standalone `trusty-memory` repo
+/// nested everything one level deeper under a `palaces/` subdirectory
+/// (`<data_dir>/palaces/<id>/palace.json`) — and that is where existing
+/// installs' data lives (e.g. 88 palaces under
+/// `~/Library/Application Support/trusty-memory/palaces/`). A daemon that uses
+/// the bare data dir as its registry root finds zero palaces because every
+/// `palace.json` sits one level below where it looked — the "palaces lost on
+/// restart" bug.
+/// What: given the standard data dir, returns `<data_dir>/palaces` when that
+/// subdirectory exists, otherwise `<data_dir>` itself. Resolving this once in
+/// `main.rs` and using the result as `AppState::data_root` keeps every call
+/// site (`status`, `palace_list`, `open_palace`, `palace_create`,
+/// `load_palaces_from_disk`) consistent without forcing a data migration.
+/// Test: `tests::resolve_palace_registry_dir_prefers_palaces_subdir` and
+/// `resolve_palace_registry_dir_falls_back_to_data_dir`.
+pub fn resolve_palace_registry_dir(data_dir: PathBuf) -> PathBuf {
+    let nested = data_dir.join("palaces");
+    if nested.is_dir() {
+        nested
+    } else {
+        data_dir
+    }
+}
+
 /// Live daemon events broadcast to connected SSE subscribers.
 ///
 /// Why: The dashboard needs push-driven updates so palace creation, drawer
@@ -175,8 +203,8 @@ impl AppState {
         }
     }
 
-    /// Scan `data_root/palaces/` and re-register every persisted palace into
-    /// the in-memory [`PalaceRegistry`].
+    /// Scan the palace registry directory and re-register every persisted
+    /// palace into the in-memory [`PalaceRegistry`].
     ///
     /// Why: `AppState::new` builds an *empty* registry, so after a daemon
     /// restart `palace_list` / the dashboard reported zero palaces even though
@@ -185,23 +213,27 @@ impl AppState {
     /// that gap by walking the on-disk layout (each subdirectory holding a
     /// `palace.json` is one palace) and rebuilding a live `PalaceHandle` for
     /// each, so recall paths see the full set immediately after a restart.
-    /// What: Runs the blocking filesystem walk + per-palace `PalaceHandle::open`
+    /// What: runs the blocking filesystem walk + per-palace `PalaceHandle::open`
     /// on a `spawn_blocking` thread (so it never stalls the async runtime),
     /// registers each successfully opened palace via `register_arc`, logs every
     /// load at `debug!`, and returns the count loaded. A palace that fails to
     /// open (corrupt index, unreadable `kg.db`, etc.) is logged at `warn!` and
     /// skipped — one bad palace must not abort startup or crash the daemon.
+    /// `data_root` is expected to already be the palace registry directory —
+    /// `main.rs` resolves it via [`resolve_palace_registry_dir`] before
+    /// constructing the `AppState`, so the flat / legacy-`palaces/` layout
+    /// difference is handled exactly once.
     /// Test: `tests::load_palaces_from_disk_rehydrates_registry` writes two
     /// palaces into a tempdir, constructs an `AppState`, calls this method, and
     /// asserts the returned count and registry contents.
     pub async fn load_palaces_from_disk(&self) -> Result<usize> {
-        let data_root = self.data_root.clone();
+        let registry_dir = self.data_root.clone();
         let registry = self.registry.clone();
         // The directory walk and each `PalaceHandle::open` perform blocking
         // filesystem + redb/usearch I/O — run the whole hydration on the
         // blocking pool so it never parks an async worker thread.
         let count = tokio::task::spawn_blocking(move || -> Result<usize> {
-            let palaces = PalaceRegistry::list_palaces(&data_root)?;
+            let palaces = PalaceRegistry::list_palaces(&registry_dir)?;
             let mut loaded = 0usize;
             for palace in palaces {
                 match trusty_common::memory_core::PalaceHandle::open(&palace) {
@@ -862,7 +894,86 @@ mod tests {
         assert!(ids.contains(&"beta".to_string()));
     }
 
-    /// Why: an empty (or missing) `palaces/` directory must not error — a
+    /// Why: existing installs (and the legacy standalone `trusty-memory` repo)
+    /// nest palaces one level deeper under a `palaces/` subdirectory. When that
+    /// subdirectory exists, `resolve_palace_registry_dir` must descend into it
+    /// so the daemon scans the level that actually holds the `palace.json`
+    /// files — otherwise it finds zero palaces, which is the restart bug.
+    /// What: creates `<dir>/palaces/`, resolves, and asserts the nested path is
+    /// returned.
+    /// Test: this test itself.
+    #[test]
+    fn resolve_palace_registry_dir_prefers_palaces_subdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(data_dir.join("palaces")).expect("mkdir palaces");
+
+        let resolved = resolve_palace_registry_dir(data_dir.clone());
+        assert_eq!(resolved, data_dir.join("palaces"));
+    }
+
+    /// Why: a fresh install with no `palaces/` subdirectory must fall back to
+    /// the data dir itself (the current flat monorepo layout).
+    #[test]
+    fn resolve_palace_registry_dir_falls_back_to_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().to_path_buf();
+
+        let resolved = resolve_palace_registry_dir(data_dir.clone());
+        assert_eq!(resolved, data_dir);
+    }
+
+    /// Why: end-to-end check that the nested-`palaces/` layout hydrates — the
+    /// daemon resolves the registry dir via `resolve_palace_registry_dir`, so
+    /// an `AppState` rooted there must load palaces persisted one level below
+    /// the bare data dir.
+    /// What: persists two palaces under `<root>/palaces/<id>/`, constructs an
+    /// `AppState` rooted at the resolved registry dir, and asserts hydration
+    /// finds both.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn load_palaces_from_disk_handles_palaces_subdir() {
+        use trusty_common::memory_core::{Palace, PalaceId, PalaceRegistry};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let nested = root.join("palaces");
+
+        {
+            let writer = PalaceRegistry::new();
+            for id in ["cto", "engineering"] {
+                let palace = Palace {
+                    id: PalaceId::new(id),
+                    name: id.to_string(),
+                    description: None,
+                    created_at: chrono::Utc::now(),
+                    data_dir: nested.join(id),
+                };
+                // create_palace anchors data_dir under the passed root, so
+                // pass `nested` here to land palaces under `<root>/palaces/`.
+                writer
+                    .create_palace(&nested, palace)
+                    .expect("persist palace under palaces/ subdir");
+            }
+        }
+
+        // Mirror main.rs: resolve the registry dir, then root AppState there.
+        let registry_dir = resolve_palace_registry_dir(root);
+        assert_eq!(registry_dir, nested, "must resolve into palaces/ subdir");
+        let state = AppState::new(registry_dir);
+        let count = state
+            .load_palaces_from_disk()
+            .await
+            .expect("load_palaces_from_disk");
+
+        assert_eq!(count, 2, "both nested palaces should be loaded");
+        assert_eq!(state.registry.len(), 2);
+        let ids: Vec<String> = state.registry.list().into_iter().map(|p| p.0).collect();
+        assert!(ids.contains(&"cto".to_string()));
+        assert!(ids.contains(&"engineering".to_string()));
+    }
+
+    /// Why: an empty (or missing) palace registry directory must not error — a
     /// brand-new install has nothing to hydrate and should report zero.
     #[tokio::test]
     async fn load_palaces_from_disk_empty_root_returns_zero() {

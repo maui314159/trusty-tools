@@ -116,10 +116,13 @@ pub fn dir_size_bytes(dir: &std::path::Path) -> u64 {
             }
             if file_type.is_dir() {
                 walk(&entry.path(), total);
-            } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    *total = total.saturating_add(meta.len());
-                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                *total = total.saturating_add(meta.len());
             }
         }
     }
