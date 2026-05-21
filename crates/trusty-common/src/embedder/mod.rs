@@ -286,9 +286,7 @@ impl FastEmbedder {
                 // compile cost (and its transient memory) on every daemon
                 // start. Falls back to a tmp path if HOME is unset.
                 let cache_dir = std::env::var("HOME")
-                    .map(|h| {
-                        format!("{}/Library/Caches/trusty-embedder/coreml", h)
-                    })
+                    .map(|h| format!("{}/Library/Caches/trusty-embedder/coreml", h))
                     .unwrap_or_else(|_| "/tmp/trusty-embedder-coreml".to_string());
                 let _ = std::fs::create_dir_all(&cache_dir);
 
