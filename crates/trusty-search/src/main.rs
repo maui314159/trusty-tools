@@ -128,22 +128,33 @@ enum Commands {
     /// with a live progress bar. Skips the reindex if the index already has
     /// chunks indexed (use --force to override).
     ///
+    /// When run with no PATH argument, trusty-search looks for a
+    /// `.trusty-search.yaml` file in the current directory and uses its
+    /// `name`, `path`, and `exclude` values as defaults. CLI flags always
+    /// override the config file. (For multi-index polyrepos, use the separate
+    /// `trusty-search.yaml` manifest — no leading dot.)
+    ///
     /// Examples:
-    ///   trusty-search index                   # CWD, name from basename
+    ///   trusty-search index                   # CWD, name from basename or .trusty-search.yaml
     ///   trusty-search index ~/Projects/myapp
     ///   trusty-search index --force           # full reindex even if up-to-date
+    ///   trusty-search index --exclude data/ --exclude "*.db"
     #[command(alias = "idx", display_order = 4)]
     Index {
-        /// Directory to register and index (default: CWD)
+        /// Directory to register and index (default: CWD, or `.trusty-search.yaml` `path`)
         path: Option<std::path::PathBuf>,
 
-        /// Index name (default: directory basename)
+        /// Index name (default: directory basename, or `.trusty-search.yaml` `name`)
         #[arg(short, long)]
         name: Option<String>,
 
         /// Force a full reindex even if the index already has chunks
         #[arg(short, long)]
         force: bool,
+
+        /// Additional glob exclusion patterns (override `.trusty-search.yaml` `exclude`)
+        #[arg(long)]
+        exclude: Vec<String>,
 
         /// SSE stream timeout in seconds (default: 600). Increase for very large repos.
         #[arg(long, default_value_t = 600)]
@@ -590,9 +601,10 @@ async fn run() -> Result<()> {
             path,
             name,
             force,
+            exclude,
             timeout,
         } => {
-            commands::index::handle_index(path, name, force, timeout).await?;
+            commands::index::handle_index(path, name, force, exclude, timeout).await?;
         }
 
         Commands::Add { file } => {

@@ -12,6 +12,7 @@ pub mod memguard;
 pub mod memory_policy;
 pub mod mmr;
 pub mod ner;
+pub mod project_config;
 pub mod registry;
 pub mod repo_config;
 pub mod scip_ingest;

@@ -4,13 +4,17 @@
 //! contains a `trusty-search.yaml` file (issue: repo-level config), we
 //! transparently fan out into one register+reindex pass per declared index
 //! so a single `trusty-search index` command can populate multiple named
-//! slices (e.g. `duetto-api` and `duetto-ui`).
+//! slices (e.g. `duetto-api` and `duetto-ui`). When a repo instead contains
+//! a single-index `.trusty-search.yaml` dotfile (issue #30), its `name`,
+//! `path`, and `exclude` values supply defaults that committed teammates and
+//! daemon restarts pick up automatically — CLI flags always override them.
 
 use super::daemon_utils::daemon_base_url;
 use super::reindex_engine::{
     register_index_with_daemon, register_index_with_daemon_filtered, run_reindex,
     run_reindex_force, RegisterFilters,
 };
+use crate::core::project_config::{ProjectConfig, PROJECT_CONFIG_FILENAME};
 use crate::core::repo_config::{language_to_exts, IndexConfig, RepoConfig, CONFIG_FILENAME};
 use anyhow::Result;
 use colored::Colorize;
@@ -19,26 +23,59 @@ use colored::Colorize;
 ///
 /// Why: register-then-reindex is the primary onboarding flow. With a
 /// `trusty-search.yaml` present, this dispatches into a multi-index pass;
-/// otherwise it falls back to the single-index behaviour.
+/// with a single-index `.trusty-search.yaml` dotfile present (issue #30) it
+/// uses that file's `name`/`path`/`exclude` as defaults; otherwise it falls
+/// back to the built-in single-index behaviour.
 /// What:
 /// 1. Auto-start the daemon if needed.
-/// 2. Look for `<path>/trusty-search.yaml`. If present, ignore `--name` and
+/// 2. Load `<cwd>/.trusty-search.yaml` (issue #30) and merge: CLI arg wins
+///    over config-file value wins over built-in default. Config `path` is
+///    resolved relative to the config file's directory (the CWD).
+/// 3. Look for `<path>/trusty-search.yaml`. If present, ignore `--name` and
 ///    register+reindex each declared index sequentially.
-/// 3. Otherwise, register one index with name = `--name` or dirname.
+/// 4. Otherwise, register one index with the merged name/path/exclude.
 ///
 /// Test: `cargo run -- index --force` against a healthy daemon prints the
 /// registration line then drives the SSE progress bar. With a yaml at
-/// `<path>/trusty-search.yaml`, it iterates each declared name.
+/// `<path>/trusty-search.yaml`, it iterates each declared name. With a
+/// `.trusty-search.yaml` dotfile in CWD, the merge precedence is exercised by
+/// `core::project_config` unit tests plus the `merge_*` tests below.
 ///
+/// `cli_path` is the optional positional `PATH` argument; `cli_name` /
+/// `cli_exclude` are the optional `--name` / `--exclude` flags.
 /// `timeout_secs` is forwarded to the SSE stream reader; 0 = no limit.
 pub async fn handle_index(
-    path: Option<std::path::PathBuf>,
-    name: Option<String>,
+    cli_path: Option<std::path::PathBuf>,
+    cli_name: Option<String>,
     force: bool,
+    cli_exclude: Vec<String>,
     timeout_secs: u64,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let project_path = path.unwrap_or(cwd);
+
+    // 1. Per-project dotfile config (`.trusty-search.yaml`, issue #30). Loaded
+    //    from the CWD only — it supplies defaults for the index name, the
+    //    subdirectory to index, and extra exclude globs. A malformed file is a
+    //    hard error so a config typo never silently degrades to defaults.
+    let project_cfg = match ProjectConfig::load(&cwd) {
+        Ok(Some(cfg)) => {
+            tracing::debug!(
+                "loaded {} from {}: name={:?} path={:?} exclude={:?}",
+                PROJECT_CONFIG_FILENAME,
+                cwd.display(),
+                cfg.name,
+                cfg.path,
+                cfg.exclude,
+            );
+            Some(cfg)
+        }
+        Ok(None) => None,
+        Err(e) => anyhow::bail!("could not parse {}: {e}", PROJECT_CONFIG_FILENAME),
+    };
+
+    // 2. Resolve PATH: CLI positional arg wins; else config `path` resolved
+    //    relative to the config file's directory (CWD); else the CWD itself.
+    let project_path = resolve_project_path(cli_path, project_cfg.as_ref(), &cwd);
 
     // 0. Auto-start the daemon if needed. `index` is useless without it,
     //    so we proactively boot it rather than dump a confusing connection
@@ -53,7 +90,7 @@ pub async fn handle_index(
     //    affected; this only changes the auto-spawn behaviour.
     crate::commands::daemon_guard::ensure_daemon_running_for_indexing(&daemon_base_url()).await?;
 
-    // 1. Repo-level config detection. `trusty-search.yaml` at the project root
+    // 3. Repo-level config detection. `trusty-search.yaml` at the project root
     //    declares one or more named indexes; when present it overrides the
     //    `--name` flag and we register each declared slice in turn.
     match RepoConfig::load(&project_path) {
@@ -65,7 +102,7 @@ pub async fn handle_index(
                 cfg.indexes.len(),
                 if cfg.indexes.len() == 1 { "" } else { "es" },
             );
-            if name.is_some() {
+            if cli_name.is_some() {
                 eprintln!(
                     "{} --name is ignored when {} is present",
                     "ℹ".yellow(),
@@ -80,21 +117,98 @@ pub async fn handle_index(
             return Ok(());
         }
         Ok(None) => {
-            // No config; fall through to single-index path.
+            // No multi-index config; fall through to the single-index path.
         }
         Err(e) => {
             anyhow::bail!("could not parse {}: {e}", CONFIG_FILENAME);
         }
     }
 
-    let index_name = name.unwrap_or_else(|| {
-        project_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    });
-    index_one(&index_name, &project_path, force, timeout_secs).await
+    // Single-index path. Merge name and exclude with the same precedence as
+    // the path resolution above: CLI flag > `.trusty-search.yaml` value >
+    // built-in default.
+    let index_name = resolve_index_name(cli_name, project_cfg.as_ref(), &project_path);
+    let exclude_globs = resolve_excludes(cli_exclude, project_cfg.as_ref());
+
+    if exclude_globs.is_empty() {
+        index_one(&index_name, &project_path, force, timeout_secs).await
+    } else {
+        let filters = RegisterFilters {
+            exclude_globs,
+            ..RegisterFilters::default()
+        };
+        index_one_with_filters(&index_name, &project_path, force, timeout_secs, &filters).await
+    }
+}
+
+/// Resolve the directory to index from the CLI arg, the dotfile config, and
+/// the CWD, in that precedence order.
+///
+/// Why: issue #30 lets a committed `.trusty-search.yaml` point at a
+/// subdirectory (`path: app`) so teammates need not retype it; an explicit
+/// CLI `PATH` must still win, and a config `path` is written relative to the
+/// config file's directory rather than the process CWD-at-call-time.
+/// What: returns `cli_path` verbatim when present; else `config_dir`-joined
+/// `cfg.path` when the config supplies one; else `config_dir` itself.
+/// Test: `merge_path_cli_wins`, `merge_path_config_relative`,
+/// `merge_path_default_is_cwd`.
+fn resolve_project_path(
+    cli_path: Option<std::path::PathBuf>,
+    cfg: Option<&ProjectConfig>,
+    config_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(p) = cli_path {
+        return p;
+    }
+    if let Some(rel) = cfg.and_then(|c| c.path.as_ref()) {
+        return config_dir.join(rel);
+    }
+    config_dir.to_path_buf()
+}
+
+/// Resolve the index name from the CLI flag, the dotfile config, and the
+/// directory basename, in that precedence order.
+///
+/// Why: issue #30 lets `.trusty-search.yaml` set a stable index `name` that
+/// differs from the directory basename, while still allowing a one-off
+/// `--name` override.
+/// What: returns `cli_name` when present; else `cfg.name`; else the final
+/// path component of `project_path` (the historical default).
+/// Test: `merge_name_cli_wins`, `merge_name_from_config`,
+/// `merge_name_default_is_basename`.
+fn resolve_index_name(
+    cli_name: Option<String>,
+    cfg: Option<&ProjectConfig>,
+    project_path: &std::path::Path,
+) -> String {
+    if let Some(n) = cli_name {
+        return n;
+    }
+    if let Some(n) = cfg.and_then(|c| c.name.clone()) {
+        return n;
+    }
+    project_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Resolve the extra exclude globs from the CLI flag and the dotfile config.
+///
+/// Why: issue #30 — `--exclude` flags must override the committed
+/// `.trusty-search.yaml` `exclude:` list rather than merge with it, matching
+/// the "CLI flag wins" precedence used for `name` and `path`.
+/// What: returns `cli_exclude` when non-empty; else `cfg.exclude` cloned; else
+/// an empty list (no extra excludes — `.gitignore` and the built-in skip list
+/// still apply daemon-side).
+/// Test: `merge_exclude_cli_wins`, `merge_exclude_from_config`,
+/// `merge_exclude_default_empty`.
+fn resolve_excludes(cli_exclude: Vec<String>, cfg: Option<&ProjectConfig>) -> Vec<String> {
+    if !cli_exclude.is_empty() {
+        return cli_exclude;
+    }
+    cfg.and_then(|c| c.exclude.clone()).unwrap_or_default()
 }
 
 /// Map a parsed `IndexConfig` to the daemon-bound `RegisterFilters`.
@@ -187,4 +301,97 @@ async fn index_one_with_filters(
         run_reindex(index_name, project_path, timeout_secs).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::project_config::ProjectConfig;
+    use std::path::{Path, PathBuf};
+
+    fn cfg(name: Option<&str>, path: Option<&str>, exclude: Option<Vec<&str>>) -> ProjectConfig {
+        ProjectConfig {
+            name: name.map(str::to_string),
+            path: path.map(PathBuf::from),
+            exclude: exclude.map(|v| v.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    // ── resolve_project_path ───────────────────────────────────────────────
+
+    #[test]
+    fn merge_path_cli_wins() {
+        let c = cfg(None, Some("app"), None);
+        let got = resolve_project_path(
+            Some(PathBuf::from("/explicit/cli")),
+            Some(&c),
+            Path::new("/repo"),
+        );
+        assert_eq!(got, PathBuf::from("/explicit/cli"));
+    }
+
+    #[test]
+    fn merge_path_config_relative() {
+        let c = cfg(None, Some("app"), None);
+        let got = resolve_project_path(None, Some(&c), Path::new("/repo"));
+        assert_eq!(got, PathBuf::from("/repo/app"));
+    }
+
+    #[test]
+    fn merge_path_default_is_cwd() {
+        let got = resolve_project_path(None, None, Path::new("/repo"));
+        assert_eq!(got, PathBuf::from("/repo"));
+    }
+
+    #[test]
+    fn merge_path_config_present_but_no_path_field() {
+        let c = cfg(Some("foo"), None, None);
+        let got = resolve_project_path(None, Some(&c), Path::new("/repo"));
+        assert_eq!(got, PathBuf::from("/repo"));
+    }
+
+    // ── resolve_index_name ─────────────────────────────────────────────────
+
+    #[test]
+    fn merge_name_cli_wins() {
+        let c = cfg(Some("from-config"), None, None);
+        let got = resolve_index_name(Some("from-cli".into()), Some(&c), Path::new("/repo/myproj"));
+        assert_eq!(got, "from-cli");
+    }
+
+    #[test]
+    fn merge_name_from_config() {
+        let c = cfg(Some("from-config"), None, None);
+        let got = resolve_index_name(None, Some(&c), Path::new("/repo/myproj"));
+        assert_eq!(got, "from-config");
+    }
+
+    #[test]
+    fn merge_name_default_is_basename() {
+        let got = resolve_index_name(None, None, Path::new("/repo/myproj"));
+        assert_eq!(got, "myproj");
+    }
+
+    // ── resolve_excludes ───────────────────────────────────────────────────
+
+    #[test]
+    fn merge_exclude_cli_wins() {
+        let c = cfg(None, None, Some(vec!["data/", "docs/"]));
+        let got = resolve_excludes(vec!["only-cli/".into()], Some(&c));
+        assert_eq!(got, vec!["only-cli/".to_string()]);
+    }
+
+    #[test]
+    fn merge_exclude_from_config() {
+        let c = cfg(None, None, Some(vec!["data/", "*.db"]));
+        let got = resolve_excludes(Vec::new(), Some(&c));
+        assert_eq!(got, vec!["data/".to_string(), "*.db".to_string()]);
+    }
+
+    #[test]
+    fn merge_exclude_default_empty() {
+        assert!(resolve_excludes(Vec::new(), None).is_empty());
+        let c = cfg(Some("foo"), None, None);
+        assert!(resolve_excludes(Vec::new(), Some(&c)).is_empty());
+    }
 }
