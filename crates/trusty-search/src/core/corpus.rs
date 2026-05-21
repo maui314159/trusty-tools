@@ -56,6 +56,10 @@ const ENTITIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entit
 /// Test: covered by the `tests` submodule.
 pub struct CorpusStore {
     db: Database,
+    /// Filesystem path the `db` was opened at. Retained so the atomic
+    /// `--force` reindex swap (issue #28, Phase 4) knows which file to rename
+    /// without the caller having to pass the path back in.
+    path: std::path::PathBuf,
 }
 
 impl CorpusStore {
@@ -87,7 +91,46 @@ impl CorpusStore {
             }
             txn.commit().context("commit corpus init txn")?;
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Open a fresh (truncated) redb corpus at `path`, discarding any existing
+    /// file first.
+    ///
+    /// Why: the `--force` reindex (issue #28, Phase 4) stages the rebuilt
+    /// corpus in `index.redb.tmp`. A stale `.tmp` left behind by a previously
+    /// aborted reindex must not contribute pre-existing rows to the new staged
+    /// corpus — the staged file must reflect *only* this reindex's output so
+    /// the post-reindex atomic rename produces a corpus identical to a clean
+    /// rebuild.
+    /// What: best-effort removes any file already at `path`, then delegates to
+    /// [`Self::open`]. A `NotFound` removal error is ignored (nothing to
+    /// clear); any other removal error is surfaced.
+    /// Test: `tests::test_force_reindex_atomic_corpus_swap`.
+    pub fn open_fresh(path: &Path) -> Result<Self> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("clear stale staging corpus at {}", path.display()))
+            }
+        }
+        Self::open(path)
+    }
+
+    /// Filesystem path this store's database was opened at.
+    ///
+    /// Why: the atomic `--force` reindex swap needs to know the staging file's
+    /// path to rename it over the live `index.redb`, and the caller would
+    /// otherwise have to thread the path alongside every `Arc<CorpusStore>`.
+    /// What: returns the stored `PathBuf`.
+    /// Test: `tests::test_force_reindex_atomic_corpus_swap` asserts the path.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Upsert a batch of chunks in a single redb write transaction.
@@ -340,5 +383,61 @@ mod tests {
         store.upsert_entities(&[]).unwrap();
         store.delete_chunks(&[]).unwrap();
         assert_eq!(store.chunk_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_entities_removes_file_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CorpusStore::open(&dir.path().join("index.redb")).unwrap();
+        store
+            .upsert_entities(&[
+                ("src/a.rs".to_string(), Vec::new()),
+                ("src/b.rs".to_string(), Vec::new()),
+            ])
+            .unwrap();
+        assert_eq!(store.load_all_entities().unwrap().len(), 2);
+        store.delete_entities("src/a.rs").unwrap();
+        let remaining = store.load_all_entities().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "src/b.rs");
+        // Deleting an unknown file is a silent no-op.
+        store.delete_entities("src/never.rs").unwrap();
+        assert_eq!(store.load_all_entities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn path_accessor_returns_open_path() {
+        // Issue #28 Phase 4: the atomic-swap path reads `path()` to know which
+        // file to rename. It must echo back exactly what `open` was given.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.redb");
+        let store = CorpusStore::open(&p).unwrap();
+        assert_eq!(store.path(), p.as_path());
+    }
+
+    #[test]
+    fn open_fresh_truncates_stale_staging_file() {
+        // Issue #28 Phase 4: a stale `index.redb.tmp` left by an aborted
+        // reindex must not contribute pre-existing rows to the next staged
+        // corpus — `open_fresh` discards the old file first.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.redb.tmp");
+
+        // Populate, then drop so the file is closed and persisted on disk.
+        {
+            let store = CorpusStore::open(&p).unwrap();
+            store.upsert_chunks(&[raw("stale:1:1", "old")]).unwrap();
+            assert_eq!(store.chunk_count().unwrap(), 1);
+        }
+        assert!(p.exists());
+
+        // `open_fresh` must yield an empty corpus despite the existing file.
+        let fresh = CorpusStore::open_fresh(&p).unwrap();
+        assert_eq!(fresh.chunk_count().unwrap(), 0);
+        assert_eq!(fresh.path(), p.as_path());
+
+        // And `open_fresh` on a path that does not exist is also fine.
+        let fresh2 = CorpusStore::open_fresh(&dir.path().join("never.redb.tmp")).unwrap();
+        assert_eq!(fresh2.chunk_count().unwrap(), 0);
     }
 }

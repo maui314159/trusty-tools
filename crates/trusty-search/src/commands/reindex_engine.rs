@@ -148,6 +148,13 @@ pub async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
 /// payload. Naming each phase makes a stalled reindex diagnosable at a glance.
 /// What: a small enum with a human-readable label per variant.
 /// Test: `tests::phase_labels_are_stable` asserts each label string.
+//
+// `Bm25` / `KnowledgeGraph` / `Upsert` are not yet constructed by the live
+// progress loop — the daemon currently fuses those phases into the terminal
+// `complete` event rather than streaming a per-phase signal. They are retained
+// (with stable labels, exercised by `phase_labels_are_stable`) so the CLI is
+// ready the moment the daemon emits per-phase SSE events.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReindexPhase {
     /// Waiting for the daemon's first SSE event.

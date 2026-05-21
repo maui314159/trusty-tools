@@ -553,8 +553,11 @@ pub async fn flush_all_indexes_on_shutdown(state: &SearchAppState) {
             }
         };
         let indexer = handle.indexer.read().await;
-        if let Err(e) = indexer.save_chunks_to_disk(&chunks_path).await {
-            tracing::warn!("shutdown: failed to save chunks for '{}': {e}", id.0);
+        // Issue #28: `flush_corpus_to_disk` writes to redb when a `CorpusStore`
+        // is wired (final consistency sweep, no full JSON rewrite) and falls
+        // back to the legacy `chunks.json` snapshot otherwise.
+        if let Err(e) = indexer.flush_corpus_to_disk(&chunks_path).await {
+            tracing::warn!("shutdown: failed to flush chunk corpus for '{}': {e}", id.0);
         }
         match indexer.save_vector_store(&hnsw_path).await {
             Ok(true) => tracing::debug!("shutdown: saved HNSW for '{}'", id.0),

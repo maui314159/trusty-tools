@@ -77,6 +77,12 @@ async fn probe_health(base: &str) -> bool {
 /// the parent terminal via `Stdio::null()` for all three fds — this is what
 /// prevents SIGHUP from a closing tmux pane / terminal from killing the
 /// daemon.
+//
+// Retained as the device-agnostic convenience wrapper over
+// `spawn_daemon_with_device`; all current call sites pass an explicit device
+// (issue #24) so this is presently unused, but it is the stable entry point
+// for callers that have no device preference.
+#[allow(dead_code)]
 pub(crate) fn spawn_daemon() -> Result<u32> {
     spawn_daemon_with_device(None)
 }

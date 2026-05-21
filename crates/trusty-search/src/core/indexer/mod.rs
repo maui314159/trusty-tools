@@ -451,8 +451,20 @@ pub struct CodeIndexer {
     pub(super) embedder: Option<Arc<dyn Embedder>>,
     pub(super) store: Option<Arc<dyn VectorStore>>,
 
-    /// In-memory chunk corpus. Will be backed by redb once #4/#6 land.
+    /// In-memory chunk corpus. Kept hot for sub-millisecond query-time
+    /// materialization (`search.rs` joins fused `(id, score)` pairs against
+    /// this map without any I/O). Issue #28 added [`Self::corpus`] as the
+    /// durable redb backing store: `chunks` is now a write-through cache of
+    /// the redb `CHUNKS_TABLE`, not the source of truth for persistence.
     pub(super) chunks: Arc<RwLock<HashMap<String, RawChunk>>>,
+
+    /// Durable redb-backed chunk corpus (issue #28). `None` for BM25-only or
+    /// test indexers built without a data dir. When `Some`, every committed
+    /// batch is written here transactionally (replacing the old full-rewrite
+    /// `chunks.json` snapshot) and the warm-boot path rehydrates `chunks` +
+    /// `entities` from it. Held behind an `Arc` so the fire-and-forget persist
+    /// task can own a clone without borrowing `&self`.
+    pub(super) corpus: Option<Arc<crate::core::corpus::CorpusStore>>,
 
     /// Per-file entities extracted by `chunk_ast`. Keyed by file path.
     pub(super) entities: Arc<RwLock<HashMap<String, Vec<RawEntity>>>>,
@@ -554,6 +566,7 @@ impl CodeIndexer {
             root_path: root_path.into(),
             embedder: None,
             store: None,
+            corpus: None,
             chunks: Arc::new(RwLock::new(HashMap::new())),
             entities: Arc::new(RwLock::new(HashMap::new())),
             chunk_embeddings: Arc::new(RwLock::new(LruCache::new(emb_cap))),
@@ -611,5 +624,69 @@ impl CodeIndexer {
         self.embedder = Some(embedder);
         self.store = Some(store);
         self
+    }
+
+    /// Attach a durable redb-backed [`crate::core::corpus::CorpusStore`]
+    /// (issue #28).
+    ///
+    /// Why: the daemon resolves one `index.redb` per index under its data dir
+    /// and wires it in before warm-boot. Test / BM25-only indexers that have
+    /// no data dir simply skip this call and run with `corpus: None` — the
+    /// ingest path treats a missing corpus store as "in-memory only", so they
+    /// behave exactly as before issue #28.
+    /// What: stores the `Arc` so both the ingest commit path and the
+    /// fire-and-forget persist task can reach it.
+    /// Test: `tests::test_corpus_store_roundtrip` builds an indexer with a
+    /// `CorpusStore`, commits a batch, and asserts a fresh indexer restores it.
+    pub fn set_corpus_store(&mut self, corpus: Arc<crate::core::corpus::CorpusStore>) {
+        self.corpus = Some(corpus);
+    }
+
+    /// Swap in a new durable corpus store, returning the one it replaced
+    /// (issue #28, Phase 4).
+    ///
+    /// Why: a `--force` reindex stages its rebuilt corpus in a temp
+    /// `index.redb.tmp`. The orchestrator swaps that staging store onto the
+    /// indexer for the duration of the reindex so every `commit_parsed_batch`
+    /// writes the new corpus to the temp file (never touching the live
+    /// `index.redb`), then swaps the finalized store back afterwards. Returning
+    /// the previous store lets the caller drop the live store's open handle
+    /// before the atomic rename — redb keeps the file mapped while any handle
+    /// is alive, so the rename-over must happen with no live `Arc` left.
+    /// What: replaces `self.corpus` with `Some(corpus)` and returns the prior
+    /// value.
+    /// Test: `tests::test_force_reindex_atomic_corpus_swap`.
+    pub fn swap_corpus_store(
+        &mut self,
+        corpus: Arc<crate::core::corpus::CorpusStore>,
+    ) -> Option<Arc<crate::core::corpus::CorpusStore>> {
+        self.corpus.replace(corpus)
+    }
+
+    /// Take the durable corpus store out of the indexer, leaving `None`
+    /// (issue #28, Phase 4).
+    ///
+    /// Why: to atomically rename the staging corpus file over the live one,
+    /// every `Arc<CorpusStore>` clone pointing at either file must first be
+    /// dropped (redb holds the file open as long as a handle exists). The
+    /// reindex orchestrator calls this to extract the staging store so it can
+    /// drop the last `Arc`, perform the rename, and then re-open + re-install
+    /// a store pointing at the now-swapped `index.redb`.
+    /// What: `Option::take` on `self.corpus`.
+    /// Test: `tests::test_force_reindex_atomic_corpus_swap`.
+    pub fn take_corpus_store(&mut self) -> Option<Arc<crate::core::corpus::CorpusStore>> {
+        self.corpus.take()
+    }
+
+    /// True iff a durable corpus store is currently wired (issue #28).
+    ///
+    /// Why: the `--force` reindex orchestrator only performs the atomic
+    /// staging-file swap when the index actually has a durable corpus —
+    /// BM25-only / test indexers run with `corpus: None` and must skip the
+    /// swap entirely.
+    /// What: `self.corpus.is_some()`.
+    /// Test: covered by `tests::test_force_reindex_atomic_corpus_swap`.
+    pub fn has_corpus_store(&self) -> bool {
+        self.corpus.is_some()
     }
 }

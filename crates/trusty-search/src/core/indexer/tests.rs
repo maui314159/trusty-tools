@@ -1129,3 +1129,213 @@ async fn test_no_boost_when_branch_files_absent() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #28 — durable redb corpus integration.
+// ---------------------------------------------------------------------------
+
+use crate::core::corpus::CorpusStore;
+
+/// Build a BM25-only indexer (no embedder/store needed) with a durable redb
+/// `CorpusStore` wired at `redb_path`.
+///
+/// Why: the corpus-integration tests exercise the commit → redb → warm-boot
+/// rehydration path, which is orthogonal to the HNSW lane. A BM25-only indexer
+/// keeps the tests hermetic (no ONNX) while still hitting every `corpus`
+/// branch in `commit_parsed_batch` / `load_chunks_from_redb` / removal.
+fn make_indexer_with_corpus(redb_path: &std::path::Path) -> CodeIndexer {
+    let mut idx = CodeIndexer::new("corpus-test", "/tmp/corpus-test");
+    let store = CorpusStore::open(redb_path).expect("open corpus store");
+    idx.set_corpus_store(Arc::new(store));
+    idx
+}
+
+/// Phase 2 + 3: a committed batch must persist to redb, and a fresh indexer
+/// pointed at the same redb file must rehydrate the corpus on warm-boot.
+#[tokio::test]
+async fn test_corpus_store_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let redb_path = dir.path().join("index.redb");
+
+    // Phase 1: index two files into an indexer with a durable corpus.
+    {
+        let idx = make_indexer_with_corpus(&redb_path);
+        idx.index_files_batch(&[
+            ("src/auth.rs".into(), "fn authenticate() {}".into()),
+            ("src/token.rs".into(), "fn verify_token() {}".into()),
+        ])
+        .await
+        .expect("index batch");
+        assert!(idx.chunk_count() >= 2);
+    } // indexer (and its CorpusStore Arc) dropped here — simulates shutdown.
+
+    // The redb file must hold the committed chunks.
+    {
+        let store = CorpusStore::open(&redb_path).unwrap();
+        assert!(
+            store.chunk_count().unwrap() >= 2,
+            "committed batch was not persisted to redb"
+        );
+    }
+
+    // Phase 2: a fresh indexer warm-boots from the redb corpus — no reindex.
+    let restored = make_indexer_with_corpus(&redb_path);
+    let n = restored
+        .load_chunks_from_redb()
+        .await
+        .expect("warm-boot from redb");
+    assert!(n >= 2, "warm-boot rehydrated {n} chunks, expected >= 2");
+    assert_eq!(restored.chunk_count(), n);
+
+    // BM25 must be rebuilt from the rehydrated corpus.
+    let bm25 = restored.bm25.read().await;
+    let hits = bm25.score_query_all("authenticate", 5);
+    drop(bm25);
+    assert!(
+        !hits.is_empty(),
+        "BM25 not rebuilt from redb-restored chunks"
+    );
+}
+
+/// Phase 3: warm-boot from an empty / missing redb corpus must yield zero
+/// chunks (the first-run / post-upgrade fallback that triggers a reindex).
+#[tokio::test]
+async fn test_corpus_store_warm_boot_empty_is_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = make_indexer_with_corpus(&dir.path().join("fresh.redb"));
+    let n = idx.load_chunks_from_redb().await.unwrap();
+    assert_eq!(n, 0, "empty redb corpus must rehydrate zero chunks");
+
+    // An indexer with no corpus store at all also yields zero (BM25-only).
+    let bare = CodeIndexer::new("bare", "/tmp/bare");
+    assert_eq!(bare.load_chunks_from_redb().await.unwrap(), 0);
+}
+
+/// Phase 2: `remove_file` / `remove_chunk` must evict from the durable redb
+/// corpus too — otherwise a warm-boot resurrects the deleted chunks.
+#[tokio::test]
+async fn test_corpus_store_deletes_on_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let redb_path = dir.path().join("index.redb");
+
+    let idx = make_indexer_with_corpus(&redb_path);
+    idx.index_files_batch(&[
+        ("src/keep.rs".into(), "fn keep_me() {}".into()),
+        ("src/drop.rs".into(), "fn drop_me() {}".into()),
+    ])
+    .await
+    .unwrap();
+    let before = idx.chunk_count();
+    assert!(before >= 2);
+
+    // Remove one file — this must delete its chunks from redb as well.
+    idx.remove_file("src/drop.rs").await.unwrap();
+    drop(idx);
+
+    // Re-open the redb corpus directly: the dropped file's chunks must be gone.
+    // redb is single-process-exclusive, so this store MUST be dropped before
+    // the warm-boot indexer below re-opens the same file.
+    let chunks = {
+        let store = CorpusStore::open(&redb_path).unwrap();
+        store.load_all_chunks().unwrap()
+    };
+    assert!(
+        chunks.iter().all(|c| c.file != "src/drop.rs"),
+        "removed file's chunks still present in redb after remove_file"
+    );
+    assert!(
+        chunks.iter().any(|c| c.file == "src/keep.rs"),
+        "remove_file evicted the wrong file's chunks from redb"
+    );
+
+    // Warm-boot a fresh indexer: the removal must survive the restart.
+    let restored = make_indexer_with_corpus(&redb_path);
+    restored.load_chunks_from_redb().await.unwrap();
+    let ids = restored.find_chunk_id("drop.rs", None).await;
+    assert!(ids.is_none(), "deleted chunk resurrected on warm-boot");
+}
+
+/// Phase 3 migration: a daemon upgraded from a JSON-snapshot build has a
+/// populated `chunks.json` and an empty `index.redb`. `migrate_corpus_to_redb`
+/// must seed redb so the next restart uses the fast path.
+#[tokio::test]
+async fn test_corpus_store_migrates_from_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let json_path = dir.path().join("chunks.json");
+    let redb_path = dir.path().join("index.redb");
+
+    // Stage a legacy JSON snapshot via an indexer with no corpus store.
+    {
+        let legacy = make_indexer();
+        legacy
+            .add_chunk(raw("a", "src/a.rs", "fn legacy_a() {}"))
+            .await
+            .unwrap();
+        legacy
+            .add_chunk(raw("b", "src/b.rs", "fn legacy_b() {}"))
+            .await
+            .unwrap();
+        legacy.save_chunks_to_disk(&json_path).await.unwrap();
+    }
+    assert!(json_path.exists());
+
+    // Warm-boot path: load the JSON snapshot, then migrate it into redb.
+    let idx = make_indexer_with_corpus(&redb_path);
+    let n = idx.load_chunks_from_disk(&json_path).await.unwrap();
+    assert_eq!(n, 2);
+    idx.migrate_corpus_to_redb().await;
+    drop(idx);
+
+    // The redb corpus must now hold the migrated chunks, so a subsequent
+    // restart can skip the JSON file entirely.
+    let restored = make_indexer_with_corpus(&redb_path);
+    let m = restored.load_chunks_from_redb().await.unwrap();
+    assert_eq!(m, 2, "redb corpus was not seeded by the JSON migration");
+}
+
+/// Phase 4: `swap_corpus_store` / `take_corpus_store` give the reindex
+/// orchestrator the ability to stage a rebuilt corpus in a temp file and then
+/// restore the indexer's durable store — without losing the original.
+#[tokio::test]
+async fn test_corpus_store_swap_and_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let live_path = dir.path().join("index.redb");
+    let tmp_path = dir.path().join("index.redb.tmp");
+
+    let mut idx = make_indexer_with_corpus(&live_path);
+    assert!(idx.has_corpus_store());
+
+    // Stage a fresh tmp corpus, capturing the live one it replaced. The prior
+    // store's `Arc` is dropped immediately: redb is single-process-exclusive,
+    // and `commit_force_corpus_swap` likewise drops the prior handle before
+    // the rename. We only assert its path first.
+    let staged = Arc::new(CorpusStore::open_fresh(&tmp_path).unwrap());
+    let prev = idx.swap_corpus_store(staged).expect("prior store returned");
+    assert_eq!(prev.path(), live_path.as_path());
+    drop(prev);
+
+    // Commit a batch — it must land in the *staging* file, not the live one.
+    idx.index_files_batch(&[("src/new.rs".into(), "fn brand_new() {}".into())])
+        .await
+        .unwrap();
+
+    // Take the staging store back out so its Arc can be dropped before a
+    // rename (mirrors `commit_force_corpus_swap`).
+    let staged_back = idx.take_corpus_store().expect("staging store taken");
+    assert_eq!(staged_back.path(), tmp_path.as_path());
+    assert!(!idx.has_corpus_store());
+    assert!(
+        staged_back.chunk_count().unwrap() >= 1,
+        "batch did not commit to the staged corpus"
+    );
+    // Drop the staging handle so the live file can be re-opened below.
+    drop(staged_back);
+
+    // The original live file must be untouched — it never saw the new batch.
+    let live = CorpusStore::open(&live_path).unwrap();
+    assert_eq!(
+        live.chunk_count().unwrap(),
+        0,
+        "live corpus was mutated while a staging corpus was swapped in"
+    );
+}

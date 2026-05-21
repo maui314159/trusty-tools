@@ -565,6 +565,15 @@ impl CodeIndexer {
         let bm25_ms = bm25_start.elapsed().as_millis() as u64;
 
         self.commit_embeddings_cache(&all_chunks, embeddings).await;
+        // Snapshot the chunks for the durable redb write BEFORE `commit_corpus`
+        // drains `all_chunks` into the in-memory map. `commit_corpus` consumes
+        // its input via `drain`, so we clone here once; the redb write is then
+        // independent of the corpus map. Skipped entirely when no `CorpusStore`
+        // is wired (test / BM25-only indexers).
+        if self.corpus.is_some() {
+            self.commit_corpus_to_redb(&all_chunks, &entities_by_file)
+                .await;
+        }
         self.commit_corpus(&mut all_chunks).await;
         self.commit_entities(entities_by_file).await;
 
@@ -694,6 +703,49 @@ impl CodeIndexer {
                 cap,
                 dropped
             );
+        }
+    }
+
+    /// Persist a committed batch to the durable redb corpus store (issue #28).
+    ///
+    /// Why: replaces the old full-rewrite `chunks.json` snapshot. Each batch is
+    /// written in its own redb write transaction, so the on-disk corpus is
+    /// always crash-consistent and the write cost is O(batch) rather than
+    /// O(corpus). The redb write runs on `spawn_blocking` because redb's
+    /// transaction API is synchronous and a large batch's `serde_json` encode
+    /// plus fsync would otherwise pin a tokio worker thread.
+    /// What: clones the chunks plus entities (cheap relative to the JSON
+    /// encode), moves them onto a blocking worker, and writes both tables.
+    /// Failures are logged at `warn` and swallowed — persistence is a
+    /// durability backup, so a transient I/O error must not abort the
+    /// in-memory commit (the next batch's write, or shutdown flush, will
+    /// re-converge the on-disk state).
+    /// Test: `tests::test_corpus_store_roundtrip`.
+    async fn commit_corpus_to_redb(
+        &self,
+        chunks: &[RawChunk],
+        entities_by_file: &[(String, Vec<RawEntity>)],
+    ) {
+        let Some(corpus) = self.corpus.clone() else {
+            return;
+        };
+        let chunks = chunks.to_vec();
+        let entities = entities_by_file.to_vec();
+        let index_id = self.index_id.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            corpus.upsert_chunks(&chunks)?;
+            corpus.upsert_entities(&entities)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                "index '{index_id}': redb corpus write failed ({e}) — \
+                 in-memory commit succeeded; on-disk corpus will re-converge \
+                 on the next batch or shutdown flush"
+            ),
+            Err(e) => tracing::warn!("index '{index_id}': redb corpus write task panicked ({e})"),
         }
     }
 

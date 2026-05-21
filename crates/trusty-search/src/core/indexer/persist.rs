@@ -20,6 +20,11 @@ use crate::core::store::VectorStore;
 
 use super::{ChunkSnapshot, CodeIndexer};
 
+/// Restored corpus payload: the full chunk list paired with the per-file
+/// entity lists. Named so the `spawn_blocking` closure that produces it on the
+/// redb warm-boot path (`load_chunks_from_redb`) has a readable signature.
+type RestoredCorpus = (Vec<RawChunk>, Vec<(String, Vec<RawEntity>)>);
+
 impl CodeIndexer {
     /// Snapshot the in-memory chunk corpus + entities to disk as JSON.
     ///
@@ -126,6 +131,157 @@ impl CodeIndexer {
         Ok(total)
     }
 
+    /// Restore the chunk corpus + entities from the durable redb store
+    /// (issue #28). Counterpart of [`Self::load_chunks_from_disk`], which read
+    /// the legacy `chunks.json` snapshot.
+    ///
+    /// Why: redb replaces the full-rewrite JSON snapshot. The warm-boot path
+    /// calls this first; only when the redb corpus is empty (a fresh install,
+    /// or the first boot after upgrading from a JSON-snapshot build) does the
+    /// caller fall back to [`Self::load_chunks_from_disk`] for a one-time
+    /// migration read.
+    /// What: reads every chunk + entity row from `CorpusStore` on a blocking
+    /// worker (redb's API is sync), refills BM25, publishes `chunks` +
+    /// `entities`, and rebuilds the symbol graph — mirroring the JSON path's
+    /// four-phase publish. Returns the number of chunks restored. A `None`
+    /// corpus store (test indexer) or an empty store yields `Ok(0)` so the
+    /// caller cleanly falls through to the JSON migration branch.
+    /// Test: `tests::test_corpus_store_roundtrip`.
+    pub async fn load_chunks_from_redb(&self) -> Result<usize> {
+        let Some(corpus) = self.corpus.clone() else {
+            return Ok(0);
+        };
+        // redb's transaction API is synchronous; do the (potentially large)
+        // deserialize on a blocking worker so we don't pin a runtime thread.
+        let (chunks, entities) = tokio::task::spawn_blocking(move || -> Result<RestoredCorpus> {
+            let chunks = corpus.load_all_chunks()?;
+            let entities = corpus.load_all_entities()?;
+            Ok((chunks, entities))
+        })
+        .await
+        .context("redb corpus load task panicked")??;
+
+        let total = chunks.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        // Phase 1: refill BM25 before publishing chunks so concurrent reads
+        // can't observe a half-state (mirrors `load_chunks_from_disk`).
+        {
+            let mut bm25 = self.bm25.write().await;
+            for chunk in &chunks {
+                let text = Self::bm25_doc_text(chunk);
+                bm25.upsert_document(&chunk.id, &text);
+            }
+        }
+        // Phase 2: publish chunks.
+        {
+            let mut corpus_map = self.chunks.write().await;
+            for chunk in chunks {
+                corpus_map.insert(chunk.id.clone(), chunk);
+            }
+        }
+        // Phase 3: publish entities.
+        {
+            let mut emap = self.entities.write().await;
+            for (file, ents) in entities {
+                emap.insert(file, ents);
+            }
+        }
+        // Phase 4: rebuild the symbol graph from the restored corpus.
+        self.rebuild_symbol_graph().await;
+        tracing::info!(
+            "restored {} chunks for index '{}' from redb corpus",
+            total,
+            self.index_id
+        );
+        Ok(total)
+    }
+
+    /// One-time migration: copy a legacy `chunks.json` snapshot into the redb
+    /// corpus store (issue #28).
+    ///
+    /// Why: daemons upgraded from a JSON-snapshot build have a populated
+    /// `chunks.json` but an empty `index.redb`. After the warm-boot path reads
+    /// the JSON snapshot into memory it calls this to seed redb so every
+    /// subsequent restart uses the fast redb path and the JSON file becomes
+    /// inert. Best-effort: a failure is logged, not fatal — the in-memory
+    /// corpus is already live and the next reindex will populate redb anyway.
+    /// What: snapshots the current in-memory `chunks` + `entities` under read
+    /// locks and writes them to the `CorpusStore` on a blocking worker.
+    /// Test: `tests::test_corpus_store_migrates_from_json`.
+    pub async fn migrate_corpus_to_redb(&self) {
+        let Some(corpus) = self.corpus.clone() else {
+            return;
+        };
+        let chunks: Vec<RawChunk> = {
+            let g = self.chunks.read().await;
+            g.values().cloned().collect()
+        };
+        let entities: Vec<(String, Vec<RawEntity>)> = {
+            let g = self.entities.read().await;
+            g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        if chunks.is_empty() {
+            return;
+        }
+        let total = chunks.len();
+        let index_id = self.index_id.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            corpus.upsert_chunks(&chunks)?;
+            corpus.upsert_entities(&entities)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => tracing::info!(
+                "index '{index_id}': migrated {total} chunks from chunks.json to redb"
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!("index '{index_id}': redb corpus migration failed ({e})")
+            }
+            Err(e) => {
+                tracing::warn!("index '{index_id}': redb corpus migration task panicked ({e})")
+            }
+        }
+    }
+
+    /// Flush the chunk corpus durably on shutdown, picking the right backend.
+    ///
+    /// Why (issue #28): the shutdown hook must persist the corpus, but the
+    /// path differs by backend. A redb-backed index has already committed
+    /// every batch transactionally, so shutdown only needs a final consistency
+    /// sweep (re-upserting the in-memory map covers the rare case of an
+    /// in-flight batch whose redb write lost a race with SIGTERM) — crucially
+    /// **without** the full-rewrite JSON encode that triggered the
+    /// memory-explosion. A legacy index (no `CorpusStore`) still needs the
+    /// JSON snapshot at `path`.
+    /// What: when a `CorpusStore` is wired, snapshots the in-memory corpus and
+    /// upserts it into redb; otherwise delegates to `save_chunks_to_disk`.
+    /// Test: covered by the corpus roundtrip integration test plus the
+    /// existing shutdown integration test.
+    pub async fn flush_corpus_to_disk(&self, path: &std::path::Path) -> Result<()> {
+        let Some(corpus) = self.corpus.clone() else {
+            // Legacy path: no redb store wired — write the JSON snapshot.
+            return self.save_chunks_to_disk(path).await;
+        };
+        let chunks: Vec<RawChunk> = {
+            let g = self.chunks.read().await;
+            g.values().cloned().collect()
+        };
+        let entities: Vec<(String, Vec<RawEntity>)> = {
+            let g = self.entities.read().await;
+            g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            corpus.upsert_chunks(&chunks)?;
+            corpus.upsert_entities(&entities)?;
+            Ok(())
+        })
+        .await
+        .context("redb corpus shutdown-flush task panicked")?
+    }
+
     /// Snapshot the HNSW vector store, if one is wired. Best-effort: returns
     /// `Ok(false)` if no store is attached (BM25-only mode) so callers can
     /// chain without checking.
@@ -216,18 +372,31 @@ impl CodeIndexer {
         let chunks = self.chunks.clone();
         let entities = self.entities.clone();
         let persist_state = self.persist_state.clone();
+        // Issue #28: when a redb `CorpusStore` is wired, the chunk corpus is
+        // already persisted transactionally per-batch by `commit_corpus_to_redb`.
+        // Skipping the full-rewrite `chunks.json` snapshot here eliminates the
+        // memory-explosion path entirely (the ~1× corpus clone + JSON encode
+        // documented in `PersistState`). Only the HNSW snapshot still needs the
+        // background task. `false` (no corpus store) keeps the legacy JSON
+        // behaviour for test / BM25-only indexers.
+        let persist_chunks_json = self.corpus.is_none();
         tokio::spawn(async move {
             // Re-resolve paths in the task so the persistence layer's path
-            // resolution failures don't crash the commit caller.
-            let chunks_path = match crate::service::persistence::chunks_path(&index_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(
-                        "incremental persist: cannot resolve chunks path for '{index_id}': {e}"
-                    );
-                    persist_state.in_flight.store(false, Ordering::Release);
-                    return;
+            // resolution failures don't crash the commit caller. The chunks
+            // JSON path is only needed in the legacy (no redb) mode.
+            let chunks_path = if persist_chunks_json {
+                match crate::service::persistence::chunks_path(&index_id) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::debug!(
+                            "incremental persist: cannot resolve chunks path for '{index_id}': {e}"
+                        );
+                        persist_state.in_flight.store(false, Ordering::Release);
+                        return;
+                    }
                 }
+            } else {
+                None
             };
             let hnsw_path = match crate::service::persistence::hnsw_path(&index_id) {
                 Ok(p) => p,
@@ -261,68 +430,59 @@ impl CodeIndexer {
                     }
                 }
 
-                // Snapshot chunks + entities under read locks. We scope the
-                // clones tightly so the Vec<RawChunk> is dropped before the
-                // next loop iteration; serde_json::to_vec is run inside a
-                // spawn_blocking so the ~hundreds-of-MB JSON build doesn't
-                // block a runtime worker thread.
-                let chunks_vec: Vec<RawChunk> = {
-                    let g = chunks.read().await;
-                    g.values().cloned().collect()
-                };
-                let entities_vec: Vec<(String, Vec<RawEntity>)> = {
-                    let g = entities.read().await;
-                    g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                };
-                let snapshot = ChunkSnapshot {
-                    version: 1,
-                    chunks: chunks_vec,
-                    entities: entities_vec,
-                };
-                if let Some(parent) = chunks_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let tmp = chunks_path.with_extension("json.tmp");
-                let chunks_path_inner = chunks_path.clone();
-                let index_id_inner = index_id.clone();
-                // Serialize + write on a blocking worker so we don't pin a
-                // runtime worker for hundreds of ms on large corpora. Move
-                // `snapshot` in so it's dropped on the blocking thread
-                // immediately after `to_vec` returns — the peak allocation
-                // is `snapshot + bytes` for the duration of `to_vec`, not
-                // `snapshot + bytes` for the full file write.
-                let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                    let bytes = match serde_json::to_vec(&snapshot) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(
-                                "incremental persist: serialize chunks failed for \
-                                 '{index_id_inner}': {e}"
-                            );
-                            return Ok(()); // non-fatal
-                        }
+                // Legacy chunks.json snapshot — only when no redb corpus
+                // store is wired (issue #28). Snapshot chunks + entities under
+                // read locks, scoped tightly so the `Vec<RawChunk>` is dropped
+                // before the next loop iteration; `serde_json::to_vec` runs
+                // inside a `spawn_blocking` so the hundreds-of-MB JSON build
+                // doesn't block a runtime worker thread.
+                if let Some(chunks_path) = &chunks_path {
+                    let chunks_vec: Vec<RawChunk> = {
+                        let g = chunks.read().await;
+                        g.values().cloned().collect()
                     };
-                    // Drop `snapshot` explicitly — we no longer need the
-                    // cloned Vec<RawChunk> now that `bytes` holds the
-                    // serialized form. This is the single biggest peak-RAM
-                    // savings: without the drop, both `snapshot` (clones)
-                    // and `bytes` (JSON) live simultaneously.
-                    // (Implicit drop at end of `to_vec` call — `snapshot`
-                    // is moved into `to_vec` then dropped at the call
-                    // boundary, so it's already gone here.)
-                    std::fs::write(&tmp, &bytes)?;
-                    std::fs::rename(&tmp, &chunks_path_inner)?;
-                    Ok(())
-                })
-                .await;
-                match join {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!("incremental persist: I/O failed for '{index_id}': {e}")
+                    let entities_vec: Vec<(String, Vec<RawEntity>)> = {
+                        let g = entities.read().await;
+                        g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    };
+                    let snapshot = ChunkSnapshot {
+                        version: 1,
+                        chunks: chunks_vec,
+                        entities: entities_vec,
+                    };
+                    if let Some(parent) = chunks_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
                     }
-                    Err(e) => tracing::warn!(
-                        "incremental persist: blocking task panicked for '{index_id}': {e}"
-                    ),
+                    let tmp = chunks_path.with_extension("json.tmp");
+                    let chunks_path_inner = chunks_path.clone();
+                    let index_id_inner = index_id.clone();
+                    // Serialize + write on a blocking worker so we don't pin a
+                    // runtime worker for hundreds of ms on large corpora.
+                    let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        let bytes = match serde_json::to_vec(&snapshot) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "incremental persist: serialize chunks failed for \
+                                     '{index_id_inner}': {e}"
+                                );
+                                return Ok(()); // non-fatal
+                            }
+                        };
+                        std::fs::write(&tmp, &bytes)?;
+                        std::fs::rename(&tmp, &chunks_path_inner)?;
+                        Ok(())
+                    })
+                    .await;
+                    match join {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!("incremental persist: I/O failed for '{index_id}': {e}")
+                        }
+                        Err(e) => tracing::warn!(
+                            "incremental persist: blocking task panicked for '{index_id}': {e}"
+                        ),
+                    }
                 }
 
                 // If no new commits arrived during the snapshot, we're

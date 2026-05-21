@@ -177,8 +177,64 @@ impl CodeIndexer {
         let removed = ids.len();
         self.remove_chunks_from_stores(&ids).await;
         self.entities.write().await.remove(file_path);
+        // Issue #28: evict the file's entity list from the durable redb store
+        // too, or a restart would resurrect it into the symbol graph.
+        self.delete_entities_from_redb(file_path).await;
         self.rebuild_symbol_graph().await;
         Ok(removed)
+    }
+
+    /// Delete a file's entity list from the durable redb corpus (issue #28).
+    ///
+    /// Why: `remove_file` drops the in-memory entity list; the redb store must
+    /// follow or a restart would rebuild a stale symbol graph. No-op when no
+    /// `CorpusStore` is wired (test / BM25-only indexers).
+    /// What: runs `CorpusStore::delete_entities` on a blocking worker (redb's
+    /// API is sync). Errors are logged at `warn`, never propagated —
+    /// persistence cleanup must not fail a live in-memory removal.
+    /// Test: covered by `tests::test_corpus_store_roundtrip` deletion paths.
+    async fn delete_entities_from_redb(&self, file_path: &str) {
+        let Some(corpus) = self.corpus.clone() else {
+            return;
+        };
+        let file = file_path.to_string();
+        let index_id = self.index_id.clone();
+        match tokio::task::spawn_blocking(move || corpus.delete_entities(&file)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("index '{index_id}': redb entity delete failed ({e})")
+            }
+            Err(e) => {
+                tracing::warn!("index '{index_id}': redb entity delete task panicked ({e})")
+            }
+        }
+    }
+
+    /// Delete a set of chunk ids from the durable redb corpus (issue #28).
+    ///
+    /// Why: `remove_chunk` / `remove_file` evict chunks from every in-memory
+    /// structure; the redb store must follow or a restart resurrects them.
+    /// What: runs `CorpusStore::delete_chunks` on a blocking worker. Errors are
+    /// logged, never propagated.
+    /// Test: covered by `tests::test_corpus_store_roundtrip` deletion paths.
+    async fn delete_chunks_from_redb(&self, ids: &[String]) {
+        let Some(corpus) = self.corpus.clone() else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let ids = ids.to_vec();
+        let index_id = self.index_id.clone();
+        match tokio::task::spawn_blocking(move || corpus.delete_chunks(&ids)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("index '{index_id}': redb chunk delete failed ({e})")
+            }
+            Err(e) => {
+                tracing::warn!("index '{index_id}': redb chunk delete task panicked ({e})")
+            }
+        }
     }
 
     /// Remove every chunk id from the HNSW store, corpus, embedding cache,
@@ -215,6 +271,8 @@ impl CodeIndexer {
                 bm25.remove_document(id);
             }
         }
+        // Issue #28: mirror the deletion into the durable redb corpus.
+        self.delete_chunks_from_redb(ids).await;
     }
 
     /// Remove a chunk from the corpus and its vector from the HNSW store.
@@ -225,6 +283,8 @@ impl CodeIndexer {
         self.chunks.write().await.remove(chunk_id);
         self.chunk_embeddings.write().await.pop(chunk_id);
         self.bm25.write().await.remove_document(chunk_id);
+        // Issue #28: mirror the deletion into the durable redb corpus.
+        self.delete_chunks_from_redb(&[chunk_id.to_string()]).await;
         self.rebuild_symbol_graph().await;
         Ok(())
     }

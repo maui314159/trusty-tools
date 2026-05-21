@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::{
+    corpus::CorpusStore,
     embed::Embedder,
     indexer::CodeIndexer,
     store::{UsearchStore, VectorStore},
@@ -44,28 +45,70 @@ pub async fn build_indexer_with_persisted_state(
     let mut indexer =
         CodeIndexer::new(index_id, root_path).with_components(Arc::clone(embedder), store);
 
-    // Restore the chunk corpus (rebuilds BM25 + symbol graph as a side effect).
+    // Issue #28: wire the durable redb corpus store before restoring chunks.
+    // A failure to open the redb file is non-fatal — we log and run without a
+    // corpus store (the index simply behaves as a pre-#28 in-memory daemon and
+    // will be re-persisted to JSON via `spawn_incremental_persist`).
+    match persistence::corpus_redb_path(index_id) {
+        Ok(redb_path) => match CorpusStore::open(&redb_path) {
+            Ok(corpus) => indexer.set_corpus_store(Arc::new(corpus)),
+            Err(e) => tracing::warn!(
+                "warm-boot: could not open redb corpus for '{index_id}' at {} ({e}) — \
+                 running without durable corpus store",
+                redb_path.display()
+            ),
+        },
+        Err(e) => tracing::warn!("cannot resolve redb corpus path for '{index_id}': {e}"),
+    }
+
+    restore_corpus(&mut indexer, index_id).await;
+    indexer
+}
+
+/// Restore the chunk corpus for `indexer`, preferring the redb store and
+/// falling back to the legacy `chunks.json` snapshot (issue #28).
+///
+/// Why: redb is the new source of truth, but daemons upgraded in place have a
+/// populated `chunks.json` and an empty `index.redb`. This function tries redb
+/// first; on an empty redb corpus it reads the JSON snapshot and then seeds
+/// redb from it so every subsequent restart uses the fast path.
+/// What: `load_chunks_from_redb` → (if 0 chunks) `load_chunks_from_disk` +
+/// `migrate_corpus_to_redb`. Either restore path rebuilds BM25 + the symbol
+/// graph as a side effect.
+/// Test: covered by the corpus roundtrip + migration integration tests.
+async fn restore_corpus(indexer: &mut CodeIndexer, index_id: &str) {
+    // Primary path: redb durable corpus.
+    match indexer.load_chunks_from_redb().await {
+        Ok(n) if n > 0 => {
+            tracing::info!("warm-boot: restored {n} chunks for index '{index_id}' from redb");
+            return;
+        }
+        Ok(_) => {} // empty redb — fall through to the JSON migration branch
+        Err(e) => tracing::warn!(
+            "warm-boot: redb corpus load failed for '{index_id}' ({e}) — \
+             trying legacy chunks.json"
+        ),
+    }
+
+    // Fallback / migration path: legacy chunks.json snapshot.
     match persistence::chunks_path(index_id) {
         Ok(path) => match indexer.load_chunks_from_disk(&path).await {
-            Ok(n) if n > 0 => tracing::info!(
-                "warm-boot: restored {} chunks for index '{}' from {}",
-                n,
-                index_id,
-                path.display()
-            ),
-            Ok(_) => {} // empty / missing — first-run case
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    "warm-boot: restored {n} chunks for index '{index_id}' from legacy {} — \
+                     migrating to redb",
+                    path.display()
+                );
+                // Seed redb so the next restart uses the fast path.
+                indexer.migrate_corpus_to_redb().await;
+            }
+            Ok(_) => {} // empty / missing — genuine first-run case
             Err(e) => tracing::warn!(
-                "warm-boot: could not load chunks for '{}' ({e}) — starting empty",
-                index_id
+                "warm-boot: could not load chunks for '{index_id}' ({e}) — starting empty"
             ),
         },
         Err(e) => tracing::warn!("cannot resolve chunks path for '{index_id}': {e}"),
     }
-    // We need `set_store` only for the daemon-startup path (where we want to
-    // separate "restored store" from "fresh store"); the function above
-    // already handed us a properly-wired indexer, so nothing else to do.
-    let _ = &mut indexer;
-    indexer
 }
 
 /// Try to load the HNSW snapshot for `index_id`. On any failure (missing,

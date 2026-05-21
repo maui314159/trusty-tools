@@ -17,11 +17,12 @@ use crate::core::indexer::{CommitTimings, ParsedBatch};
 use crate::core::memguard::{current_rss_mb, index_memory_limit_mb};
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::walker::{should_skip_content, walk_source_files};
+use anyhow::Context;
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -896,6 +897,221 @@ async fn emit_complete_event(
         .await;
 }
 
+/// Begin the atomic-swap corpus staging for a `--force` reindex (issue #28,
+/// Phase 4).
+///
+/// Why: a `--force` reindex rebuilds the entire corpus. Committing those
+/// chunks straight into the live `index.redb` would expose a half-rebuilt
+/// corpus to concurrent searches and, on a crash mid-reindex, leave the
+/// serving corpus permanently torn. Staging the new corpus in a sibling
+/// `index.redb.tmp` and atomically renaming it into place only on success
+/// keeps the live corpus intact until the rebuild is complete.
+/// What: when the index has a durable corpus store, opens a fresh
+/// `index.redb.tmp` and swaps it onto the indexer (so every
+/// `commit_parsed_batch` writes the new corpus to the temp file). Returns the
+/// staging store's path so the caller can finalize or discard it. Returns
+/// `None` (skip staging) when the index has no corpus store (BM25-only / test
+/// indexers) or the temp path can't be resolved.
+async fn begin_force_corpus_swap(handle: &IndexHandle, index_id: &IndexId) -> Option<PathBuf> {
+    {
+        // Quick read-lock probe: nothing to stage if no durable corpus.
+        if !handle.indexer.read().await.has_corpus_store() {
+            return None;
+        }
+    }
+    let tmp_path = match crate::service::persistence::corpus_redb_tmp_path(&index_id.0) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                "force reindex: cannot resolve staging corpus path for '{}' ({e}) — \
+                 reindex will write directly to the live corpus",
+                index_id.0
+            );
+            return None;
+        }
+    };
+    // Open the staging store on a blocking worker (redb's API is sync).
+    let tmp_for_open = tmp_path.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        crate::core::corpus::CorpusStore::open_fresh(&tmp_for_open)
+    })
+    .await;
+    let staged = match staged {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "force reindex: could not open staging corpus for '{}' ({e}) — \
+                 reindex will write directly to the live corpus",
+                index_id.0
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "force reindex: staging corpus open task panicked for '{}': {e}",
+                index_id.0
+            );
+            return None;
+        }
+    };
+    // Swap the staging store onto the indexer. The prior live store's `Arc` is
+    // dropped here (the indexer held the only daemon-side clone); reads during
+    // the reindex are served from the in-memory `chunks` HashMap, so dropping
+    // the durable handle does not affect search.
+    let mut indexer = handle.indexer.write().await;
+    let _prev = indexer.swap_corpus_store(Arc::new(staged));
+    drop(indexer);
+    tracing::info!(
+        "force reindex: staging rebuilt corpus for '{}' in {}",
+        index_id.0,
+        tmp_path.display()
+    );
+    Some(tmp_path)
+}
+
+/// Finalize (commit) the atomic corpus swap after a successful `--force`
+/// reindex (issue #28, Phase 4).
+///
+/// Why: once the reindex has committed every batch to `index.redb.tmp`, the
+/// temp file holds the complete rebuilt corpus. Renaming it over the live
+/// `index.redb` makes the swap atomic — a search either sees the entire old
+/// corpus or the entire new one, never a mix.
+/// What: takes the staging store out of the indexer and drops its last `Arc`
+/// (redb keeps the file mapped while any handle is alive, so the handle MUST
+/// be dropped before the rename), renames `index.redb.tmp` → `index.redb`,
+/// re-opens a `CorpusStore` on the swapped-in file, and installs it on the
+/// indexer. Any failure leaves the previous live corpus in place and logs at
+/// `warn` — a botched swap must not crash the daemon.
+async fn commit_force_corpus_swap(handle: &IndexHandle, index_id: &IndexId, tmp_path: &Path) {
+    let live_path = match crate::service::persistence::corpus_redb_path(&index_id.0) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                "force reindex: cannot resolve live corpus path for '{}' ({e}) — \
+                 staged corpus left at {}",
+                index_id.0,
+                tmp_path.display()
+            );
+            return;
+        }
+    };
+    // Drop the staging store's last Arc so redb releases the temp file before
+    // the rename.
+    {
+        let mut indexer = handle.indexer.write().await;
+        let _ = indexer.take_corpus_store();
+    }
+    let tmp = tmp_path.to_path_buf();
+    let live = live_path.clone();
+    let index_id_inner = index_id.0.clone();
+    // rename + re-open on a blocking worker (filesystem + redb sync calls).
+    let reopened = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::core::corpus::CorpusStore> {
+            std::fs::rename(&tmp, &live).with_context(|| {
+                format!(
+                    "atomic-swap rename {} -> {} for '{index_id_inner}'",
+                    tmp.display(),
+                    live.display()
+                )
+            })?;
+            crate::core::corpus::CorpusStore::open(&live)
+                .with_context(|| format!("re-open swapped corpus for '{index_id_inner}'"))
+        },
+    )
+    .await;
+    match reopened {
+        Ok(Ok(store)) => {
+            handle
+                .indexer
+                .write()
+                .await
+                .set_corpus_store(Arc::new(store));
+            tracing::info!(
+                "force reindex: atomically swapped rebuilt corpus into {} for '{}'",
+                live_path.display(),
+                index_id.0
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(
+            "force reindex: atomic corpus swap failed for '{}' ({e}) — \
+             previous corpus preserved; in-memory state is the rebuilt one",
+            index_id.0
+        ),
+        Err(e) => tracing::warn!(
+            "force reindex: atomic corpus swap task panicked for '{}': {e}",
+            index_id.0
+        ),
+    }
+}
+
+/// Discard the staging corpus after an aborted / failed `--force` reindex
+/// (issue #28, Phase 4).
+///
+/// Why: if the reindex aborts (memory limit) or fails, the partially-written
+/// `index.redb.tmp` must not survive — the next `--force` reindex's
+/// `open_fresh` would clear it anyway, but leaving multi-GB stale temp files
+/// on disk between reindexes wastes space. The live `index.redb` is untouched
+/// by an aborted reindex, so reverting just means deleting the temp and
+/// re-opening the original live store.
+/// What: takes the staging store out of the indexer, drops its `Arc`, deletes
+/// `index.redb.tmp`, then re-opens and re-installs the live `index.redb` store
+/// so the indexer's durable corpus points back at the untouched original.
+async fn abort_force_corpus_swap(handle: &IndexHandle, index_id: &IndexId, tmp_path: &Path) {
+    {
+        let mut indexer = handle.indexer.write().await;
+        let _ = indexer.take_corpus_store();
+    }
+    let live_path = crate::service::persistence::corpus_redb_path(&index_id.0);
+    let tmp = tmp_path.to_path_buf();
+    let index_id_inner = index_id.0.clone();
+    let restored = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<crate::core::corpus::CorpusStore>> {
+            match std::fs::remove_file(&tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    "force reindex: could not delete staging corpus {} for '{index_id_inner}': {e}",
+                    tmp.display()
+                ),
+            }
+            match live_path {
+                Ok(live) => Ok(Some(crate::core::corpus::CorpusStore::open(&live)?)),
+                Err(e) => {
+                    tracing::warn!(
+                        "force reindex: cannot resolve live corpus path for '{index_id_inner}' \
+                         ({e}) — index left without a durable corpus until next restart"
+                    );
+                    Ok(None)
+                }
+            }
+        },
+    )
+    .await;
+    match restored {
+        Ok(Ok(Some(store))) => {
+            handle
+                .indexer
+                .write()
+                .await
+                .set_corpus_store(Arc::new(store));
+            tracing::warn!(
+                "force reindex: aborted — discarded staging corpus and restored the \
+                 original durable corpus for '{}'",
+                index_id.0
+            );
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            "force reindex: could not restore the original corpus for '{}' after abort ({e})",
+            index_id.0
+        ),
+        Err(e) => tracing::warn!(
+            "force reindex: corpus-restore task panicked for '{}': {e}",
+            index_id.0
+        ),
+    }
+}
+
 /// Variant of `spawn_reindex` that GC's the progress map after completion.
 /// See `spawn_reindex` for the rationale.
 pub fn spawn_reindex_with_cleanup(
@@ -945,6 +1161,20 @@ pub fn spawn_reindex_with_cleanup(
         if force {
             hashes.clear();
         }
+
+        // Issue #28, Phase 4: a `--force` reindex stages its rebuilt corpus in
+        // a sibling `index.redb.tmp`. Every `commit_parsed_batch` below writes
+        // the new corpus to the staging file; the live `index.redb` is left
+        // untouched until the reindex completes, at which point the staging
+        // file is atomically renamed over it. `None` when staging was skipped
+        // (non-force reindex, BM25-only index, or unresolvable temp path) — in
+        // that case commits write directly to the live corpus, exactly as
+        // before Phase 4.
+        let corpus_swap_tmp: Option<PathBuf> = if force {
+            begin_force_corpus_swap(&handle, &index_id).await
+        } else {
+            None
+        };
 
         // Per-subsystem timing accumulators. Each phase (parse, embed, BM25,
         // vector upsert) is measured inside the indexer (see `ParsedBatch` /
@@ -1096,6 +1326,21 @@ pub fn spawn_reindex_with_cleanup(
         // by running out of batches, by observing `mem_abort`, or by the
         // receiver being closed). Awaiting it surfaces panics for tracing.
         let _ = producer.await;
+
+        // Issue #28, Phase 4: finalize the atomic corpus swap. Every batch
+        // committed above wrote to `index.redb.tmp`; now that the batch loop
+        // is done we either atomically rename it over the live `index.redb`
+        // (clean completion) or discard it and restore the original
+        // (memory-abort). Done before the KG rebuild so the durable corpus is
+        // settled regardless of how the rebuild fares.
+        if let Some(tmp_path) = &corpus_swap_tmp {
+            let aborted = mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire);
+            if aborted {
+                abort_force_corpus_swap(&handle, &index_id, tmp_path).await;
+            } else {
+                commit_force_corpus_swap(&handle, &index_id, tmp_path).await;
+            }
+        }
 
         // Phase 3: rebuild the symbol graph once for the whole reindex.
         // Issue #90: always run, even after a memory abort — graph

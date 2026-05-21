@@ -119,9 +119,38 @@ pub fn hnsw_path(index_id: &str) -> Result<PathBuf> {
     Ok(index_data_dir(index_id)?.join("hnsw.usearch"))
 }
 
-/// Path to the chunk corpus snapshot for a given index.
+/// Path to the legacy JSON chunk corpus snapshot for a given index.
+///
+/// Retained for the issue #28 migration path: a daemon upgraded from a
+/// JSON-snapshot build reads this once to seed the redb corpus, after which
+/// [`corpus_redb_path`] is authoritative.
 pub fn chunks_path(index_id: &str) -> Result<PathBuf> {
     Ok(index_data_dir(index_id)?.join("chunks.json"))
+}
+
+/// Path to the redb-backed durable chunk corpus for a given index (issue #28).
+///
+/// Why: redb replaces the full-rewrite `chunks.json` snapshot with a
+/// transactional KV store written incrementally per batch. Each index gets one
+/// `index.redb` file under its data dir.
+/// What: returns `<data_dir>/indexes/<id>/index.redb`.
+/// Test: covered indirectly by the corpus roundtrip integration test.
+pub fn corpus_redb_path(index_id: &str) -> Result<PathBuf> {
+    Ok(index_data_dir(index_id)?.join("index.redb"))
+}
+
+/// Path to the staging redb corpus written during a `--force` reindex
+/// (issue #28, Phase 4).
+///
+/// Why: a `--force` reindex rebuilds the entire corpus. Writing those chunks
+/// directly into the live `index.redb` would expose a partially-rebuilt corpus
+/// to concurrent searches (and to a crash mid-reindex). Phase 4 stages the new
+/// corpus in a sibling `index.redb.tmp` file and atomically renames it over
+/// `index.redb` only once the reindex has fully completed.
+/// What: returns `<data_dir>/indexes/<id>/index.redb.tmp`.
+/// Test: covered by `tests::test_force_reindex_atomic_corpus_swap`.
+pub fn corpus_redb_tmp_path(index_id: &str) -> Result<PathBuf> {
+    Ok(index_data_dir(index_id)?.join("index.redb.tmp"))
 }
 
 /// Load the registry file. Missing file → empty registry (first-run case).
