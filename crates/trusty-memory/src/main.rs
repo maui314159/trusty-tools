@@ -140,10 +140,19 @@ enum MonitorTarget {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    trusty_common::init_tracing(cli.verbose);
+    // Issue #35: initialise tracing with an in-memory `LogBuffer` so the HTTP
+    // daemon's `GET /api/v1/logs/tail` endpoint can serve recent logs. The
+    // buffer-backed subscriber still writes the standard `fmt` layer to
+    // stderr, so non-HTTP subcommands (and the MCP stdio path, which must
+    // keep stdout clean) are unaffected. The buffer is only wired into the
+    // `AppState` on the HTTP serve path.
+    let log_buffer = trusty_common::init_tracing_with_buffer(
+        cli.verbose,
+        trusty_common::log_buffer::DEFAULT_LOG_CAPACITY,
+    );
 
     match cli.command {
-        Command::Serve { http, palace } => run_serve(http, palace).await,
+        Command::Serve { http, palace } => run_serve(http, palace, log_buffer).await,
         Command::Migrate {
             target,
             dry_run,
@@ -190,16 +199,25 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
 /// Why: keeps `main` focused on parsing while putting the `AppState`
 /// construction in one place.
 /// What: builds an `AppState` rooted at the standard data dir, applies the
-/// `--palace` default if any, then routes to `run_stdio` or `run_http`.
+/// `--palace` default if any, and — on the HTTP path — wires the issue-#35
+/// `LogBuffer` so `GET /api/v1/logs/tail` serves captured logs. The stdio
+/// path does not need the buffer (no HTTP surface), so it is dropped there.
 /// Test: not unit-tested (process-level entry point); exercised manually via
 /// `cargo run -p trusty-memory -- serve` and the parent integration tests.
-async fn run_serve(http: Option<SocketAddr>, palace: Option<String>) -> Result<()> {
+async fn run_serve(
+    http: Option<SocketAddr>,
+    palace: Option<String>,
+    log_buffer: trusty_common::log_buffer::LogBuffer,
+) -> Result<()> {
     let data_root = trusty_common::resolve_data_dir("trusty-memory")?;
-    let state = AppState::new(data_root).with_default_palace(palace);
 
     if let Some(addr) = http {
+        let state = AppState::new(data_root)
+            .with_default_palace(palace)
+            .with_log_buffer(log_buffer);
         run_http(state, addr).await
     } else {
+        let state = AppState::new(data_root).with_default_palace(palace);
         run_stdio(state).await
     }
 }

@@ -205,7 +205,7 @@ fn tune_batch_size_for_provider(provider: trusty_common::embedder::ExecutionProv
 /// exit-1 message.
 /// Test: run twice in a row — the second invocation must exit 1 with the
 /// "another daemon is already running" message.
-pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<()> {
+pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bool) -> Result<()> {
     // Background self-spawn path: when invoked without `--foreground`, fork a
     // detached copy of ourselves with `--foreground` and return immediately.
     //
@@ -250,6 +250,15 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
         );
         return Ok(());
     }
+
+    // Issue #35: the foreground daemon owns tracing init so it can wire the
+    // in-memory `LogBuffer` that backs `GET /logs/tail`. `main.rs` skips its
+    // usual `init_tracing` call for the `start` command precisely so this
+    // `try_init` wins the race and the buffer captures every log line.
+    let log_buffer = trusty_common::init_tracing_with_buffer(
+        if verbose { 2 } else { 0 },
+        trusty_common::log_buffer::DEFAULT_LOG_CAPACITY,
+    );
 
     // Translate the `--device` CLI flag into the `TRUSTY_DEVICE` env var that
     // `trusty-embedder` reads at session-init time. An explicit shell-level
@@ -417,10 +426,15 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
     // `state.install_embedder()` flips the watch channel.
     let cfg = crate::service::load_user_config();
 
+    // Issue #35: hand the daemon's `LogBuffer` (created above by
+    // `init_tracing_with_buffer`) to the HTTP state so `GET /logs/tail`
+    // serves the same lines the tracing subscriber captures. Without this
+    // the endpoint would only ever see the empty default buffer.
     let state = crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
         .with_local_model(cfg.local_model)
         .with_openrouter_model(cfg.openrouter_model)
-        .with_openrouter_api_key(cfg.openrouter_api_key);
+        .with_openrouter_api_key(cfg.openrouter_api_key)
+        .with_log_buffer(log_buffer);
 
     // Spawn embedder load on a background task; the daemon's HTTP server
     // starts serving requests in parallel. On success, `install_embedder`

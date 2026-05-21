@@ -4253,7 +4253,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -4273,7 +4273,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -6942,7 +6942,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6979,7 +6979,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10228,7 +10228,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10264,6 +10264,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "syn 2.0.117",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -10334,7 +10335,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10547,7 +10548,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.3.66"
+version = "0.3.67"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -623,7 +623,15 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Tracing init + NO_COLOR handling via shared trusty-common helpers.
-    trusty_common::init_tracing(if cli.verbose { 2 } else { 0 });
+    //
+    // The `start` daemon command initialises tracing itself via
+    // `init_tracing_with_buffer` so it can wire the in-memory `LogBuffer`
+    // that backs `GET /logs/tail` (issue #35). Installing a plain subscriber
+    // here would win the `try_init` race and leave that buffer empty, so we
+    // skip the early init for `start` only.
+    if !matches!(cli.command, Commands::Start { .. }) {
+        trusty_common::init_tracing(if cli.verbose { 2 } else { 0 });
+    }
     trusty_common::maybe_disable_color(false);
 
     match cli.command {
@@ -703,7 +711,7 @@ async fn run() -> Result<()> {
             foreground,
             device,
         } => {
-            commands::start::handle_start(port, foreground, &device).await?;
+            commands::start::handle_start(port, foreground, &device, cli.verbose).await?;
         }
 
         Commands::Stop => {

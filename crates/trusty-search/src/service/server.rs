@@ -198,6 +198,39 @@ pub struct SearchAppState {
     /// Test: `emit_propagates_to_subscriber` verifies a subscriber observes
     /// the emitted event.
     pub events: Arc<broadcast::Sender<DaemonEvent>>,
+    /// In-memory ring buffer of recent tracing log lines, fed by the
+    /// `LogBufferLayer` wired into the subscriber at daemon startup.
+    ///
+    /// Why (issue #35): the `GET /logs/tail` endpoint serves the last N log
+    /// lines so operators can inspect a running daemon without tailing a file
+    /// or restarting with a different `RUST_LOG`. The buffer must be shared
+    /// between the tracing layer (writer) and the HTTP handler (reader).
+    /// What: a cheap `Arc`-backed clone of the same buffer the subscriber
+    /// writes to. Defaults to an empty buffer for test states that never
+    /// install the layer.
+    /// Test: `logs_tail_returns_recent_lines` pushes lines then GETs them.
+    pub log_buffer: trusty_common::log_buffer::LogBuffer,
+    /// Most recent on-disk footprint of the daemon's data directory, in bytes.
+    ///
+    /// Why (issue #35): `GET /health` reports `disk_bytes` (redb + usearch +
+    /// snapshot files). Walking the directory tree on every health request
+    /// would make a 2 s health poll do unbounded I/O; instead a background
+    /// task recomputes it every 10 s and stores the result here so the
+    /// handler reads it lock-free.
+    /// What: an `AtomicU64` updated by the task spawned in `build_router`.
+    /// `0` until the first walk completes (typically within 10 s of startup).
+    /// Test: `health_includes_resource_fields` asserts the field is present.
+    pub disk_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-process RSS + CPU sampler, refreshed on each `/health` request.
+    ///
+    /// Why (issue #35): `GET /health` reports `rss_mb` and `cpu_pct`. CPU
+    /// usage is a delta between two `sysinfo` refreshes, so the sampler must
+    /// persist between requests — hence the shared `Mutex`.
+    /// What: a `tokio::sync::Mutex<SysMetrics>` so the async health handler
+    /// can sample without blocking the runtime. `/health` is polled at ~2 s
+    /// intervals so lock contention is negligible.
+    /// Test: `health_includes_resource_fields`.
+    pub sys_metrics: Arc<tokio::sync::Mutex<trusty_common::sys_metrics::SysMetrics>>,
 }
 
 impl SearchAppState {
@@ -230,7 +263,33 @@ impl SearchAppState {
             openrouter_api_key,
             chat_provider: Arc::new(OnceCell::new()),
             events: Arc::new(events_tx),
+            // Default to an empty buffer — `build_router` callers that have
+            // installed the `LogBufferLayer` override this via
+            // `with_log_buffer`. Test states keep the empty default.
+            log_buffer: trusty_common::log_buffer::LogBuffer::new(
+                trusty_common::log_buffer::DEFAULT_LOG_CAPACITY,
+            ),
+            disk_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sys_metrics: Arc::new(tokio::sync::Mutex::new(
+                trusty_common::sys_metrics::SysMetrics::new(),
+            )),
         }
+    }
+
+    /// Builder-style: attach the daemon's shared [`LogBuffer`] so the
+    /// `GET /logs/tail` endpoint serves the same lines the tracing subscriber
+    /// captures.
+    ///
+    /// Why (issue #35): `start.rs` builds the buffer (via
+    /// `init_tracing_with_buffer`) before constructing the `SearchAppState`,
+    /// then hands a clone here so the HTTP handler and the tracing layer
+    /// observe the same ring.
+    /// What: replaces the empty default buffer with the supplied one.
+    /// Test: `logs_tail_returns_recent_lines`.
+    #[must_use]
+    pub fn with_log_buffer(mut self, buffer: trusty_common::log_buffer::LogBuffer) -> Self {
+        self.log_buffer = buffer;
+        self
     }
 
     /// Send a `DaemonEvent` to all connected SSE subscribers.
@@ -410,6 +469,22 @@ struct HealthResponse {
     /// embedder is healthy or still warming up. Omitted from JSON when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     embedder_error: Option<String>,
+    /// Current process Resident Set Size in megabytes (issue #35). Sampled via
+    /// the shared `SysMetrics` on each health request.
+    rss_mb: u64,
+    /// Soft RSS ceiling (MB) configured for the daemon's indexing pipeline —
+    /// the `TRUSTY_MEMORY_LIMIT_MB` value resolved by `MemoryPolicy` (issue
+    /// #35). `0` means no limit is configured. Lets operators see `rss_mb`
+    /// relative to its budget without a second request.
+    rss_limit_mb: u64,
+    /// On-disk footprint of the daemon's data directory in bytes (issue #35):
+    /// the sum of every redb / usearch / snapshot file. Refreshed by a
+    /// background task every 10 s; `0` until the first walk completes.
+    disk_bytes: u64,
+    /// Current process CPU usage as a percentage (issue #35), where `100.0`
+    /// means one fully-saturated core. Sampled via `SysMetrics`; the first
+    /// reading after daemon start may be `0.0` until a delta window exists.
+    cpu_pct: f32,
 }
 
 #[derive(Serialize)]
@@ -474,9 +549,12 @@ pub fn build_router(state: SearchAppState) -> Router {
     // at `/`).
     let state_arc = Arc::new(state);
     spawn_status_ticker(Arc::clone(&state_arc));
+    spawn_disk_size_ticker(Arc::clone(&state_arc));
     let router = Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
         .route("/health", get(health_handler))
+        .route("/logs/tail", get(logs_tail_handler))
+        .route("/admin/stop", post(admin_stop_handler))
         .route("/status/stream", get(status_stream_handler))
         .route(
             "/indexes",
@@ -544,6 +622,48 @@ fn spawn_status_ticker(state: Arc<SearchAppState>) {
     });
 }
 
+/// Spawn a background ticker that recomputes the data-directory size every
+/// 10 seconds and stores it in `state.disk_bytes`.
+///
+/// Why (issue #35): `GET /health` reports `disk_bytes`. Walking the data
+/// directory (redb + usearch + snapshot files) on every health request would
+/// turn a 2 s health poll into unbounded recursive I/O. Computing it off the
+/// request path on a fixed cadence keeps `/health` cheap and bounds the
+/// staleness to ~10 s — fine for an at-a-glance footprint figure.
+/// What: spawns a detached tokio task holding a `Weak<SearchAppState>` so the
+/// ticker stops automatically when the daemon drops its last `Arc`. Each tick
+/// runs the (blocking) directory walk on `spawn_blocking` so it never stalls
+/// the async runtime, then stores the byte total atomically.
+/// Test: covered indirectly — `health_includes_resource_fields` asserts the
+/// `disk_bytes` field is present and non-negative.
+fn spawn_disk_size_ticker(state: Arc<SearchAppState>) {
+    let weak = Arc::downgrade(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            // The directory walk is blocking filesystem I/O — run it on the
+            // blocking pool so it never parks an async worker thread.
+            let bytes =
+                tokio::task::spawn_blocking(|| match crate::service::persistence::data_dir() {
+                    Ok(dir) => trusty_common::sys_metrics::dir_size_bytes(&dir),
+                    Err(e) => {
+                        tracing::debug!("disk_size_ticker: could not resolve data dir: {e}");
+                        0
+                    }
+                })
+                .await
+                .unwrap_or(0);
+            state
+                .disk_bytes
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<HealthResponse> {
     // Why: open-mpm (and other external integrators) probe `/health` to detect
     // a running trusty-search daemon before spawning their own. Including
@@ -576,6 +696,16 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         // `trusty-search start`'s readiness probe succeeds quickly.
         "initializing"
     };
+    // Issue #35: sample process RSS + CPU. The sampler is shared behind a
+    // Mutex because sysinfo derives CPU% from the delta between refreshes.
+    let (rss_mb, cpu_pct) = {
+        let mut metrics = state.sys_metrics.lock().await;
+        metrics.sample()
+    };
+    // `rss_limit_mb` mirrors the resolved TRUSTY_MEMORY_LIMIT_MB soft cap.
+    // `memory_limit_mb()` returns `None` when no limit is configured.
+    let rss_limit_mb = crate::core::memguard::memory_limit_mb().unwrap_or(0);
+    let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -583,7 +713,79 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         uptime_secs: state.started_at.elapsed().as_secs(),
         embedder: embedder_status,
         embedder_error,
+        rss_mb,
+        rss_limit_mb,
+        disk_bytes,
+        cpu_pct,
     })
+}
+
+/// Query parameters for `GET /logs/tail`.
+///
+/// Why (issue #35): callers ask for a bounded number of recent log lines;
+/// `n` defaults to a useful page size and is clamped server-side so a
+/// misconfigured client cannot request more lines than the buffer holds.
+/// What: `n` is optional; absent → [`DEFAULT_LOGS_TAIL_N`]. Clamped to
+/// `[1, MAX_LOGS_TAIL_N]` in the handler.
+/// Test: `logs_tail_clamps_n` exercises the clamp.
+#[derive(Deserialize)]
+pub struct LogsTailParams {
+    #[serde(default = "default_logs_tail_n")]
+    pub n: usize,
+}
+
+/// Default number of log lines returned by `GET /logs/tail` when `n` is
+/// absent. 100 lines is enough context for a glance without a huge payload.
+const DEFAULT_LOGS_TAIL_N: usize = 100;
+
+/// Hard ceiling on `GET /logs/tail?n=` — equal to the ring-buffer capacity,
+/// so a request can never ask for more lines than the buffer can hold.
+const MAX_LOGS_TAIL_N: usize = trusty_common::log_buffer::DEFAULT_LOG_CAPACITY;
+
+fn default_logs_tail_n() -> usize {
+    DEFAULT_LOGS_TAIL_N
+}
+
+/// `GET /logs/tail?n=200` — return the most recent N tracing log lines.
+///
+/// Why (issue #35): operators debugging a running daemon want recent logs
+/// over HTTP without SSHing to the box or restarting with a different
+/// `RUST_LOG`. The in-memory ring buffer (fed by the `LogBufferLayer` wired
+/// into the subscriber at startup) makes this near-free.
+/// What: clamps `n` to `[1, MAX_LOGS_TAIL_N]`, drains the tail of
+/// `state.log_buffer`, and returns `{ "lines": [...], "total": <buffered> }`
+/// where `total` is the number of lines currently buffered (so callers can
+/// tell whether the ring has wrapped).
+/// Test: `logs_tail_returns_recent_lines` and `logs_tail_clamps_n`.
+async fn logs_tail_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Query(params): Query<LogsTailParams>,
+) -> Json<serde_json::Value> {
+    let n = params.n.clamp(1, MAX_LOGS_TAIL_N);
+    let lines = state.log_buffer.tail(n);
+    Json(serde_json::json!({
+        "lines": lines,
+        "total": state.log_buffer.len(),
+    }))
+}
+
+/// `POST /admin/stop` — request a graceful shutdown of the daemon.
+///
+/// Why (issue #35): the admin UI and operators want a one-call way to stop
+/// the daemon without resolving its PID and sending a signal. The daemon is
+/// localhost-only and trusts every caller, so no auth is required.
+/// What: spawns a detached task that sleeps 200 ms (giving this HTTP response
+/// time to flush to the client) and then calls `std::process::exit(0)`.
+/// Returns `{ "ok": true, "message": "shutting down" }` immediately.
+/// Test: `admin_stop_returns_ok` asserts the response shape (it does not
+/// drive the real exit — that would terminate the test process).
+async fn admin_stop_handler(State(_state): State<Arc<SearchAppState>>) -> Json<serde_json::Value> {
+    tracing::warn!("admin_stop: shutdown requested via POST /admin/stop");
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "ok": true, "message": "shutting down" }))
 }
 
 /// Request body for `PATCH /config`. Any field may be omitted to leave that
@@ -2508,5 +2710,97 @@ mod tests {
         let status = crate::service::reindex::ReindexStatus::AbortedMemory;
         let json = serde_json::to_string(&status).expect("serialize");
         assert_eq!(json, "\"abortedmemory\"");
+    }
+
+    /// Issue #35 — `GET /health` carries the enriched resource fields
+    /// (`rss_mb`, `rss_limit_mb`, `disk_bytes`, `cpu_pct`).
+    ///
+    /// Why: external probes and the admin UI render these; the JSON contract
+    /// must remain stable. `rss_mb` is sampled live so it is asserted only
+    /// for presence, not an exact value.
+    /// What: builds a bare `SearchAppState`, calls `health_handler`, and
+    /// asserts every new field deserialises with a plausible value.
+    /// Test: this test.
+    #[tokio::test]
+    async fn health_includes_resource_fields() {
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let Json(resp) = health_handler(State(state)).await;
+        // rss_mb is sampled from the live test process; tolerate 0 only in
+        // sandboxes where /proc is restricted, but it must be a sane unit.
+        assert!(resp.rss_mb < 1024 * 1024, "rss_mb unit must be MB");
+        // cpu_pct is a non-negative percentage (first sample may be 0.0).
+        assert!(resp.cpu_pct >= 0.0, "cpu_pct must be non-negative");
+        // disk_bytes / rss_limit_mb are u64 — presence is the contract here;
+        // the disk ticker has not run yet so disk_bytes is 0.
+        assert_eq!(resp.disk_bytes, 0, "disk ticker has not ticked yet");
+        let _ = resp.rss_limit_mb;
+    }
+
+    /// Issue #35 — `GET /logs/tail` returns the most recent buffered lines.
+    ///
+    /// Why: operators inspect a running daemon via this endpoint; it must
+    /// surface exactly what the shared `LogBuffer` holds and report `total`.
+    /// What: attaches a `LogBuffer`, pushes three lines, calls the handler
+    /// with `n=2`, and asserts the tail + `total` count.
+    /// Test: this test.
+    #[tokio::test]
+    async fn logs_tail_returns_recent_lines() {
+        let buffer = trusty_common::log_buffer::LogBuffer::new(100);
+        buffer.push("line one".to_string());
+        buffer.push("line two".to_string());
+        buffer.push("line three".to_string());
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()).with_log_buffer(buffer));
+        let Json(body) = logs_tail_handler(State(state), Query(LogsTailParams { n: 2 })).await;
+        let lines = body["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 2, "n=2 must return two lines");
+        assert_eq!(lines[0].as_str(), Some("line two"));
+        assert_eq!(lines[1].as_str(), Some("line three"));
+        assert_eq!(body["total"].as_u64(), Some(3), "total counts all buffered");
+    }
+
+    /// Issue #35 — `GET /logs/tail?n=` is clamped to `[1, MAX_LOGS_TAIL_N]`.
+    ///
+    /// Why: a misconfigured client must not be able to request more lines
+    /// than the buffer holds, and `n=0` must still return at least one line.
+    /// What: pushes one line, requests `n=0` and an oversized `n`, asserting
+    /// both clamp to a valid result.
+    /// Test: this test.
+    #[tokio::test]
+    async fn logs_tail_clamps_n() {
+        let buffer = trusty_common::log_buffer::LogBuffer::new(100);
+        for i in 0..5 {
+            buffer.push(format!("l{i}"));
+        }
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()).with_log_buffer(buffer));
+        // n=0 clamps up to 1.
+        let Json(zero) =
+            logs_tail_handler(State(Arc::clone(&state)), Query(LogsTailParams { n: 0 })).await;
+        assert_eq!(zero["lines"].as_array().expect("lines").len(), 1);
+        // n past MAX clamps down to the buffer length (5 here).
+        let Json(big) = logs_tail_handler(
+            State(state),
+            Query(LogsTailParams {
+                n: MAX_LOGS_TAIL_N * 10,
+            }),
+        )
+        .await;
+        assert_eq!(big["lines"].as_array().expect("lines").len(), 5);
+    }
+
+    /// Issue #35 — `POST /admin/stop` acknowledges the shutdown request.
+    ///
+    /// Why: the response shape `{ ok, message }` is the documented contract
+    /// for the admin UI's stop button.
+    /// What: calls `admin_stop_handler` and asserts the JSON body. It does
+    /// NOT await the spawned exit task — that would terminate the test
+    /// process — but the 200 ms delay before `process::exit` guarantees the
+    /// test returns first.
+    /// Test: this test.
+    #[tokio::test]
+    async fn admin_stop_returns_ok() {
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let Json(body) = admin_stop_handler(State(state)).await;
+        assert_eq!(body["ok"], serde_json::Value::Bool(true));
+        assert_eq!(body["message"].as_str(), Some("shutting down"));
     }
 }

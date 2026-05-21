@@ -92,6 +92,8 @@ pub fn router() -> Router<AppState> {
             get(get_chat_session).delete(delete_chat_session),
         )
         .route("/health", get(health))
+        .route("/api/v1/logs/tail", get(logs_tail))
+        .route("/api/v1/admin/stop", post(admin_stop))
         .fallback(static_handler);
 
     trusty_common::server::with_standard_middleware(router)
@@ -104,26 +106,131 @@ pub fn router() -> Router<AppState> {
 /// Liveness/version payload for `GET /health`.
 ///
 /// Why: `daemon_probe` requires an HTTP 200 from `/health` to confirm that the
-/// port is owned by this daemon (and not a stale or foreign process).
-/// What: Carries a fixed `status` string plus the compile-time crate version.
-/// Test: Asserted by `health_endpoint_returns_ok` in this module's tests.
+/// port is owned by this daemon (and not a stale or foreign process). Issue
+/// #35 enriches it with process resource metrics so operators (and the admin
+/// UI) can see RSS, disk footprint, CPU, and uptime in one cheap call.
+/// What: Carries a fixed `status` string, the compile-time crate version, and
+/// the issue-#35 resource block (`rss_mb`, `disk_bytes`, `cpu_pct`,
+/// `uptime_secs`).
+/// Test: Asserted by `health_endpoint_returns_ok` and
+/// `health_endpoint_includes_resource_fields` in this module's tests.
 #[derive(serde::Serialize)]
 struct HealthResponse {
     status: &'static str,
     version: &'static str,
+    /// Current process Resident Set Size in megabytes (issue #35). Sampled
+    /// via the shared `SysMetrics` on each health request.
+    rss_mb: u64,
+    /// On-disk footprint of the daemon's `data_root` in bytes (issue #35):
+    /// the sum of every palace file. Refreshed by a background task every
+    /// 10 s; `0` until the first walk completes.
+    disk_bytes: u64,
+    /// Current process CPU usage as a percentage (issue #35), where `100.0`
+    /// means one fully-saturated core. The first reading after daemon start
+    /// may be `0.0` until a delta window exists.
+    cpu_pct: f32,
+    /// Seconds elapsed since the daemon started (issue #35).
+    uptime_secs: u64,
 }
 
 /// `GET /health` — unauthenticated liveness probe.
 ///
 /// Why: Gives `daemon_probe` and external monitors a cheap way to confirm port
-/// ownership without touching palace state.
-/// What: Returns HTTP 200 with `{"status":"ok","version":"<crate version>"}`.
-/// Test: `health_endpoint_returns_ok` drives this through the router.
-async fn health() -> Json<HealthResponse> {
+/// ownership without touching palace state. Issue #35 additionally reports
+/// process RSS, CPU, the `data_root` disk footprint, and uptime.
+/// What: Returns HTTP 200 with `{status, version, rss_mb, disk_bytes,
+/// cpu_pct, uptime_secs}`. RSS + CPU are sampled live via the shared
+/// `SysMetrics`; `disk_bytes` is read from the background-ticker atomic;
+/// `uptime_secs` is the elapsed time since `state.started_at`.
+/// Test: `health_endpoint_returns_ok` and
+/// `health_endpoint_includes_resource_fields`.
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let (rss_mb, cpu_pct) = {
+        let mut metrics = state.sys_metrics.lock().await;
+        metrics.sample()
+    };
+    let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let uptime_secs = state.started_at.elapsed().as_secs();
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        rss_mb,
+        disk_bytes,
+        cpu_pct,
+        uptime_secs,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Logs tail + admin stop (issue #35)
+// ---------------------------------------------------------------------------
+
+/// Default number of log lines returned by `GET /api/v1/logs/tail` when `n`
+/// is absent. 100 lines is enough context for a glance without a huge payload.
+const DEFAULT_LOGS_TAIL_N: usize = 100;
+
+/// Hard ceiling on `GET /api/v1/logs/tail?n=` — equal to the ring-buffer
+/// capacity, so a request can never ask for more lines than the buffer holds.
+const MAX_LOGS_TAIL_N: usize = trusty_common::log_buffer::DEFAULT_LOG_CAPACITY;
+
+fn default_logs_tail_n() -> usize {
+    DEFAULT_LOGS_TAIL_N
+}
+
+/// Query parameters for `GET /api/v1/logs/tail`.
+///
+/// Why (issue #35): callers ask for a bounded number of recent log lines;
+/// `n` defaults to a useful page size and is clamped server-side so a
+/// misconfigured client cannot request more lines than the buffer holds.
+/// What: `n` is optional; absent → [`DEFAULT_LOGS_TAIL_N`]. Clamped to
+/// `[1, MAX_LOGS_TAIL_N]` in the handler.
+/// Test: `logs_tail_clamps_n` exercises the clamp.
+#[derive(serde::Deserialize)]
+struct LogsTailParams {
+    #[serde(default = "default_logs_tail_n")]
+    n: usize,
+}
+
+/// `GET /api/v1/logs/tail?n=200` — return the most recent N tracing log lines.
+///
+/// Why (issue #35): operators debugging a running daemon want recent logs
+/// over HTTP without SSHing to the box or restarting with a different
+/// `RUST_LOG`. The in-memory ring buffer (fed by the `LogBufferLayer` wired
+/// into the subscriber at startup) makes this near-free.
+/// What: clamps `n` to `[1, MAX_LOGS_TAIL_N]`, drains the tail of
+/// `state.log_buffer`, and returns `{ "lines": [...], "total": <buffered> }`
+/// where `total` is the number of lines currently buffered (so callers can
+/// tell whether the ring has wrapped).
+/// Test: `logs_tail_returns_recent_lines` and `logs_tail_clamps_n`.
+async fn logs_tail(
+    State(state): State<AppState>,
+    Query(params): Query<LogsTailParams>,
+) -> Json<Value> {
+    let n = params.n.clamp(1, MAX_LOGS_TAIL_N);
+    let lines = state.log_buffer.tail(n);
+    Json(serde_json::json!({
+        "lines": lines,
+        "total": state.log_buffer.len(),
+    }))
+}
+
+/// `POST /api/v1/admin/stop` — request a graceful shutdown of the daemon.
+///
+/// Why (issue #35): the admin UI and operators want a one-call way to stop
+/// the daemon without resolving its PID and sending a signal. The daemon is
+/// localhost-only and trusts every caller, so no auth is required.
+/// What: spawns a detached task that sleeps 200 ms (giving this HTTP response
+/// time to flush to the client) and then calls `std::process::exit(0)`.
+/// Returns `{ "ok": true, "message": "shutting down" }` immediately.
+/// Test: `admin_stop_returns_ok` asserts the response shape (it does not
+/// drive the real exit — that would terminate the test process).
+async fn admin_stop(State(_state): State<AppState>) -> Json<Value> {
+    tracing::warn!("admin_stop: shutdown requested via POST /api/v1/admin/stop");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "ok": true, "message": "shutting down" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,6 +1986,143 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Issue #35 — `GET /health` carries the enriched resource block
+    /// (`rss_mb`, `disk_bytes`, `cpu_pct`, `uptime_secs`).
+    ///
+    /// Why: external probes and the admin UI render these; the JSON contract
+    /// must remain stable. `rss_mb` is sampled live so it is asserted only
+    /// for a sane unit, not an exact value.
+    /// What: drives `/health` through the router and asserts every new field
+    /// deserialises with a plausible value.
+    /// Test: this test.
+    #[tokio::test]
+    async fn health_endpoint_includes_resource_fields() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        // rss_mb must be a sane unit (megabytes, not bytes).
+        let rss_mb = v["rss_mb"].as_u64().expect("rss_mb is u64");
+        assert!(rss_mb < 1024 * 1024, "rss_mb unit must be MB");
+        // cpu_pct is a non-negative percentage (first sample may be 0.0).
+        let cpu = v["cpu_pct"].as_f64().expect("cpu_pct is a number");
+        assert!(cpu >= 0.0, "cpu_pct must be non-negative");
+        // disk ticker has not run in this oneshot test → 0.
+        assert_eq!(v["disk_bytes"].as_u64(), Some(0));
+        // uptime_secs is present and a u64.
+        assert!(v["uptime_secs"].is_u64(), "uptime_secs must be present");
+    }
+
+    /// Issue #35 — `GET /api/v1/logs/tail` returns the most recent buffered
+    /// lines and the total count.
+    ///
+    /// Why: operators inspect a running daemon via this endpoint; it must
+    /// surface exactly what the shared `LogBuffer` holds.
+    /// What: attaches a `LogBuffer` to the state, pushes three lines, GETs
+    /// `?n=2`, and asserts the tail + `total`.
+    /// Test: this test.
+    #[tokio::test]
+    async fn logs_tail_returns_recent_lines() {
+        let buffer = trusty_common::log_buffer::LogBuffer::new(100);
+        buffer.push("line one".to_string());
+        buffer.push("line two".to_string());
+        buffer.push("line three".to_string());
+        let state = test_state().with_log_buffer(buffer);
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs/tail?n=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let lines = v["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 2, "n=2 must return two lines");
+        assert_eq!(lines[0].as_str(), Some("line two"));
+        assert_eq!(lines[1].as_str(), Some("line three"));
+        assert_eq!(v["total"].as_u64(), Some(3));
+    }
+
+    /// Issue #35 — `GET /api/v1/logs/tail?n=` is clamped to
+    /// `[1, MAX_LOGS_TAIL_N]`.
+    ///
+    /// Why: a misconfigured client must not request more lines than the
+    /// buffer holds, and `n=0` must still return at least one line.
+    /// What: pushes five lines, requests `n=0` (clamps to 1) and an oversized
+    /// `n` (clamps to the buffer length).
+    /// Test: this test.
+    #[tokio::test]
+    async fn logs_tail_clamps_n() {
+        let buffer = trusty_common::log_buffer::LogBuffer::new(100);
+        for i in 0..5 {
+            buffer.push(format!("l{i}"));
+        }
+        let state = test_state().with_log_buffer(buffer);
+        let app = router().with_state(state);
+
+        // n=0 clamps up to 1.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs/tail?n=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["lines"].as_array().expect("lines").len(), 1);
+
+        // n far past MAX clamps down to the buffer length (5).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs/tail?n=999999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["lines"].as_array().expect("lines").len(), 5);
+    }
+
+    /// Issue #35 — `POST /api/v1/admin/stop` acknowledges the shutdown
+    /// request with `{ ok, message }`.
+    ///
+    /// Why: the response shape is the documented contract for the admin UI's
+    /// stop button.
+    /// What: calls `admin_stop` directly and asserts the JSON body. It does
+    /// NOT await the spawned exit task — that would terminate the test
+    /// process — but the 200 ms delay before `process::exit` guarantees the
+    /// test returns first.
+    /// Test: this test.
+    #[tokio::test]
+    async fn admin_stop_returns_ok() {
+        let state = test_state();
+        let Json(body) = admin_stop(State(state)).await;
+        assert_eq!(body["ok"], Value::Bool(true));
+        assert_eq!(body["message"].as_str(), Some("shutting down"));
     }
 
     #[tokio::test]

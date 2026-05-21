@@ -26,7 +26,7 @@ authors = ["Bob Matsuoka <bob@matsuoka.com>"]
 
 [workspace.dependencies]
 # ── Internal crates (path deps so the monorepo builds without publish cycles) ──
-trusty-common = { path = "crates/trusty-common", version = "0.4.5" }
+trusty-common = { path = "crates/trusty-common", version = "0.4.6" }
 trusty-mcp-core = { path = "crates/trusty-mcp-core", version = "0.1" }
 trusty-embedder = { path = "crates/trusty-embedder", version = "0.1" }
 trusty-symgraph = { path = "crates/trusty-symgraph", version = "0.2.2" }
@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
 fastembed = { version = "5", default-features = false }
 lru = "0.12"
@@ -81,6 +81,8 @@ walkdir = "2"
 regex = "1"
 gray_matter = "0.2"
 notify = "6"
+# Process / system introspection (RSS, CPU sampling for daemon /health).
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Storage / KG / embeddings (trusty-memory-core).
 usearch = "2.25"

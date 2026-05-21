@@ -34,6 +34,27 @@ pub mod chat;
 pub mod claude_config;
 pub mod project_discovery;
 
+/// Bounded in-memory ring buffer of recent tracing log lines.
+///
+/// Why: trusty-* daemons expose a `/logs/tail` endpoint so operators can read
+/// recent logs over HTTP without file I/O or a daemon restart. The buffer and
+/// its `tracing_subscriber::Layer` live here so every daemon shares one impl.
+/// What: `LogBuffer` (thread-safe capped `VecDeque<String>`) plus
+/// `LogBufferLayer` (the tracing layer that feeds it).
+/// Test: `cargo test -p trusty-common log_buffer` covers capacity eviction,
+/// tail semantics, and layer capture.
+pub mod log_buffer;
+
+/// Process RSS / CPU sampling and data-directory sizing for daemon health.
+///
+/// Why: every trusty-* daemon's `/health` endpoint reports its own resident
+/// memory, CPU usage, and on-disk footprint; the sampling logic is identical
+/// across them so it lives here once.
+/// What: `SysMetrics` (per-process RSS + CPU sampler) and `dir_size_bytes`
+/// (recursive directory byte count).
+/// Test: `cargo test -p trusty-common sys_metrics`.
+pub mod sys_metrics;
+
 /// macOS LaunchAgent generation and lifecycle management. macOS-only —
 /// the module compiles to nothing on every other platform.
 #[cfg(target_os = "macos")]
@@ -320,6 +341,50 @@ pub fn init_tracing(verbose_count: u8) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+/// Initialise the global tracing subscriber and capture events into a
+/// [`log_buffer::LogBuffer`] so the daemon can serve recent logs over HTTP.
+///
+/// Why: daemons expose `GET /logs/tail`, which needs an in-memory ring of
+/// recent log lines. Routing capture through the subscriber means every
+/// existing `tracing::info!` / `warn!` call site is mirrored automatically —
+/// no second logging API to keep in sync. The stderr `fmt` layer is retained
+/// so operators still see live logs in the terminal / launchd log file.
+/// What: builds a `tracing_subscriber::registry` with two layers — the
+/// standard stderr `fmt` layer (same verbosity ladder + `RUST_LOG` override
+/// as [`init_tracing`]) and a [`log_buffer::LogBufferLayer`] feeding the
+/// returned [`log_buffer::LogBuffer`]. Uses `try_init`, so a process that has
+/// already installed a subscriber keeps it; the returned buffer is still
+/// valid (just empty) in that case.
+/// Test: `cargo test -p trusty-common log_buffer` covers the layer; the
+/// daemon `/logs/tail` integration tests cover the wired path end-to-end.
+#[must_use]
+pub fn init_tracing_with_buffer(verbose_count: u8, capacity: usize) -> log_buffer::LogBuffer {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let default_filter = match verbose_count {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+
+    let buffer = log_buffer::LogBuffer::new(capacity);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false);
+    // try_init so callers that pre-install a subscriber don't panic — the
+    // returned buffer simply stays empty in that (rare) case.
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(log_buffer::LogBufferLayer::new(buffer.clone()))
+        .try_init();
+    buffer
 }
 
 /// Disable coloured terminal output when requested or when stdout is not a TTY.

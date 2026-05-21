@@ -99,6 +99,45 @@ pub struct AppState {
     /// receives instantly. Cap of 128 buffers transient slow readers; if a
     /// receiver lags it gets `RecvError::Lagged` and we emit a `lag` frame.
     pub events: Arc<broadcast::Sender<DaemonEvent>>,
+    /// Instant the daemon started, used to compute `uptime_secs` on `/health`.
+    ///
+    /// Why (issue #35): `GET /health` reports how long the daemon has been
+    /// up. Capturing a monotonic `Instant` at `AppState` construction lets the
+    /// handler compute the elapsed seconds cheaply and without a clock-skew
+    /// hazard.
+    /// What: a wall-monotonic `Instant`; `AppState::new` stamps it at startup.
+    /// Test: `health_endpoint_includes_resource_fields`.
+    pub started_at: std::time::Instant,
+    /// In-memory ring buffer of recent tracing log lines (issue #35).
+    ///
+    /// Why: the `GET /api/v1/logs/tail` endpoint serves the last N log lines
+    /// so operators can inspect a running daemon without tailing a file. The
+    /// buffer is shared between the tracing `LogBufferLayer` (writer) and the
+    /// HTTP handler (reader).
+    /// What: a cheap `Arc`-backed clone of the buffer the subscriber writes
+    /// to. Defaults to an empty buffer for states that never install the
+    /// layer (tests, the stdio path).
+    /// Test: `logs_tail_returns_recent_lines`.
+    pub log_buffer: trusty_common::log_buffer::LogBuffer,
+    /// Most recent on-disk footprint of `data_root`, in bytes (issue #35).
+    ///
+    /// Why: `GET /health` reports `disk_bytes`. Walking the data directory on
+    /// every health request would make a frequent health poll do unbounded
+    /// I/O; a background task recomputes it every 10 s and stores it here so
+    /// the handler reads it lock-free.
+    /// What: an `AtomicU64` updated by the ticker spawned in `run_http_on`.
+    /// `0` until the first walk completes.
+    /// Test: `health_endpoint_includes_resource_fields`.
+    pub disk_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-process RSS + CPU sampler, refreshed on each `/health` request
+    /// (issue #35).
+    ///
+    /// Why: CPU usage is a delta between two `sysinfo` refreshes, so the
+    /// sampler must persist between requests — hence the shared `Mutex`.
+    /// What: a `tokio::sync::Mutex<SysMetrics>` so the async health handler
+    /// can sample without blocking the runtime.
+    /// Test: `health_endpoint_includes_resource_fields`.
+    pub sys_metrics: Arc<tokio::sync::Mutex<trusty_common::sys_metrics::SysMetrics>>,
 }
 
 impl AppState {
@@ -123,7 +162,32 @@ impl AppState {
             chat_provider: Arc::new(OnceCell::new()),
             session_stores: Arc::new(dashmap::DashMap::new()),
             events: Arc::new(events_tx),
+            started_at: std::time::Instant::now(),
+            // Default to an empty buffer — `with_log_buffer` overrides this
+            // when the daemon installs the `LogBufferLayer` (HTTP mode).
+            log_buffer: trusty_common::log_buffer::LogBuffer::new(
+                trusty_common::log_buffer::DEFAULT_LOG_CAPACITY,
+            ),
+            disk_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sys_metrics: Arc::new(tokio::sync::Mutex::new(
+                trusty_common::sys_metrics::SysMetrics::new(),
+            )),
         }
+    }
+
+    /// Builder-style: attach the daemon's shared [`LogBuffer`] so the
+    /// `GET /api/v1/logs/tail` endpoint serves the same lines the tracing
+    /// subscriber captures (issue #35).
+    ///
+    /// Why: `main` builds the buffer (via `init_tracing_with_buffer`) before
+    /// constructing the `AppState`, then hands a clone here so the HTTP
+    /// handler and the tracing layer observe the same ring.
+    /// What: replaces the empty default buffer with the supplied one.
+    /// Test: `logs_tail_returns_recent_lines`.
+    #[must_use]
+    pub fn with_log_buffer(mut self, buffer: trusty_common::log_buffer::LogBuffer) -> Self {
+        self.log_buffer = buffer;
+        self
     }
 
     /// Send a `DaemonEvent` to all connected SSE subscribers.
@@ -393,6 +457,11 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
 pub async fn run_http_on(state: AppState, listener: tokio::net::TcpListener) -> Result<()> {
     use axum::routing::get;
 
+    // Issue #35: recompute the `data_root` disk footprint every 10 s on a
+    // background task so `GET /health` reports `disk_bytes` without doing a
+    // recursive directory walk on the request path.
+    spawn_disk_size_ticker(state.clone());
+
     let app = web::router()
         .route("/sse", get(sse_handler))
         .with_state(state);
@@ -410,6 +479,41 @@ pub async fn run_http_on(state: AppState, listener: tokio::net::TcpListener) -> 
 pub async fn run_http(state: AppState, addr: std::net::SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     run_http_on(state, listener).await
+}
+
+/// Spawn a background ticker that recomputes the `data_root` disk footprint
+/// every 10 seconds and stores it in `state.disk_bytes` (issue #35).
+///
+/// Why: `GET /health` reports `disk_bytes`. Walking the data directory on
+/// every health request would turn a frequent health poll into unbounded
+/// recursive I/O. Computing it off the request path on a fixed cadence keeps
+/// `/health` cheap and bounds the staleness to ~10 s — fine for an
+/// at-a-glance footprint figure.
+/// What: spawns a detached tokio task. `AppState` is cheap to `Clone` (all
+/// `Arc` fields), so the task holds a full clone; the daemon process lives
+/// for the lifetime of the server anyway, so no `Weak` downgrade is needed.
+/// Each tick runs the blocking directory walk on `spawn_blocking` so it never
+/// stalls the async runtime, then stores the byte total atomically.
+/// Test: `health_endpoint_includes_resource_fields` asserts the field shape;
+/// the ticker cadence is not unit-tested (timing-dependent).
+fn spawn_disk_size_ticker(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let dir = state.data_root.clone();
+            // The directory walk is blocking filesystem I/O — run it on the
+            // blocking pool so it never parks an async worker thread.
+            let bytes = tokio::task::spawn_blocking(move || {
+                trusty_common::sys_metrics::dir_size_bytes(&dir)
+            })
+            .await
+            .unwrap_or(0);
+            state
+                .disk_bytes
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }
 
 /// Live SSE event stream — pushes `DaemonEvent` frames to dashboard clients.
