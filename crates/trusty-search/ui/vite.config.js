@@ -25,6 +25,9 @@ export default defineConfig({
       '/search': 'http://127.0.0.1:7878',
       '/chat': 'http://127.0.0.1:7878',
       '/facts': 'http://127.0.0.1:7878',
+      '/logs': 'http://127.0.0.1:7878',
+      '/config': 'http://127.0.0.1:7878',
+      '/admin': 'http://127.0.0.1:7878',
     },
   },
 });

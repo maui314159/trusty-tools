@@ -1,36 +1,36 @@
 <script>
   /*
-   * Why: Fixed-position dark sidebar matching the trusty-memory layout so
+   * Why: Fixed-position dark sidebar matching the trusty-search layout so
    * operators jumping between the two tools get a consistent shell.
-   * What: Three top-level routes — Dashboard, Search, Indexes — backed by
-   * the hash router. Brand text reads "Trusty Search".
-   * Test: Click each nav item, confirm hash updates and `.active` moves.
+   * What: Four top-level routes — Health, Palaces, Logs, Dream — backed by
+   * the hash router. Brand text reads "Trusty Memory".
+   * Test: click each nav item, confirm hash updates and `.active` moves.
    */
   import { getRoute, navigate } from '../router.svelte.js';
 
   let route = $derived(getRoute());
 
   const links = [
-    { path: '/', label: 'Dashboard', icon: '◇' },
-    { path: '/search', label: 'Search', icon: '⌕' },
-    { path: '/indexes', label: 'Indexes', icon: '▣' },
-    { path: '/health', label: 'Health', icon: '♥' },
+    { path: '/', label: 'Health', icon: '♥' },
+    { path: '/palaces', label: 'Palaces', icon: '▤' },
     { path: '/logs', label: 'Logs', icon: '☰' },
-    { path: '/config', label: 'Config', icon: '⚙' }
+    { path: '/dream', label: 'Dream', icon: '☾' }
   ];
 
   function isActive(path) {
-    if (path === '/') return route.path === '/' || route.path === '';
+    if (path === '/') {
+      return route.path === '/' || route.path === '' || route.path === '/health';
+    }
     return route.path.startsWith(path);
   }
 </script>
 
 <aside class="sidebar">
   <div class="brand">
-    <div class="logo">T</div>
+    <div class="logo">M</div>
     <div>
-      <div class="brand-title">Trusty Search</div>
-      <div class="brand-sub">Code Search</div>
+      <div class="brand-title">Trusty Memory</div>
+      <div class="brand-sub">Memory Palace</div>
     </div>
   </div>
   <nav>

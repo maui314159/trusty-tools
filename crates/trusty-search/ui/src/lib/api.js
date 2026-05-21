@@ -66,5 +66,24 @@ export const api = {
     request('/chat', {
       method: 'POST',
       body: JSON.stringify({ index_id, message, history })
-    })
+    }),
+
+  /** Tail the daemon's in-memory log ring buffer. */
+  logsTail: (n = 200) => request(`/logs/tail?n=${encodeURIComponent(n)}`),
+
+  /** Current daemon memory-limit configuration. */
+  getConfig: () => request('/config'),
+
+  /**
+   * Update daemon runtime config (memory limits). The daemon exposes a
+   * PATCH endpoint; omitted fields are left unchanged.
+   */
+  updateConfig: (patch) =>
+    request('/config', {
+      method: 'PATCH',
+      body: JSON.stringify(patch)
+    }),
+
+  /** Request a graceful daemon shutdown. */
+  stopDaemon: () => request('/admin/stop', { method: 'POST' })
 };

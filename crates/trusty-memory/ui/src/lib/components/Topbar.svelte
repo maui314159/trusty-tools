@@ -1,12 +1,11 @@
 <script>
   /*
-   * Why: Breadcrumb + daemon-status header that mirrors trusty-memory's
-   * Topbar. The redesign (issue #38) adds service controls — a Stop button
-   * wired to `POST /admin/stop` plus restart guidance — and keeps the
-   * version badge doubling as a health indicator.
+   * Why: Breadcrumb + daemon-status header. The version badge doubles as a
+   * health indicator — green when reachable, muted while connecting. Service
+   * controls (Stop) let operators shut the daemon down from the browser.
    * What: Renders crumbs derived from the current route, then a right-side
    * cluster with the version/online badge and a Stop control.
-   * Test: navigate to /search, confirm crumb reads "Search"; click Stop,
+   * Test: navigate to /palaces, confirm crumb reads "Palaces"; click Stop,
    * confirm the dialog appears.
    */
   import { getHealth } from '../state.svelte.js';
@@ -20,31 +19,24 @@
 
   let crumbs = $derived.by(() => {
     const segs = route.segments;
-    if (segs.length === 0) return ['Dashboard'];
-    if (segs[0] === 'search') return ['Search'];
-    if (segs[0] === 'indexes' || segs[0] === 'index') {
-      const parts = ['Indexes'];
-      if (segs.length > 1) parts.push(segs[1]);
-      return parts;
-    }
-    if (segs[0] === 'config') return ['Config'];
-    if (segs[0] === 'health') return ['Health'];
+    if (segs.length === 0) return ['Health'];
+    if (segs[0] === 'palaces' || segs[0] === 'palace') return ['Palaces'];
     if (segs[0] === 'logs') return ['Logs'];
-    return ['Dashboard'];
+    if (segs[0] === 'dream') return ['Dream'];
+    if (segs[0] === 'health') return ['Health'];
+    return ['Health'];
   });
 
   let healthy = $derived(health && health.status === 'ok');
 
   /**
-   * Why: a one-click daemon stop saves operators from resolving the PID and
-   * sending a signal. The daemon is localhost-only so no auth is needed.
-   * What: confirms, then POSTs `/admin/stop`; the daemon exits ~200ms later.
-   * Test: click Stop, accept the dialog, confirm the badge flips to offline.
+   * Why: a one-click daemon stop saves operators from resolving the PID. The
+   * daemon is localhost-only so no auth is needed.
+   * What: confirms, then POSTs `/api/v1/admin/stop`; the daemon exits shortly.
+   * Test: click Stop, accept the dialog, observe the badge flip to offline.
    */
   async function stopDaemon() {
-    if (!confirm('Stop the trusty-search daemon? Active searches will be interrupted.')) {
-      return;
-    }
+    if (!confirm('Stop the trusty-memory daemon?')) return;
     stopping = true;
     actionNote = null;
     try {
@@ -59,14 +51,13 @@
   }
 
   /**
-   * Why: there is no remote start/restart endpoint — once the daemon stops it
-   * cannot be revived over HTTP. Surface the CLI command instead of a button
-   * that cannot work.
+   * Why: there is no remote start/restart endpoint — surface the CLI command
+   * instead of a button that cannot work.
    * What: shows the restart instruction in a transient note.
    * Test: click Restart, confirm the CLI hint appears.
    */
   function restartHint() {
-    actionNote = 'Restart from a terminal: `trusty-search stop && trusty-search start`.';
+    actionNote = 'Restart from a terminal: `trusty-memory serve --http <addr>`.';
   }
 </script>
 
@@ -86,7 +77,7 @@
         class="btn btn-sm btn-danger"
         onclick={stopDaemon}
         disabled={stopping || !healthy}
-        title="POST /admin/stop"
+        title="POST /api/v1/admin/stop"
       >
         {stopping ? 'Stopping…' : 'Stop'}
       </button>

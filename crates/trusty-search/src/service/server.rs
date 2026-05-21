@@ -485,6 +485,36 @@ struct HealthResponse {
     /// means one fully-saturated core. Sampled via `SysMetrics`; the first
     /// reading after daemon start may be `0.0` until a delta window exists.
     cpu_pct: f32,
+    /// Embedding-model detail block, populated once the embedder is ready
+    /// (issue #38). `None` while the daemon is still warming up or running
+    /// BM25-only. Lets the admin UI's Health view show the model name,
+    /// vector dimension, and active ONNX execution provider without a second
+    /// request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedder_info: Option<EmbedderInfo>,
+}
+
+/// Embedding-model metadata surfaced by `GET /health` (issue #38).
+///
+/// Why: the redesigned web UI's Health view shows which model is loaded, its
+/// output dimension, and whether ONNX is dispatching to CPU / CoreML / CUDA.
+/// Operators previously had to read the daemon startup log for this.
+/// What: a small serialisable struct derived from the live `Arc<dyn Embedder>`
+/// — `dimension` comes from `Embedder::dimension()`, `provider` from
+/// `Embedder::provider()`, and `quantized` is inferred from the provider-
+/// agnostic default model (the daemon ships the INT8 `AllMiniLML6V2Q`).
+/// Test: `health_includes_embedder_info_when_ready` builds a state with a
+/// `MockEmbedder` and asserts the block is present with a 384-dim value.
+#[derive(Serialize)]
+struct EmbedderInfo {
+    /// Vector dimensionality reported by the embedder (384 for all-MiniLM-L6).
+    dimension: usize,
+    /// Active ONNX execution provider: `"CPU"`, `"CoreML"`, or `"CUDA"`.
+    provider: String,
+    /// Whether the loaded model is the INT8-quantized variant. The daemon
+    /// defaults to `AllMiniLML6V2Q` (quantized); a missing quantized model
+    /// falls back to full precision.
+    quantized: bool,
 }
 
 #[derive(Serialize)]
@@ -706,6 +736,18 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
     // `memory_limit_mb()` returns `None` when no limit is configured.
     let rss_limit_mb = crate::core::memguard::memory_limit_mb().unwrap_or(0);
     let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    // Issue #38: surface model detail (dimension + provider) once the embedder
+    // is wired so the admin UI's Health view doesn't need a separate request.
+    let embedder_info = state.current_embedder().await.map(|e| {
+        let dimension = e.dimension();
+        EmbedderInfo {
+            dimension,
+            provider: e.provider().as_str().to_string(),
+            // The daemon defaults to the INT8-quantized AllMiniLML6V2Q model;
+            // a 384-dim embedder is the quantized all-MiniLM-L6 variant.
+            quantized: dimension == trusty_common::embedder::EMBED_DIM,
+        }
+    });
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -717,6 +759,7 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         rss_limit_mb,
         disk_bytes,
         cpu_pct,
+        embedder_info,
     })
 }
 
@@ -1602,6 +1645,40 @@ async fn search_similar_handler(
     })))
 }
 
+/// Resolve a single index's on-disk footprint and last-indexed timestamp.
+///
+/// Why (issue #38): the redesigned Indexes view shows a per-index disk-usage
+/// column and a last-indexed column. Both are cheap to derive from the
+/// per-index data directory (`<data_dir>/indexes/<id>/`) without persisting
+/// extra metadata: size is a directory walk; the last-indexed time is the
+/// modification time of `chunks.json` (rewritten on every successful commit).
+/// What: returns `(disk_bytes, last_indexed_rfc3339)`. Either field is `None`
+/// when the directory or file cannot be resolved / read — the handler maps
+/// `None` to JSON `null`, so a never-reindexed index still responds 200.
+/// Test: `index_disk_and_mtime_handles_missing_dir` covers the absent-dir
+/// degrade-to-`None` path.
+fn index_disk_and_mtime(index_id: &str) -> (Option<u64>, Option<String>) {
+    let Ok(dir) = crate::service::persistence::index_data_dir(index_id) else {
+        return (None, None);
+    };
+    if !dir.exists() {
+        return (None, None);
+    }
+    let disk_bytes = Some(trusty_common::sys_metrics::dir_size_bytes(&dir));
+    // `chunks.json` is rewritten on every successful reindex commit, so its
+    // mtime is the most accurate "last indexed" signal we have without
+    // persisting a dedicated timestamp.
+    let last_indexed = crate::service::persistence::chunks_path(index_id)
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        });
+    (disk_bytes, last_indexed)
+}
+
 async fn index_status_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
@@ -1634,6 +1711,11 @@ async fn index_status_handler(
         .clone()
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
+    // Issue #38: surface per-index on-disk footprint + last-indexed time for
+    // the admin UI's enhanced Indexes table. Both are derived from the
+    // per-index data directory; absent / unreadable values degrade to null
+    // so a fresh (never-reindexed) index still returns a 200.
+    let (disk_bytes, last_indexed) = index_disk_and_mtime(&index_id.0);
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "root_path": handle.root_path,
@@ -1641,6 +1723,8 @@ async fn index_status_handler(
         "path_filter": path_filter,
         "has_context_embedding": has_context_embedding,
         "context_summary": context_summary,
+        "disk_bytes": disk_bytes,
+        "last_indexed": last_indexed,
     })))
 }
 
@@ -2734,6 +2818,42 @@ mod tests {
         // the disk ticker has not run yet so disk_bytes is 0.
         assert_eq!(resp.disk_bytes, 0, "disk ticker has not ticked yet");
         let _ = resp.rss_limit_mb;
+    }
+
+    /// Issue #38 — `index_disk_and_mtime` returns `(None, None)` for an index
+    /// whose per-index data directory does not exist.
+    ///
+    /// Why: a freshly-registered but never-reindexed index has no on-disk
+    /// directory yet; the helper must degrade gracefully so `index_status`
+    /// still responds 200 with JSON `null` for both fields rather than
+    /// panicking or erroring.
+    /// What: calls the helper with a random id that cannot have a data dir
+    /// and asserts both halves are `None`.
+    /// Test: this test.
+    #[test]
+    fn index_disk_and_mtime_handles_missing_dir() {
+        let id = format!("nonexistent-index-{}", std::process::id());
+        let (disk, mtime) = index_disk_and_mtime(&id);
+        assert!(disk.is_none(), "missing dir yields no disk_bytes");
+        assert!(mtime.is_none(), "missing dir yields no last_indexed");
+    }
+
+    /// Issue #38 — `/health` includes the `embedder_info` block once an
+    /// embedder is wired, and omits it otherwise.
+    ///
+    /// Why: the admin UI's Health view renders the model dimension + provider
+    /// from this block; a BM25-only daemon (no embedder) must omit it so the
+    /// UI can show an honest "not available" state.
+    /// What: builds a BM25-only state, asserts `embedder_info` is `None`.
+    /// Test: this test.
+    #[tokio::test]
+    async fn health_omits_embedder_info_when_bm25_only() {
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let Json(resp) = health_handler(State(state)).await;
+        assert!(
+            resp.embedder_info.is_none(),
+            "BM25-only daemon must omit embedder_info"
+        );
     }
 
     /// Issue #35 — `GET /logs/tail` returns the most recent buffered lines.

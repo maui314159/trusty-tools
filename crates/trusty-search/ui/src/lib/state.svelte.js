@@ -153,10 +153,19 @@ export async function refreshIndexes() {
             id,
             chunk_count: s.chunk_count ?? 0,
             root_path: s.root_path ?? '',
+            disk_bytes: s.disk_bytes ?? null,
+            last_indexed: s.last_indexed ?? null,
             error: false
           };
         } catch (_e) {
-          return { id, chunk_count: 0, root_path: '', error: true };
+          return {
+            id,
+            chunk_count: 0,
+            root_path: '',
+            disk_bytes: null,
+            last_indexed: null,
+            error: true
+          };
         }
       })
     );

@@ -1,23 +1,22 @@
 <script>
   /*
-   * Why: Shell layout that mirrors trusty-memory — fixed dark sidebar on
-   * the left, sticky topbar with breadcrumbs + version badge, and a
-   * hash-routed content pane that renders one of three views.
-   * What: Bootstraps the centralized state (health + indexes), then
-   * dispatches the route to Dashboard / Search / Indexes.
-   * Test: Open /ui in a browser, verify the three nav items render and the
-   * version badge turns green once /health responds.
+   * Why: Shell layout for the trusty-memory admin UI — fixed dark sidebar,
+   * sticky topbar with breadcrumbs + service controls, and a hash-routed
+   * content pane. Mirrors the trusty-search shell so operators jumping
+   * between the two tools get a consistent experience.
+   * What: Bootstraps shared health state, then dispatches the route to
+   * Health / Palaces / Logs / Dream.
+   * Test: open the SPA, verify the four nav items render and the version
+   * badge turns green once /health responds.
    */
   import Sidebar from './lib/components/Sidebar.svelte';
   import Topbar from './lib/components/Topbar.svelte';
-  import Dashboard from './lib/views/Dashboard.svelte';
-  import Search from './lib/views/Search.svelte';
-  import Indexes from './lib/views/Indexes.svelte';
-  import Config from './lib/views/Config.svelte';
   import Health from './lib/views/Health.svelte';
+  import Palaces from './lib/views/Palaces.svelte';
   import Logs from './lib/views/Logs.svelte';
+  import Dream from './lib/views/Dream.svelte';
   import { getRoute } from './lib/router.svelte.js';
-  import { refreshHealth, refreshIndexes } from './lib/state.svelte.js';
+  import { refreshHealth, refreshStatus } from './lib/state.svelte.js';
   import { onMount } from 'svelte';
 
   let bootError = $state(null);
@@ -26,7 +25,7 @@
     refreshHealth().catch((e) => {
       bootError = e.message || String(e);
     });
-    refreshIndexes().catch(() => {});
+    refreshStatus().catch(() => {});
     // Poll /health every 10s so the version badge stays live.
     const t = setInterval(() => {
       refreshHealth().catch(() => {});
@@ -38,13 +37,12 @@
 
   let view = $derived.by(() => {
     const segs = route.segments;
-    if (segs.length === 0) return { kind: 'dashboard' };
-    if (segs[0] === 'search') return { kind: 'search' };
-    if (segs[0] === 'indexes' || segs[0] === 'index') return { kind: 'indexes' };
-    if (segs[0] === 'config') return { kind: 'config' };
-    if (segs[0] === 'health') return { kind: 'health' };
+    if (segs.length === 0) return { kind: 'health' };
+    if (segs[0] === 'palaces' || segs[0] === 'palace') return { kind: 'palaces' };
     if (segs[0] === 'logs') return { kind: 'logs' };
-    return { kind: 'dashboard' };
+    if (segs[0] === 'dream') return { kind: 'dream' };
+    if (segs[0] === 'health') return { kind: 'health' };
+    return { kind: 'health' };
   });
 </script>
 
@@ -61,23 +59,19 @@
           <div class="card-body">
             <p>{bootError}</p>
             <p class="text-muted text-sm">
-              Make sure trusty-search is running with
-              <code>trusty-search serve</code>.
+              Make sure trusty-memory is running with
+              <code>trusty-memory serve --http 127.0.0.1:7079</code>.
             </p>
           </div>
         </div>
-      {:else if view.kind === 'dashboard'}
-        <Dashboard />
-      {:else if view.kind === 'search'}
-        <Search />
-      {:else if view.kind === 'indexes'}
-        <Indexes />
-      {:else if view.kind === 'config'}
-        <Config />
       {:else if view.kind === 'health'}
         <Health />
+      {:else if view.kind === 'palaces'}
+        <Palaces />
       {:else if view.kind === 'logs'}
         <Logs />
+      {:else if view.kind === 'dream'}
+        <Dream />
       {/if}
     </div>
   </div>
