@@ -19,30 +19,35 @@ use anyhow::Result;
 use colored::Colorize;
 use eventsource_stream::Eventsource;
 use futures_util::stream::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::IsTerminal;
 use std::time::Duration;
 
-/// Print per-subsystem indexing time breakdown after a successful reindex.
+/// Print the per-phase indexing time breakdown after a successful reindex.
 ///
-/// Why: gives the operator proof that each subsystem (parse, embed, BM25, KG)
-/// actually ran and how long each took. The vector-count check is the
-/// smoking-gun signal for the "embedder silently fell back to BM25" failure
-/// mode — printed as a loud warning so it can never go unnoticed.
-/// What: 4-line breakdown, plus a 5th warning line when `vector_count == 0`
-/// despite non-zero chunks (the BM25-only-mode signal).
-/// Test: call with synthetic timings where vector_count==0 and total_chunks>0;
-/// assert the warning line is printed.
+/// Why: gives the operator proof that each phase (parse/chunk, embed, vector
+/// upsert, BM25, knowledge graph) actually ran and how long each took. The
+/// daemon reports these as a post-hoc `timings` payload on the terminal
+/// `complete` SSE event — they cannot be streamed live because the daemon's
+/// orchestrator fuses parse/embed/commit per batch and runs BM25/KG/upsert as
+/// finalization. The vector-count check is the smoking-gun signal for the
+/// "embedder silently fell back to BM25" failure mode — printed as a loud
+/// warning so it can never go unnoticed.
+/// What: a 5-line phase breakdown (Parse/chunk, Embed, Upsert vectors, BM25,
+/// Knowledge graph), with the Embed line replaced by a warning when
+/// `vector_count == 0` despite non-zero chunks (the BM25-only-mode signal).
+/// Test: `tests::timing_breakdown_*` exercise the warning and normal paths.
 pub fn print_timing_breakdown(t: &ReindexTimings, total_chunks: u64) {
     println!(
         "  {} {:>7}  ({} chunks)",
-        "Parse+chunk:".dimmed(),
+        "Parse/chunk:   ".dimmed(),
         fmt_elapsed(t.parse_ms),
         format_with_commas(total_chunks),
     );
     if t.vector_count == 0 && total_chunks > 0 {
         println!(
             "  {} {}",
-            "Embed (HNSW):".dimmed(),
+            "Embed:         ".dimmed(),
             "SKIPPED (embedder unavailable — BM25-only mode)"
                 .yellow()
                 .bold(),
@@ -50,15 +55,25 @@ pub fn print_timing_breakdown(t: &ReindexTimings, total_chunks: u64) {
     } else {
         println!(
             "  {} {:>7}  ({} vectors)",
-            "Embed (HNSW):".dimmed(),
+            "Embed:         ".dimmed(),
             fmt_elapsed(t.embed_ms),
             format_with_commas(t.vector_count),
         );
     }
-    println!("  {} {:>7}", "BM25:".dimmed(), fmt_elapsed(t.bm25_ms));
+    println!(
+        "  {} {:>7}  ({} vectors)",
+        "Upsert vectors:".dimmed(),
+        fmt_elapsed(t.vector_upsert_ms),
+        format_with_commas(t.vector_count),
+    );
+    println!(
+        "  {} {:>7}",
+        "BM25 index:    ".dimmed(),
+        fmt_elapsed(t.bm25_ms)
+    );
     println!(
         "  {} {:>7}  ({} symbols, {} edges)",
-        "KG:".dimmed(),
+        "Knowledge graph:".dimmed(),
         fmt_elapsed(t.kg_ms),
         format_with_commas(t.symbol_count),
         format_with_commas(t.edge_count),
@@ -122,16 +137,69 @@ pub async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Multi-line live progress display for a reindex.
+/// Distinct phases of a reindex, surfaced to the user as a phase label on the
+/// progress display.
 ///
-/// Why: a single-line `ProgressBar` can't simultaneously show file progress,
-/// chunk count, skipped count, speed, and elapsed/ETA. `MultiProgress` stacks
-/// three lines (header / files bar / stats) that update independently.
+/// Why: the previous UI only showed a single undifferentiated "Indexing" line.
+/// Operators want to know which phase is running — parsing/embedding files is
+/// the dominant phase (and the only one with file-level progress), while BM25,
+/// knowledge-graph, and vector-upsert are post-batch finalization steps that
+/// the daemon reports only via the terminal `complete` event's `timings`
+/// payload. Naming each phase makes a stalled reindex diagnosable at a glance.
+/// What: a small enum with a human-readable label per variant.
+/// Test: `tests::phase_labels_are_stable` asserts each label string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReindexPhase {
+    /// Waiting for the daemon's first SSE event.
+    Connecting,
+    /// Walking + parsing + embedding source files (the file-level progress
+    /// phase). The daemon's pipelined orchestrator fuses parse, embed, and the
+    /// per-batch commit into one stream of `batch` events, so the CLI cannot
+    /// split them further without daemon-side changes.
+    ParseEmbed,
+    /// Building the BM25 lexical index (reported post-hoc via `timings`).
+    Bm25,
+    /// Building the knowledge graph / symbol graph (reported via `timings`).
+    KnowledgeGraph,
+    /// Upserting embedding vectors into the HNSW store (reported via `timings`).
+    Upsert,
+    /// Terminal: the reindex finished.
+    Done,
+}
+
+impl ReindexPhase {
+    /// Human-readable phase label rendered on the header line.
+    fn label(self) -> &'static str {
+        match self {
+            ReindexPhase::Connecting => "Connecting to daemon…",
+            ReindexPhase::ParseEmbed => "Parsing & embedding files",
+            ReindexPhase::Bm25 => "Building BM25 index…",
+            ReindexPhase::KnowledgeGraph => "Building knowledge graph…",
+            ReindexPhase::Upsert => "Upserting vectors…",
+            ReindexPhase::Done => "Done",
+        }
+    }
+}
+
+/// Multi-line live progress display for a reindex, with a per-phase label.
 ///
-/// Layout:
-///   ⟳ Indexing <index>
+/// Why: a single-line `ProgressBar` can't simultaneously show the current
+/// phase, file progress, chunk count, embedding rate, and ETA. `MultiProgress`
+/// stacks three lines (header+phase / files bar / stats) that update
+/// independently. The header now carries the active [`ReindexPhase`] so the
+/// operator can see whether the slow step is parse/embed or a post-batch
+/// finalization phase.
+///
+/// All progress draws to **stderr** (never stdout — stdout is the MCP JSON-RPC
+/// transport channel). When stdout is not a TTY (the CLI output is piped or
+/// redirected) the draw target is [`ProgressDrawTarget::hidden`], so no
+/// progress noise pollutes captured output; the terminal summary lines still
+/// print via `println!`.
+///
+/// Layout (TTY only):
+///   ⟳ Parsing & embedding files — myindex
 ///     [████████░░░░] 7,234/14,445 files (50%) — ETA 50s
-///     Files: 7,234/14,445  Chunks: 58,402  Skipped: 12  Speed: 142 files/s  Elapsed: 50s  ETA: 50s
+///     Embedding... 58,402 chunks — 142 cps — Files 7,234/14,445  Skipped 12  Elapsed 50s  ETA 3m 12s
 struct ReindexUi {
     /// Held to keep the MultiProgress draw target alive for the bars' lifetime.
     #[allow(dead_code)]
@@ -139,17 +207,30 @@ struct ReindexUi {
     header: ProgressBar,
     files: ProgressBar,
     stats: ProgressBar,
+    /// Current phase; used to label the header line.
+    phase: ReindexPhase,
 }
 
 impl ReindexUi {
-    fn new(index_id: &str) -> Self {
-        let multi = MultiProgress::new();
+    /// Build the UI. `interactive` is `false` when stdout is not a TTY — in
+    /// that case every bar draws to a hidden target so piped output stays
+    /// clean. Progress, when shown, always renders to stderr.
+    fn new(index_id: &str, interactive: bool) -> Self {
+        let multi = if interactive {
+            MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
+        } else {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        };
 
         let header = multi.add(ProgressBar::new(1));
         if let Ok(s) = ProgressStyle::with_template("{spinner:.cyan} {msg}") {
             header.set_style(s);
         }
-        header.set_message(format!("Indexing {}", index_id.bold()));
+        header.set_message(format!(
+            "{} — {}",
+            ReindexPhase::Connecting.label(),
+            index_id.bold()
+        ));
         header.enable_steady_tick(Duration::from_millis(120));
 
         let files = multi.add(ProgressBar::new(1));
@@ -170,7 +251,16 @@ impl ReindexUi {
             header,
             files,
             stats,
+            phase: ReindexPhase::Connecting,
         }
+    }
+
+    /// Switch the active phase and refresh the header label. The `index_id` is
+    /// re-rendered so the header always reads `<phase> — <index>`.
+    fn set_phase(&mut self, phase: ReindexPhase, index_id: &str) {
+        self.phase = phase;
+        self.header
+            .set_message(format!("{} — {}", phase.label(), index_id.bold()));
     }
 
     fn set_total(&self, total: u64) {
@@ -181,7 +271,20 @@ impl ReindexUi {
         self.files.set_position(indexed);
     }
 
-    fn update_stats(&self, indexed: u64, total_chunks: u64, skipped: u64, elapsed_secs: u64) {
+    /// Refresh the stats line for the parse/embed phase.
+    ///
+    /// `chunks_per_sec` is the embedding throughput reported by the daemon's
+    /// most recent `batch` event (0 when unavailable). The ETA is derived from
+    /// file throughput, which is the only quantity for which a reliable total
+    /// is known (`total_files`); chunk totals are not known until completion.
+    fn update_stats(
+        &self,
+        indexed: u64,
+        total_chunks: u64,
+        skipped: u64,
+        chunks_per_sec: u64,
+        elapsed_secs: u64,
+    ) {
         let total = self.files.length().unwrap_or(0);
         let files_per_sec = indexed.checked_div(elapsed_secs).unwrap_or(0);
         let eta = if files_per_sec > 0 && total > indexed {
@@ -190,12 +293,12 @@ impl ReindexUi {
             "?".to_string()
         };
         self.stats.set_message(format!(
-            "Files: {indexed}/{total}  Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}  ETA: {eta}",
+            "Embedding… {chunks} chunks — {cps} cps — Files {indexed}/{total}  Skipped {skipped}  Elapsed {elapsed}  ETA {eta}",
+            chunks = format_with_commas(total_chunks),
+            cps = chunks_per_sec,
             indexed = format_with_commas(indexed),
             total = format_with_commas(total),
-            chunks = format_with_commas(total_chunks),
             skipped = format_with_commas(skipped),
-            fps = files_per_sec,
             elapsed = fmt_secs(elapsed_secs),
             eta = eta,
         ));
@@ -282,7 +385,6 @@ pub struct ReindexTimings {
     pub parse_ms: u64,
     pub embed_ms: u64,
     pub bm25_ms: u64,
-    #[allow(dead_code)]
     pub vector_upsert_ms: u64,
     pub kg_ms: u64,
     pub vector_count: u64,
@@ -405,10 +507,16 @@ pub async fn run_reindex_with(
             resp.status()
         );
     }
-    // MultiProgress UI: header + files bar + stats line. Built eagerly so
-    // the user sees something during the 1–2 second daemon warmup before the
-    // first SSE event arrives.
-    let ui = ReindexUi::new(index_id);
+    // Progress is shown only when stdout is a TTY. When the CLI output is
+    // piped or redirected (`std::io::stdout()` is not a terminal) the bars
+    // draw to a hidden target so captured output stays clean. Progress always
+    // renders to stderr regardless — stdout is the MCP JSON-RPC transport.
+    let interactive = std::io::stdout().is_terminal();
+
+    // MultiProgress UI: header (with phase label) + files bar + stats line.
+    // Built eagerly so the user sees something during the 1–2 second daemon
+    // warmup before the first SSE event arrives.
+    let mut ui = ReindexUi::new(index_id, interactive);
 
     // Atomics shared with the wall-clock ticker. The ticker refreshes the
     // stats line every second so the user sees movement even when the SSE
@@ -419,12 +527,17 @@ pub async fn run_reindex_with(
     let indexed_now = StdArc::new(AtomicU64::new(0));
     let chunks_now = StdArc::new(AtomicU64::new(0));
     let skipped_now = StdArc::new(AtomicU64::new(0));
+    // Most recent embedding throughput (chunks/sec) reported by a `batch`
+    // event. The ticker reads this so the stats line keeps showing the last
+    // known rate even between sparse SSE events.
+    let cps_now = StdArc::new(AtomicU64::new(0));
     let tick_done = StdArc::new(AtomicBool::new(false));
 
     let ticker = {
         let indexed_now = indexed_now.clone();
         let chunks_now = chunks_now.clone();
         let skipped_now = skipped_now.clone();
+        let cps_now = cps_now.clone();
         let tick_done = tick_done.clone();
         let stats_bar = ui.stats.clone();
         let files_bar = ui.files.clone();
@@ -440,6 +553,7 @@ pub async fn run_reindex_with(
                 let indexed = indexed_now.load(Ordering::Acquire);
                 let chunks = chunks_now.load(Ordering::Acquire);
                 let skipped = skipped_now.load(Ordering::Acquire);
+                let cps = cps_now.load(Ordering::Acquire);
                 let fps = indexed.checked_div(elapsed).unwrap_or(0);
                 let total = files_bar.length().unwrap_or(0);
                 let eta = if fps > 0 && total > indexed {
@@ -448,12 +562,12 @@ pub async fn run_reindex_with(
                     "?".to_string()
                 };
                 stats_bar.set_message(format!(
-                    "Files: {indexed}/{total}  Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}s  ETA: {eta}",
+                    "Embedding… {chunks} chunks — {cps} cps — Files {indexed}/{total}  Skipped {skipped}  Elapsed {elapsed}s  ETA {eta}",
+                    chunks = format_with_commas(chunks),
+                    cps = cps,
                     indexed = format_with_commas(indexed),
                     total = format_with_commas(total),
-                    chunks = format_with_commas(chunks),
                     skipped = format_with_commas(skipped),
-                    fps = fps,
                     elapsed = elapsed,
                     eta = eta,
                 ));
@@ -521,6 +635,10 @@ pub async fn run_reindex_with(
             Some("start") => {
                 let total = evt.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
                 ui.set_total(total);
+                // The daemon's pipelined orchestrator emits `batch` events for
+                // the fused parse/embed/commit phase; label it accordingly the
+                // moment the stream opens.
+                ui.set_phase(ReindexPhase::ParseEmbed, index_id);
             }
             Some("batch") => {
                 let indexed = evt.get("indexed").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -528,11 +646,18 @@ pub async fn run_reindex_with(
                     .get("batch_chunks")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                // Daemon reports cumulative embedding throughput per batch
+                // (added in 0.3.x). Absent on older daemons → cps stays 0.
+                let chunks_per_sec = evt
+                    .get("chunks_per_sec")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let total = evt.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
                 if total > 0 && ui.files.length() != Some(total.max(1)) {
                     ui.set_total(total);
                 }
                 indexed_now.store(indexed, Ordering::Release);
+                cps_now.store(chunks_per_sec, Ordering::Release);
                 let new_chunks =
                     chunks_now.fetch_add(batch_chunks, Ordering::AcqRel) + batch_chunks;
                 ui.set_position(indexed);
@@ -540,6 +665,7 @@ pub async fn run_reindex_with(
                     indexed,
                     new_chunks,
                     skipped_now.load(Ordering::Acquire),
+                    chunks_per_sec,
                     started.elapsed().as_secs(),
                 );
             }
@@ -552,6 +678,7 @@ pub async fn run_reindex_with(
                     indexed,
                     chunks_now.load(Ordering::Acquire),
                     skipped,
+                    cps_now.load(Ordering::Acquire),
                     started.elapsed().as_secs(),
                 );
             }
@@ -585,6 +712,7 @@ pub async fn run_reindex_with(
                 }
                 outcome.completed = true;
                 ui.set_position(outcome.indexed);
+                ui.set_phase(ReindexPhase::Done, index_id);
                 done = true;
             }
             Some("error") => {
@@ -851,4 +979,92 @@ pub async fn fetch_chunk_count(index_id: &str) -> Option<u64> {
     }
     let body: serde_json::Value = resp.json().await.ok()?;
     body.get("chunk_count").and_then(|v| v.as_u64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The phase labels are user-facing strings; pin them so a rename is a
+    /// deliberate, reviewed change rather than an accidental drift.
+    #[test]
+    fn phase_labels_are_stable() {
+        assert_eq!(ReindexPhase::Connecting.label(), "Connecting to daemon…");
+        assert_eq!(
+            ReindexPhase::ParseEmbed.label(),
+            "Parsing & embedding files"
+        );
+        assert_eq!(ReindexPhase::Bm25.label(), "Building BM25 index…");
+        assert_eq!(
+            ReindexPhase::KnowledgeGraph.label(),
+            "Building knowledge graph…"
+        );
+        assert_eq!(ReindexPhase::Upsert.label(), "Upserting vectors…");
+        assert_eq!(ReindexPhase::Done.label(), "Done");
+    }
+
+    /// A non-interactive `ReindexUi` (piped stdout) must build without panic
+    /// and draw to a hidden target — no progress output is produced. This is
+    /// the path exercised whenever the CLI output is captured or piped.
+    #[test]
+    fn ui_builds_hidden_when_not_interactive() {
+        let mut ui = ReindexUi::new("test-index", false);
+        assert_eq!(ui.phase, ReindexPhase::Connecting);
+        // Phase transitions and stat updates are no-ops against a hidden
+        // target but must not panic.
+        ui.set_phase(ReindexPhase::ParseEmbed, "test-index");
+        assert_eq!(ui.phase, ReindexPhase::ParseEmbed);
+        ui.set_total(100);
+        ui.set_position(50);
+        ui.update_stats(50, 4_096, 3, 128, 10);
+        ui.set_phase(ReindexPhase::Done, "test-index");
+        assert_eq!(ui.phase, ReindexPhase::Done);
+        ui.finish("done".to_string());
+    }
+
+    /// An interactive `ReindexUi` must also build cleanly. indicatif's
+    /// `ProgressDrawTarget::stderr()` self-suppresses when stderr is not a
+    /// TTY (the case under `cargo test`), so this exercises the construction
+    /// path without emitting noise.
+    #[test]
+    fn ui_builds_interactive() {
+        let ui = ReindexUi::new("test-index", true);
+        assert_eq!(ui.phase, ReindexPhase::Connecting);
+        ui.abandon("aborted".to_string());
+    }
+
+    /// `print_timing_breakdown` must not panic for the BM25-only fallback
+    /// case (`vector_count == 0` with chunks present) — this is the warning
+    /// path that surfaces a silently-degraded embedder.
+    #[test]
+    fn timing_breakdown_bm25_only_does_not_panic() {
+        let t = ReindexTimings {
+            parse_ms: 1_000,
+            embed_ms: 0,
+            bm25_ms: 200,
+            vector_upsert_ms: 0,
+            kg_ms: 50,
+            vector_count: 0,
+            symbol_count: 10,
+            edge_count: 4,
+        };
+        print_timing_breakdown(&t, 1_234);
+    }
+
+    /// `print_timing_breakdown` must not panic for a normal completion with
+    /// non-zero vectors across every phase.
+    #[test]
+    fn timing_breakdown_normal_does_not_panic() {
+        let t = ReindexTimings {
+            parse_ms: 5_000,
+            embed_ms: 90_000,
+            bm25_ms: 1_200,
+            vector_upsert_ms: 3_400,
+            kg_ms: 800,
+            vector_count: 62_926,
+            symbol_count: 14_823,
+            edge_count: 41_002,
+        };
+        print_timing_breakdown(&t, 62_926);
+    }
 }

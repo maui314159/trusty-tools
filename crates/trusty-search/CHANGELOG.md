@@ -13,6 +13,20 @@ _(no unreleased changes)_
 
 ---
 
+## [0.3.57] — 2026-05-21
+
+### Changed
+- Granular per-phase progress for `trusty-search index` / `reindex`. The live
+  progress display now carries a phase label on its header line
+  (`Connecting → Parsing & embedding files → Done`) and the stats line shows
+  embedding throughput (`<N> cps`) and a file-derived ETA. The post-reindex
+  timing breakdown is reorganised into five named phases — Parse/chunk, Embed,
+  Upsert vectors, BM25 index, Knowledge graph — and now includes the
+  vector-upsert timing. Progress draws to **stderr** only and is suppressed
+  entirely when stdout is not a TTY (piped / redirected output).
+
+---
+
 ## [0.3.56] — 2026-05-21
 
 ### Fixed
