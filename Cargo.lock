@@ -10368,6 +10368,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusty-monitor-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "trusty-common",
+]
+
+[[package]]
 name = "trusty-mpm-cli"
 version = "0.2.9"
 dependencies = [
