@@ -24,6 +24,54 @@ use super::{
     ParsedBatch,
 };
 
+/// Resident-set-size of the current process, in megabytes.
+///
+/// Why: used by the CoreML memory tripwire to measure the RSS delta a single
+/// `embed_batch` call produced. CoreML on Apple Silicon can spike RSS by tens
+/// of GB within one call (the per-batch buffer is not released until the call
+/// returns), so the inter-batch RSS poller fires too late to prevent the
+/// spike — the tripwire instead measures the damage after the fact and halves
+/// the batch size for subsequent calls.
+/// What: reads resident set size for `std::process::id()`. On macOS, shells
+/// out to `ps -o rss= -p <pid>` (KiB). On Linux, parses `VmRSS` from
+/// `/proc/self/status` (KiB). Returns 0 on any error — the tripwire then
+/// degrades gracefully (a 0 reading just means the tripwire never fires).
+/// Test: `tripwire_tests::test_current_rss_mb_is_plausible` asserts the value
+/// is in a plausible range (the probe is intentionally non-fatal — a 0 reading
+/// just disables the tripwire — so it is only checked against a sanity ceiling).
+fn current_rss_mb() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let pid = std::process::id();
+        Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("VmRSS:"))
+                    .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+            })
+            .and_then(|kb| kb.parse::<usize>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
 impl CodeIndexer {
     /// Rebuild the symbol graph from the current corpus. Called after any
     /// mutation (`add_chunk`, `remove_chunk`, `index_file`). Rebuilding is
@@ -422,25 +470,56 @@ impl CodeIndexer {
         // Test: covered indirectly by `test_index_files_batch_*` on CPU
         // builds; behavioural verification on CoreML is via an Apple
         // Silicon smoke run.
-        let batch_size = match embedder.provider() {
+        let is_coreml = matches!(
+            embedder.provider(),
             trusty_common::embedder::ExecutionProvider::CoreML
-            | trusty_common::embedder::ExecutionProvider::CoreMLAne => {
-                let bs = crate::core::resolve_coreml_batch_size();
-                tracing::debug!(
-                    "embed_chunks_in_batches: CoreML provider active ({:?}) — using \
-                     TRUSTY_COREML_BATCH_SIZE={bs} (chunks={chunk_total})",
-                    embedder.provider()
-                );
-                bs
-            }
-            _ => embed_batch_size(),
+                | trusty_common::embedder::ExecutionProvider::CoreMLAne
+        );
+        let mut batch_size = if is_coreml {
+            let bs = crate::core::resolve_coreml_batch_size();
+            tracing::debug!(
+                "embed_chunks_in_batches: CoreML provider active ({:?}) — using \
+                 TRUSTY_COREML_BATCH_SIZE={bs} (chunks={chunk_total})",
+                embedder.provider()
+            );
+            bs
+        } else {
+            embed_batch_size()
         };
-        for batch_start in (0..chunk_total).step_by(batch_size) {
+
+        // CoreML memory tripwire (issue: CoreML RSS spike within a single
+        // batch). CoreML buffers are sized to the full batch tensor shape and
+        // drawn from Apple Silicon's unified memory; a too-large batch can
+        // spike RSS by tens of GB *inside* `embed_batch`, faster than the
+        // inter-batch RSS poller can react. We snapshot RSS before each call
+        // and measure the delta after it returns; if the delta exceeds the
+        // tripwire threshold, we halve `batch_size` for the remaining
+        // sub-batches (once per reindex) so RSS never climbs into jetsam
+        // territory. The tripwire is **non-fatal** — on a trip we log a
+        // warning, reduce the batch size, and continue. It applies only on
+        // the CoreML provider; CPU and CUDA paths skip it entirely (CPU has
+        // the ORT arena disabled; CUDA buffers live in device memory).
+        let tripwire_mb = if is_coreml {
+            crate::core::resolve_coreml_tripwire_mb()
+        } else {
+            0
+        };
+        let mut tripwire_fired = false;
+
+        let mut batch_start = 0usize;
+        while batch_start < chunk_total {
+            // `batch_size` may have been halved by the tripwire; recompute the
+            // end of the current sub-batch each iteration.
             let batch_end = (batch_start + batch_size).min(chunk_total);
             let batch_texts: Vec<&str> = chunks[batch_start..batch_end]
                 .iter()
                 .map(|c| c.content.as_str())
                 .collect();
+
+            // Snapshot RSS immediately before the embed call (CoreML only —
+            // `current_rss_mb` shells out, so skip the cost on CPU/CUDA).
+            let rss_before = if is_coreml { current_rss_mb() } else { 0 };
+
             let batch_vecs = embedder
                 .embed_batch(&batch_texts)
                 .await
@@ -455,6 +534,34 @@ impl CodeIndexer {
             for (offset, vec) in batch_vecs.into_iter().enumerate() {
                 embeddings[batch_start + offset] = Some(vec);
             }
+
+            // Measure the post-call RSS delta and trip the wire if it spiked.
+            // `rss_before == 0` means the RSS probe failed — the tripwire
+            // degrades gracefully and simply does not fire.
+            if is_coreml && !tripwire_fired && rss_before > 0 {
+                let rss_after = current_rss_mb();
+                let delta_mb = rss_after.saturating_sub(rss_before);
+                if delta_mb > tripwire_mb {
+                    let new_size =
+                        (batch_size / 2).max(crate::core::memory_policy::COREML_BATCH_SIZE_MIN);
+                    tracing::warn!(
+                        "embed_chunks_in_batches: CoreML RSS delta {}MB exceeds tripwire \
+                         {}MB after batch of {} chunks — halving batch size {} → {} for \
+                         remaining sub-batches (non-fatal, reindex continues)",
+                        delta_mb,
+                        tripwire_mb,
+                        batch_texts.len(),
+                        batch_size,
+                        new_size,
+                    );
+                    batch_size = new_size;
+                    // Only halve once per reindex — a second trip would most
+                    // likely be the same spike still draining, not new growth.
+                    tripwire_fired = true;
+                }
+            }
+
+            batch_start = batch_end;
         }
         Ok(embeddings)
     }
@@ -779,5 +886,30 @@ impl CodeIndexer {
     /// read-only KG queries from concurrent search handlers.
     pub async fn symbol_graph(&self) -> Arc<SymbolGraph> {
         Arc::clone(&*self.symbol_graph.read().await)
+    }
+}
+
+#[cfg(test)]
+mod tripwire_tests {
+    use super::current_rss_mb;
+
+    /// `current_rss_mb` must never panic and must return a plausible value.
+    ///
+    /// Why: the CoreML tripwire depends on this probe. It is intentionally
+    /// non-fatal — a failed probe returns 0 and the tripwire simply never
+    /// fires — so the only hard guarantee is "no panic, plausible range".
+    /// What: on macOS/Linux the live test process has a non-zero RSS, so the
+    /// reading should be > 0 and below an implausible 1 TB ceiling. On other
+    /// platforms the function returns 0 by design.
+    #[test]
+    fn test_current_rss_mb_is_plausible() {
+        let rss = current_rss_mb();
+        // Sanity ceiling: no test host has a 1 TB resident set.
+        assert!(rss < 1024 * 1024, "current_rss_mb implausibly large: {rss}");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            // The running test process must occupy some resident memory.
+            assert!(rss > 0, "current_rss_mb should be > 0 on macOS/Linux");
+        }
     }
 }

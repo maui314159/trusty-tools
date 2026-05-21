@@ -376,7 +376,7 @@ impl CodeIndexer {
                 .batch_counter
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
-            if n % crate::core::indexer::HNSW_SNAPSHOT_BATCH_INTERVAL != 0 {
+            if !n.is_multiple_of(crate::core::indexer::HNSW_SNAPSHOT_BATCH_INTERVAL) {
                 return;
             }
         }

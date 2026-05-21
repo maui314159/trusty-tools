@@ -227,6 +227,56 @@ pub fn resolve_coreml_batch_size() -> usize {
     }
 }
 
+/// Default value for `TRUSTY_COREML_TRIPWIRE_MB` (per-batch RSS-delta ceiling
+/// that triggers automatic CoreML batch-size halving).
+///
+/// Why: CoreML buffers are sized to the full batch tensor shape and drawn from
+/// unified memory. On Apple Silicon, a batch that's too large can spike RSS by
+/// tens of GB in a single call — faster than the inter-batch RSS poller can
+/// react. The tripwire fires *after* the call returns and measures the delta;
+/// if delta > threshold, the batch size is halved for subsequent calls.
+/// What: RSS delta (in MB) for a single `embed_batch` call that triggers
+/// automatic batch-size halving. Default 4 GB; overridable via
+/// `TRUSTY_COREML_TRIPWIRE_MB`.
+/// Test: `test_coreml_tripwire_default` and `test_coreml_tripwire_env_override`.
+pub const DEFAULT_COREML_TRIPWIRE_MB: usize = 4096; // 4 GB delta per batch
+
+/// Resolve the CoreML memory tripwire threshold from the environment.
+///
+/// Why: keeps the env-parse logic in one place so the reindex pipeline sees a
+/// single, well-defined semantics for the per-batch RSS-delta ceiling. The
+/// tripwire is a *safety net* for experimenting with larger CoreML batch
+/// sizes (64, 128) — it lets the pipeline back off automatically if a larger
+/// batch causes dangerous unified-memory growth, rather than climbing into
+/// jetsam territory.
+/// What: reads `TRUSTY_COREML_TRIPWIRE_MB`, parses as `usize`. Falls back to
+/// `DEFAULT_COREML_TRIPWIRE_MB` when unset, empty, unparseable, or zero. Logs
+/// a warning on parse failure so typos surface.
+/// Test: `test_coreml_tripwire_default`, `test_coreml_tripwire_env_override`,
+/// and `test_coreml_tripwire_env_invalid`.
+pub fn resolve_coreml_tripwire_mb() -> usize {
+    match std::env::var("TRUSTY_COREML_TRIPWIRE_MB") {
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                tracing::warn!(
+                    "memory_policy: TRUSTY_COREML_TRIPWIRE_MB={v:?} is zero; \
+                     using default ({DEFAULT_COREML_TRIPWIRE_MB})"
+                );
+                DEFAULT_COREML_TRIPWIRE_MB
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "memory_policy: TRUSTY_COREML_TRIPWIRE_MB={v:?} is not a valid usize; \
+                     using default ({DEFAULT_COREML_TRIPWIRE_MB})"
+                );
+                DEFAULT_COREML_TRIPWIRE_MB
+            }
+        },
+        Err(_) => DEFAULT_COREML_TRIPWIRE_MB,
+    }
+}
+
 /// Floor for the computed batch size. Below this throughput collapses but the
 /// process is still functional. Raised from 8 → 32 (issue #19): with the
 /// ORT arena allocator disabled on the CPU path, per-slot transient
@@ -1138,6 +1188,59 @@ mod tests {
             match prior {
                 Some(v) => std::env::set_var("TRUSTY_COREML_BATCH_SIZE", v),
                 None => std::env::remove_var("TRUSTY_COREML_BATCH_SIZE"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_tripwire_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_TRIPWIRE_MB").ok();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::remove_var("TRUSTY_COREML_TRIPWIRE_MB") };
+        assert_eq!(resolve_coreml_tripwire_mb(), DEFAULT_COREML_TRIPWIRE_MB);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", v),
+                None => std::env::remove_var("TRUSTY_COREML_TRIPWIRE_MB"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_tripwire_env_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_TRIPWIRE_MB").ok();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", "8192") };
+        assert_eq!(resolve_coreml_tripwire_mb(), 8192);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", v),
+                None => std::env::remove_var("TRUSTY_COREML_TRIPWIRE_MB"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_tripwire_env_invalid() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("TRUSTY_COREML_TRIPWIRE_MB").ok();
+        // Zero: fall back to default (with warn).
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", "0") };
+        assert_eq!(resolve_coreml_tripwire_mb(), DEFAULT_COREML_TRIPWIRE_MB);
+        // Garbage: fall back to default (with warn).
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", "not-a-number") };
+        assert_eq!(resolve_coreml_tripwire_mb(), DEFAULT_COREML_TRIPWIRE_MB);
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_COREML_TRIPWIRE_MB", v),
+                None => std::env::remove_var("TRUSTY_COREML_TRIPWIRE_MB"),
             }
         }
     }

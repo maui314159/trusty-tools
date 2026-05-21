@@ -24,7 +24,9 @@ pub use classifier::{QueryClassifier, QueryIntent};
 pub use embed::{Embedder, FastEmbedder};
 pub use entity::{extract_entities, EdgeKind, EntityExtractor, EntityType, RawEntity};
 pub use indexer::{CodeChunk, CodeIndexer};
-pub use memory_policy::{resolve_coreml_batch_size, MemoryPolicy, MemoryTier};
+pub use memory_policy::{
+    resolve_coreml_batch_size, resolve_coreml_tripwire_mb, MemoryPolicy, MemoryTier,
+};
 pub use mmr::{cosine_similarity, mmr_rerank};
 pub use registry::{IndexHandle, IndexId, IndexRegistry};
 pub use scip_ingest::{CodeEntityIndex, ScipEdge, ScipEntityRef, ScipIndex};
