@@ -205,7 +205,7 @@ impl ReindexPhase {
 ///
 /// Layout (TTY only):
 ///   ⟳ Parsing & embedding files — myindex
-///     [████████░░░░] 7,234/14,445 files (50%) — ETA 50s
+///     [████████░░░░] 7,234/14,445 files  •  58,402 chunks  (50%) — ETA 50s
 ///     Embedding... 58,402 chunks — 142 cps — Files 7,234/14,445  Skipped 12  Elapsed 50s  ETA 3m 12s
 struct ReindexUi {
     /// Held to keep the MultiProgress draw target alive for the bars' lifetime.
@@ -216,6 +216,19 @@ struct ReindexUi {
     stats: ProgressBar,
     /// Current phase; used to label the header line.
     phase: ReindexPhase,
+}
+
+/// Build the files-bar `{msg}` suffix carrying the running chunk count.
+///
+/// Why: indicatif templates only interpolate built-in fields (`{pos}`, `{len}`,
+/// `{percent}`, `{eta}`, `{msg}`). The files bar's template embeds `{msg}` so
+/// the chunk count rides on the same line as the file count; this helper is the
+/// single place that formats that suffix so the synchronous `update_stats` path
+/// and the wall-clock ticker render it identically.
+/// What: returns e.g. `"58,402 chunks"` with thousands separators.
+/// Test: `tests::files_bar_chunk_msg_formats_with_commas` pins the output.
+fn files_bar_chunk_msg(chunks: u64) -> String {
+    format!("{} chunks", format_with_commas(chunks))
 }
 
 impl ReindexUi {
@@ -241,11 +254,15 @@ impl ReindexUi {
         header.enable_steady_tick(Duration::from_millis(120));
 
         let files = multi.add(ProgressBar::new(1));
+        // `{msg}` carries the running chunk count (see `files_bar_chunk_msg`):
+        // indicatif templates only interpolate built-in fields, so the chunk
+        // count rides on the bar's message slot rather than a custom token.
         if let Ok(s) = ProgressStyle::with_template(
-            "  [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) — ETA {eta}",
+            "  [{bar:40.cyan/blue}] {pos}/{len} files  •  {msg}  ({percent}%) — ETA {eta}",
         ) {
             files.set_style(s.progress_chars("█░ "));
         }
+        files.set_message(files_bar_chunk_msg(0));
 
         let stats = multi.add(ProgressBar::new(1));
         if let Ok(s) = ProgressStyle::with_template("  {msg}") {
@@ -264,10 +281,17 @@ impl ReindexUi {
 
     /// Switch the active phase and refresh the header label. The `index_id` is
     /// re-rendered so the header always reads `<phase> — <index>`.
+    ///
+    /// Entering [`ReindexPhase::ParseEmbed`] resets the files bar position to 0
+    /// so progress starts fresh from the beginning of the actual indexing phase
+    /// rather than carrying over any position left from the `Connecting` state.
     fn set_phase(&mut self, phase: ReindexPhase, index_id: &str) {
         self.phase = phase;
         self.header
             .set_message(format!("{} — {}", phase.label(), index_id.bold()));
+        if phase == ReindexPhase::ParseEmbed {
+            self.files.set_position(0);
+        }
     }
 
     fn set_total(&self, total: u64) {
@@ -284,6 +308,9 @@ impl ReindexUi {
     /// most recent `batch` event (0 when unavailable). The ETA is derived from
     /// file throughput, which is the only quantity for which a reliable total
     /// is known (`total_files`); chunk totals are not known until completion.
+    ///
+    /// Also refreshes the files bar's `{msg}` slot with the running chunk count
+    /// so the `[████]` line and the stats line stay in sync.
     fn update_stats(
         &self,
         indexed: u64,
@@ -299,6 +326,7 @@ impl ReindexUi {
         } else {
             "?".to_string()
         };
+        self.files.set_message(files_bar_chunk_msg(total_chunks));
         self.stats.set_message(format!(
             "Embedding… {chunks} chunks — {cps} cps — Files {indexed}/{total}  Skipped {skipped}  Elapsed {elapsed}  ETA {eta}",
             chunks = format_with_commas(total_chunks),
@@ -568,6 +596,9 @@ pub async fn run_reindex_with(
                 } else {
                     "?".to_string()
                 };
+                // Keep the files bar's chunk-count suffix moving in lockstep
+                // with the stats line, even between sparse SSE `batch` events.
+                files_bar.set_message(files_bar_chunk_msg(chunks));
                 stats_bar.set_message(format!(
                     "Embedding… {chunks} chunks — {cps} cps — Files {indexed}/{total}  Skipped {skipped}  Elapsed {elapsed}s  ETA {eta}",
                     chunks = format_with_commas(chunks),
@@ -719,6 +750,15 @@ pub async fn run_reindex_with(
                 }
                 outcome.completed = true;
                 ui.set_position(outcome.indexed);
+                // Reflect the authoritative final chunk count on the files bar
+                // before the UI is finished/cleared.
+                ui.update_stats(
+                    outcome.indexed,
+                    outcome.total_chunks,
+                    outcome.skipped,
+                    cps_now.load(Ordering::Acquire),
+                    started.elapsed().as_secs(),
+                );
                 ui.set_phase(ReindexPhase::Done, index_id);
                 done = true;
             }
@@ -1008,6 +1048,15 @@ mod tests {
         );
         assert_eq!(ReindexPhase::Upsert.label(), "Upserting vectors…");
         assert_eq!(ReindexPhase::Done.label(), "Done");
+    }
+
+    /// The files-bar `{msg}` suffix must carry the chunk count with thousands
+    /// separators so the `[████]` line and the stats line agree.
+    #[test]
+    fn files_bar_chunk_msg_formats_with_commas() {
+        assert_eq!(files_bar_chunk_msg(0), "0 chunks");
+        assert_eq!(files_bar_chunk_msg(42), "42 chunks");
+        assert_eq!(files_bar_chunk_msg(58_402), "58,402 chunks");
     }
 
     /// A non-interactive `ReindexUi` (piped stdout) must build without panic
