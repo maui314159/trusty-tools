@@ -11,11 +11,11 @@
 //! rendering, and uptime/count formatting without a terminal.
 
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
-    Frame,
 };
 
 /// Terminal width (in columns) at or above which panels render side by side.
@@ -620,7 +620,7 @@ fn memory_version_badge(panel: &DaemonPanel<MemoryData>) -> (char, &'static str,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     /// A trusty-search payload with two indexes for rendering tests.
     fn sample_search() -> SearchData {
@@ -762,18 +762,26 @@ mod tests {
             base_url: "http://127.0.0.1:7878".into(),
         };
         let lines = search_panel_lines(&panel);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Uptime:") && l.contains("2h 4m")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Indexes:") && l.contains('2')));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("cto") && l.contains("1,200")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("trusty") && l.contains("19.0k")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Uptime:") && l.contains("2h 4m"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Indexes:") && l.contains('2'))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("cto") && l.contains("1,200"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("trusty") && l.contains("19.0k"))
+        );
     }
 
     #[test]
@@ -783,18 +791,26 @@ mod tests {
             base_url: "http://127.0.0.1:7070".into(),
         };
         let lines = memory_panel_lines(&panel);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Palaces:") && l.contains('2')));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Vectors:") && l.contains("8,400")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("KG triples:") && l.contains("1,200")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("default") && l.contains("8,400")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Palaces:") && l.contains('2'))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Vectors:") && l.contains("8,400"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("KG triples:") && l.contains("1,200"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("default") && l.contains("8,400"))
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::dashboard::{MemoryData, PalaceRow};
+use crate::monitor::dashboard::{MemoryData, PalaceRow};
 
 /// Default trusty-memory daemon address used when discovery fails.
 ///
@@ -37,7 +37,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// when present, otherwise [`DEFAULT_MEMORY_URL`].
 /// Test: `resolve_memory_url_returns_http_url`.
 pub fn resolve_memory_url() -> String {
-    match trusty_common::read_daemon_addr("trusty-memory") {
+    match crate::read_daemon_addr("trusty-memory") {
         Ok(Some(addr)) => normalize_url(&addr),
         _ => DEFAULT_MEMORY_URL.to_string(),
     }

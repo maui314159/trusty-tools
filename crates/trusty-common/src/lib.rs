@@ -119,6 +119,22 @@ pub mod symgraph;
 #[cfg(feature = "memory-core")]
 pub mod memory_core;
 
+/// Unified monitor TUI for the trusty-search and trusty-memory daemons
+/// (formerly the `trusty-monitor-tui` crate).
+///
+/// Why: operators run both daemons and want one terminal surface that shows
+/// the health of both at a glance. Living here behind the `monitor-tui`
+/// feature flag matches the workspace's "one fewer published crate" direction
+/// (issue #31 companion) and keeps the dashboard logic unit-testable.
+/// What: gated behind the `monitor-tui` feature, which pulls in `ratatui` and
+/// `crossterm`. Exposes `monitor::run` (the entry point the `trusty-monitor`
+/// binary calls) plus the pure `dashboard` / `search_client` / `memory_client`
+/// submodules.
+/// Test: `cargo test -p trusty-common --features monitor-tui` covers the
+/// rendering, layout, and HTTP-client pieces.
+#[cfg(feature = "monitor-tui")]
+pub mod monitor;
+
 pub use chat::{
     ChatEvent, ChatProvider, LocalModelConfig, OllamaProvider, OpenRouterProvider, ToolCall,
     ToolDef, auto_detect_local_provider,

@@ -1,6 +1,6 @@
 [package]
 name = "trusty-common"
-version = "0.4.2"
+version = "0.4.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -36,6 +36,12 @@ uuid = { workspace = true, optional = true }
 fastembed = { workspace = true, features = ["hf-hub-native-tls"], optional = true }
 lru = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
+
+# Optional: enabled by the `monitor-tui` feature (formerly the
+# `trusty-monitor-tui` crate). ratatui + crossterm power the unified
+# terminal dashboard for the trusty-search and trusty-memory daemons.
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
 
 # Optional: enabled by the `symgraph` / `symgraph-parser` features (formerly
 # the `trusty-symgraph` crate). The `symgraph` feature pulls in only the
@@ -106,6 +112,14 @@ optional = true
 [dev-dependencies]
 toml = "0.8"
 tempfile = { workspace = true }
+
+# The unified monitor TUI binary (formerly the `trusty-monitor-tui` crate).
+# Gated behind `monitor-tui` so the default `cargo build` of `trusty-common`
+# as a library does not pull in ratatui / crossterm.
+[[bin]]
+name = "trusty-monitor"
+path = "src/bin/trusty-monitor.rs"
+required-features = ["monitor-tui"]
 
 [features]
 default = []
@@ -212,3 +226,8 @@ memory-core = [
 # feature. Pulls in the `kuzu` crate. Off by default because kuzu adds a
 # large native dependency.
 memory-core-kuzu = ["memory-core", "dep:kuzu"]
+# Enables the `monitor` module + the `trusty-monitor` binary: the unified
+# ratatui dashboard for the trusty-search and trusty-memory daemons
+# (formerly the `trusty-monitor-tui` crate). Pulls in ratatui + crossterm;
+# the daemon HTTP clients reuse the `reqwest` already required.
+monitor-tui = ["dep:ratatui", "dep:crossterm"]

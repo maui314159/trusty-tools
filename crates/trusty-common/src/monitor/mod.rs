@@ -2,15 +2,17 @@
 //!
 //! Why: operators run both the trusty-search and trusty-memory daemons and
 //! want one terminal surface that shows the health of both at a glance,
-//! without juggling two `curl /health` tabs. Exposing the dashboard as a
-//! library keeps the event loop, rendering, and HTTP transport in separate,
-//! independently testable modules.
+//! without juggling two `curl /health` tabs. Living in `trusty-common` behind
+//! the `monitor-tui` feature flag keeps the event loop, rendering, and HTTP
+//! transport in separate, independently testable modules without shipping a
+//! separate published crate (issue #31 companion).
 //! What: a ratatui app that polls both daemons on a 2-second timer (input
 //! polled every 50ms so keys feel instant), renders the [`dashboard`] panels,
 //! and offers a `[r]` reindex action against the focused search index. Offline
 //! daemons are retried every 5 seconds while the other panel keeps refreshing.
-//! Test: `cargo test -p trusty-monitor-tui` covers the pure rendering, layout,
-//! and client pieces; `trusty-monitor` launches the live dashboard.
+//! Test: `cargo test -p trusty-common --features monitor-tui` covers the pure
+//! rendering, layout, and client pieces; `trusty-monitor` launches the live
+//! dashboard.
 
 pub mod dashboard;
 pub mod memory_client;
@@ -21,9 +23,9 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 use dashboard::{DashboardState, PanelStatus};
 use memory_client::MemoryClient;

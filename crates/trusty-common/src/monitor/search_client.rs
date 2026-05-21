@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::dashboard::{IndexRow, SearchData};
+use crate::monitor::dashboard::{IndexRow, SearchData};
 
 /// Default trusty-search daemon address used when discovery fails.
 ///
@@ -42,7 +42,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`DEFAULT_SEARCH_URL`].
 /// Test: `resolve_search_url_falls_back_to_default` exercises the fallback path.
 pub fn resolve_search_url() -> String {
-    match trusty_common::read_daemon_addr("trusty-search") {
+    match crate::read_daemon_addr("trusty-search") {
         Ok(Some(addr)) => normalize_url(&addr),
         _ => DEFAULT_SEARCH_URL.to_string(),
     }
