@@ -84,6 +84,32 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Monitor the trusty-memory daemon via web UI or terminal dashboard.
+    ///
+    /// `monitor web` prints the daemon's admin-panel URL; `monitor tui`
+    /// launches the unified ratatui dashboard shared with `trusty-search`,
+    /// showing the trusty-search AND trusty-memory daemons side by side.
+    #[command(subcommand_required = true)]
+    Monitor {
+        #[command(subcommand)]
+        target: MonitorTarget,
+    },
+}
+
+/// Target surface for the `monitor` subcommand.
+///
+/// Why: operators want either a quick link to the daemon's web UI or the
+/// full unified terminal dashboard; this enum names the two.
+/// What: `Web` prints the daemon's `/ui` URL; `Tui` launches the shared
+/// `trusty_common::monitor` ratatui dashboard.
+/// Test: `cargo run -p trusty-memory -- monitor --help` lists both variants.
+#[derive(Debug, Subcommand)]
+enum MonitorTarget {
+    /// Open the web dashboard URL in the terminal (or browser).
+    Web,
+    /// Launch the unified terminal UI dashboard (trusty-search + trusty-memory).
+    Tui,
 }
 
 #[tokio::main]
@@ -100,6 +126,32 @@ async fn main() -> Result<()> {
         } => handle_migrate(target, dry_run, config_only),
         Command::Setup => handle_setup(),
         Command::Service { action } => handle_service(&action),
+        Command::Monitor { target } => run_monitor(target).await,
+    }
+}
+
+/// Dispatch the `monitor` subcommand.
+///
+/// Why: keeps `main` focused on parsing while putting the daemon-address
+/// discovery and dashboard launch in one place.
+/// What: `Web` resolves the live daemon address from the lock file and prints
+/// its `/ui` URL (exiting non-zero when no daemon is running); `Tui` launches
+/// the shared `trusty_common::monitor` ratatui dashboard.
+/// Test: not unit-tested (process-level entry point); `cargo run -p
+/// trusty-memory -- monitor --help` lists both targets.
+async fn run_monitor(target: MonitorTarget) -> Result<()> {
+    match target {
+        MonitorTarget::Web => match trusty_common::read_daemon_addr("trusty-memory")? {
+            Some(addr) => {
+                println!("{addr}/ui");
+                Ok(())
+            }
+            None => {
+                eprintln!("trusty-memory daemon not running (no address found)");
+                std::process::exit(1);
+            }
+        },
+        MonitorTarget::Tui => trusty_common::monitor::run().await,
     }
 }
 

@@ -518,17 +518,48 @@ enum Commands {
         action: commands::config::ConfigAction,
     },
 
+    /// Monitor the trusty-search daemon via web UI or terminal dashboard
+    ///
+    /// `monitor web` prints the admin panel URL of the running daemon (and
+    /// attempts to open it in the default browser). `monitor tui` launches the
+    /// unified ratatui dashboard that shows the trusty-search AND trusty-memory
+    /// daemons side by side.
+    ///
+    /// Examples:
+    ///   trusty-search monitor web
+    ///   trusty-search monitor tui
+    #[command(display_order = 30, subcommand_required = true)]
+    Monitor {
+        #[command(subcommand)]
+        target: MonitorTarget,
+    },
+
     /// Generate shell completion script
     ///
     /// Examples:
     ///   trusty-search completions zsh > ~/.zsh/completions/_trusty-search
     ///   trusty-search completions bash >> ~/.bashrc
-    #[command(display_order = 30)]
+    #[command(display_order = 31)]
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+/// Target surface for the `monitor` subcommand.
+///
+/// Why: operators want either a quick browser link to the daemon's admin
+/// panel or the full unified terminal dashboard; this enum names the two.
+/// What: `Web` prints (and opens) the daemon's `/ui` URL; `Tui` launches the
+/// shared `trusty_common::monitor` ratatui dashboard.
+/// Test: `cargo run -p trusty-search -- monitor --help` lists both variants.
+#[derive(Subcommand)]
+enum MonitorTarget {
+    /// Open the web dashboard URL in the terminal (or browser)
+    Web,
+    /// Launch the unified terminal UI dashboard (trusty-search + trusty-memory)
+    Tui,
 }
 
 /// Why: Allow users to override `QueryClassifier`'s automatic intent detection
@@ -710,6 +741,26 @@ async fn run() -> Result<()> {
         Commands::Config { action } => {
             commands::config::handle_config(action).await?;
         }
+
+        Commands::Monitor { target } => match target {
+            MonitorTarget::Web => {
+                // Prefer the live address written by a running daemon; fall
+                // back to the default loopback port so the command still
+                // prints something useful when the daemon has not started.
+                let url = match trusty_common::read_daemon_addr("trusty-search") {
+                    Ok(Some(addr)) => format!("{addr}/ui"),
+                    _ => format!(
+                        "http://127.0.0.1:{}/ui",
+                        trusty_search::service::DEFAULT_PORT
+                    ),
+                };
+                println!("{url}");
+                open::that(&url).ok();
+            }
+            MonitorTarget::Tui => {
+                trusty_common::monitor::run().await?;
+            }
+        },
 
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();

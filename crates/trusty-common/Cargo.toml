@@ -1,6 +1,6 @@
 [package]
 name = "trusty-common"
-version = "0.4.3"
+version = "0.4.4"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -113,14 +113,6 @@ optional = true
 toml = "0.8"
 tempfile = { workspace = true }
 
-# The unified monitor TUI binary (formerly the `trusty-monitor-tui` crate).
-# Gated behind `monitor-tui` so the default `cargo build` of `trusty-common`
-# as a library does not pull in ratatui / crossterm.
-[[bin]]
-name = "trusty-monitor"
-path = "src/bin/trusty-monitor.rs"
-required-features = ["monitor-tui"]
-
 [features]
 default = []
 # Enables the `server` module: standard axum middleware stack (CORS, trace,
@@ -226,8 +218,10 @@ memory-core = [
 # feature. Pulls in the `kuzu` crate. Off by default because kuzu adds a
 # large native dependency.
 memory-core-kuzu = ["memory-core", "dep:kuzu"]
-# Enables the `monitor` module + the `trusty-monitor` binary: the unified
-# ratatui dashboard for the trusty-search and trusty-memory daemons
-# (formerly the `trusty-monitor-tui` crate). Pulls in ratatui + crossterm;
-# the daemon HTTP clients reuse the `reqwest` already required.
+# Enables the `monitor` module: the unified ratatui dashboard for the
+# trusty-search and trusty-memory daemons (formerly the `trusty-monitor-tui`
+# crate, and before that the standalone `trusty-monitor` binary). Pulls in
+# ratatui + crossterm; the daemon HTTP clients reuse the `reqwest` already
+# required. Consumed via `trusty_common::monitor::run()` by the
+# `monitor tui` subcommand of `trusty-search` and `trusty-memory`.
 monitor-tui = ["dep:ratatui", "dep:crossterm"]

@@ -17,6 +17,7 @@
 //!   3. Patches every discovered Claude settings file with an MCP server
 //!      entry pointing at `trusty-memory serve`. Falls back to creating
 //!      `~/.claude/settings.json` when no settings files were found.
+//!
 //! Test: unit tests cover the patch phase against tempdir-rooted settings
 //! files. The launchd phase is side-effecting (macOS only) and exercised
 //! manually via `cargo run -p trusty-memory -- setup`.

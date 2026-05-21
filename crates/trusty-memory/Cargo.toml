@@ -1,6 +1,6 @@
 [package]
 name = "trusty-memory"
-version = "0.1.52"
+version = "0.1.53"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
@@ -28,7 +28,7 @@ name = "trusty-memory"
 path = "src/main.rs"
 
 [dependencies]
-trusty-common = { path = "../trusty-common", version = "0.4.0", features = ["axum-server", "mcp", "memory-core"] }
+trusty-common = { path = "../trusty-common", version = "0.4.4", features = ["axum-server", "mcp", "memory-core", "monitor-tui"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

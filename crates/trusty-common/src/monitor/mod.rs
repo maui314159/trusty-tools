@@ -11,8 +11,8 @@
 //! and offers a `[r]` reindex action against the focused search index. Offline
 //! daemons are retried every 5 seconds while the other panel keeps refreshing.
 //! Test: `cargo test -p trusty-common --features monitor-tui` covers the pure
-//! rendering, layout, and client pieces; `trusty-monitor` launches the live
-//! dashboard.
+//! rendering, layout, and client pieces; `trusty-search monitor tui` and
+//! `trusty-memory monitor tui` launch the live dashboard.
 
 pub mod dashboard;
 pub mod memory_client;
@@ -42,7 +42,8 @@ const OFFLINE_RETRY: Duration = Duration::from_millis(5000);
 
 /// Run the unified monitor dashboard.
 ///
-/// Why: the single entry point the `trusty-monitor` binary calls.
+/// Why: the single entry point the `monitor tui` subcommand of
+/// `trusty-search` and `trusty-memory` calls.
 /// What: resolves both daemon URLs from the service lock files, sets up the
 /// alternate screen / raw mode, runs [`run_loop`], and always restores the
 /// terminal afterward even on error.
@@ -173,37 +174,44 @@ async fn run_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| dashboard::render(f, state))?;
 
-        if event::poll(INPUT_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                use crossterm::event::{KeyEventKind, KeyModifiers};
-                // crossterm reports both press and release on some platforms;
-                // act only on the press so a key never fires twice.
-                if key.kind != KeyEventKind::Release {
-                    // Ctrl-C always quits, regardless of the help overlay.
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
+        // Drain a pending keypress, if any. `event::poll` is non-blocking
+        // beyond the short `INPUT_POLL` window; a non-`Key` event (resize,
+        // mouse) leaves `key` `None` and the input handling is skipped.
+        let key = if event::poll(INPUT_POLL)? {
+            match event::read()? {
+                Event::Key(key) => Some(key),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            use crossterm::event::{KeyEventKind, KeyModifiers};
+            // crossterm reports both press and release on some platforms;
+            // act only on the press so a key never fires twice.
+            if key.kind != KeyEventKind::Release {
+                // Ctrl-C always quits, regardless of the help overlay.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    return Ok(());
+                }
+                if state.show_help {
+                    if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+                        state.show_help = false;
+                    } else if key.code == KeyCode::Char('q') {
                         return Ok(());
                     }
-                    if state.show_help {
-                        if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
-                            state.show_help = false;
-                        } else if key.code == KeyCode::Char('q') {
-                            return Ok(());
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('?') => state.show_help = true,
+                        KeyCode::Tab => state.toggle_focus(),
+                        KeyCode::Char('r') => {
+                            trigger_reindex(state, search).await;
+                            // Reflect the new chunk counts immediately.
+                            poll_search(state, search).await;
+                            last_search_poll = Instant::now();
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                            KeyCode::Char('?') => state.show_help = true,
-                            KeyCode::Tab => state.toggle_focus(),
-                            KeyCode::Char('r') => {
-                                trigger_reindex(state, search).await;
-                                // Reflect the new chunk counts immediately.
-                                poll_search(state, search).await;
-                                last_search_poll = Instant::now();
-                            }
-                            _ => {}
-                        }
+                        _ => {}
                     }
                 }
             }

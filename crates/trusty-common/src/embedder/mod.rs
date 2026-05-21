@@ -647,8 +647,10 @@ mod tests {
     /// is now `CoreMLAne` (CPU + Neural Engine, no GPU unified-memory
     /// allocation) — the safe replacement for the original `CoreML` (CPU + GPU
     /// + ANE) default that caused the 72 GB virtual-RSS spike.
+    ///
     /// What: clears `TRUSTY_DEVICE` and `TRUSTY_COREML_COMPUTE_UNITS`, calls
     /// `init_options`, asserts `CoreMLAne`.
+    ///
     /// Test: this test, on M-series Mac.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
