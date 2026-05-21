@@ -1,17 +1,22 @@
 //! Service-specific terminal UI for the trusty-memory daemon.
 //!
 //! Why: operators of the trusty-memory daemon want a focused terminal surface
-//! — a palace list with aggregate counts, a streaming activity log of dream /
-//! drawer / recall events, and a recall query bar — rather than the generic
-//! two-daemon dashboard. Living in `trusty-common` behind the `monitor-tui`
-//! feature keeps the pure state / rendering testable (issue #34).
-//! What: a ratatui app with a 3-zone layout (title bar, PALACES + ACTIVITY
-//! split, RECALL input bar). It polls the daemon every 2 seconds, subscribes
-//! to the `/sse` event stream on startup, runs cross-palace recalls from the
-//! input bar on `[Enter]`, and triggers a dream cycle on `[d]`.
+//! — a palace list, a streaming activity log of dream / drawer / recall
+//! events, and a recall query bar — rather than the generic two-daemon
+//! dashboard. Living in `trusty-common` behind the `monitor-tui` feature keeps
+//! the pure state / rendering testable (issue #34).
+//! What: a ratatui app with a 3-zone layout (title bar, PALACES + right-hand
+//! split, RECALL input bar). The PALACES list always leads with an "All
+//! palaces" entry that fans recalls out across every palace; the right side is
+//! split vertically into an ACTIVITY feed (top) and a STATISTICS panel
+//! (bottom), both scoped to the selected palace — or aggregated when "All" is
+//! selected. It polls the daemon every 2 seconds, subscribes to the `/sse`
+//! event stream on startup, runs cross-palace recalls from the input bar on
+//! `[Enter]`, and triggers a dream cycle on `[d]`.
 //! Test: `cargo test -p trusty-common --features monitor-tui` covers the pure
-//! state, palace row formatting, and dream-event logging; `trusty-memory
-//! monitor tui` launches the live UI.
+//! state, the "All" selector, palace row formatting, the activity / statistics
+//! line builders, and dream-event logging; `trusty-memory monitor tui`
+//! launches the live UI.
 
 use std::time::{Duration, Instant};
 
@@ -31,7 +36,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use crate::monitor::dashboard::{MemoryData, PalaceRow, format_count};
-use crate::monitor::memory_client::{MemoryClient, MemoryEvent, resolve_memory_url};
+use crate::monitor::memory_client::{MemoryClient, MemoryEvent, RecallHit, resolve_memory_url};
 use crate::monitor::utils::{ActivityLog, DaemonStatus};
 
 /// Data-refresh interval: how often the daemon is polled.
@@ -52,6 +57,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// One-line key hint shown along the bottom of the UI.
 pub const KEY_HINT: &str =
     "[Tab] focus  [d] dream  [↑↓] select  [Enter] recall  [q] quit  [?] help";
+
+/// Label for the synthetic "All palaces" entry at the top of the list.
+///
+/// Why: selecting it fans recalls / stats out across every palace; a single
+/// constant keeps the label consistent between the list and the panel titles.
+/// What: the display text of the palace list's first row.
+/// Test: `test_palace_lines` asserts this is the first row.
+pub const ALL_LABEL: &str = "All palaces";
 
 /// Which zone of the memory UI currently holds keyboard focus.
 ///
@@ -75,8 +88,11 @@ pub enum MemoryFocus {
 /// the rendering a pure function of this snapshot.
 /// What: the daemon URL and status, the aggregate stats, the palace list and
 /// selection cursor, the bounded activity log, the query buffer, the focused
-/// zone, and the help flag.
-/// Test: `test_selected_clamp`, `test_toggle_focus`, `test_palace_row_display`.
+/// zone, and the help flag. The selection cursor addresses a list whose first
+/// row is the synthetic "All palaces" entry, so cursor `0` means "All" and
+/// cursor `n` (n ≥ 1) means `palaces[n - 1]`.
+/// Test: `test_selected_clamp`, `test_toggle_focus`, `test_palace_row_display`,
+/// `test_all_selector`.
 #[derive(Debug, Clone)]
 pub struct MemoryTuiState {
     /// The trusty-memory daemon base URL being monitored.
@@ -87,7 +103,8 @@ pub struct MemoryTuiState {
     pub status: Option<MemoryData>,
     /// One row per palace.
     pub palaces: Vec<PalaceRow>,
-    /// Cursor into [`Self::palaces`] for the selected row.
+    /// Cursor into the palace list, where row `0` is the "All palaces" entry
+    /// and row `n` (n ≥ 1) selects `palaces[n - 1]`.
     pub selected: usize,
     /// Bounded, timestamped log of dream / drawer / recall activity.
     pub log: ActivityLog,
@@ -146,38 +163,73 @@ impl MemoryTuiState {
     /// Move the palace selection down one row, clamped to the last palace.
     ///
     /// Why: `↓` navigates the PALACES list when it has focus.
-    /// What: increments [`Self::selected`] but never past the last row.
+    /// What: increments [`Self::selected`] but never past the last row. The
+    /// list has `palaces.len() + 1` rows (row 0 is "All palaces").
     /// Test: `test_selected_clamp`.
     pub fn select_down(&mut self) {
-        let last = self.palaces.len().saturating_sub(1);
-        if self.selected < last {
+        if self.selected < self.last_row() {
             self.selected += 1;
         }
+    }
+
+    /// The index of the last selectable row.
+    ///
+    /// Why: the list always carries the synthetic "All" row, so the last valid
+    /// cursor is `palaces.len()` (not `palaces.len() - 1`).
+    /// What: returns `palaces.len()` — row 0 is "All", rows `1..=len` are the
+    /// individual palaces.
+    /// Test: `test_selected_clamp`.
+    fn last_row(&self) -> usize {
+        self.palaces.len()
     }
 
     /// Clamp the selection cursor to the current palace count.
     ///
     /// Why: a poll can shrink the palace list leaving the cursor past the end;
     /// this keeps it valid before rendering.
-    /// What: caps [`Self::selected`] at `palaces.len().saturating_sub(1)`; an
-    /// empty list resets the cursor to zero.
+    /// What: caps [`Self::selected`] at `palaces.len()` (the "All" row plus one
+    /// row per palace).
     /// Test: `test_selected_clamp`.
     pub fn clamp_selection(&mut self) {
-        let last = self.palaces.len().saturating_sub(1);
-        if self.selected > last {
-            self.selected = last;
+        if self.selected > self.last_row() {
+            self.selected = self.last_row();
         }
     }
 
-    /// The id of the currently selected palace, if any.
+    /// Whether the "All palaces" entry is currently selected.
     ///
-    /// Why: `[d]` dreams over every palace but `[Enter]` recalls and the log
-    /// labels the selected palace; both need its id.
-    /// What: returns `Some(id)` for the row at [`Self::selected`], or `None`
-    /// when the palace list is empty.
+    /// Why: when "All" is selected the UI fans recalls out across every palace
+    /// and aggregates the activity feed and statistics.
+    /// What: returns `true` exactly when the cursor is on row 0.
+    /// Test: `test_all_selector`.
+    pub fn is_all_selected(&self) -> bool {
+        self.selected == 0
+    }
+
+    /// The id of the currently selected single palace, if any.
+    ///
+    /// Why: `[Enter]` recalls and the log labels the selected palace; neither
+    /// applies to a single palace when "All" is selected.
+    /// What: returns `Some(id)` for the palace at cursor row `n ≥ 1`, or `None`
+    /// when "All" is selected or the palace list is empty.
     /// Test: `test_selected_id`.
     pub fn selected_id(&self) -> Option<&str> {
-        self.palaces.get(self.selected).map(|p| p.id.as_str())
+        if self.selected == 0 {
+            return None;
+        }
+        self.palaces.get(self.selected - 1).map(|p| p.id.as_str())
+    }
+
+    /// The scope filter for the activity feed and statistics panels.
+    ///
+    /// Why: the right-hand panels render the selected palace's events / stats,
+    /// or every palace's when "All" is selected; this folds the cursor into the
+    /// `Option<&str>` filter [`ActivityLog::tail_scoped`] expects.
+    /// What: returns `None` when "All" is selected (un-filtered) or `Some(id)`
+    /// for the selected single palace.
+    /// Test: `test_all_selector`.
+    pub fn scope_filter(&self) -> Option<&str> {
+        self.selected_id()
     }
 }
 
@@ -251,39 +303,80 @@ async fn poll_daemon(state: &mut MemoryTuiState, client: &mut MemoryClient) {
     }
 }
 
-/// Run a cross-palace recall and append the hits to the activity log.
+/// Run a recall and append the hits to the activity log.
 ///
 /// Why: pressing `[Enter]` in the recall bar runs a memory recall; the
-/// operator sees the results inline in the ACTIVITY panel.
-/// What: calls `client.recall`, appends a `recall "<q>" → N results` summary
-/// plus one indented `· <snippet>` continuation line per hit. An empty query
-/// is a no-op; a transport error is logged.
+/// operator sees the results inline in the ACTIVITY panel. The recall endpoint
+/// is inherently cross-palace, so when a single palace is selected the hits
+/// are filtered to that palace; when "All palaces" is selected every hit is
+/// shown.
+/// What: calls `client.recall`, then — for the "All" selection — appends a
+/// daemon-wide `recall "<q>" → N results` summary plus one `palace_id`-scoped
+/// `· [palace] snippet` continuation per hit. For a single palace it appends a
+/// palace-scoped summary counting only that palace's hits and a continuation
+/// per kept hit. An empty query is a no-op; transport errors are logged scoped
+/// to the selection.
 /// Test: thin I/O glue; result projection is tested in `memory_client`.
 async fn run_recall(state: &mut MemoryTuiState, client: &MemoryClient) {
     let query = state.input.trim().to_string();
     if query.is_empty() {
         return;
     }
+    let scope = state.selected_id().map(str::to_string);
     match client.recall(&query, RECALL_TOP_K).await {
-        Ok(hits) => {
-            state
-                .log
-                .push(format!("recall \"{query}\" → {} results", hits.len()));
-            for hit in &hits {
-                state.log.push_raw(format!("  · {}", hit.snippet));
+        Ok(hits) => match &scope {
+            // "All palaces": one daemon-wide summary, each hit scoped to its
+            // own palace so the per-palace feed still shows it.
+            None => {
+                state
+                    .log
+                    .push(format!("recall \"{query}\" (all) → {} results", hits.len()));
+                for hit in &hits {
+                    let palace = if hit.palace_id.is_empty() {
+                        "?"
+                    } else {
+                        hit.palace_id.as_str()
+                    };
+                    state
+                        .log
+                        .push_raw_scoped(palace, format!("  · [{palace}] {}", hit.snippet));
+                }
             }
-        }
-        Err(e) => state.log.push(format!("recall \"{query}\" failed: {e}")),
+            // A single palace: keep only that palace's hits.
+            Some(id) => {
+                let kept: Vec<&RecallHit> = hits.iter().filter(|h| h.palace_id == *id).collect();
+                state
+                    .log
+                    .push_scoped(id, format!("recall \"{query}\" → {} results", kept.len()));
+                for hit in kept {
+                    state
+                        .log
+                        .push_raw_scoped(id, format!("  · {}", hit.snippet));
+                }
+            }
+        },
+        Err(e) => match &scope {
+            None => state
+                .log
+                .push(format!("recall \"{query}\" (all) failed: {e}")),
+            Some(id) => state
+                .log
+                .push_scoped(id, format!("recall \"{query}\" failed: {e}")),
+        },
     }
     state.input.clear();
 }
 
-/// Append a streamed `/sse` event to the activity log.
+/// Append a streamed `/sse` event to the activity log, scoped to its palace.
 ///
 /// Why: the SSE task forwards [`MemoryEvent`]s through a channel; the event
-/// loop drains them and this turns each into a human-readable log entry.
-/// What: `DreamCompleted` records a header plus an indented merge/prune/compact
-/// line; drawer and palace events record a single line each.
+/// loop drains them and this turns each into a human-readable log entry. The
+/// drawer events concern one palace, so they are tagged with its id and the
+/// per-palace activity feed keeps only its own events.
+/// What: `DreamCompleted` records a daemon-wide header plus an indented
+/// merge/prune/compact line; `DrawerAdded` / `DrawerDeleted` record a single
+/// line each scoped to `palace_id`; `PalaceCreated` records a daemon-wide line
+/// (the new palace has no id yet on the wire).
 /// Test: `test_log_append_dream`, `test_apply_memory_event`.
 pub fn apply_memory_event(state: &mut MemoryTuiState, event: MemoryEvent) {
     match event {
@@ -301,17 +394,19 @@ pub fn apply_memory_event(state: &mut MemoryTuiState, event: MemoryEvent) {
             palace_id,
             drawer_count,
         } => {
-            state
-                .log
-                .push(format!("SSE: drawer added → {palace_id} ({drawer_count})"));
+            state.log.push_scoped(
+                &palace_id,
+                format!("SSE: drawer added → {palace_id} ({drawer_count})"),
+            );
         }
         MemoryEvent::DrawerDeleted {
             palace_id,
             drawer_count,
         } => {
-            state.log.push(format!(
-                "SSE: drawer deleted → {palace_id} ({drawer_count})"
-            ));
+            state.log.push_scoped(
+                &palace_id,
+                format!("SSE: drawer deleted → {palace_id} ({drawer_count})"),
+            );
         }
         MemoryEvent::PalaceCreated { name } => {
             state.log.push(format!("SSE: palace created → {name}"));
@@ -423,8 +518,9 @@ pub fn help_text() -> String {
     [
         "  Tab     switch focus between the palace list and the recall bar",
         "  ↑ / ↓   move the palace selection (when the list has focus)",
+        "  All     the top list row fans recalls / stats across every palace",
         "  d       run a dream cycle across every palace",
-        "  Enter   run a recall query (recall bar)",
+        "  Enter   run a recall query — all palaces, or the selected one",
         "  ?       toggle this help overlay",
         "  q / Esc quit",
     ]
@@ -462,37 +558,124 @@ pub fn palace_row(palace: &PalaceRow, selected: bool) -> String {
     )
 }
 
-/// Build the lines for the PALACES panel body.
+/// One rendered row of the PALACES panel.
 ///
-/// Why: separating line construction from the ratatui widgets lets a test
+/// Why: the renderer styles three row kinds differently — the "All" row is
+/// bold, the selected row is highlighted, ordinary rows are plain — so the line
+/// builder must surface which kind each row is rather than just a bool.
+/// What: the row `text`, whether it is `selected`, and whether it is the
+/// synthetic `is_all` ("All palaces") row.
+/// Test: `test_palace_lines`, `test_all_selector`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PalaceListRow {
+    /// The fully-formatted row text.
+    pub text: String,
+    /// Whether this row is the current selection.
+    pub selected: bool,
+    /// Whether this row is the synthetic "All palaces" entry.
+    pub is_all: bool,
+}
+
+/// Build the rows for the PALACES panel body.
+///
+/// Why: separating row construction from the ratatui widgets lets a test
 /// assert the rendered content without a terminal backend.
-/// What: returns one `(text, selected)` pair per palace, then a blank spacer
-/// and three aggregate-count lines; an empty list shows a placeholder.
-/// Test: `test_palace_lines`.
-pub fn palace_lines(state: &MemoryTuiState) -> Vec<(String, bool)> {
-    let mut lines: Vec<(String, bool)> = Vec::new();
+/// What: returns the synthetic "All palaces" row first (carrying the summed
+/// vector count across every palace), then one row per palace. With no palaces
+/// the "All" row is still shown followed by a placeholder line.
+/// Test: `test_palace_lines`, `test_all_selector`.
+pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
+    let mut rows: Vec<PalaceListRow> = Vec::with_capacity(state.palaces.len() + 1);
+
+    // The synthetic "All palaces" row always leads the list. The label may be
+    // wider than the per-palace name column — it is shown in full.
+    let total_vectors: u64 = state.palaces.iter().map(|p| p.vector_count).sum();
+    let all_selected = state.selected == 0;
+    let all_marker = if all_selected { ">" } else { " " };
+    rows.push(PalaceListRow {
+        text: format!("{all_marker} {ALL_LABEL}  {}v", format_count(total_vectors),),
+        selected: all_selected,
+        is_all: true,
+    });
+
     if state.palaces.is_empty() {
-        lines.push(("(no palaces)".to_string(), false));
-    } else {
-        for (i, palace) in state.palaces.iter().enumerate() {
-            lines.push((palace_row(palace, i == state.selected), i == state.selected));
-        }
+        rows.push(PalaceListRow {
+            text: "  (no palaces)".to_string(),
+            selected: false,
+            is_all: false,
+        });
+        return rows;
     }
-    lines.push((String::new(), false));
-    let stats = state.status.clone().unwrap_or_default();
-    lines.push((
-        format!("vectors:  {}", format_count(stats.total_vectors)),
-        false,
-    ));
-    lines.push((
-        format!("drawers:  {}", format_count(stats.total_drawers)),
-        false,
-    ));
-    lines.push((
-        format!("kg:       {}", format_count(stats.total_kg_triples)),
-        false,
-    ));
-    lines
+
+    for (i, palace) in state.palaces.iter().enumerate() {
+        // Row 0 is "All", so palace `i` lives at cursor row `i + 1`.
+        let row = i + 1;
+        let selected = row == state.selected;
+        rows.push(PalaceListRow {
+            text: palace_row(palace, selected),
+            selected,
+            is_all: false,
+        });
+    }
+    rows
+}
+
+/// Build the STATISTICS panel lines for the current selection.
+///
+/// Why: the bottom-right panel shows counts and sizes for whichever palace is
+/// selected, or aggregate totals plus a per-palace breakdown when "All" is
+/// selected; isolating the builder makes the content testable without a
+/// terminal.
+/// What: for a single palace, returns its name, vector count, and id. For the
+/// "All" selection, returns the palace count and the daemon's aggregate
+/// vector / drawer / KG-triple totals, plus one `· <name>: <vectors>`
+/// breakdown line per palace.
+/// Test: `test_stats_lines`.
+pub fn stats_lines(state: &MemoryTuiState) -> Vec<String> {
+    if state.is_all_selected() {
+        let stats = state.status.clone().unwrap_or_default();
+        let mut lines = vec![
+            format!("Scope:        {ALL_LABEL}"),
+            format!("Palaces:      {}", state.palaces.len()),
+            format!("Vectors:      {}", format_count(stats.total_vectors)),
+            format!("Drawers:      {}", format_count(stats.total_drawers)),
+            format!("KG triples:   {}", format_count(stats.total_kg_triples)),
+        ];
+        if state.palaces.is_empty() {
+            lines.push("(no palaces)".to_string());
+        } else {
+            lines.push(String::new());
+            for palace in &state.palaces {
+                let label = if palace.name.is_empty() {
+                    &palace.id
+                } else {
+                    &palace.name
+                };
+                lines.push(format!(
+                    "  · {:<12} {:>7}v",
+                    truncate(label, 12),
+                    format_count(palace.vector_count),
+                ));
+            }
+        }
+        return lines;
+    }
+
+    match state.palaces.get(state.selected.saturating_sub(1)) {
+        Some(palace) => {
+            let label = if palace.name.is_empty() {
+                "(unnamed)"
+            } else {
+                palace.name.as_str()
+            };
+            vec![
+                format!("Palace:       {label}"),
+                format!("Vectors:      {}", format_count(palace.vector_count)),
+                format!("Id:           {}", palace.id),
+            ]
+        }
+        None => vec!["(no palace selected)".to_string()],
+    }
 }
 
 /// Truncate a string to `max` characters, appending an ellipsis when cut.
@@ -531,12 +714,22 @@ pub fn title_line(state: &MemoryTuiState) -> String {
     }
 }
 
+/// Vertical split of the right-hand pane: ACTIVITY over STATISTICS.
+///
+/// Why: the right side shows two things — a live event feed and the selected
+/// palace's stats; isolating the split as a named constant keeps `render`
+/// terse and documents the 60 / 40 ratio.
+/// What: the ACTIVITY panel takes the top 60 %, STATISTICS the bottom 40 %.
+const ACTIVITY_PERCENT: u16 = 60;
+
 /// Draw the memory TUI frame.
 ///
 /// Why: the single entry point the event loop calls each tick.
-/// What: a 4-row vertical layout — title bar, the PALACES/ACTIVITY split, the
-/// RECALL input bar, and the key-hint footer. A centred help overlay floats on
-/// top when `show_help` is set.
+/// What: a 4-row vertical layout — title bar, the PALACES / right-pane split,
+/// the RECALL input bar, and the key-hint footer. The right pane is itself
+/// split vertically into an ACTIVITY feed (top 60 %) and a STATISTICS panel
+/// (bottom 40 %), both scoped to the selected palace — or aggregated when "All"
+/// is selected. A centred help overlay floats on top when `show_help` is set.
 /// Test: line content is unit-tested via the `*_lines` helpers; this glue is
 /// exercised by `test_render_smoke`.
 pub fn render(frame: &mut Frame, state: &MemoryTuiState) {
@@ -562,7 +755,7 @@ pub fn render(frame: &mut Frame, state: &MemoryTuiState) {
         rows[0],
     );
 
-    // PALACES + ACTIVITY split.
+    // PALACES on the left, the ACTIVITY / STATISTICS stack on the right.
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -574,16 +767,21 @@ pub fn render(frame: &mut Frame, state: &MemoryTuiState) {
     let list_focused = state.focus == MemoryFocus::List;
     let palace_items: Vec<ListItem> = palace_lines(state)
         .into_iter()
-        .map(|(text, selected)| {
-            let style = if selected {
+        .map(|row| {
+            let style = if row.selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if row.is_all {
+                // The unselected "All" row stays distinct — bold yellow.
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(text, style)))
+            ListItem::new(Line::from(Span::styled(row.text, style)))
         })
         .collect();
     frame.render_widget(
@@ -591,20 +789,41 @@ pub fn render(frame: &mut Frame, state: &MemoryTuiState) {
         split[0],
     );
 
-    // ACTIVITY panel — show the tail that fits the panel height.
-    let activity_height = split[1].height.saturating_sub(2) as usize;
-    let activity_items: Vec<ListItem> = if state.log.is_empty() {
-        vec![ListItem::new("(no activity yet)")]
-    } else {
+    // Right pane: ACTIVITY (top) over STATISTICS (bottom).
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(ACTIVITY_PERCENT),
+            Constraint::Percentage(100 - ACTIVITY_PERCENT),
+        ])
+        .split(split[1]);
+
+    // ACTIVITY panel — the tail of the scoped feed that fits the panel height.
+    let scope = state.scope_filter();
+    let activity_title = match scope {
+        Some(id) => format!("ACTIVITY — {id}"),
+        None => format!("ACTIVITY — {ALL_LABEL}"),
+    };
+    let activity_height = right[0].height.saturating_sub(2) as usize;
+    let activity_items: Vec<ListItem> = if state.log.has_scoped(scope) {
         state
             .log
-            .tail(activity_height.max(1))
+            .tail_scoped(scope, activity_height.max(1))
             .map(|line| ListItem::new(line.as_str()))
             .collect()
+    } else {
+        vec![ListItem::new("(no activity yet)")]
     };
     frame.render_widget(
-        List::new(activity_items).block(panel_block("ACTIVITY", false)),
-        split[1],
+        List::new(activity_items).block(panel_block(&activity_title, false)),
+        right[0],
+    );
+
+    // STATISTICS panel — counts and sizes for the selection.
+    let stats_items: Vec<ListItem> = stats_lines(state).into_iter().map(ListItem::new).collect();
+    frame.render_widget(
+        List::new(stats_items).block(panel_block("STATISTICS", false)),
+        right[1],
     );
 
     // RECALL input bar.
@@ -751,20 +970,21 @@ mod tests {
     #[test]
     fn test_selected_clamp() {
         let mut state = sample_state();
+        // The list has 1 ("All") + 2 palaces = 3 rows; the cursor stops at 2.
         for _ in 0..10 {
             state.select_down();
         }
-        assert_eq!(state.selected, 1, "clamped to palaces.len() - 1");
+        assert_eq!(state.selected, 2, "clamped to palaces.len()");
         for _ in 0..10 {
             state.select_up();
         }
         assert_eq!(state.selected, 0);
-        // A shrunk palace list re-clamps the cursor.
-        state.selected = 1;
+        // A shrunk palace list re-clamps the cursor (1 "All" + 1 palace = 1).
+        state.selected = 2;
         state.palaces.truncate(1);
         state.clamp_selection();
-        assert_eq!(state.selected, 0);
-        // An empty list resets the cursor.
+        assert_eq!(state.selected, 1);
+        // An empty list leaves only the "All" row at cursor 0.
         state.palaces.clear();
         state.selected = 9;
         state.clamp_selection();
@@ -774,12 +994,73 @@ mod tests {
     #[test]
     fn test_selected_id() {
         let mut state = sample_state();
+        // Cursor 0 is "All" — no single palace.
+        assert!(state.is_all_selected());
+        assert_eq!(state.selected_id(), None);
+        // Cursor 1 is the first palace.
+        state.select_down();
         assert_eq!(state.selected_id(), Some("default"));
         state.select_down();
         assert_eq!(state.selected_id(), Some("work"));
         state.palaces.clear();
         state.clamp_selection();
         assert_eq!(state.selected_id(), None);
+    }
+
+    #[test]
+    fn test_all_selector() {
+        let mut state = sample_state();
+        // The default selection is the "All palaces" row.
+        assert!(state.is_all_selected());
+        assert_eq!(state.scope_filter(), None);
+        // Moving down off row 0 picks a single palace and a scoped filter.
+        state.select_down();
+        assert!(!state.is_all_selected());
+        assert_eq!(state.scope_filter(), Some("default"));
+        state.select_up();
+        assert!(state.is_all_selected());
+
+        // The palace list always leads with the "All" row.
+        let rows = palace_lines(&state);
+        assert_eq!(rows.len(), 3, "1 'All' row + 2 palaces");
+        assert!(rows[0].is_all);
+        assert!(rows[0].text.contains(ALL_LABEL));
+        assert!(rows[0].selected, "'All' is selected by default");
+        assert!(!rows[1].is_all);
+        assert!(rows[1].text.contains("default"));
+    }
+
+    #[test]
+    fn test_stats_lines() {
+        let mut state = sample_state();
+        // "All" selected → aggregate totals + per-palace breakdown.
+        let all = stats_lines(&state);
+        assert!(
+            all.iter()
+                .any(|l| l.contains("Palaces:") && l.contains('2'))
+        );
+        assert!(
+            all.iter()
+                .any(|l| l.contains("Vectors:") && l.contains("8,400"))
+        );
+        assert!(
+            all.iter()
+                .any(|l| l.contains("KG triples:") && l.contains("1,200"))
+        );
+        assert!(all.iter().any(|l| l.contains("default")));
+
+        // A single palace selected → that palace's detail.
+        state.select_down(); // cursor 1 → default
+        let one = stats_lines(&state);
+        assert!(
+            one.iter()
+                .any(|l| l.contains("Palace:") && l.contains("default"))
+        );
+        assert!(
+            one.iter()
+                .any(|l| l.contains("Vectors:") && l.contains("8,400"))
+        );
+        assert!(one.iter().any(|l| l.contains("Id:")));
     }
 
     #[test]
@@ -821,32 +1102,25 @@ mod tests {
     #[test]
     fn test_palace_lines() {
         let state = sample_state();
-        let lines = palace_lines(&state);
-        // Two palace rows + blank spacer + three aggregate lines.
-        assert_eq!(lines.len(), 6);
-        assert!(lines[0].0.contains("default") && lines[0].1);
-        assert!(lines[1].0.contains("work") && !lines[1].1);
-        assert!(lines[2].0.is_empty());
-        assert!(
-            lines
-                .iter()
-                .any(|(t, _)| t.contains("vectors:") && t.contains("8,400"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(t, _)| t.contains("drawers:") && t.contains("14"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(t, _)| t.contains("kg:") && t.contains("1,200"))
-        );
+        let rows = palace_lines(&state);
+        // 1 "All" row + 2 palace rows.
+        assert_eq!(rows.len(), 3);
+        // Row 0 is "All", selected by default.
+        assert!(rows[0].is_all);
+        assert!(rows[0].selected);
+        assert!(rows[0].text.contains(ALL_LABEL));
+        assert!(rows[0].text.starts_with('>'));
+        // Rows 1..3 are the palaces, unselected.
+        assert!(!rows[1].is_all && !rows[1].selected);
+        assert!(rows[1].text.contains("default"));
+        assert!(rows[2].text.contains("work"));
 
-        // An empty palace list shows a placeholder, still with the stats.
+        // An empty palace list still shows the "All" row plus a placeholder.
         let empty = MemoryTuiState::new("http://x");
-        let lines = palace_lines(&empty);
-        assert!(lines[0].0.contains("no palaces"));
+        let rows = palace_lines(&empty);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_all);
+        assert!(rows[1].text.contains("no palaces"));
     }
 
     #[test]
@@ -901,6 +1175,26 @@ mod tests {
         assert!(lines[0].contains("drawer added → default (14)"));
         assert!(lines[1].contains("drawer deleted → work (2)"));
         assert!(lines[2].contains("palace created → notes"));
+
+        // Drawer events are scoped to their palace; the per-palace feed keeps
+        // only its own drawer event plus the daemon-wide palace-created line.
+        let default_feed: Vec<&String> = state.log.tail_scoped(Some("default"), 100).collect();
+        assert_eq!(default_feed.len(), 2);
+        assert!(
+            default_feed
+                .iter()
+                .any(|l| l.contains("drawer added → default"))
+        );
+        assert!(
+            default_feed
+                .iter()
+                .any(|l| l.contains("palace created → notes"))
+        );
+        assert!(
+            !default_feed
+                .iter()
+                .any(|l| l.contains("drawer deleted → work"))
+        );
     }
 
     #[test]
@@ -958,9 +1252,13 @@ mod tests {
 
     #[test]
     fn test_render_smoke() {
+        // A full render in several states must not panic — exercise both the
+        // "All" selection (aggregated panels) and a single-palace selection.
         let mut state = sample_state();
         state.log.push("SSE: dream_completed");
-        state.log.push("recall \"auth flow\" → 3 results");
+        state
+            .log
+            .push_scoped("default", "recall \"auth flow\" → 3 results");
         state.input = "auth flow".into();
         state.focus = MemoryFocus::Input;
         for (w, h) in [(120u16, 30u16), (80, 24)] {
@@ -968,8 +1266,16 @@ mod tests {
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
                 .draw(|f| render(f, &state))
-                .expect("render must not panic");
+                .expect("render (All) must not panic");
         }
+        // Single-palace selection — the right panels scope to that palace.
+        state.selected = 1;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| render(f, &state))
+            .expect("render (single palace) must not panic");
+
         state.show_help = true;
         state.daemon_status = DaemonStatus::Connecting;
         let backend = TestBackend::new(120, 30);

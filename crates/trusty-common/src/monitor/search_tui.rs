@@ -5,13 +5,18 @@
 //! and a query bar — rather than the generic two-daemon dashboard. Living in
 //! `trusty-common` behind the `monitor-tui` feature keeps the pure state /
 //! rendering testable without a separate published crate (issue #34).
-//! What: a ratatui app with a 3-zone layout (title bar, INDEXES + ACTIVITY
-//! split, SEARCH input bar). It polls the daemon every 2 seconds, streams
-//! reindex progress over SSE on `[r]`, and runs hybrid searches from the input
-//! bar on `[Enter]`. Input is polled every 50 ms so keys feel instant.
+//! What: a ratatui app with a 3-zone layout (title bar, INDEXES + right-hand
+//! split, SEARCH input bar). The INDEXES list always leads with an "All
+//! indexes" entry that fans queries out across every index; the right side is
+//! split vertically into an ACTIVITY feed (top) and a STATISTICS panel
+//! (bottom), both scoped to the selected index — or aggregated when "All" is
+//! selected. It polls the daemon every 2 seconds, streams reindex progress
+//! over SSE on `[r]`, and runs hybrid searches from the input bar on `[Enter]`.
+//! Input is polled every 50 ms so keys feel instant.
 //! Test: `cargo test -p trusty-common --features monitor-tui` covers the pure
-//! state, log capacity, and selection clamp; `trusty-search monitor tui`
-//! launches the live UI.
+//! state, log capacity, selection clamp, the "All" selector, and the
+//! activity / statistics line builders; `trusty-search monitor tui` launches
+//! the live UI.
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +58,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const KEY_HINT: &str =
     "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [q] quit  [?] help";
 
+/// Label for the synthetic "All indexes" entry at the top of the list.
+///
+/// Why: selecting it fans queries / stats out across every index; a single
+/// constant keeps the label consistent between the list and the panel titles.
+/// What: the display text of the index list's first row.
+/// Test: `test_index_lines` asserts this is the first row.
+pub const ALL_LABEL: &str = "All indexes";
+
 /// Which zone of the search UI currently holds keyboard focus.
 ///
 /// Why: `[Tab]` cycles focus; the index list and the query bar consume keys
@@ -75,7 +88,11 @@ pub enum SearchFocus {
 /// the rendering a pure function of this snapshot.
 /// What: the daemon URL and status, the index list and selection cursor, the
 /// bounded activity log, the query buffer, the focused zone, and the help flag.
-/// Test: `test_selected_clamp`, `test_toggle_focus`, `test_log_append`.
+/// The selection cursor addresses a list whose first row is the synthetic
+/// "All indexes" entry, so cursor `0` means "All" and cursor `n` (n ≥ 1) means
+/// `indexes[n - 1]`.
+/// Test: `test_selected_clamp`, `test_toggle_focus`, `test_log_append`,
+/// `test_all_selector`.
 #[derive(Debug, Clone)]
 pub struct SearchTuiState {
     /// The trusty-search daemon base URL being monitored.
@@ -84,7 +101,8 @@ pub struct SearchTuiState {
     pub daemon_status: DaemonStatus,
     /// One row per registered index.
     pub indexes: Vec<IndexRow>,
-    /// Cursor into [`Self::indexes`] for the selected row.
+    /// Cursor into the index list, where row `0` is the "All indexes" entry
+    /// and row `n` (n ≥ 1) selects `indexes[n - 1]`.
     pub selected: usize,
     /// Bounded, timestamped log of reindex / search activity.
     pub log: ActivityLog,
@@ -142,38 +160,73 @@ impl SearchTuiState {
     /// Move the index selection down one row, clamped to the last index.
     ///
     /// Why: `↓` navigates the INDEXES list when it has focus.
-    /// What: increments [`Self::selected`] but never past the last row.
+    /// What: increments [`Self::selected`] but never past the last row. The
+    /// list has `indexes.len() + 1` rows (row 0 is "All indexes").
     /// Test: `test_selected_clamp`.
     pub fn select_down(&mut self) {
-        let last = self.indexes.len().saturating_sub(1);
-        if self.selected < last {
+        if self.selected < self.last_row() {
             self.selected += 1;
         }
+    }
+
+    /// The index of the last selectable row.
+    ///
+    /// Why: the list always carries the synthetic "All" row, so the last valid
+    /// cursor is `indexes.len()` (not `indexes.len() - 1`).
+    /// What: returns `indexes.len()` — row 0 is "All", rows `1..=len` are the
+    /// individual indexes.
+    /// Test: `test_selected_clamp`.
+    fn last_row(&self) -> usize {
+        self.indexes.len()
     }
 
     /// Clamp the selection cursor to the current index count.
     ///
     /// Why: a poll can shrink the index list (an index was deleted) leaving the
     /// cursor past the end; this keeps it valid before rendering.
-    /// What: caps [`Self::selected`] at `indexes.len().saturating_sub(1)`; an
-    /// empty list resets the cursor to zero.
+    /// What: caps [`Self::selected`] at `indexes.len()` (the "All" row plus one
+    /// row per index).
     /// Test: `test_selected_clamp`.
     pub fn clamp_selection(&mut self) {
-        let last = self.indexes.len().saturating_sub(1);
-        if self.selected > last {
-            self.selected = last;
+        if self.selected > self.last_row() {
+            self.selected = self.last_row();
         }
     }
 
-    /// The id of the currently selected index, if any.
+    /// Whether the "All indexes" entry is currently selected.
     ///
-    /// Why: `[r]` reindexes and `[Enter]` searches the selected index; both
-    /// need its id.
-    /// What: returns `Some(id)` for the row at [`Self::selected`], or `None`
-    /// when the index list is empty.
+    /// Why: when "All" is selected the UI fans queries out across every index
+    /// and aggregates the activity feed and statistics.
+    /// What: returns `true` exactly when the cursor is on row 0.
+    /// Test: `test_all_selector`.
+    pub fn is_all_selected(&self) -> bool {
+        self.selected == 0
+    }
+
+    /// The id of the currently selected single index, if any.
+    ///
+    /// Why: `[r]` reindexes and `[Enter]` searches a single index; both need
+    /// its id, and neither applies when "All" is selected.
+    /// What: returns `Some(id)` for the index at cursor row `n ≥ 1`, or `None`
+    /// when "All" is selected or the index list is empty.
     /// Test: `test_selected_id`.
     pub fn selected_id(&self) -> Option<&str> {
-        self.indexes.get(self.selected).map(|i| i.id.as_str())
+        if self.selected == 0 {
+            return None;
+        }
+        self.indexes.get(self.selected - 1).map(|i| i.id.as_str())
+    }
+
+    /// The scope filter for the activity feed and statistics panels.
+    ///
+    /// Why: the right-hand panels render the selected index's events / stats,
+    /// or every index's when "All" is selected; this folds the cursor into the
+    /// `Option<&str>` filter [`ActivityLog::tail_scoped`] expects.
+    /// What: returns `None` when "All" is selected (un-filtered) or `Some(id)`
+    /// for the selected single index.
+    /// Test: `test_all_selector`.
+    pub fn scope_filter(&self) -> Option<&str> {
+        self.selected_id()
     }
 }
 
@@ -247,53 +300,132 @@ async fn poll_daemon(state: &mut SearchTuiState, client: &mut SearchClient) {
     }
 }
 
-/// Run a search against the selected index and append the hits to the log.
+/// Run a search and append the hits to the activity log.
 ///
 /// Why: pressing `[Enter]` in the query bar runs a hybrid search; the operator
-/// sees the results inline in the ACTIVITY panel.
-/// What: calls `client.search`, appends a `search "<q>" → N results` summary
-/// plus one indented `path:line  snippet` continuation line per hit. An empty
-/// query or absent index is a no-op note; a transport error is logged.
+/// sees the results inline in the ACTIVITY panel. When "All indexes" is
+/// selected the search fans out across every registered index.
+/// What: with a single index selected, calls `client.search` for it and logs a
+/// `search "<q>" → N results` summary plus one indented continuation line per
+/// hit, all tagged with that index's id. With "All" selected it iterates every
+/// index, logging each index's per-index summary tagged to that index and a
+/// final daemon-wide total line. An empty query is a no-op; transport errors
+/// are logged.
 /// Test: thin I/O glue; result projection is tested in `search_client`.
 async fn run_search(state: &mut SearchTuiState, client: &SearchClient) {
     let query = state.input.trim().to_string();
     if query.is_empty() {
         return;
     }
-    let Some(id) = state.selected_id().map(str::to_string) else {
+
+    if state.is_all_selected() {
+        run_search_all(state, client, &query).await;
+    } else if let Some(id) = state.selected_id().map(str::to_string) {
+        run_search_one(state, client, &id, &query).await;
+    } else {
         state.log.push("search: no index selected");
-        state.input.clear();
-        return;
-    };
-    match client.search(&id, &query, SEARCH_TOP_K).await {
-        Ok(hits) => {
-            state
-                .log
-                .push(format!("search \"{query}\" → {} results", hits.len()));
-            for hit in &hits {
-                state
-                    .log
-                    .push_raw(format!("  {}:{}  {}", hit.file, hit.line, hit.snippet));
-            }
-        }
-        Err(e) => state.log.push(format!("search \"{query}\" failed: {e}")),
     }
     state.input.clear();
 }
 
-/// Apply one streamed reindex event to the activity log.
+/// Run a search against one index and append the hits to the log.
 ///
-/// Why: the reindex SSE task forwards [`ReindexEvent`]s through a channel; the
-/// event loop drains them and this turns each into a human-readable log line.
+/// Why: the single-index path of [`run_search`]; isolating it keeps the
+/// fan-out loop in [`run_search_all`] terse.
+/// What: calls `client.search(id, …)`, appends an `id`-scoped summary line and
+/// one indented `path:line  snippet` continuation per hit. A transport error
+/// is logged as an `id`-scoped failure line.
+/// Test: thin I/O glue; result projection is tested in `search_client`.
+async fn run_search_one(state: &mut SearchTuiState, client: &SearchClient, id: &str, query: &str) {
+    match client.search(id, query, SEARCH_TOP_K).await {
+        Ok(hits) => {
+            state
+                .log
+                .push_scoped(id, format!("search \"{query}\" → {} results", hits.len()));
+            for hit in &hits {
+                state
+                    .log
+                    .push_raw_scoped(id, format!("  {}:{}  {}", hit.file, hit.line, hit.snippet));
+            }
+        }
+        Err(e) => state
+            .log
+            .push_scoped(id, format!("search \"{query}\" failed: {e}")),
+    }
+}
+
+/// Fan a search out across every index and append a merged summary.
+///
+/// Why: the "All indexes" selector lets an operator run one query over the
+/// whole machine's corpus; the activity feed then shows each index's hit count
+/// (tagged so the per-index view still works) plus a daemon-wide total.
+/// What: snapshots the index ids, then for each calls `client.search`,
+/// appending an `id`-scoped `· <id>: N results` line. A daemon-wide
+/// `search "<q>" (all) → T results across K indexes` total line closes the
+/// burst. With no indexes registered it logs a single note.
+/// Test: thin I/O glue; the single-index search is unit-tested in
+/// `search_client`.
+async fn run_search_all(state: &mut SearchTuiState, client: &SearchClient, query: &str) {
+    let ids: Vec<String> = state.indexes.iter().map(|i| i.id.clone()).collect();
+    if ids.is_empty() {
+        state.log.push("search (all): no indexes registered");
+        return;
+    }
+    state
+        .log
+        .push(format!("search \"{query}\" (all) → {} indexes", ids.len()));
+    let mut total = 0usize;
+    for id in &ids {
+        match client.search(id, query, SEARCH_TOP_K).await {
+            Ok(hits) => {
+                total += hits.len();
+                state
+                    .log
+                    .push_raw_scoped(id, format!("  · {id}: {} results", hits.len()));
+            }
+            Err(e) => state
+                .log
+                .push_raw_scoped(id, format!("  · {id}: failed: {e}")),
+        }
+    }
+    state.log.push(format!(
+        "search \"{query}\" (all) → {total} results across {} indexes",
+        ids.len()
+    ));
+}
+
+/// One reindex SSE event tagged with the index it concerns.
+///
+/// Why: a reindex is started per-index, but the streamed [`ReindexEvent`]s
+/// carry no index id; pairing each with `index_id` lets the activity log scope
+/// the line so the per-index feed (and the "All" merge) stay correct.
+/// What: the index id the reindex targets and the streamed event.
+/// Test: `test_apply_reindex_event` exercises the scoped logging.
+#[derive(Debug, Clone)]
+pub struct ScopedReindexEvent {
+    /// The index this reindex event belongs to.
+    pub index_id: String,
+    /// The streamed reindex progress event.
+    pub event: ReindexEvent,
+}
+
+/// Apply one streamed reindex event to the activity log, scoped to its index.
+///
+/// Why: the reindex SSE task forwards [`ScopedReindexEvent`]s through a
+/// channel; the event loop drains them and this turns each into a
+/// human-readable, index-scoped log line so the per-index activity feed shows
+/// only its own reindex progress.
 /// What: `Started` / `Progress` / `Complete` / `Failed` each map to a distinct
-/// timestamped line, with progress carrying a percent-complete figure.
+/// timestamped line tagged with `scoped.index_id`, with progress carrying a
+/// percent-complete figure.
 /// Test: `test_apply_reindex_event`.
-pub fn apply_reindex_event(state: &mut SearchTuiState, event: ReindexEvent) {
-    match event {
+pub fn apply_reindex_event(state: &mut SearchTuiState, scoped: ScopedReindexEvent) {
+    let id = scoped.index_id;
+    match scoped.event {
         ReindexEvent::Started { total_files } => {
             state
                 .log
-                .push(format!("reindex started: {total_files} files"));
+                .push_scoped(&id, format!("reindex started: {total_files} files"));
         }
         ReindexEvent::Progress {
             indexed,
@@ -306,19 +438,21 @@ pub fn apply_reindex_event(state: &mut SearchTuiState, event: ReindexEvent) {
             };
             state
                 .log
-                .push(format!("indexing: {indexed}/{total_files} ({pct}%)"));
+                .push_scoped(&id, format!("indexing: {indexed}/{total_files} ({pct}%)"));
         }
         ReindexEvent::Complete {
             total_chunks,
             status,
         } => {
-            state.log.push(format!(
-                "reindex {status}: {} chunks",
-                format_count(total_chunks)
-            ));
+            state.log.push_scoped(
+                &id,
+                format!("reindex {status}: {} chunks", format_count(total_chunks)),
+            );
         }
         ReindexEvent::Failed(message) => {
-            state.log.push(format!("reindex error: {message}"));
+            state
+                .log
+                .push_scoped(&id, format!("reindex error: {message}"));
         }
     }
 }
@@ -340,8 +474,9 @@ async fn run_loop<B: ratatui::backend::Backend>(
     poll_daemon(state, client).await;
     let mut last_poll = Instant::now();
 
-    // Channel for reindex SSE events forwarded by a background task.
-    let (reindex_tx, mut reindex_rx) = mpsc::channel::<ReindexEvent>(64);
+    // Channel for reindex SSE events forwarded by a background task. Each
+    // event is tagged with its index id so the activity feed can scope it.
+    let (reindex_tx, mut reindex_rx) = mpsc::channel::<ScopedReindexEvent>(64);
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -383,15 +518,33 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 (SearchFocus::List, KeyCode::Up) => state.select_up(),
                 (SearchFocus::List, KeyCode::Down) => state.select_down(),
                 (SearchFocus::List, KeyCode::Char('r')) => {
-                    if let Some(id) = state.selected_id().map(str::to_string) {
-                        state.log.push(format!("reindex triggered: {id}"));
-                        let stream_client = client.clone();
-                        let tx = reindex_tx.clone();
-                        tokio::spawn(async move {
-                            stream_client.reindex_stream(&id, tx).await;
-                        });
+                    let targets: Vec<String> = if state.is_all_selected() {
+                        state.indexes.iter().map(|i| i.id.clone()).collect()
                     } else {
-                        state.log.push("reindex: no index selected");
+                        state
+                            .selected_id()
+                            .map(str::to_string)
+                            .into_iter()
+                            .collect()
+                    };
+                    if targets.is_empty() {
+                        if state.is_all_selected() {
+                            state.log.push("reindex (all): no indexes registered");
+                        } else {
+                            state.log.push("reindex: no index selected");
+                        }
+                    } else {
+                        if state.is_all_selected() {
+                            state
+                                .log
+                                .push(format!("reindex triggered: all {} indexes", targets.len()));
+                        }
+                        for id in targets {
+                            state
+                                .log
+                                .push_scoped(&id, format!("reindex triggered: {id}"));
+                            spawn_reindex(client.clone(), reindex_tx.clone(), id);
+                        }
                     }
                 }
                 // Input-focus bindings.
@@ -415,6 +568,36 @@ async fn run_loop<B: ratatui::backend::Backend>(
     }
 }
 
+/// Spawn a background task streaming one index's reindex into `out`.
+///
+/// Why: `SearchClient::reindex_stream` emits bare [`ReindexEvent`]s, but the
+/// event loop needs each tagged with its index id; this bridges a per-index
+/// inner channel onto the loop's [`ScopedReindexEvent`] channel so several
+/// indexes can reindex concurrently (the "All" fan-out) without losing track
+/// of which event belongs to which index.
+/// What: spawns the SSE streaming task plus a forwarding task that wraps every
+/// [`ReindexEvent`] in a [`ScopedReindexEvent`] carrying `index_id`.
+/// Test: side-effect-only (spawns tasks); the scoped event handling is
+/// unit-tested via `test_apply_reindex_event`.
+fn spawn_reindex(client: SearchClient, out: mpsc::Sender<ScopedReindexEvent>, index_id: String) {
+    let (inner_tx, mut inner_rx) = mpsc::channel::<ReindexEvent>(64);
+    let stream_id = index_id.clone();
+    tokio::spawn(async move {
+        client.reindex_stream(&stream_id, inner_tx).await;
+    });
+    tokio::spawn(async move {
+        while let Some(event) = inner_rx.recv().await {
+            let scoped = ScopedReindexEvent {
+                index_id: index_id.clone(),
+                event,
+            };
+            if out.send(scoped).await.is_err() {
+                break; // event loop gone — stop forwarding.
+            }
+        }
+    });
+}
+
 /// The body text for the help overlay, one binding per line.
 ///
 /// Why: kept separate so a test can assert every binding is documented.
@@ -424,8 +607,9 @@ pub fn help_text() -> String {
     [
         "  Tab     switch focus between the index list and the search bar",
         "  ↑ / ↓   move the index selection (when the list has focus)",
-        "  r       reindex the selected index (streams live progress)",
-        "  Enter   run a search against the selected index (search bar)",
+        "  All     the top list row fans queries / stats across every index",
+        "  r       reindex the selected index — or all, when 'All' is selected",
+        "  Enter   run a search against the selected index — or all of them",
         "  ?       toggle this help overlay",
         "  q / Esc quit",
     ]
@@ -442,31 +626,125 @@ pub fn left_panel_width(width: u16) -> u16 {
     LEFT_PANEL_MAX.min(width / 3)
 }
 
-/// Build the lines for the INDEXES panel body.
+/// One rendered row of the INDEXES panel.
 ///
-/// Why: separating line construction from the ratatui widgets lets a test
+/// Why: the renderer styles three row kinds differently — the "All" row is
+/// bold, the selected row is highlighted, ordinary rows are plain — so the line
+/// builder must surface which kind each row is rather than just a bool.
+/// What: the row `text`, whether it is `selected`, and whether it is the
+/// synthetic `is_all` ("All indexes") row.
+/// Test: `test_index_lines`, `test_all_selector`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexListRow {
+    /// The fully-formatted row text.
+    pub text: String,
+    /// Whether this row is the current selection.
+    pub selected: bool,
+    /// Whether this row is the synthetic "All indexes" entry.
+    pub is_all: bool,
+}
+
+/// Build the rows for the INDEXES panel body.
+///
+/// Why: separating row construction from the ratatui widgets lets a test
 /// assert the rendered content without a terminal backend.
-/// What: returns one `(text, selected)` pair per index — id, chunk count, and
-/// a `✓` marker — or a single placeholder line when there are no indexes.
-/// Test: `test_index_lines`.
-pub fn index_lines(state: &SearchTuiState) -> Vec<(String, bool)> {
+/// What: returns the synthetic "All indexes" row first (carrying the summed
+/// chunk count across every index), then one row per index — id, chunk count,
+/// and a `✓` marker. With no indexes registered the "All" row is still shown
+/// followed by a placeholder line.
+/// Test: `test_index_lines`, `test_all_selector`.
+pub fn index_lines(state: &SearchTuiState) -> Vec<IndexListRow> {
+    let mut rows: Vec<IndexListRow> = Vec::with_capacity(state.indexes.len() + 1);
+
+    // The synthetic "All indexes" row always leads the list.
+    let total_chunks: u64 = state.indexes.iter().map(|i| i.chunk_count).sum();
+    let all_selected = state.selected == 0;
+    let all_marker = if all_selected { ">" } else { " " };
+    rows.push(IndexListRow {
+        text: format!(
+            "{all_marker} {:<12} {:>8} ∗",
+            truncate(ALL_LABEL, 12),
+            format_count(total_chunks),
+        ),
+        selected: all_selected,
+        is_all: true,
+    });
+
     if state.indexes.is_empty() {
-        return vec![("(no indexes registered)".to_string(), false)];
+        rows.push(IndexListRow {
+            text: "  (no indexes registered)".to_string(),
+            selected: false,
+            is_all: false,
+        });
+        return rows;
     }
-    state
-        .indexes
-        .iter()
-        .enumerate()
-        .map(|(i, idx)| {
-            let marker = if i == state.selected { ">" } else { " " };
-            let text = format!(
+
+    for (i, idx) in state.indexes.iter().enumerate() {
+        // Row 0 is "All", so index `i` lives at cursor row `i + 1`.
+        let row = i + 1;
+        let selected = row == state.selected;
+        let marker = if selected { ">" } else { " " };
+        rows.push(IndexListRow {
+            text: format!(
                 "{marker} {:<12} {:>8} ✓",
                 truncate(&idx.id, 12),
                 format_count(idx.chunk_count),
-            );
-            (text, i == state.selected)
-        })
-        .collect()
+            ),
+            selected,
+            is_all: false,
+        });
+    }
+    rows
+}
+
+/// Build the STATISTICS panel lines for the current selection.
+///
+/// Why: the bottom-right panel shows counts and sizes for whichever index is
+/// selected, or aggregate totals plus a per-index breakdown when "All" is
+/// selected; isolating the builder makes the content testable without a
+/// terminal.
+/// What: for a single index, returns its id, chunk count, and indexed root
+/// path. For the "All" selection, returns the index count, the summed chunk
+/// count, and one `· <id>: <chunks>` breakdown line per index.
+/// Test: `test_stats_lines`.
+pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
+    if state.is_all_selected() {
+        let total: u64 = state.indexes.iter().map(|i| i.chunk_count).sum();
+        let mut lines = vec![
+            format!("Scope:        {ALL_LABEL}"),
+            format!("Indexes:      {}", state.indexes.len()),
+            format!("Total chunks: {}", format_count(total)),
+        ];
+        if state.indexes.is_empty() {
+            lines.push("(no indexes registered)".to_string());
+        } else {
+            lines.push(String::new());
+            for idx in &state.indexes {
+                lines.push(format!(
+                    "  · {:<14} {:>8}",
+                    truncate(&idx.id, 14),
+                    format_count(idx.chunk_count),
+                ));
+            }
+        }
+        return lines;
+    }
+
+    match state.indexes.get(state.selected.saturating_sub(1)) {
+        Some(idx) => vec![
+            format!("Index:        {}", idx.id),
+            format!("Chunks:       {}", format_count(idx.chunk_count)),
+            format!(
+                "Root path:    {}",
+                if idx.root_path.is_empty() {
+                    "(unknown)"
+                } else {
+                    idx.root_path.as_str()
+                }
+            ),
+        ],
+        None => vec!["(no index selected)".to_string()],
+    }
 }
 
 /// Truncate a string to `max` characters, appending an ellipsis when cut.
@@ -505,12 +783,22 @@ pub fn title_line(state: &SearchTuiState) -> String {
     }
 }
 
+/// Vertical split of the right-hand pane: ACTIVITY over STATISTICS.
+///
+/// Why: the right side shows two things — a live event feed and the selected
+/// index's stats; isolating the split as a named constant keeps `render` terse
+/// and documents the 60 / 40 ratio.
+/// What: the ACTIVITY panel takes the top 60 %, STATISTICS the bottom 40 %.
+const ACTIVITY_PERCENT: u16 = 60;
+
 /// Draw the search TUI frame.
 ///
 /// Why: the single entry point the event loop calls each tick.
-/// What: a 4-row vertical layout — title bar, the INDEXES/ACTIVITY split, the
-/// SEARCH input bar, and the key-hint footer. A centred help overlay floats on
-/// top when `show_help` is set.
+/// What: a 4-row vertical layout — title bar, the INDEXES / right-pane split,
+/// the SEARCH input bar, and the key-hint footer. The right pane is itself
+/// split vertically into an ACTIVITY feed (top 60 %) and a STATISTICS panel
+/// (bottom 40 %), both scoped to the selected index — or aggregated when "All"
+/// is selected. A centred help overlay floats on top when `show_help` is set.
 /// Test: line content is unit-tested via the `*_lines` helpers; this glue is
 /// exercised by `test_render_smoke`.
 pub fn render(frame: &mut Frame, state: &SearchTuiState) {
@@ -536,7 +824,7 @@ pub fn render(frame: &mut Frame, state: &SearchTuiState) {
         rows[0],
     );
 
-    // INDEXES + ACTIVITY split.
+    // INDEXES on the left, the ACTIVITY / STATISTICS stack on the right.
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -548,16 +836,21 @@ pub fn render(frame: &mut Frame, state: &SearchTuiState) {
     let list_focused = state.focus == SearchFocus::List;
     let index_items: Vec<ListItem> = index_lines(state)
         .into_iter()
-        .map(|(text, selected)| {
-            let style = if selected {
+        .map(|row| {
+            let style = if row.selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if row.is_all {
+                // The unselected "All" row stays distinct — bold yellow.
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(text, style)))
+            ListItem::new(Line::from(Span::styled(row.text, style)))
         })
         .collect();
     frame.render_widget(
@@ -565,20 +858,41 @@ pub fn render(frame: &mut Frame, state: &SearchTuiState) {
         split[0],
     );
 
-    // ACTIVITY panel — show the tail that fits the panel height.
-    let activity_height = split[1].height.saturating_sub(2) as usize;
-    let activity_items: Vec<ListItem> = if state.log.is_empty() {
-        vec![ListItem::new("(no activity yet)")]
-    } else {
+    // Right pane: ACTIVITY (top) over STATISTICS (bottom).
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(ACTIVITY_PERCENT),
+            Constraint::Percentage(100 - ACTIVITY_PERCENT),
+        ])
+        .split(split[1]);
+
+    // ACTIVITY panel — the tail of the scoped feed that fits the panel height.
+    let scope = state.scope_filter();
+    let activity_title = match scope {
+        Some(id) => format!("ACTIVITY — {id}"),
+        None => format!("ACTIVITY — {ALL_LABEL}"),
+    };
+    let activity_height = right[0].height.saturating_sub(2) as usize;
+    let activity_items: Vec<ListItem> = if state.log.has_scoped(scope) {
         state
             .log
-            .tail(activity_height.max(1))
+            .tail_scoped(scope, activity_height.max(1))
             .map(|line| ListItem::new(line.as_str()))
             .collect()
+    } else {
+        vec![ListItem::new("(no activity yet)")]
     };
     frame.render_widget(
-        List::new(activity_items).block(panel_block("ACTIVITY", false)),
-        split[1],
+        List::new(activity_items).block(panel_block(&activity_title, false)),
+        right[0],
+    );
+
+    // STATISTICS panel — counts and sizes for the selection.
+    let stats_items: Vec<ListItem> = stats_lines(state).into_iter().map(ListItem::new).collect();
+    frame.render_widget(
+        List::new(stats_items).block(panel_block("STATISTICS", false)),
+        right[1],
     );
 
     // SEARCH input bar.
@@ -722,22 +1036,22 @@ mod tests {
     #[test]
     fn test_selected_clamp() {
         let mut state = sample_state();
-        // select_down stops at the last index, never past it.
+        // The list has 1 ("All") + 3 indexes = 4 rows; the cursor stops at 3.
         for _ in 0..10 {
             state.select_down();
         }
-        assert_eq!(state.selected, 2, "clamped to indexes.len() - 1");
-        // select_up saturates at zero.
+        assert_eq!(state.selected, 3, "clamped to indexes.len()");
+        // select_up saturates at zero (the "All" row).
         for _ in 0..10 {
             state.select_up();
         }
         assert_eq!(state.selected, 0);
-        // A shrunk index list re-clamps the cursor.
-        state.selected = 2;
+        // A shrunk index list re-clamps the cursor (1 "All" + 1 index = row 1).
+        state.selected = 3;
         state.indexes.truncate(1);
         state.clamp_selection();
-        assert_eq!(state.selected, 0);
-        // An empty list resets the cursor to zero.
+        assert_eq!(state.selected, 1);
+        // An empty list leaves only the "All" row at cursor 0.
         state.indexes.clear();
         state.selected = 5;
         state.clamp_selection();
@@ -747,12 +1061,70 @@ mod tests {
     #[test]
     fn test_selected_id() {
         let mut state = sample_state();
+        // Cursor 0 is "All" — no single index.
+        assert!(state.is_all_selected());
+        assert_eq!(state.selected_id(), None);
+        // Cursor 1 is the first index.
+        state.select_down();
         assert_eq!(state.selected_id(), Some("cto"));
         state.select_down();
         assert_eq!(state.selected_id(), Some("trusty"));
         state.indexes.clear();
         state.clamp_selection();
         assert_eq!(state.selected_id(), None);
+    }
+
+    #[test]
+    fn test_all_selector() {
+        let mut state = sample_state();
+        // The default selection is the "All indexes" row.
+        assert!(state.is_all_selected());
+        assert_eq!(state.scope_filter(), None);
+        // Moving down off row 0 picks a single index and a scoped filter.
+        state.select_down();
+        assert!(!state.is_all_selected());
+        assert_eq!(state.scope_filter(), Some("cto"));
+        // Moving back up returns to "All".
+        state.select_up();
+        assert!(state.is_all_selected());
+        assert_eq!(state.scope_filter(), None);
+
+        // The index list always leads with the "All" row.
+        let rows = index_lines(&state);
+        assert_eq!(rows.len(), 4, "1 'All' row + 3 indexes");
+        assert!(rows[0].is_all);
+        assert!(rows[0].text.contains(ALL_LABEL));
+        assert!(rows[0].selected, "'All' is selected by default");
+        assert!(!rows[1].is_all);
+        assert!(rows[1].text.contains("cto"));
+    }
+
+    #[test]
+    fn test_stats_lines() {
+        let mut state = sample_state();
+        // "All" selected → aggregate totals + a per-index breakdown.
+        let all = stats_lines(&state);
+        assert!(
+            all.iter()
+                .any(|l| l.contains("Indexes:") && l.contains('3'))
+        );
+        // 1,200 + 18,994 + 900 = 21,094 → abbreviated as 21.1k.
+        assert!(all.iter().any(|l| l.contains("Total chunks:")));
+        assert!(all.iter().any(|l| l.contains("cto")));
+        assert!(all.iter().any(|l| l.contains("trusty")));
+
+        // A single index selected → that index's detail.
+        state.select_down(); // cursor 1 → cto
+        let one = stats_lines(&state);
+        assert!(
+            one.iter()
+                .any(|l| l.contains("Index:") && l.contains("cto"))
+        );
+        assert!(
+            one.iter()
+                .any(|l| l.contains("Chunks:") && l.contains("1,200"))
+        );
+        assert!(one.iter().any(|l| l.contains("/tmp/cto")));
     }
 
     #[test]
@@ -776,23 +1148,34 @@ mod tests {
         assert_eq!(line.as_bytes()[9], b']');
     }
 
+    /// Tag a [`ReindexEvent`] with a test index id.
+    fn scoped(event: ReindexEvent) -> ScopedReindexEvent {
+        ScopedReindexEvent {
+            index_id: "cto".into(),
+            event,
+        }
+    }
+
     #[test]
     fn test_apply_reindex_event() {
         let mut state = SearchTuiState::new("http://x");
-        apply_reindex_event(&mut state, ReindexEvent::Started { total_files: 1200 });
         apply_reindex_event(
             &mut state,
-            ReindexEvent::Progress {
-                indexed: 600,
-                total_files: 1200,
-            },
+            scoped(ReindexEvent::Started { total_files: 1200 }),
         );
         apply_reindex_event(
             &mut state,
-            ReindexEvent::Complete {
+            scoped(ReindexEvent::Progress {
+                indexed: 600,
+                total_files: 1200,
+            }),
+        );
+        apply_reindex_event(
+            &mut state,
+            scoped(ReindexEvent::Complete {
                 total_chunks: 19_012,
                 status: "complete".into(),
-            },
+            }),
         );
         let lines: Vec<&String> = state.log.iter().collect();
         assert_eq!(lines.len(), 3);
@@ -800,8 +1183,13 @@ mod tests {
         assert!(lines[1].contains("600/1200 (50%)"));
         assert!(lines[2].contains("reindex complete: 19.0k chunks"));
 
+        // The events are scoped to the "cto" index, so the per-index activity
+        // feed keeps them and a different index's feed does not.
+        assert_eq!(state.log.tail_scoped(Some("cto"), 100).count(), 3);
+        assert_eq!(state.log.tail_scoped(Some("trusty"), 100).count(), 0);
+
         // A failed event records an error line.
-        apply_reindex_event(&mut state, ReindexEvent::Failed("disk full".into()));
+        apply_reindex_event(&mut state, scoped(ReindexEvent::Failed("disk full".into())));
         assert!(
             state
                 .log
@@ -823,19 +1211,27 @@ mod tests {
     #[test]
     fn test_index_lines() {
         let state = sample_state();
-        let lines = index_lines(&state);
-        assert_eq!(lines.len(), 3);
-        // The selected (first) row is marked.
-        assert!(lines[0].0.contains("cto") && lines[0].1);
-        assert!(lines[0].0.starts_with('>'));
-        assert!(lines[1].0.contains("trusty") && !lines[1].1);
-        assert!(lines[1].0.contains("19.0k"));
+        let rows = index_lines(&state);
+        // 1 "All" row + 3 index rows.
+        assert_eq!(rows.len(), 4);
+        // Row 0 is "All", selected by default, and bold-marked with `>`.
+        assert!(rows[0].is_all);
+        assert!(rows[0].selected);
+        assert!(rows[0].text.starts_with('>'));
+        assert!(rows[0].text.contains(ALL_LABEL));
+        // Row 1 is the first index, unselected.
+        assert!(!rows[1].is_all && !rows[1].selected);
+        assert!(rows[1].text.contains("cto"));
+        // Row 2 carries its chunk count.
+        assert!(rows[2].text.contains("trusty"));
+        assert!(rows[2].text.contains("19.0k"));
 
-        // An empty index list shows a placeholder.
+        // An empty index list still shows the "All" row plus a placeholder.
         let empty = SearchTuiState::new("http://x");
-        let lines = index_lines(&empty);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].0.contains("no indexes"));
+        let rows = index_lines(&empty);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_all);
+        assert!(rows[1].text.contains("no indexes"));
     }
 
     #[test]
@@ -872,10 +1268,14 @@ mod tests {
 
     #[test]
     fn test_render_smoke() {
-        // A full render in several states must not panic.
+        // A full render in several states must not panic — exercise both the
+        // "All" selection (aggregated panels) and a single-index selection.
         let mut state = sample_state();
-        state.log.push("reindex started: 1200 files");
-        state.log.push("search \"fn embed\" → 5 results");
+        state.log.push("daemon started");
+        state.log.push_scoped("cto", "reindex started: 1200 files");
+        state
+            .log
+            .push_scoped("trusty", "search \"fn embed\" → 5 results");
         state.input = "fn authenticate".into();
         state.focus = SearchFocus::Input;
         for (w, h) in [(120u16, 30u16), (80, 24)] {
@@ -883,8 +1283,16 @@ mod tests {
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
                 .draw(|f| render(f, &state))
-                .expect("render must not panic");
+                .expect("render (All) must not panic");
         }
+        // Single-index selection — the right panels scope to that index.
+        state.selected = 1;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| render(f, &state))
+            .expect("render (single index) must not panic");
+
         // Help overlay and offline daemon paths.
         state.show_help = true;
         state.daemon_status = DaemonStatus::Connecting;

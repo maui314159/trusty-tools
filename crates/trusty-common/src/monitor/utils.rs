@@ -98,18 +98,40 @@ pub fn timestamped(msg: &str) -> String {
     format!("[{hh:02}:{mm:02}:{ss:02}] {msg}")
 }
 
+/// One retained activity-log line plus the collection it belongs to.
+///
+/// Why: the split-panel TUIs filter the activity feed by the selected
+/// collection / palace, and the "All" selector merges every collection's
+/// events; tagging each line with its scope makes both filtering and merging a
+/// pure projection over the same backing buffer.
+/// What: the formatted log `text` and an optional `scope` — the collection /
+/// palace id the line is about, or `None` for daemon-wide lines (and indented
+/// continuation lines, which inherit their parent's scope visually).
+/// Test: `test_log_scoped_filtering`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    /// The fully-formatted log line as it is rendered.
+    pub text: String,
+    /// The collection / palace id this line concerns, or `None` for
+    /// daemon-wide events.
+    pub scope: Option<String>,
+}
+
 /// A bounded, append-only activity log shared by both service TUIs.
 ///
 /// Why: each TUI streams indexing / recall / dream events into a scrolling
 /// "ACTIVITY" panel; an unbounded log would grow without limit over a long
-/// session, so the buffer is capped and the oldest lines are dropped.
-/// What: wraps a [`VecDeque<String>`] capped at [`Self::MAX_ENTRIES`]; `push`
-/// timestamps and appends a line, `push_raw` appends an already-formatted
-/// (e.g. indented continuation) line.
-/// Test: `test_log_max_capacity`, `test_log_push_timestamps`.
+/// session, so the buffer is capped and the oldest lines are dropped. Each line
+/// also carries the collection it concerns so the split-panel TUIs can filter
+/// the feed to the selected collection (or show all of them).
+/// What: wraps a [`VecDeque<LogEntry>`] capped at [`Self::MAX_ENTRIES`]; `push`
+/// timestamps and appends a daemon-wide line, `push_scoped` tags a line with a
+/// collection id, `push_raw` appends an already-formatted continuation line.
+/// Test: `test_log_max_capacity`, `test_log_push_timestamps`,
+/// `test_log_scoped_filtering`.
 #[derive(Debug, Clone, Default)]
 pub struct ActivityLog {
-    entries: VecDeque<String>,
+    entries: VecDeque<LogEntry>,
 }
 
 impl ActivityLog {
@@ -133,25 +155,73 @@ impl ActivityLog {
         }
     }
 
-    /// Timestamp `msg` and append it, evicting the oldest line on overflow.
+    /// Timestamp `msg` and append it as a daemon-wide line.
     ///
-    /// Why: the common case — record a fresh event with a `[HH:MM:SS]` prefix.
-    /// What: pushes `timestamped(msg)`; when the deque exceeds
+    /// Why: the common case — record a fresh event with a `[HH:MM:SS]` prefix
+    /// that is not specific to any one collection.
+    /// What: pushes `timestamped(msg)` with no scope; when the deque exceeds
     /// [`Self::MAX_ENTRIES`] the front (oldest) line is dropped.
     /// Test: `test_log_max_capacity`, `test_log_push_timestamps`.
     pub fn push(&mut self, msg: impl AsRef<str>) {
-        self.push_raw(timestamped(msg.as_ref()));
+        self.push_entry(LogEntry {
+            text: timestamped(msg.as_ref()),
+            scope: None,
+        });
     }
 
-    /// Append an already-formatted line verbatim, evicting on overflow.
+    /// Timestamp `msg` and append it, tagged with the collection `scope`.
+    ///
+    /// Why: the split-panel TUIs filter the activity feed to the selected
+    /// collection; tagging the event lets the renderer keep or drop it.
+    /// What: pushes `timestamped(msg)` carrying `scope` as its collection id;
+    /// enforces the [`Self::MAX_ENTRIES`] cap.
+    /// Test: `test_log_scoped_filtering`.
+    pub fn push_scoped(&mut self, scope: impl Into<String>, msg: impl AsRef<str>) {
+        self.push_entry(LogEntry {
+            text: timestamped(msg.as_ref()),
+            scope: Some(scope.into()),
+        });
+    }
+
+    /// Append an already-formatted, daemon-wide line verbatim.
     ///
     /// Why: continuation lines (indented search results, dream sub-stats) are
     /// written without their own timestamp so they read as part of the event
     /// above them.
-    /// What: pushes `line` unchanged; enforces the [`Self::MAX_ENTRIES`] cap.
+    /// What: pushes `line` unchanged with no scope; enforces the
+    /// [`Self::MAX_ENTRIES`] cap.
     /// Test: `test_log_max_capacity`.
     pub fn push_raw(&mut self, line: impl Into<String>) {
-        self.entries.push_back(line.into());
+        self.push_entry(LogEntry {
+            text: line.into(),
+            scope: None,
+        });
+    }
+
+    /// Append an already-formatted continuation line tagged with `scope`.
+    ///
+    /// Why: an indented continuation line (a search hit beneath its summary)
+    /// must share its parent event's collection so a scoped filter keeps the
+    /// whole event together.
+    /// What: pushes `line` unchanged carrying `scope`; enforces the
+    /// [`Self::MAX_ENTRIES`] cap.
+    /// Test: `test_log_scoped_filtering`.
+    pub fn push_raw_scoped(&mut self, scope: impl Into<String>, line: impl Into<String>) {
+        self.push_entry(LogEntry {
+            text: line.into(),
+            scope: Some(scope.into()),
+        });
+    }
+
+    /// Append a fully-built [`LogEntry`], evicting the oldest on overflow.
+    ///
+    /// Why: the typed `push*` helpers all funnel through one place that
+    /// enforces the capacity cap.
+    /// What: pushes `entry`; drops the front line while the deque exceeds
+    /// [`Self::MAX_ENTRIES`].
+    /// Test: `test_log_max_capacity`.
+    pub fn push_entry(&mut self, entry: LogEntry) {
+        self.entries.push_back(entry);
         while self.entries.len() > Self::MAX_ENTRIES {
             self.entries.pop_front();
         }
@@ -176,25 +246,71 @@ impl ActivityLog {
         self.entries.is_empty()
     }
 
-    /// The last `n` lines, oldest-first, for rendering the visible tail.
+    /// The last `n` line texts, oldest-first, for rendering the visible tail.
     ///
     /// Why: the activity panel shows only the lines that fit; the renderer
     /// asks for as many as the panel height allows.
-    /// What: returns a borrowed iterator over the final `min(n, len)` lines.
+    /// What: returns a borrowed iterator over the final `min(n, len)` line
+    /// texts, ignoring scope (the un-filtered "All" view).
     /// Test: `test_log_tail`.
     pub fn tail(&self, n: usize) -> impl Iterator<Item = &String> {
         let skip = self.entries.len().saturating_sub(n);
-        self.entries.iter().skip(skip)
+        self.entries.iter().skip(skip).map(|e| &e.text)
     }
 
-    /// Every line, oldest-first.
+    /// The last `n` line texts whose scope matches `filter`, oldest-first.
+    ///
+    /// Why: the split-panel TUIs show the activity feed for one selected
+    /// collection; `None` keeps every line (the "All" view), while
+    /// `Some(id)` keeps only that collection's lines plus daemon-wide lines.
+    /// What: filters the backing buffer — a line is kept when `filter` is
+    /// `None`, when the line's scope is `None` (daemon-wide), or when the
+    /// line's scope equals `filter` — then yields the last `n` matching texts.
+    /// Test: `test_log_scoped_filtering`.
+    pub fn tail_scoped<'a>(
+        &'a self,
+        filter: Option<&'a str>,
+        n: usize,
+    ) -> impl Iterator<Item = &'a String> {
+        let matched: Vec<&String> = self
+            .entries
+            .iter()
+            .filter(move |e| match (filter, e.scope.as_deref()) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(want), Some(got)) => want == got,
+            })
+            .map(|e| &e.text)
+            .collect();
+        let skip = matched.len().saturating_sub(n);
+        matched.into_iter().skip(skip)
+    }
+
+    /// Whether any retained line matches the scope `filter`.
+    ///
+    /// Why: the renderer shows a "(no activity yet)" placeholder when the
+    /// scoped feed is empty even though the global log is not.
+    /// What: returns `true` when at least one line passes [`Self::tail_scoped`]'s
+    /// filter for `filter`.
+    /// Test: `test_log_scoped_filtering`.
+    pub fn has_scoped(&self, filter: Option<&str>) -> bool {
+        self.entries
+            .iter()
+            .any(|e| match (filter, e.scope.as_deref()) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(want), Some(got)) => want == got,
+            })
+    }
+
+    /// Every line text, oldest-first.
     ///
     /// Why: the renderer maps lines to ratatui `ListItem`s; some tests assert
     /// on the full contents.
-    /// What: returns a borrowed iterator over all retained lines.
+    /// What: returns a borrowed iterator over all retained line texts.
     /// Test: `test_log_push_timestamps`.
     pub fn iter(&self) -> impl Iterator<Item = &String> {
-        self.entries.iter()
+        self.entries.iter().map(|e| &e.text)
     }
 }
 
@@ -309,5 +425,41 @@ mod tests {
         assert_eq!(tail[2], "l9");
         // Asking for more than exist clamps to the available count.
         assert_eq!(log.tail(100).count(), 10);
+    }
+
+    #[test]
+    fn test_log_scoped_filtering() {
+        // A mix of scoped and daemon-wide lines: a scoped filter keeps its own
+        // collection plus daemon-wide lines; `None` keeps everything.
+        let mut log = ActivityLog::new();
+        log.push("daemon started"); // scope None
+        log.push_scoped("cto", "reindex cto");
+        log.push_raw_scoped("cto", "  100/200 files");
+        log.push_scoped("trusty", "search trusty");
+
+        // No filter → every line.
+        let all: Vec<&String> = log.tail_scoped(None, 100).collect();
+        assert_eq!(all.len(), 4);
+
+        // Filter to `cto` → its two lines plus the daemon-wide line.
+        let cto: Vec<&String> = log.tail_scoped(Some("cto"), 100).collect();
+        assert_eq!(cto.len(), 3);
+        assert!(cto.iter().any(|l| l.contains("reindex cto")));
+        assert!(cto.iter().any(|l| l.contains("100/200 files")));
+        assert!(cto.iter().any(|l| l.contains("daemon started")));
+        assert!(!cto.iter().any(|l| l.contains("search trusty")));
+
+        // Filter to a collection with no scoped lines → only daemon-wide.
+        let other: Vec<&String> = log.tail_scoped(Some("absent"), 100).collect();
+        assert_eq!(other.len(), 1);
+        assert!(other[0].contains("daemon started"));
+
+        // `has_scoped` mirrors the filter.
+        assert!(log.has_scoped(None));
+        assert!(log.has_scoped(Some("cto")));
+        assert!(log.has_scoped(Some("absent"))); // daemon-wide line still matches
+
+        // The tail bound applies after filtering.
+        assert_eq!(log.tail_scoped(Some("cto"), 1).count(), 1);
     }
 }
