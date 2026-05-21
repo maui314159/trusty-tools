@@ -28,7 +28,7 @@ name = "trusty-memory"
 path = "src/main.rs"
 
 [dependencies]
-trusty-common = { path = "../trusty-common", version = "0.4.7", features = ["axum-server", "mcp", "memory-core", "monitor-tui"] }
+trusty-common = { path = "../trusty-common", version = "0.4.8", features = ["axum-server", "mcp", "memory-core", "monitor-tui"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
