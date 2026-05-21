@@ -215,9 +215,17 @@ async fn run_serve(
         let state = AppState::new(data_root)
             .with_default_palace(palace)
             .with_log_buffer(log_buffer);
+        // Re-hydrate every on-disk palace before serving so the dashboard and
+        // `palace_list` see the full set immediately after a restart. Without
+        // this the registry starts empty and palaces "disappear" until a tool
+        // call lazily re-opens them one at a time.
+        let count = state.load_palaces_from_disk().await?;
+        tracing::info!("Loaded {count} palaces from disk");
         run_http(state, addr).await
     } else {
         let state = AppState::new(data_root).with_default_palace(palace);
+        let count = state.load_palaces_from_disk().await?;
+        tracing::info!("Loaded {count} palaces from disk");
         run_stdio(state).await
     }
 }

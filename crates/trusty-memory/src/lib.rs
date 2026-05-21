@@ -175,6 +175,60 @@ impl AppState {
         }
     }
 
+    /// Scan `data_root/palaces/` and re-register every persisted palace into
+    /// the in-memory [`PalaceRegistry`].
+    ///
+    /// Why: `AppState::new` builds an *empty* registry, so after a daemon
+    /// restart `palace_list` / the dashboard reported zero palaces even though
+    /// dozens existed on disk — palace metadata was persisted by
+    /// `palace_create` but never re-hydrated on startup. This method closes
+    /// that gap by walking the on-disk layout (each subdirectory holding a
+    /// `palace.json` is one palace) and rebuilding a live `PalaceHandle` for
+    /// each, so recall paths see the full set immediately after a restart.
+    /// What: Runs the blocking filesystem walk + per-palace `PalaceHandle::open`
+    /// on a `spawn_blocking` thread (so it never stalls the async runtime),
+    /// registers each successfully opened palace via `register_arc`, logs every
+    /// load at `debug!`, and returns the count loaded. A palace that fails to
+    /// open (corrupt index, unreadable `kg.db`, etc.) is logged at `warn!` and
+    /// skipped — one bad palace must not abort startup or crash the daemon.
+    /// Test: `tests::load_palaces_from_disk_rehydrates_registry` writes two
+    /// palaces into a tempdir, constructs an `AppState`, calls this method, and
+    /// asserts the returned count and registry contents.
+    pub async fn load_palaces_from_disk(&self) -> Result<usize> {
+        let data_root = self.data_root.clone();
+        let registry = self.registry.clone();
+        // The directory walk and each `PalaceHandle::open` perform blocking
+        // filesystem + redb/usearch I/O — run the whole hydration on the
+        // blocking pool so it never parks an async worker thread.
+        let count = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let palaces = PalaceRegistry::list_palaces(&data_root)?;
+            let mut loaded = 0usize;
+            for palace in palaces {
+                match trusty_common::memory_core::PalaceHandle::open(&palace) {
+                    Ok(handle) => {
+                        tracing::debug!(
+                            palace = %palace.id,
+                            data_dir = %palace.data_dir.display(),
+                            "loaded palace from disk"
+                        );
+                        registry.register_arc(handle);
+                        loaded += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            palace = %palace.id,
+                            "skipping palace during startup hydration: {e:#}"
+                        );
+                    }
+                }
+            }
+            Ok(loaded)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join load_palaces_from_disk: {e}"))??;
+        Ok(count)
+    }
+
     /// Builder-style: attach the daemon's shared [`LogBuffer`] so the
     /// `GET /api/v1/logs/tail` endpoint serves the same lines the tracing
     /// subscriber captures (issue #35).
@@ -748,6 +802,77 @@ mod tests {
             msg.contains("missing 'palace'"),
             "expected helpful error, got: {msg}"
         );
+    }
+
+    /// Why: regression for the "palaces lost on restart" bug — `AppState::new`
+    /// builds an empty registry, so the daemon must call
+    /// `load_palaces_from_disk` on startup to re-register palaces persisted by
+    /// a previous run. Without that call the registry stays empty even though
+    /// `palace.json` files exist on disk.
+    /// What: persists two palaces under a tempdir (via the same
+    /// `create_palace` path the `palace_create` tool uses), constructs a fresh
+    /// `AppState` rooted there, calls `load_palaces_from_disk`, and asserts the
+    /// returned count and registry contents.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn load_palaces_from_disk_rehydrates_registry() {
+        use trusty_common::memory_core::{Palace, PalaceId, PalaceRegistry};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+
+        // Phase 1: persist two palaces to disk, then drop the writer registry
+        // so nothing is held in memory — simulating a prior daemon run.
+        {
+            let writer = PalaceRegistry::new();
+            for id in ["alpha", "beta"] {
+                let palace = Palace {
+                    id: PalaceId::new(id),
+                    name: id.to_string(),
+                    description: None,
+                    created_at: chrono::Utc::now(),
+                    data_dir: root.join(id),
+                };
+                writer
+                    .create_palace(&root, palace)
+                    .expect("persist palace to disk");
+            }
+        }
+
+        // Add a stray non-palace subdirectory; the walker must ignore it.
+        std::fs::create_dir_all(root.join("not-a-palace")).expect("mkdir");
+
+        // Phase 2: fresh AppState starts with an empty registry (the bug).
+        let state = AppState::new(root);
+        assert!(
+            state.registry.is_empty(),
+            "AppState::new must start with an empty registry"
+        );
+
+        // The fix: hydrate from disk.
+        let count = state
+            .load_palaces_from_disk()
+            .await
+            .expect("load_palaces_from_disk");
+
+        assert_eq!(count, 2, "both persisted palaces should be loaded");
+        assert_eq!(state.registry.len(), 2, "registry should hold both palaces");
+        let ids: Vec<String> = state.registry.list().into_iter().map(|p| p.0).collect();
+        assert!(ids.contains(&"alpha".to_string()));
+        assert!(ids.contains(&"beta".to_string()));
+    }
+
+    /// Why: an empty (or missing) `palaces/` directory must not error — a
+    /// brand-new install has nothing to hydrate and should report zero.
+    #[tokio::test]
+    async fn load_palaces_from_disk_empty_root_returns_zero() {
+        let state = test_state();
+        let count = state
+            .load_palaces_from_disk()
+            .await
+            .expect("load_palaces_from_disk on empty root");
+        assert_eq!(count, 0);
+        assert!(state.registry.is_empty());
     }
 
     /// Why: initialize without a default palace must omit `default_palace`
