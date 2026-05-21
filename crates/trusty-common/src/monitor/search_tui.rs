@@ -31,7 +31,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc;
 
@@ -87,12 +87,12 @@ pub enum SearchFocus {
 /// input — keeping every piece of state in one struct keeps the loop terse and
 /// the rendering a pure function of this snapshot.
 /// What: the daemon URL and status, the index list and selection cursor, the
-/// bounded activity log, the query buffer, the focused zone, and the help flag.
-/// The selection cursor addresses a list whose first row is the synthetic
-/// "All indexes" entry, so cursor `0` means "All" and cursor `n` (n ≥ 1) means
-/// `indexes[n - 1]`.
+/// scroll offset of the index panel, the bounded activity log, the query
+/// buffer, the focused zone, and the help flag. The selection cursor addresses
+/// a list whose first row is the synthetic "All indexes" entry, so cursor `0`
+/// means "All" and cursor `n` (n ≥ 1) means `indexes[n - 1]`.
 /// Test: `test_selected_clamp`, `test_toggle_focus`, `test_log_append`,
-/// `test_all_selector`.
+/// `test_all_selector`, `test_scroll_offset`.
 #[derive(Debug, Clone)]
 pub struct SearchTuiState {
     /// The trusty-search daemon base URL being monitored.
@@ -104,6 +104,9 @@ pub struct SearchTuiState {
     /// Cursor into the index list, where row `0` is the "All indexes" entry
     /// and row `n` (n ≥ 1) selects `indexes[n - 1]`.
     pub selected: usize,
+    /// Index of the first row drawn in the INDEXES panel — the scroll offset
+    /// that keeps [`Self::selected`] on screen when the list overflows.
+    pub scroll_offset: usize,
     /// Bounded, timestamped log of reindex / search activity.
     pub log: ActivityLog,
     /// The in-progress search query buffer.
@@ -127,6 +130,7 @@ impl SearchTuiState {
             daemon_status: DaemonStatus::Connecting,
             indexes: Vec::new(),
             selected: 0,
+            scroll_offset: 0,
             log: ActivityLog::new(),
             input: String::new(),
             focus: SearchFocus::List,
@@ -190,6 +194,25 @@ impl SearchTuiState {
     pub fn clamp_selection(&mut self) {
         if self.selected > self.last_row() {
             self.selected = self.last_row();
+        }
+    }
+
+    /// Recompute the scroll offset so the selected row fits a `visible` window.
+    ///
+    /// Why: the INDEXES panel is a fixed-height viewport; when the list has
+    /// more rows than fit, the panel must scroll so [`Self::selected`] is never
+    /// drawn off-screen — otherwise `↑`/`↓` appear to do nothing past the edge.
+    /// What: given the panel's visible row count, shifts [`Self::scroll_offset`]
+    /// down when the cursor falls below the window and up when it rises above
+    /// it, leaving it untouched while the cursor is already in view. A zero
+    /// `visible` is treated as one row so the offset always tracks the cursor.
+    /// Test: `test_scroll_offset`.
+    pub fn sync_scroll(&mut self, visible: usize) {
+        let window = visible.max(1);
+        if self.selected >= self.scroll_offset + window {
+            self.scroll_offset = self.selected + 1 - window;
+        } else if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
         }
     }
 
@@ -480,6 +503,8 @@ async fn run_loop<B: ratatui::backend::Backend>(
 
     loop {
         terminal.draw(|f| render(f, state))?;
+        // `terminal.draw` requires `state` mutably (the renderer scrolls the
+        // index list); the closure reborrows it for the rest of the loop.
 
         // Drain any reindex events the SSE task has produced since last frame.
         while let Ok(event) = reindex_rx.try_recv() {
@@ -801,7 +826,7 @@ const ACTIVITY_PERCENT: u16 = 60;
 /// is selected. A centred help overlay floats on top when `show_help` is set.
 /// Test: line content is unit-tested via the `*_lines` helpers; this glue is
 /// exercised by `test_render_smoke`.
-pub fn render(frame: &mut Frame, state: &SearchTuiState) {
+pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
     let area = frame.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -853,9 +878,17 @@ pub fn render(frame: &mut Frame, state: &SearchTuiState) {
             ListItem::new(Line::from(Span::styled(row.text, style)))
         })
         .collect();
-    frame.render_widget(
+    // Scroll the INDEXES list so the selected row stays visible: the panel
+    // height minus its two border rows is the visible window.
+    let index_visible = split[0].height.saturating_sub(2) as usize;
+    state.sync_scroll(index_visible);
+    let mut index_state = ListState::default()
+        .with_offset(state.scroll_offset)
+        .with_selected(Some(state.selected));
+    frame.render_stateful_widget(
         List::new(index_items).block(panel_block("INDEXES", list_focused)),
         split[0],
+        &mut index_state,
     );
 
     // Right pane: ACTIVITY (top) over STATISTICS (bottom).
@@ -1267,6 +1300,52 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_offset() {
+        // A list taller than its viewport must scroll so the cursor stays in
+        // view; a list that fits leaves the offset pinned at zero.
+        let mut state = sample_state();
+        // 3 indexes + the "All" row = 4 rows; an 8-row window holds them all.
+        for row in 0..=state.last_row() {
+            state.selected = row;
+            state.sync_scroll(8);
+            assert_eq!(state.scroll_offset, 0, "no scroll while the list fits");
+        }
+
+        // Grow the list well past a 5-row window and walk the cursor down.
+        state.indexes = (0..40)
+            .map(|n| IndexRow {
+                id: format!("idx-{n}"),
+                chunk_count: 1,
+                root_path: String::new(),
+            })
+            .collect();
+        let window = 5;
+        for row in 0..=state.last_row() {
+            state.selected = row;
+            state.sync_scroll(window);
+            assert!(
+                row >= state.scroll_offset && row < state.scroll_offset + window,
+                "row {row} must be inside [{}, {})",
+                state.scroll_offset,
+                state.scroll_offset + window,
+            );
+        }
+        // The cursor at the bottom pins the window against the list end.
+        assert_eq!(state.scroll_offset, state.last_row() + 1 - window);
+
+        // Walking back up drags the window up with the cursor.
+        for row in (0..=state.last_row()).rev() {
+            state.selected = row;
+            state.sync_scroll(window);
+            assert!(
+                row >= state.scroll_offset && row < state.scroll_offset + window,
+                "row {row} must stay visible while scrolling up",
+            );
+        }
+        assert_eq!(state.scroll_offset, 0, "back at the top");
+    }
+
+    #[test]
     fn test_render_smoke() {
         // A full render in several states must not panic — exercise both the
         // "All" selection (aggregated panels) and a single-index selection.
@@ -1282,7 +1361,7 @@ mod tests {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
-                .draw(|f| render(f, &state))
+                .draw(|f| render(f, &mut state))
                 .expect("render (All) must not panic");
         }
         // Single-index selection — the right panels scope to that index.
@@ -1290,8 +1369,24 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|f| render(f, &state))
+            .draw(|f| render(f, &mut state))
             .expect("render (single index) must not panic");
+
+        // A list far longer than the panel must render (and scroll) cleanly.
+        state.indexes = (0..60)
+            .map(|n| IndexRow {
+                id: format!("idx-{n}"),
+                chunk_count: 100,
+                root_path: String::new(),
+            })
+            .collect();
+        state.selected = state.last_row();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| render(f, &mut state))
+            .expect("overflowing list render must not panic");
+        assert!(state.scroll_offset > 0, "long list scrolled to the cursor");
 
         // Help overlay and offline daemon paths.
         state.show_help = true;
@@ -1299,7 +1394,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|f| render(f, &state))
+            .draw(|f| render(f, &mut state))
             .expect("help render must not panic");
     }
 }
