@@ -108,20 +108,13 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
     // (384-dim L2-normalised f32).
     #[cfg(feature = "candle")]
     {
-        if std::env::var("TRUSTY_EMBEDDER")
-            .ok()
-            .as_deref()
-            == Some("candle")
-        {
-            let candle = tokio::task::spawn_blocking(
-                crate::service::candle_embedder::CandleEmbedder::new,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("candle embedder init task panicked: {e}"))??;
+        if std::env::var("TRUSTY_EMBEDDER").ok().as_deref() == Some("candle") {
+            let candle =
+                tokio::task::spawn_blocking(crate::service::candle_embedder::CandleEmbedder::new)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("candle embedder init task panicked: {e}"))??;
             let dim = candle.dimension();
-            tracing::info!(
-                "embedder initialized: model=all-MiniLM-L6-v2 dim={dim} backend=candle"
-            );
+            tracing::info!("embedder initialized: model=all-MiniLM-L6-v2 dim={dim} backend=candle");
             return Ok(std::sync::Arc::new(candle));
         }
     }

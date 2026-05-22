@@ -494,6 +494,7 @@ impl CorpusStore {
     /// transactions against the KG tables exported as
     /// `pub(crate) const KG_*_TABLE` in this module.
     /// Test: covered indirectly by every `SymbolGraph::*_corpus` test.
+    #[allow(dead_code)]
     pub(crate) fn db(&self) -> &Database {
         &self.db
     }
@@ -702,6 +703,7 @@ impl CorpusStore {
 /// What: walks the table on the supplied read transaction and returns a
 /// `Vec<(key, adjacency)>`. Corrupt rows are logged at `warn` and skipped.
 /// Test: covered transitively by `save_load_kg_roundtrip`.
+#[allow(clippy::type_complexity)]
 fn load_adjacency(
     txn: &redb::ReadTransaction,
     table_def: TableDefinition<'_, &str, &[u8]>,

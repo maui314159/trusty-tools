@@ -118,6 +118,7 @@ pub struct LouvainCommunities {
 /// Test: `tests::project_symmetrises_bidirectional_edges` asserts that a graph
 /// with both a→b and b→a yields a single undirected edge whose weight is the
 /// sum of the two directed multipliers.
+#[allow(clippy::type_complexity)]
 fn project_undirected(
     graph: &DiGraph<SymbolNode, EdgeKind>,
     by_symbol: &HashMap<String, NodeIndex>,
@@ -238,7 +239,6 @@ fn one_louvain_level(adj: &[Vec<(usize, f64)>], rng: &mut StdRng) -> Vec<usize> 
             // Always evaluate "stay" via the cached k_i_in_current.
             let stay_gain = k_i_in_current / m - sigma_tot[current] * k_i / (two_m * m);
             if stay_gain > best_gain {
-                best_gain = stay_gain;
                 best_comm = current;
             }
 
@@ -388,6 +388,7 @@ fn modularity(adj: &[Vec<(usize, f64)>], community: &[usize]) -> f64 {
 /// community of its heaviest neighbour (if any). Communities with no
 /// neighbours are left intact (truly isolated symbols).
 /// Test: covered transitively by `tests::singleton_pruned_into_neighbour`.
+#[allow(clippy::ptr_arg)]
 fn prune_singletons(adj: &[Vec<(usize, f64)>], community: &mut Vec<usize>) {
     let mut sizes: HashMap<usize, usize> = HashMap::new();
     for &c in community.iter() {
@@ -524,7 +525,6 @@ impl LouvainCommunities {
             // Stop when no measurable improvement (1e-9 tolerance) or only one
             // super-node remains (further aggregation is a no-op).
             if (q - last_q).abs() < 1e-9 || current_adj.len() <= 1 {
-                last_q = q;
                 break;
             }
             last_q = q;
@@ -552,7 +552,7 @@ impl LouvainCommunities {
 // `project_undirected` is exercised indirectly through `LouvainCommunities::
 // detect`; suppress the unused-helper warning when the module is compiled in
 // isolation (e.g. for documentation generation).
-#[allow(dead_code)]
+#[allow(dead_code, clippy::type_complexity)]
 fn _keep_project_in_scope(
     g: &DiGraph<SymbolNode, EdgeKind>,
     m: &HashMap<String, NodeIndex>,

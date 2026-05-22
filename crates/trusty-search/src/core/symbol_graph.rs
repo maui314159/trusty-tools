@@ -135,6 +135,7 @@ impl SymbolGraph {
     ///     `DocConcept` / `NaturalLanguagePhrase` entity whose `text`
     ///     resolves to a defined symbol, draw an edge from each symbol in the
     ///     entity's source file to that target.
+    ///
     /// Test: covered by `test_phase_bc_edges_wired_from_entities`.
     pub fn build_from_chunks_with_entities(
         chunks: &[ChunkTuple],

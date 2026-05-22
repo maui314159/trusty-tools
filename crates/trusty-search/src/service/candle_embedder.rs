@@ -110,8 +110,12 @@ impl CandleEmbedder {
         // and drops here. After `BertModel::load` the mmap is no longer
         // referenced.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], DTYPE, &device)
-                .context("load safetensors weights")?
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&weights_filename),
+                DTYPE,
+                &device,
+            )
+            .context("load safetensors weights")?
         };
         let model = BertModel::load(vb, &config).context("instantiate bert model")?;
 
@@ -159,8 +163,8 @@ impl CandleEmbedder {
             mask.extend_from_slice(enc.get_attention_mask());
         }
 
-        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &self.device)
-            .context("stack input_ids")?;
+        let input_ids =
+            Tensor::from_vec(ids, (batch, seq_len), &self.device).context("stack input_ids")?;
         let attn_mask_u32 = Tensor::from_vec(mask, (batch, seq_len), &self.device)
             .context("stack attention_mask")?;
         let token_type_ids = input_ids.zeros_like().context("zeros for token_type_ids")?;
@@ -172,9 +176,7 @@ impl CandleEmbedder {
 
         // Mean-pool along the sequence axis with the attention mask.
         // hidden: [B, T, D] (f32). mask: [B, T] (u32 → f32, broadcast to D).
-        let mask_f = attn_mask_u32
-            .to_dtype(DType::F32)
-            .context("mask to f32")?;
+        let mask_f = attn_mask_u32.to_dtype(DType::F32).context("mask to f32")?;
         let mask_b_t_1 = mask_f.unsqueeze(2).context("unsqueeze mask")?;
         let masked = hidden
             .broadcast_mul(&mask_b_t_1)

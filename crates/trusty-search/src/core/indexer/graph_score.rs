@@ -173,11 +173,7 @@ mod tests {
         )
     }
 
-    fn synthetic_record(
-        id: usize,
-        centroid: &str,
-        members: &[&str],
-    ) -> CommunityRecord {
+    fn synthetic_record(id: usize, centroid: &str, members: &[&str]) -> CommunityRecord {
         CommunityRecord {
             id,
             members: members.iter().map(|s| s.to_string()).collect(),
@@ -198,13 +194,7 @@ mod tests {
     fn high_degree_node_scores_higher() {
         let chunks = vec![
             mk_chunk("a.rs:1:5", "a.rs", "hub", &[], ChunkType::Function),
-            mk_chunk(
-                "a.rs:7:9",
-                "a.rs",
-                "caller1",
-                &["hub"],
-                ChunkType::Function,
-            ),
+            mk_chunk("a.rs:7:9", "a.rs", "caller1", &["hub"], ChunkType::Function),
             mk_chunk(
                 "a.rs:11:13",
                 "a.rs",

@@ -264,8 +264,7 @@ pub struct SearchAppState {
     /// `invalidate_graph_scorer`).
     /// Test: covered by the search integration tests that exercise the
     /// post-MMR ranking blend.
-    pub graph_scorers:
-        Arc<DashMap<IndexId, Arc<crate::core::indexer::graph_score::GraphScorer>>>,
+    pub graph_scorers: Arc<DashMap<IndexId, Arc<crate::core::indexer::graph_score::GraphScorer>>>,
 }
 
 impl SearchAppState {
@@ -350,9 +349,7 @@ impl SearchAppState {
                 })
                 .collect::<Vec<_>>(),
             Err(e) => {
-                tracing::debug!(
-                    "graph_scorer: failed to load communities for '{index_id}': {e}"
-                );
+                tracing::debug!("graph_scorer: failed to load communities for '{index_id}': {e}");
                 Vec::new()
             }
         };
