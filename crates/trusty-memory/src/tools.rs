@@ -267,6 +267,19 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                 }
             },
             {
+                "name": "get_prompt_context",
+                "description": "Fetch the current project context (aliases, conventions, facts, shorthands) from the memory palace as a Markdown block ready to drop into the model's working context. Call at the start of each turn. Pass an optional `query` to filter to facts whose subject or object contains the query string (case-insensitive).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Optional filter — only return facts whose subject or object contains this string (case-insensitive). Omit to return all hot facts."
+                        }
+                    }
+                }
+            },
+            {
                 "name": "memory_recall_all",
                 "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
                 "inputSchema": {
@@ -740,6 +753,60 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 .collect();
             Ok(json!({ "query": query, "results": payload }))
         }
+        "get_prompt_context" => {
+            // Why (issue #42): the model calls this at the start of each
+            // turn to pull aliases/conventions/facts into its working
+            // context. A `query` filter lets it scope the result to just
+            // the facts that matter for the current task — cheap on the
+            // wire and keeps the prompt focused.
+            // What: read-locks the cache once, clones the snapshot, then
+            // releases the lock so the formatter runs without blocking
+            // concurrent readers. When `query` is set we re-format a
+            // filtered subset of the raw triples; otherwise we serve the
+            // pre-formatted string directly.
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let cache_snapshot = {
+                let guard = state
+                    .prompt_context_cache
+                    .read()
+                    .map_err(|e| anyhow!("prompt cache lock poisoned: {e}"))?;
+                guard.clone()
+            };
+
+            let body = if let Some(q) = query.as_deref() {
+                let needle = q.to_lowercase();
+                let filtered: Vec<(String, String, String)> = cache_snapshot
+                    .triples
+                    .into_iter()
+                    .filter(|(subject, _predicate, object)| {
+                        subject.to_lowercase().contains(&needle)
+                            || object.to_lowercase().contains(&needle)
+                    })
+                    .collect();
+                let formatted = crate::prompt_facts::build_prompt_context(&filtered);
+                if formatted.is_empty() {
+                    "No project context found matching your query.".to_string()
+                } else {
+                    formatted
+                }
+            } else if cache_snapshot.formatted.is_empty() {
+                "No prompt facts stored yet.".to_string()
+            } else {
+                cache_snapshot.formatted
+            };
+
+            // Return the body as a bare JSON string so the MCP envelope's
+            // `content[0].text` carries the formatted Markdown verbatim
+            // (ready to paste into the model's working context) without an
+            // extra `{"context": "..."}` wrapper that callers would have
+            // to strip.
+            Ok(Value::String(body))
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -827,7 +894,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -848,6 +915,7 @@ mod tests {
             "add_alias",
             "list_prompt_facts",
             "remove_prompt_fact",
+            "get_prompt_context",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -989,9 +1057,9 @@ mod tests {
         {
             let guard = state.prompt_context_cache.read().expect("read lock");
             assert!(
-                guard.contains("tga → trusty-git-analytics"),
+                guard.formatted.contains("tga → trusty-git-analytics"),
                 "prompt cache should contain alias; got: {}",
-                *guard
+                guard.formatted
             );
         }
 
@@ -1006,9 +1074,11 @@ mod tests {
         {
             let guard = state.prompt_context_cache.read().expect("read lock");
             assert!(
-                guard.contains("tm → trusty-memory (the MCP frontend)"),
+                guard
+                    .formatted
+                    .contains("tm → trusty-memory (the MCP frontend)"),
                 "alias with extra not formatted; got: {}",
-                *guard
+                guard.formatted
             );
         }
 
@@ -1024,14 +1094,14 @@ mod tests {
         {
             let guard = state.prompt_context_cache.read().expect("read lock");
             assert!(
-                !guard.contains("tga → trusty-git-analytics"),
+                !guard.formatted.contains("tga → trusty-git-analytics"),
                 "retracted alias still in cache: {}",
-                *guard
+                guard.formatted
             );
             assert!(
-                guard.contains("tm → trusty-memory"),
+                guard.formatted.contains("tm → trusty-memory"),
                 "non-retracted alias missing from cache: {}",
-                *guard
+                guard.formatted
             );
         }
 
@@ -1044,6 +1114,92 @@ mod tests {
         .await
         .expect("remove_prompt_fact missing");
         assert_eq!(missing["removed"], false);
+    }
+
+    /// Why (issue #42): `get_prompt_context` is the per-message replacement
+    /// for the deprecated `prompts/get` flow. It must (a) return a hint when
+    /// the cache is empty, (b) return the formatted block when populated,
+    /// and (c) filter by `query` against subject/object case-insensitively.
+    #[tokio::test]
+    async fn get_prompt_context_serves_cache_and_filters() {
+        let state = test_state();
+
+        // (a) empty cache -> "No prompt facts stored yet."
+        let resp = dispatch_tool(&state, "get_prompt_context", json!({}))
+            .await
+            .expect("get_prompt_context empty");
+        assert_eq!(resp.as_str().unwrap(), "No prompt facts stored yet.");
+
+        // Populate the cache by hand with a known triple set.
+        {
+            let mut guard = state.prompt_context_cache.write().expect("write lock");
+            let triples = vec![
+                (
+                    "tga".to_string(),
+                    "is_alias_for".to_string(),
+                    "trusty-git-analytics".to_string(),
+                ),
+                (
+                    "tm".to_string(),
+                    "is_alias_for".to_string(),
+                    "trusty-memory".to_string(),
+                ),
+                (
+                    "fact-1".to_string(),
+                    "is_fact".to_string(),
+                    "MSRV is 1.88".to_string(),
+                ),
+            ];
+            let formatted = crate::prompt_facts::build_prompt_context(&triples);
+            *guard = crate::prompt_facts::PromptFactsCache { triples, formatted };
+        }
+
+        // (b) unfiltered -> serves the full formatted block.
+        let resp = dispatch_tool(&state, "get_prompt_context", json!({}))
+            .await
+            .expect("get_prompt_context populated");
+        let text = resp.as_str().expect("string body");
+        assert!(text.contains("tga → trusty-git-analytics"));
+        assert!(text.contains("tm → trusty-memory"));
+        assert!(text.contains("MSRV is 1.88"));
+
+        // (c) filtered to "tga" -> only the matching alias.
+        let resp = dispatch_tool(&state, "get_prompt_context", json!({"query": "tga"}))
+            .await
+            .expect("get_prompt_context filtered");
+        let text = resp.as_str().expect("string body");
+        assert!(text.contains("tga → trusty-git-analytics"));
+        assert!(!text.contains("tm → trusty-memory"));
+        assert!(!text.contains("MSRV is 1.88"));
+
+        // Case-insensitive match on the object side.
+        let resp = dispatch_tool(&state, "get_prompt_context", json!({"query": "MEMORY"}))
+            .await
+            .expect("get_prompt_context case-insensitive");
+        let text = resp.as_str().expect("string body");
+        assert!(text.contains("tm → trusty-memory"));
+        assert!(!text.contains("tga → trusty-git-analytics"));
+
+        // No match -> "No project context found matching your query."
+        let resp = dispatch_tool(
+            &state,
+            "get_prompt_context",
+            json!({"query": "zzz-nonexistent"}),
+        )
+        .await
+        .expect("get_prompt_context no-match");
+        assert_eq!(
+            resp.as_str().unwrap(),
+            "No project context found matching your query."
+        );
+
+        // Empty/whitespace `query` is treated as no filter.
+        let resp = dispatch_tool(&state, "get_prompt_context", json!({"query": "   "}))
+            .await
+            .expect("get_prompt_context whitespace");
+        let text = resp.as_str().expect("string body");
+        assert!(text.contains("tga → trusty-git-analytics"));
+        assert!(text.contains("tm → trusty-memory"));
     }
 
     #[tokio::test]

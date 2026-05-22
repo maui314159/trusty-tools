@@ -331,6 +331,8 @@ When the user (or any agent) refers to a crate by abbreviation, resolve it using
 
 These abbreviations apply everywhere: ticket descriptions, build commands, references in conversation. Always expand before running `cargo` commands.
 
+> **Auto-resolution:** When connected to trusty-memory MCP, call `get_prompt_context()` at the start of each turn to load current aliases and conventions. Pass a `query` string to filter to relevant facts only.
+
 ## Development Environment
 
 ### Required Tools

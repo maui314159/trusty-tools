@@ -48,7 +48,8 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
     let s: &[&str] = match name {
         // Read-only / query
         "memory_recall" | "memory_recall_deep" | "memory_recall_all" | "memory_list"
-        | "palace_list" | "palace_info" | "kg_query" | "list_prompt_facts" => &[MEMORY_READ],
+        | "palace_list" | "palace_info" | "kg_query" | "list_prompt_facts"
+        | "get_prompt_context" => &[MEMORY_READ],
 
         // Mutating
         "memory_remember" | "memory_forget" | "palace_create" | "palace_compact" | "kg_assert"
@@ -64,7 +65,7 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
 /// Why: Produces the JSON value used as the `result` of an
 /// `rpc.discover` JSON-RPC response so any compliant client can introspect
 /// every method, its parameters, and its required scopes.
-/// What: Pulls the 11 tool definitions from `tool_definitions_with` and
+/// What: Pulls the full tool definition list from `tool_definitions_with` and
 /// hands them to the shared `trusty_mcp_core::openrpc::discover_response`
 /// builder with `scopes_for_tool` as the scope resolver. `has_default`
 /// must match the runtime state so the emitted `required` arrays line up

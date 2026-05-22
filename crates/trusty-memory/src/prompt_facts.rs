@@ -1,19 +1,45 @@
-//! Prompt-facts surface: hot KG predicates exposed as an MCP prompt.
+//! Prompt-facts surface: hot KG predicates exposed via a per-message tool.
 //!
 //! Why: Certain KG triples — aliases, project conventions, ambient facts —
-//! belong at the *top* of every Claude session so the model doesn't have to
-//! discover them via tool calls. MCP hosts (Claude Code) read `prompts/list`
-//! + `prompts/get` once at connect time, so a single cached string surfaced
-//! as a prompt gives us zero per-message overhead.
+//! belong in the model's working context so it doesn't have to discover them
+//! via blind searches. The original design surfaced them via MCP prompts
+//! (`prompts/list` + `prompts/get`) at session init, but hosts only read
+//! those once per connection. Switching to a tool (`get_prompt_context`) the
+//! model can invoke per-turn lets it pull fresh, query-filtered context on
+//! demand without the staleness of a session-init snapshot.
 //! What: Defines the `HOT_PREDICATES` allow-list, the grouping/formatting
 //! logic that turns `(subject, predicate, object)` triples into a Markdown
-//! context block, and the helpers used by the MCP layer to fetch and
-//! refresh that block.
+//! context block, the `PromptFactsCache` struct holding raw triples + a
+//! pre-formatted string, and helpers used by the MCP `get_prompt_context`
+//! tool to fetch (and optionally filter) the cached context.
 //! Test: see the `tests` module — covers `is_hot_predicate`, the formatter
 //! grouping/sections, and the empty-input shortcut.
 
 use crate::AppState;
 use anyhow::Result;
+
+/// Cached prompt-facts surface: raw triples and a pre-formatted Markdown block.
+///
+/// Why: The `get_prompt_context` tool serves two access modes — unfiltered
+/// (returns the pre-formatted block directly) and filtered (re-runs the
+/// formatter on a `query`-matching subset). Caching only the formatted string
+/// would force a fresh `gather_hot_triples` pass for every filtered call;
+/// caching only the triples would force re-formatting for every unfiltered
+/// call. Holding both lets the hot path stay O(1) and the filtered path stay
+/// O(n) without ever re-walking the KG.
+/// What: A plain `Default + Clone` struct. `triples` holds the active
+/// `(subject, predicate, object)` rows for every hot predicate across every
+/// palace; `formatted` is `build_prompt_context(&triples)` cached for the
+/// no-filter case.
+/// Test: `rebuild_prompt_cache_populates_triples_and_formatted` (in
+/// `tools::tests`); `get_prompt_context_filters_by_query`.
+#[derive(Default, Clone)]
+pub struct PromptFactsCache {
+    /// All active hot-predicate triples: (subject, predicate, object).
+    pub triples: Vec<(String, String, String)>,
+    /// Pre-formatted string of all triples (used when no query filter).
+    pub formatted: String,
+}
 
 /// Predicates whose currently-active triples are always included in the
 /// session-init prompt context.
@@ -174,13 +200,14 @@ pub async fn gather_hot_triples(state: &AppState) -> Result<Vec<(String, String,
 /// Refresh `AppState.prompt_context_cache` from the live palace registry.
 ///
 /// Why: Every write that touches a hot predicate (`kg_assert`, `add_alias`,
-/// `remove_prompt_fact`) must update the cache so the next `prompts/get`
-/// returns the fresh content. Centralising the refresh here means the
-/// dispatch sites only have to call one function.
+/// `remove_prompt_fact`) must update the cache so the next
+/// `get_prompt_context` tool call returns the fresh content. Centralising
+/// the refresh here means the dispatch sites only have to call one function.
 /// What: Calls `gather_hot_triples`, formats via `build_prompt_context`,
-/// then takes the cache's write lock and replaces the stored string. The
-/// write is non-blocking from the caller's perspective: the lock is held
-/// only for the assignment, not the gather/format work.
+/// then takes the cache's write lock and replaces both the raw triples and
+/// the pre-formatted string in a single assignment. The write is
+/// non-blocking from the caller's perspective: the lock is held only for
+/// the assignment, not the gather/format work.
 /// Test: `rebuild_prompt_cache_reflects_writes` (in `tools::tests`).
 pub async fn rebuild_prompt_cache(state: &AppState) -> Result<()> {
     let triples = gather_hot_triples(state).await?;
@@ -191,62 +218,8 @@ pub async fn rebuild_prompt_cache(state: &AppState) -> Result<()> {
         // cache, which is strictly better than panicking the MCP loop.
         anyhow::anyhow!("prompt cache lock poisoned: {e}")
     })?;
-    *guard = formatted;
+    *guard = PromptFactsCache { triples, formatted };
     Ok(())
-}
-
-/// Build the MCP `prompts/list` response body.
-///
-/// Why: Hosts call this once per connection to enumerate available prompts;
-/// the response shape is fixed by the MCP spec.
-/// What: Returns the single `project_context` entry. Kept as a free
-/// function so tests don't need to spin up a server.
-/// Test: `prompts_list_returns_project_context` (in `lib::tests`).
-pub fn prompts_list_response() -> serde_json::Value {
-    serde_json::json!({
-        "prompts": [
-            {
-                "name": "project_context",
-                "description": "Project aliases, conventions, and facts from the memory palace. Include at session start.",
-            }
-        ]
-    })
-}
-
-/// Build the MCP `prompts/get` response body for a given prompt name.
-///
-/// Why: Splitting the formatting from the dispatch keeps the JSON-RPC
-/// envelope construction in `handle_message` and lets us unit-test the
-/// payload shape directly.
-/// What: For `project_context`, reads the cached string and wraps it in a
-/// single-user-message envelope. Falls back to a "no context stored yet"
-/// hint when the cache is empty. For any other name, returns a JSON-RPC
-/// error shape (caller wraps as a `Response::err`).
-/// Test: `prompts_get_returns_cached_context_or_hint`.
-pub fn prompts_get_response(state: &AppState, name: &str) -> Result<serde_json::Value> {
-    if name != "project_context" {
-        anyhow::bail!("unknown prompt: {name}");
-    }
-    let cache = state.prompt_context_cache.clone();
-    let text = {
-        let guard = cache
-            .read()
-            .map_err(|e| anyhow::anyhow!("prompt cache lock poisoned: {e}"))?;
-        guard.clone()
-    };
-    let body = if text.is_empty() {
-        "No project context stored yet. Use add_alias or assert_fact to add context.".to_string()
-    } else {
-        text
-    };
-    Ok(serde_json::json!({
-        "messages": [
-            {
-                "role": "user",
-                "content": { "type": "text", "text": body }
-            }
-        ]
-    }))
 }
 
 #[cfg(test)]
