@@ -90,6 +90,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/dream/status", get(dream_status))
         .route("/api/v1/dream/run", post(dream_run))
         .route("/api/v1/kg/gaps", get(kg_gaps_handler))
+        .route("/api/v1/kg/prompt-context", get(prompt_context_handler))
+        .route("/api/v1/kg/aliases", post(add_alias_handler))
+        .route(
+            "/api/v1/kg/prompt-facts",
+            get(list_prompt_facts_handler).delete(remove_prompt_fact_handler),
+        )
         .route("/api/v1/chat", post(chat_handler))
         .route("/api/v1/chat/providers", get(list_providers))
         .route(
@@ -1134,6 +1140,230 @@ async fn kg_gaps_handler(
     let body: Vec<KnowledgeGapResponse> =
         gaps.into_iter().map(KnowledgeGapResponse::from).collect();
     Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Prompt-facts surface (issue #42)
+// ---------------------------------------------------------------------------
+
+/// Query parameters shared by the prompt-context / prompt-facts read endpoints.
+///
+/// Why: Both `GET /api/v1/kg/prompt-context` and `GET /api/v1/kg/prompt-facts`
+/// optionally accept a `palace` filter so callers can scope reads to a single
+/// project namespace. A shared struct keeps the wire shape consistent.
+/// What: A single optional `palace` query parameter. When omitted, handlers
+/// span every palace in the registry (matching the MCP tool behaviour).
+/// Test: `prompt_context_endpoint_returns_formatted_block`,
+/// `list_prompt_facts_endpoint_returns_hot_triples`.
+#[derive(Deserialize)]
+struct PromptFactsQuery {
+    // Accepted for forward-compat with the MCP tool surface, but ignored:
+    // the prompt cache is registry-wide, so reads always span every palace.
+    // We keep the field rather than ignoring `?palace=...` silently so a
+    // future per-palace filter is a non-breaking schema addition.
+    #[serde(default)]
+    #[allow(dead_code)]
+    palace: Option<String>,
+}
+
+/// Wire shape for `POST /api/v1/kg/aliases`.
+///
+/// Why: Mirrors the `add_alias` MCP tool: a short → full mapping with an
+/// optional palace target. Keeping the field names identical between the
+/// HTTP and MCP surfaces makes documentation and client code reuse trivial.
+/// What: Required `short` and `full`; optional `palace` (falls back to the
+/// daemon default).
+/// Test: `add_alias_endpoint_asserts_triple_and_refreshes_cache`.
+#[derive(Deserialize)]
+struct AddAliasRequest {
+    short: String,
+    full: String,
+    #[serde(default)]
+    palace: Option<String>,
+}
+
+/// Wire shape for a single hot-predicate triple in JSON responses.
+///
+/// Why: `list_prompt_facts` returns a structured array rather than the
+/// pre-formatted Markdown so dashboards and tooling can render their own
+/// views over the raw data.
+/// What: subject/predicate/object string trio matching the underlying KG row.
+/// Test: `list_prompt_facts_endpoint_returns_hot_triples`.
+#[derive(Serialize)]
+struct PromptFactRow {
+    subject: String,
+    predicate: String,
+    object: String,
+}
+
+/// Query parameters for `DELETE /api/v1/kg/prompt-facts`.
+///
+/// Why: The MCP tool retracts the active interval for a `(subject, predicate)`
+/// pair across every palace; the HTTP endpoint matches that contract so a
+/// dashboard "Remove" button doesn't need to know which palace owns the fact.
+/// What: Required `subject` and `predicate`; the issue spec mentions an
+/// optional `object` filter but the underlying `KnowledgeGraph::retract` API
+/// closes the entire `(subject, predicate)` interval — we accept `object`
+/// for forward-compat but currently ignore it, mirroring the MCP tool.
+/// Test: `remove_prompt_fact_endpoint_soft_deletes_and_refreshes_cache`.
+#[derive(Deserialize)]
+struct RemovePromptFactQuery {
+    subject: String,
+    predicate: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    object: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    palace: Option<String>,
+}
+
+/// `GET /api/v1/kg/prompt-context` — return the formatted prompt-context block.
+///
+/// Why: Lets non-MCP callers (the admin UI, curl, integration tests) fetch
+/// the same Markdown block the `get_prompt_context` tool returns, without
+/// needing to speak JSON-RPC. The body is a plain text response so it can
+/// be piped straight into a model prompt.
+/// What: Reads the in-memory `prompt_context_cache` (already kept fresh by
+/// any write that touches a hot predicate), returns the formatted string,
+/// or a placeholder message when nothing has been stored yet.
+/// Test: `prompt_context_endpoint_returns_formatted_block`.
+async fn prompt_context_handler(
+    State(state): State<AppState>,
+    Query(_q): Query<PromptFactsQuery>,
+) -> Result<Response, ApiError> {
+    let cache_snapshot = {
+        let guard = state
+            .prompt_context_cache
+            .read()
+            .map_err(|e| ApiError::internal(format!("prompt cache lock poisoned: {e}")))?;
+        guard.clone()
+    };
+    let body = if cache_snapshot.formatted.is_empty() {
+        "No prompt facts stored yet.".to_string()
+    } else {
+        cache_snapshot.formatted
+    };
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(resp)
+}
+
+/// `POST /api/v1/kg/aliases` — assert a `(short, is_alias_for, full)` triple.
+///
+/// Why: HTTP counterpart to the `add_alias` MCP tool — lets the admin UI
+/// (or an external automation) register aliases without speaking JSON-RPC.
+/// What: Resolves the target palace (request body → daemon default), opens
+/// the palace handle, asserts the alias triple, and rebuilds the prompt
+/// cache so subsequent `GET /api/v1/kg/prompt-context` calls reflect the
+/// write immediately.
+/// Test: `add_alias_endpoint_asserts_triple_and_refreshes_cache`.
+async fn add_alias_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AddAliasRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if req.short.is_empty() || req.full.is_empty() {
+        return Err(ApiError::bad_request("short and full are required"));
+    }
+    let palace_name = req
+        .palace
+        .clone()
+        .or_else(|| state.default_palace.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request("missing 'palace' (no default palace configured)")
+        })?;
+    let handle = open_handle(&state, &palace_name)?;
+    let triple = Triple {
+        subject: req.short.clone(),
+        predicate: "is_alias_for".to_string(),
+        object: req.full.clone(),
+        valid_from: chrono::Utc::now(),
+        valid_to: None,
+        confidence: 1.0,
+        provenance: Some("add_alias_http".to_string()),
+    };
+    handle
+        .kg
+        .assert(triple)
+        .await
+        .map_err(|e| ApiError::internal(format!("kg.assert failed: {e:#}")))?;
+    if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(&state).await {
+        tracing::warn!("rebuild_prompt_cache after HTTP add_alias failed: {e:#}");
+    }
+    Ok(Json(json!({
+        "subject": req.short,
+        "predicate": "is_alias_for",
+        "object": req.full,
+        "palace": palace_name,
+    })))
+}
+
+/// `GET /api/v1/kg/prompt-facts` — list every active hot-predicate triple.
+///
+/// Why: Mirrors the `list_prompt_facts` MCP tool. Returning the raw triples
+/// (rather than the formatted block) lets dashboards group, search, and
+/// edit them with their own UI.
+/// What: Calls `gather_hot_triples` over the live registry and serialises
+/// each row as `{subject, predicate, object}`.
+/// Test: `list_prompt_facts_endpoint_returns_hot_triples`.
+async fn list_prompt_facts_handler(
+    State(state): State<AppState>,
+    Query(_q): Query<PromptFactsQuery>,
+) -> Result<Json<Vec<PromptFactRow>>, ApiError> {
+    let triples = crate::prompt_facts::gather_hot_triples(&state)
+        .await
+        .map_err(|e| ApiError::internal(format!("gather_hot_triples: {e:#}")))?;
+    let rows: Vec<PromptFactRow> = triples
+        .into_iter()
+        .map(|(subject, predicate, object)| PromptFactRow {
+            subject,
+            predicate,
+            object,
+        })
+        .collect();
+    Ok(Json(rows))
+}
+
+/// `DELETE /api/v1/kg/prompt-facts?subject=...&predicate=...` — soft-delete
+/// the active triple matching the given `(subject, predicate)` pair.
+///
+/// Why: HTTP counterpart to the `remove_prompt_fact` MCP tool. Mirrors the
+/// retract-across-palaces semantics so a single call cleans up the fact
+/// regardless of which palace stored it.
+/// What: Iterates every palace, calls `kg.retract(subject, predicate)`, and
+/// reports the total number of intervals closed. Rebuilds the prompt cache
+/// when at least one retraction occurred.
+/// Test: `remove_prompt_fact_endpoint_soft_deletes_and_refreshes_cache`.
+async fn remove_prompt_fact_handler(
+    State(state): State<AppState>,
+    Query(q): Query<RemovePromptFactQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if q.subject.is_empty() || q.predicate.is_empty() {
+        return Err(ApiError::bad_request("subject and predicate are required"));
+    }
+    let mut closed_total: usize = 0;
+    for palace_id in state.registry.list() {
+        if let Some(handle) = state.registry.get(&palace_id) {
+            match handle.kg.retract(&q.subject, &q.predicate).await {
+                Ok(n) => closed_total += n,
+                Err(e) => tracing::warn!(
+                    palace = %palace_id.as_str(),
+                    "HTTP retract failed: {e:#}",
+                ),
+            }
+        }
+    }
+    if closed_total > 0 {
+        if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(&state).await {
+            tracing::warn!("rebuild_prompt_cache after HTTP remove_prompt_fact failed: {e:#}");
+        }
+        Ok(Json(json!({"removed": true, "closed": closed_total})))
+    } else {
+        Ok(Json(json!({"removed": false, "reason": "not found"})))
+    }
 }
 
 /// Recompute the gaps for `handle` and write them to the registry cache.
@@ -3267,6 +3497,265 @@ mod tests {
         assert_eq!(arr[0]["subject"], "alpha");
         assert_eq!(arr[0]["predicate"], "is");
         assert_eq!(arr[0]["object"], "thing");
+    }
+
+    /// Why (issue #42): `GET /api/v1/kg/prompt-context` must serve the
+    /// formatted Markdown block from the in-memory cache (or a placeholder
+    /// when empty). Mirrors the MCP `get_prompt_context` tool but over HTTP.
+    #[tokio::test]
+    async fn prompt_context_endpoint_returns_formatted_block() {
+        let state = test_state();
+
+        // Empty cache returns the placeholder text.
+        let app = router().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kg/prompt-context")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(text, "No prompt facts stored yet.");
+
+        // Populate the cache and re-fetch.
+        {
+            let mut guard = state.prompt_context_cache.write().expect("write lock");
+            let triples = vec![(
+                "tga".to_string(),
+                "is_alias_for".to_string(),
+                "trusty-git-analytics".to_string(),
+            )];
+            let formatted = crate::prompt_facts::build_prompt_context(&triples);
+            *guard = crate::prompt_facts::PromptFactsCache { triples, formatted };
+        }
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kg/prompt-context")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("tga → trusty-git-analytics"), "got: {text}");
+    }
+
+    /// Why (issue #42): `POST /api/v1/kg/aliases` must assert the alias as
+    /// an `is_alias_for` triple AND refresh the prompt cache so subsequent
+    /// reads see the new alias.
+    #[tokio::test]
+    async fn add_alias_endpoint_asserts_triple_and_refreshes_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let state = AppState::new(root).with_default_palace(Some("aliases".to_string()));
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("aliases"),
+            name: "aliases".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("aliases"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        let body = json!({"short": "tm", "full": "trusty-memory"});
+        let app = router().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/kg/aliases")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["subject"], "tm");
+        assert_eq!(v["object"], "trusty-memory");
+
+        // The prompt cache must reflect the new alias.
+        let guard = state.prompt_context_cache.read().expect("read lock");
+        assert!(
+            guard.formatted.contains("tm → trusty-memory"),
+            "cache missing alias; got: {}",
+            guard.formatted
+        );
+    }
+
+    /// Why (issue #42): `GET /api/v1/kg/prompt-facts` returns the structured
+    /// JSON array of every hot-predicate triple across the registry (so a
+    /// dashboard can render its own table).
+    #[tokio::test]
+    async fn list_prompt_facts_endpoint_returns_hot_triples() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let state = AppState::new(root).with_default_palace(Some("listfacts".to_string()));
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("listfacts"),
+            name: "listfacts".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("listfacts"),
+        };
+        let handle = state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        // Insert one hot triple and one non-hot triple; only the hot one
+        // should surface.
+        handle
+            .kg
+            .assert(Triple {
+                subject: "ts".to_string(),
+                predicate: "is_alias_for".to_string(),
+                object: "trusty-search".to_string(),
+                valid_from: chrono::Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .expect("assert alias");
+        handle
+            .kg
+            .assert(Triple {
+                subject: "alice".to_string(),
+                predicate: "works_at".to_string(),
+                object: "Acme".to_string(),
+                valid_from: chrono::Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .expect("assert works_at");
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kg/prompt-facts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("array");
+        assert!(
+            arr.iter().any(|r| r["subject"] == "ts"
+                && r["predicate"] == "is_alias_for"
+                && r["object"] == "trusty-search"),
+            "missing ts alias; got {arr:?}"
+        );
+        // The non-hot `works_at` triple must not be present.
+        assert!(
+            !arr.iter().any(|r| r["predicate"] == "works_at"),
+            "non-hot triple leaked into prompt facts: {arr:?}"
+        );
+    }
+
+    /// Why (issue #42): `DELETE /api/v1/kg/prompt-facts` must retract the
+    /// interval and refresh the cache; the next list call must omit it.
+    #[tokio::test]
+    async fn remove_prompt_fact_endpoint_soft_deletes_and_refreshes_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let state = AppState::new(root).with_default_palace(Some("rmfacts".to_string()));
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("rmfacts"),
+            name: "rmfacts".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("rmfacts"),
+        };
+        let handle = state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        handle
+            .kg
+            .assert(Triple {
+                subject: "ta".to_string(),
+                predicate: "is_alias_for".to_string(),
+                object: "trusty-analyze".to_string(),
+                valid_from: chrono::Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .expect("assert alias");
+        // Prime the cache so we can observe the removal effect.
+        crate::prompt_facts::rebuild_prompt_cache(&state)
+            .await
+            .expect("rebuild prompt cache");
+
+        let app = router().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/kg/prompt-facts?subject=ta&predicate=is_alias_for")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["removed"], true);
+        assert!(v["closed"].as_u64().unwrap_or(0) >= 1);
+
+        // Cache must no longer contain the alias.
+        {
+            let guard = state.prompt_context_cache.read().expect("read lock");
+            assert!(
+                !guard.formatted.contains("ta → trusty-analyze"),
+                "alias still in cache after delete: {}",
+                guard.formatted
+            );
+        }
+
+        // Removing a non-existent fact returns removed=false.
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/kg/prompt-facts?subject=nope&predicate=is_alias_for")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["removed"], false);
     }
 
     #[tokio::test]
