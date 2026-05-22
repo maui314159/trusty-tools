@@ -139,6 +139,26 @@ pub struct SearchTuiState {
     pub sort_key: ThreeWaySortKey,
     /// Whether the index list is grouped by inferred project.
     pub group_by_project: bool,
+    /// The last daemon log line seen on the previous `logs_tail` poll.
+    ///
+    /// Why: `GET /logs/tail` returns the last N lines from a ring buffer; the
+    /// poll cycle uses this watermark to identify only the lines that arrived
+    /// since the previous tick, so historical lines are not re-pushed every
+    /// 2 seconds.
+    /// What: the most-recent line from the previous successful poll, or
+    /// `None` before the first poll completes.
+    /// Test: `test_push_new_log_lines_skips_first_poll`.
+    pub log_watermark: Option<String>,
+    /// True until the first successful `logs_tail` response.
+    ///
+    /// Why: when the operator opens the TUI, the ring buffer may already
+    /// hold lines from earlier daemon activity; dumping them all into the
+    /// activity feed would bury whatever happens next. This flag suppresses
+    /// the initial dump and only records a watermark on the first poll.
+    /// What: starts `true`, flips to `false` after the first poll resolves
+    /// the watermark.
+    /// Test: `test_push_new_log_lines_skips_first_poll`.
+    pub log_first_poll: bool,
 }
 
 impl SearchTuiState {
@@ -163,6 +183,8 @@ impl SearchTuiState {
             filter_active: false,
             sort_key: ThreeWaySortKey::default(),
             group_by_project: false,
+            log_watermark: None,
+            log_first_poll: true,
         }
     }
 
@@ -344,6 +366,27 @@ pub async fn run_with_url(base_url: String) -> anyhow::Result<()> {
     result
 }
 
+/// Compute which lines from `new_lines` are genuinely new since `watermark`.
+///
+/// Why: `GET /logs/tail` returns the last N lines from a ring buffer; on
+/// every poll we receive an overlapping window. This helper finds the
+/// suffix of `new_lines` that appears after the last-seen watermark line,
+/// so only truly new lines get pushed to the activity log.
+/// What: if `watermark` is `None`, returns all of `new_lines` (first poll
+/// after the initial skip). Otherwise finds the rightmost occurrence of
+/// `watermark` in `new_lines` and returns everything after it. If the
+/// watermark is not found (ring buffer wrapped), returns all of `new_lines`.
+/// Test: `test_new_log_lines_since_watermark`.
+pub fn new_log_lines_since<'a>(new_lines: &'a [String], watermark: Option<&str>) -> &'a [String] {
+    let Some(mark) = watermark else {
+        return new_lines;
+    };
+    match new_lines.iter().rposition(|line| line == mark) {
+        Some(idx) => &new_lines[idx + 1..],
+        None => new_lines,
+    }
+}
+
 /// Poll the trusty-search daemon and fold the result into `state`.
 ///
 /// Why: keeps the per-poll I/O out of the event loop so the loop can re-poll
@@ -373,6 +416,26 @@ async fn poll_daemon(state: &mut SearchTuiState, client: &mut SearchClient) {
             state.daemon_status = DaemonStatus::Offline {
                 last_error: e.to_string(),
             };
+        }
+    }
+
+    // Passive background activity: surface daemon-side log lines (file-watcher
+    // reindexes, startup scans) in the ACTIVITY panel without any user input.
+    // Daemon lines are unscoped — they apply to the daemon as a whole, not to
+    // any single index — so they appear under every scope filter.
+    let tail = client.logs_tail(50).await;
+    if state.log_first_poll {
+        // The ring buffer may already hold lines from before the operator
+        // opened the TUI; record the high-water mark but do not dump them.
+        state.log_watermark = tail.last().cloned();
+        state.log_first_poll = false;
+    } else {
+        let new = new_log_lines_since(&tail, state.log_watermark.as_deref());
+        for line in new {
+            state.log.push(line.clone());
+        }
+        if let Some(last) = tail.last() {
+            state.log_watermark = Some(last.clone());
         }
     }
 }
@@ -989,8 +1052,12 @@ pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
             format!("Indexes:      {}", state.indexes.len()),
             format!("Total chunks: {}", format_count(total)),
         ];
+        // Graph total — always shown so the panel surfaces graph readiness
+        // even before any index has been reindexed with the symbol graph.
         if total_nodes > 0 {
             lines.push(format!("Graph nodes:  {}", format_count(total_nodes)));
+        } else {
+            lines.push("Graph nodes:  (none — reindex to build)".to_string());
         }
         if state.indexes.is_empty() {
             lines.push("(no indexes registered)".to_string());
@@ -1030,11 +1097,16 @@ pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
                     when.format("%Y-%m-%d %H:%M UTC")
                 ));
             }
-            // Graph stats section — only shown when the daemon has actually
-            // built a graph for the index (node_count > 0).
-            if idx.node_count > 0 {
-                lines.push(String::new());
-                lines.push("Graph:".to_string());
+            // Graph stats section — always shown so users know whether the
+            // daemon has built a symbol graph for this index. When
+            // `node_count == 0` we surface a hint to reindex; otherwise we
+            // emit the full nodes/edges breakdown, edge-kind bars, and (if
+            // present) the communities subsection.
+            lines.push(String::new());
+            lines.push("Graph:".to_string());
+            if idx.node_count == 0 {
+                lines.push("  (no graph — press [r] to reindex)".to_string());
+            } else {
                 lines.push(format!(
                     "  Nodes:    {:>8}  Edges: {:>8}",
                     format_count(idx.node_count),
@@ -1514,17 +1586,34 @@ mod tests {
 
     #[test]
     fn test_stats_lines_no_graph_section() {
-        // An index with node_count == 0 should not produce a Graph section
-        // at all, even if other graph counters are spuriously populated.
+        // An index with node_count == 0 should still produce a Graph section
+        // header, but the body collapses to a single hint line — and the
+        // full breakdown (Nodes/Edges, Communities) must remain hidden so
+        // the spurious edge/community counters don't leak into the UI.
         let mut state = sample_state();
         state.indexes[0].node_count = 0;
         state.indexes[0].edge_count = 100; // ignored without nodes
         state.indexes[0].community_count = 5; // ignored without nodes
         state.select_down();
         let lines = stats_lines(&state);
-        assert!(!lines.iter().any(|l| l == "Graph:"));
-        assert!(!lines.iter().any(|l| l == "Communities:"));
-        assert!(!lines.iter().any(|l| l.contains("Nodes:")));
+        assert!(
+            lines.iter().any(|l| l == "Graph:"),
+            "Graph header should always appear"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(no graph — press [r] to reindex)")),
+            "empty-graph hint should appear when node_count == 0"
+        );
+        assert!(
+            !lines.iter().any(|l| l == "Communities:"),
+            "Communities section must stay hidden without nodes"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Nodes:")),
+            "Nodes/Edges breakdown must stay hidden without nodes"
+        );
     }
 
     #[test]
@@ -2117,5 +2206,63 @@ mod tests {
         terminal
             .draw(|f| render(f, &mut state))
             .expect("help render must not panic");
+    }
+
+    #[test]
+    fn test_new_log_lines_since_watermark() {
+        let lines: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // watermark "c" → returns ["d","e"]
+        assert_eq!(new_log_lines_since(&lines, Some("c")), &["d", "e"]);
+        // watermark at last line → empty
+        assert_eq!(new_log_lines_since(&lines, Some("e")), &[] as &[String]);
+        // watermark not in list → all lines (ring buffer wrapped)
+        assert_eq!(new_log_lines_since(&lines, Some("z")), lines.as_slice());
+        // no watermark → all lines
+        assert_eq!(new_log_lines_since(&lines, None), lines.as_slice());
+        // empty input → empty output
+        assert!(new_log_lines_since(&[], Some("a")).is_empty());
+    }
+
+    #[test]
+    fn test_push_new_log_lines_skips_first_poll() {
+        let mut state = SearchTuiState::new("http://x");
+        assert!(state.log_first_poll);
+        let lines: Vec<String> = ["info: daemon started", "info: index loaded"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Simulate first poll: no lines pushed, watermark recorded.
+        if state.log_first_poll {
+            state.log_watermark = lines.last().cloned();
+            state.log_first_poll = false;
+        }
+        assert!(!state.log_first_poll);
+        assert!(state.log.is_empty());
+        // Simulate second poll with a new line appended.
+        let lines2: Vec<String> = [
+            "info: daemon started",
+            "info: index loaded",
+            "info: watch triggered",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let new = new_log_lines_since(&lines2, state.log_watermark.as_deref());
+        for line in new {
+            state.log.push(line.clone());
+        }
+        state.log_watermark = lines2.last().cloned();
+        assert_eq!(state.log.len(), 1);
+        assert!(
+            state
+                .log
+                .iter()
+                .next()
+                .map(|l| l.contains("watch triggered"))
+                .unwrap_or(false)
+        );
     }
 }

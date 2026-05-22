@@ -70,6 +70,20 @@ struct HealthWire {
     uptime_secs: u64,
 }
 
+/// Wire shape of `GET /logs/tail` from the trusty-search daemon.
+///
+/// Why: the daemon returns `{ "lines": [...], "total": <usize> }`; only the
+/// lines are surfaced in the activity panel, but `total` is captured (and
+/// ignored) so the deserialiser does not reject the payload.
+/// What: a `lines` array of plain log strings.
+/// Test: covered by the daemon suite; the TUI consumer is tested via
+/// `test_push_new_log_lines_skips_first_poll`.
+#[derive(Debug, Deserialize)]
+struct LogsTailWire {
+    #[serde(default)]
+    lines: Vec<String>,
+}
+
 /// Wire shape of `GET /indexes` from the trusty-search daemon.
 #[derive(Debug, Deserialize)]
 struct IndexListWire {
@@ -320,6 +334,42 @@ impl SearchClient {
             .json()
             .await?;
         Ok(c)
+    }
+
+    /// Fetch the N most-recent daemon log lines from `GET /logs/tail`.
+    ///
+    /// Why: the search TUI polls this on every refresh tick so background
+    /// daemon activity (file-watcher reindexes, startup scans) surfaces in
+    /// the ACTIVITY panel without the user having to press `[r]`.
+    /// What: GETs `/logs/tail?n=<n>` and returns the log lines as plain
+    /// strings, stripping any timestamp/level prefix if the wire format
+    /// includes it. Returns an empty Vec on error so callers can degrade
+    /// gracefully.
+    /// Test: covered by the daemon suite; the TUI integration is tested via
+    /// `test_push_new_log_lines`.
+    pub async fn logs_tail(&self, n: usize) -> Vec<String> {
+        let url = format!("{}/logs/tail?n={n}", self.base);
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("logs_tail request failed: {e}");
+                return Vec::new();
+            }
+        };
+        let resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("logs_tail returned non-2xx: {e}");
+                return Vec::new();
+            }
+        };
+        match resp.json::<LogsTailWire>().await {
+            Ok(wire) => wire.lines,
+            Err(e) => {
+                tracing::debug!("logs_tail parse failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Trigger a reindex of `id` via `POST /indexes/:id/reindex`.
