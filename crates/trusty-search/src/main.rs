@@ -21,7 +21,7 @@ mod detect;
 // Re-export the library's modules into the binary's `crate::` namespace so
 // existing `crate::core::*` / `crate::service::*` / `crate::mcp::*` imports
 // in `commands/*.rs` resolve without churn after the workspace consolidation.
-pub(crate) use trusty_search::{core, mcp, service};
+pub(crate) use trusty_search::{config, core, mcp, service};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -64,12 +64,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     // ── Project commands (auto-detect index from CWD) ──────────────────────
-    /// Hybrid search in current project  [alias: s]
+    /// Hybrid search in the current project  [alias: s]
+    ///
+    /// Runs against a single named index — the one detected from CWD (`.git`,
+    /// `.trusty-search` marker) or overridden via the global `--index` flag.
+    /// To search across every registered project at once, use `query` instead.
+    ///
+    /// AGENT USAGE: prefer `search` when the working directory is inside the
+    /// project you want to query — it's faster and the intent classifier has
+    /// the best signal-to-noise ratio on a single corpus. Use `query` for
+    /// cross-repo or unknown-project lookups.
     ///
     /// Examples:
     ///   trusty-search search "fn authenticate"
     ///   trusty-search search "error handling" --intent conceptual
     ///   trusty-search search "TODO FIXME" --intent bugdebt --top-k 20
+    ///   trusty-search --index other-proj search "Database pool"
     #[command(alias = "s", display_order = 1)]
     Search {
         /// Search query (natural language or code)
@@ -122,11 +132,16 @@ enum Commands {
     #[command(alias = "st", display_order = 3)]
     Status,
 
-    /// Register and index a project in one step  [alias: idx]
+    /// Register and index a project, or remove an existing registration  [alias: idx]
     ///
-    /// Registers the index with the daemon if needed, then runs a reindex
-    /// with a live progress bar. Skips the reindex if the index already has
-    /// chunks indexed (use --force to override).
+    /// With no subcommand: registers the index with the daemon if needed, then
+    /// runs a reindex with a live progress bar. Skips the reindex if the index
+    /// already has chunks indexed (use --force to override).
+    ///
+    /// With `remove`: deletes the daemon-side registration matching the given
+    /// (or auto-detected) path AND drops the matching entry from
+    /// `~/.config/trusty-search/config.yaml`. The on-disk redb data is left
+    /// intact — re-registering reuses it.
     ///
     /// When run with no PATH argument, trusty-search looks for a
     /// `.trusty-search.yaml` file in the current directory and uses its
@@ -134,12 +149,23 @@ enum Commands {
     /// override the config file. (For multi-index polyrepos, use the separate
     /// `trusty-search.yaml` manifest — no leading dot.)
     ///
+    /// AGENT USAGE: prefer `trusty-search index` (no subcommand) to onboard a
+    /// repo before any search calls. Use `trusty-search index remove` to
+    /// clean up after a project is deleted or relocated; this avoids stale
+    /// entries appearing in `trusty-search list`.
+    ///
     /// Examples:
     ///   trusty-search index                   # CWD, name from basename or .trusty-search.yaml
     ///   trusty-search index ~/Projects/myapp
     ///   trusty-search index --force           # full reindex even if up-to-date
     ///   trusty-search index --exclude data/ --exclude "*.db"
-    #[command(alias = "idx", display_order = 4)]
+    ///   trusty-search index remove            # remove registration for CWD's project
+    ///   trusty-search index remove ~/Projects/old-app
+    #[command(
+        alias = "idx",
+        display_order = 4,
+        args_conflicts_with_subcommands = true
+    )]
     Index {
         /// Directory to register and index (default: CWD, or `.trusty-search.yaml` `path`)
         path: Option<std::path::PathBuf>,
@@ -159,6 +185,10 @@ enum Commands {
         /// SSE stream timeout in seconds (default: 600). Increase for very large repos.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+
+        /// Optional subcommand. When absent, the default register+reindex flow runs.
+        #[command(subcommand)]
+        action: Option<IndexAction>,
     },
 
     /// Register current directory as a named index (see `index`)
@@ -246,6 +276,15 @@ enum Commands {
     // ── Global / multi-index commands ─────────────────────────────────────
     /// List all registered indexes with stats  [alias: ls]
     ///
+    /// Shows every project currently known to the daemon — including ones
+    /// added manually via `trusty-search index` and ones auto-discovered at
+    /// startup from `~/.config/trusty-search/config.yaml` `scan_paths`.
+    /// Use `--json` to pipe the result into scripts.
+    ///
+    /// AGENT USAGE: call this before `search` / `query` to confirm an index
+    /// is registered. If a project you expected is missing, run
+    /// `trusty-search index` from inside its directory.
+    ///
     /// Examples:
     ///   trusty-search list
     ///   trusty-search list --json
@@ -294,6 +333,19 @@ enum Commands {
     /// Use `--foreground` when the process is supervised by launchd, systemd,
     /// or Docker — those supervisors require the managed binary to stay in
     /// the foreground rather than forking.
+    ///
+    /// AUTO-DISCOVERY (issue #40): after the daemon hydrates its registry
+    /// from `indexes.toml`, it walks the `scan_paths` declared in
+    /// `~/.config/trusty-search/config.yaml` (or, when absent, the default
+    /// list `~/Projects`, `~/code`, `~/src`) one level deep and indexes any
+    /// directory containing `.claude/`, `CLAUDE.md`, or `.git/` that is not
+    /// already registered. The behaviour is best-effort and never blocks
+    /// daemon startup — failures are logged at warn level.
+    ///
+    /// AGENT USAGE: call this once at workstation boot (or rely on the macOS
+    /// launchd agent installed via `trusty-search service install`). Every
+    /// other CLI subcommand auto-detects the running daemon, so the agent
+    /// rarely needs to invoke `start` directly.
     ///
     /// Examples:
     ///   trusty-search start
@@ -569,6 +621,41 @@ enum Commands {
     },
 }
 
+/// Subcommands attached to the `index` command.
+///
+/// Why: `trusty-search index` historically only registered + reindexed. Issue
+/// #40 adds a `remove` action that deletes the daemon-side registration AND
+/// drops the matching entry from `~/.config/trusty-search/config.yaml`. Using
+/// an enum here keeps the default register-and-reindex flow intact (clap's
+/// `args_conflicts_with_subcommands` lets the top-level args coexist with an
+/// optional subcommand) while opening the door to additional actions
+/// (`rename`, `move`, …) without further breaking changes.
+/// What: a single `Remove` variant carrying the optional `PATH`.
+/// Test: `cargo run -p trusty-search -- index --help` lists the variant;
+/// `index_remove::tests::*` cover path resolution.
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Remove an index registration (daemon + global config)
+    ///
+    /// Deletes the daemon-side registration matching the given (or
+    /// auto-detected) path via `DELETE /indexes/:id`, then drops the matching
+    /// entry from `~/.config/trusty-search/config.yaml` so the project is not
+    /// re-discovered on the next daemon restart. The on-disk redb / HNSW
+    /// snapshot is preserved — re-registering with the same path reuses it.
+    ///
+    /// AGENT USAGE: use this when a project has been moved or deleted so the
+    /// daemon stops reporting an empty/stale entry. Auto-detect from CWD when
+    /// possible; pass an explicit PATH when running from outside the project.
+    ///
+    /// Examples:
+    ///   trusty-search index remove
+    ///   trusty-search index remove ~/Projects/old-app
+    Remove {
+        /// Directory of the index to remove (default: auto-detected from CWD)
+        path: Option<std::path::PathBuf>,
+    },
+}
+
 /// Target surface for the `monitor` subcommand.
 ///
 /// Why: operators want a quick browser link to the daemon's admin panel, the
@@ -691,9 +778,15 @@ async fn run() -> Result<()> {
             force,
             exclude,
             timeout,
-        } => {
-            commands::index::handle_index(path, name, force, exclude, timeout).await?;
-        }
+            action,
+        } => match action {
+            Some(IndexAction::Remove { path: rm_path }) => {
+                commands::index_remove::handle_index_remove(rm_path).await?;
+            }
+            None => {
+                commands::index::handle_index(path, name, force, exclude, timeout).await?;
+            }
+        },
 
         Commands::Add { file } => {
             commands::add::handle_add(&cli.index, file).await?;

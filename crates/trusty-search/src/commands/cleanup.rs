@@ -126,10 +126,7 @@ pub async fn handle_cleanup(yes: bool, dry_run: bool) -> Result<()> {
 
     // 5) Dry-run wins over --yes.
     if dry_run {
-        println!(
-            "{} dry-run: no indexes were removed.",
-            "ℹ".cyan()
-        );
+        println!("{} dry-run: no indexes were removed.", "ℹ".cyan());
         return Ok(());
     }
 

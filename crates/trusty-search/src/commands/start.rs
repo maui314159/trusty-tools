@@ -489,6 +489,11 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
                 // Issue #85: restore every index recorded in `indexes.toml`
                 // now that we have a fully-wired hybrid pipeline.
                 restore_indexes(&install_state, &embedder).await;
+                // Issue #40: auto-discover Claude Code / git projects under
+                // the user's configured (or default) scan paths and index any
+                // not yet known to the daemon. Spawned as a separate task so
+                // it cannot block the embedder-ready handoff above.
+                tokio::spawn(crate::commands::discover::auto_discover_and_index());
             }
             Ok(Ok(Err(e))) => {
                 let msg = format!("FastEmbedder init failed: {e}");
