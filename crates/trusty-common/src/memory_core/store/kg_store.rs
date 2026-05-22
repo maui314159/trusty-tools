@@ -66,6 +66,31 @@ pub const DRAWERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("drawers
 /// Test: `round_trip_payload_key`.
 pub const PAYLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("payloads");
 
+/// Recall analytics event log (hit/miss telemetry).
+///
+/// Why: Issue #57 — `RecallLog` was the last rusqlite/r2d2 consumer in the
+///      Memory Palace stack. Migrating it onto redb removes the heavy native
+///      SQLite dependency chain from the default build and lines analytics
+///      storage up with the rest of the palace (KG, payloads).
+/// What: Key = monotonic u64 event id (derived from `Utc::now()` epoch ms with
+///       an in-process tiebreaker so concurrent inserts in the same ms remain
+///       unique and sort by insertion order).
+///       Value = postcard-encoded `RecallEvent`.
+/// Test: Coverage lives in `analytics::tests` (round-trip + reopen).
+pub const RECALL_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("recall_log");
+
+/// Chat-session store (for the trusty-memory web UI's chat panel).
+///
+/// Why: Each chat session is keyed by a UUID string and carries a small
+///      JSON-encoded history blob. A dedicated table keeps session rows out
+///      of the KG range scans and supports the same redb-on-disk format the
+///      rest of the Memory Palace already uses (issue #56).
+/// What: Key = session id (UTF-8 bytes, typically a UUID).
+///       Value = postcard-encoded `ChatSessionRecord` (title, created_at,
+///       updated_at, JSON-encoded history string).
+/// Test: Round-trips via `crate::memory_core::store::chat_sessions::tests`.
+pub const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("chat_sessions");
+
 // ── Value types (postcard-serializable) ──────────────────────────────────
 
 /// Why: The TRIPLES table value carries the object plus temporal/confidence
@@ -413,6 +438,8 @@ mod tests {
             ACTIVE_SUBJECT_COUNTS.name(),
             DRAWERS.name(),
             PAYLOADS.name(),
+            SESSIONS.name(),
+            RECALL_LOG.name(),
         ];
         for i in 0..names.len() {
             for j in (i + 1)..names.len() {
