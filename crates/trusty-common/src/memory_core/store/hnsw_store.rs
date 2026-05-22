@@ -423,6 +423,28 @@ impl HnswStore {
         Ok(self.len()? == 0)
     }
 
+    /// Snapshot every drawer key currently mapped to a vector.
+    ///
+    /// Why: The dream compaction / orphan-detection pass (issue #51) needs
+    /// to enumerate every drawer UUID known to the index so it can diff
+    /// against the authoritative drawer table and drop the strays. Unlike
+    /// the old usearch-era `key_map`, `VECTOR_KEYS` is persisted, so this
+    /// works after a cold reopen too.
+    /// What: Iterates `VECTOR_KEYS` and collects each key (the string
+    /// UUID) into a `Vec<String>`. Returns an empty vec for a fresh
+    /// store.
+    /// Test: Indirectly via `vector::tests::compact_orphans_removes_only_missing_ids`.
+    pub fn all_keys(&self) -> Result<Vec<String>> {
+        let rtx = self.db.begin_read()?;
+        let keys = rtx.open_table(VECTOR_KEYS)?;
+        let mut out = Vec::new();
+        for entry in keys.iter()? {
+            let (k, _) = entry?;
+            out.push(k.value().to_string());
+        }
+        Ok(out)
+    }
+
     /// Remove `VECTORS` rows whose `vector_id` no longer has a matching
     /// `VECTOR_KEYS` entry (i.e. dangling vectors). Also clears tombstoned
     /// rows from `VECTORS` and `DELETED_VECTORS` in the same pass.

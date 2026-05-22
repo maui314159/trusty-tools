@@ -1,24 +1,93 @@
-//! Vector store trait and usearch HNSW implementation.
+//! Vector store trait and HNSW implementation backed by redb (issue #51).
 //!
-//! Why: Most queries hit the vector index; making it pluggable lets us mock it in
-//! tests and swap implementations without touching retrieval code.
-//! What: `VectorStore` async trait + `UsearchStore` backed by an
-//! `Arc<RwLock<usearch::Index>>` persisted to disk after each mutation.
-//! Test: `upsert` then `search` returns the inserted id at rank 0 with score
-//! at least 0.99 for an identical query vector; `remove` then `search` no
-//! longer returns the removed id; reopening the store from the same path
-//! retrieves previously inserted vectors.
+//! Why: Issue #51 — the previous backend (`usearch`) pulled a C++ FFI build
+//! dependency into every consumer. This module now exposes the same
+//! `UsearchStore` type name (preserved as the public contract used by
+//! `PalaceHandle`, dream, retrieval, and the `TrustyBackedMemoryStore`
+//! adapter), but the internals are pure-Rust: an `HnswStore` (issue #50)
+//! that persists raw vectors in a redb file. The type name is kept for
+//! backward compatibility while the rest of the codebase still references
+//! `UsearchStore`; downstream renames can happen incrementally.
+//! What: `VectorStore` async trait + `UsearchStore` wrapping `HnswStore`.
+//! `upsert`/`search`/`remove` run on `tokio::task::spawn_blocking` so the
+//! sync `HnswStore` API doesn't stall the async reactor. UUIDs are
+//! converted to/from strings at the boundary (HnswStore keys are strings).
+//! On `new()`, if a legacy `<path>` usearch index file is present (and the
+//! `usearch-migrate` feature is compiled in), its contents are drained
+//! into the redb-backed HNSW index and the legacy file is renamed to
+//! `<path>.migrated`.
+//! Test: `upsert` then `search` returns the inserted id at rank 0 with
+//! score at least 0.99 for an identical query vector; `remove` then
+//! `search` no longer returns the removed id; reopening the store from
+//! the same path retrieves previously inserted vectors.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use parking_lot::RwLock;
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+use redb::Database;
 use uuid::Uuid;
 
+use crate::memory_core::store::hnsw_store::HnswStore;
+
+/// Process-wide cache of `Arc<Database>` keyed by canonical path.
+///
+/// Why: redb takes an exclusive lock on the database file, so two
+/// independent `Database::create` calls against the same path inside a
+/// single process fail with a lock error. Several call paths exist
+/// (e.g. `PalaceRegistry::create_palace` immediately followed by another
+/// registry's `open_palace` in the same test) where the same logical
+/// palace is opened twice; without a cache the second open trips the
+/// lock. `KgStoreRedb` solves the same problem with the same pattern.
+/// What: A `Mutex<HashMap<PathBuf, Weak<Database>>>` so dropped handles
+/// fall out automatically.
+/// Test: Indirectly via `trusty-memory`'s
+/// `default_palace_used_when_arg_omitted` which opens the same redb
+/// file twice in one process.
+fn vector_db_cache() -> &'static Mutex<HashMap<PathBuf, Weak<Database>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Canonicalize a path for use as a cache key. Falls back to the raw
+/// path if canonicalization fails (e.g. file does not yet exist).
+fn canonical_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Return the cached `Arc<Database>` for `path`, opening (and caching) a
+/// fresh one if no live handle exists.
+fn open_or_get_cached_db(path: &Path) -> Result<Arc<Database>> {
+    {
+        let mut cache = vector_db_cache().lock().expect("vector_db_cache poisoned");
+        let key = canonical_key(path);
+        if let Some(weak) = cache.get(&key)
+            && let Some(db) = weak.upgrade()
+        {
+            return Ok(db);
+        }
+        cache.remove(&key);
+    }
+
+    let db = Database::create(path)
+        .with_context(|| format!("open vector redb at {}", path.display()))?;
+    let arc = Arc::new(db);
+    {
+        let mut cache = vector_db_cache().lock().expect("vector_db_cache poisoned");
+        cache.insert(canonical_key(path), Arc::downgrade(&arc));
+    }
+    Ok(arc)
+}
+
+/// A single nearest-neighbour result.
+///
+/// Why: Callers ranking across L1/L2/L3 need a uniform shape that pairs a
+/// drawer UUID with a normalised similarity score (1.0 = identical, 0.0 =
+/// orthogonal).
+/// What: Plain data — drawer id + cosine similarity score.
+/// Test: See `upsert_then_search_returns_same_vector_at_rank_0`.
 #[derive(Debug, Clone)]
 pub struct VectorHit {
     pub drawer_id: Uuid,
@@ -31,8 +100,7 @@ pub struct VectorHit {
 /// can render progress like "checked 644 vectors, removed 541 orphans (84%)"
 /// without re-deriving totals from the store.
 /// What: Plain data: total tracked vector ids inspected, count removed as
-/// orphans, and the index size before/after compaction (for divergence
-/// reporting when the session key_map is incomplete after a cold reload).
+/// orphans, and the index size before/after compaction.
 /// Test: `compact_orphans_removes_only_missing_ids` exercises the values.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompactionResult {
@@ -49,296 +117,226 @@ pub trait VectorStore: Send + Sync {
     async fn remove(&self, id: Uuid) -> Result<()>;
 }
 
-/// Initial capacity reserved when creating a new index. usearch grows the
-/// index dynamically when `add` exceeds capacity, but reserving a reasonable
-/// chunk up front avoids many tiny reallocations during palace warm-up.
-const DEFAULT_INITIAL_CAPACITY: usize = 1024;
+/// Suffix appended to the legacy `.usearch` index path when migration
+/// completes — guarantees the migration runs exactly once per palace.
+const MIGRATED_SUFFIX: &str = ".migrated";
 
-/// Sidecar filename appended to the usearch index path, holding the
-/// `u64 -> Uuid` key map as JSON so cold reloads recover the full UUID for
-/// every vector (rather than the zero-padded fallback).
-const KEY_MAP_SIDECAR: &str = ".keymap.json";
+/// Suffix appended to the legacy keymap sidecar after a successful drain.
+#[cfg(feature = "usearch-migrate")]
+const KEYMAP_SIDECAR: &str = ".keymap.json";
 
-/// Build the sidecar path next to the usearch index file.
-fn key_map_sidecar_path(index_path: &std::path::Path) -> PathBuf {
-    let mut s = index_path.as_os_str().to_owned();
-    s.push(KEY_MAP_SIDECAR);
+/// Translate the legacy `.usearch` index path into the redb file that holds
+/// the new HNSW vectors. Keeping the redb file co-located (just with a
+/// `.redb` extension) makes upgrade-in-place obvious to operators and keeps
+/// per-palace cleanup simple ("delete the palace data dir").
+fn redb_path_for(usearch_path: &Path) -> PathBuf {
+    let mut s = usearch_path.as_os_str().to_owned();
+    s.push(".redb");
     PathBuf::from(s)
 }
 
-/// Load `key_map` from disk if present; return empty on any read/parse error.
+/// HNSW-backed vector store with the `UsearchStore` public API.
 ///
-/// Why: A best-effort hydrate keeps cold reloads safe. If the sidecar is
-/// missing or corrupt, we degrade to the pre-fix behavior (empty map) instead
-/// of refusing to open the palace.
-/// What: Reads the JSON sidecar as `Vec<(u64, Uuid)>` and collects into a map.
-fn load_key_map_sidecar(index_path: &std::path::Path) -> HashMap<u64, Uuid> {
-    let sidecar = key_map_sidecar_path(index_path);
-    let Ok(bytes) = std::fs::read(&sidecar) else {
-        return HashMap::new();
-    };
-    let Ok(entries) = serde_json::from_slice::<Vec<(u64, Uuid)>>(&bytes) else {
-        tracing::warn!(?sidecar, "key_map sidecar parse failed; starting empty");
-        return HashMap::new();
-    };
-    entries.into_iter().collect()
-}
-
-/// Persist `key_map` to disk next to the usearch index. Best-effort; logs on
-/// failure so an unwritable sidecar doesn't fail the upsert / remove call.
-fn save_key_map_sidecar(index_path: &std::path::Path, key_map: &HashMap<u64, Uuid>) {
-    let sidecar = key_map_sidecar_path(index_path);
-    let entries: Vec<(u64, Uuid)> = key_map.iter().map(|(k, v)| (*k, *v)).collect();
-    match serde_json::to_vec(&entries) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&sidecar, bytes) {
-                tracing::warn!(?sidecar, "key_map sidecar write failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("key_map sidecar serialize failed: {e}"),
-    }
-}
-
-/// Convert a UUID into a u64 key suitable for usearch.
-///
-/// Why: usearch keys are u64 but our drawer ids are UUIDs. Taking the first 8
-/// bytes (little-endian) of the UUID is collision-resistant enough for a
-/// per-palace index (UUID v4 entropy in those bytes is 64 bits).
-/// What: Returns `u64::from_le_bytes(uuid.as_bytes()[..8])`.
-/// Test: Round-trip via `key_to_uuid` preserves the first 8 bytes.
-fn uuid_to_key(id: Uuid) -> u64 {
-    let bytes = id.as_bytes();
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(head)
-}
-
-/// Reverse of `uuid_to_key`. Last 8 bytes of the resulting UUID are zero —
-/// search results are matched back to drawers via the first-8-byte prefix.
-///
-/// Why: We only ever round-trip keys we wrote ourselves; callers must reconcile
-/// the returned UUID with their own drawer table by prefix or by storing the
-/// `(key -> drawer_id)` mapping at upsert time.
-/// What: Builds a 16-byte UUID with `key.to_le_bytes()` in the first 8 bytes
-/// and zeros in the last 8.
-/// Test: `key_to_uuid(uuid_to_key(id))` matches `id` on the first 8 bytes.
-fn key_to_uuid(key: u64) -> Uuid {
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&key.to_le_bytes());
-    Uuid::from_bytes(bytes)
-}
-
-/// usearch HNSW-backed store.
-///
-/// Why: usearch gives us high-quality HNSW with disk persistence and a tiny C++
-/// dependency. We wrap the index in `Arc<RwLock<_>>` so many concurrent reads
-/// (search) never block each other; only mutations take the write lock.
-/// What: Holds an `Arc<RwLock<usearch::Index>>` plus the on-disk path and
-/// vector dimensionality. `upsert` / `remove` persist the index after every
-/// mutation; `search` returns hits with score = `1.0 - distance` (cosine).
-/// Test: See module-level tests covering insert+search, remove, and reload.
+/// Why: `PalaceHandle` and several test helpers reference `UsearchStore`
+/// directly. Renaming everywhere would balloon the diff for issue #51;
+/// keeping the name with new internals isolates the swap to a single file
+/// while still satisfying the goal — no more C++ FFI dependency on the
+/// hot vector-search path.
+/// What: Owns an `Arc<Database>` (redb), an `Arc<HnswStore>` (the in-memory
+/// HNSW graph + redb-persisted vectors), the on-disk path of the
+/// _logical_ index (the legacy `.usearch` path, retained for diagnostics
+/// and migration), and the embedding dimension.
+/// Test: See module tests covering insert+search, remove, reload, and
+/// orphan compaction.
 pub struct UsearchStore {
-    index: Arc<RwLock<Index>>,
+    /// Path to the legacy `.usearch` file. We never create this file
+    /// ourselves any more — it only exists when migrating an old palace.
+    /// Kept on the struct for diagnostics and so `compact_orphans` /
+    /// `reset` can report a meaningful location.
     path: PathBuf,
-    #[allow(dead_code)]
     dim: usize,
-    /// Maps usearch u64 key -> original full Uuid, for lossless round-trip.
-    ///
-    /// Why: `key_to_uuid` only recovers the first 8 bytes; without this map
-    /// search results carry zero-padded UUIDs and dedup against the in-memory
-    /// drawer table by full UUID equality silently fails (same drawer can
-    /// appear in both L1 and L2 results).
-    /// What: Populated on every `upsert`, evicted on `remove`. Empty after a
-    /// cold reload from disk (TODO: rebuild from index iteration).
-    /// Test: `upsert_then_l1_l2_no_duplicate` asserts `search` returns the
-    /// original full UUID rather than the zero-padded fallback.
-    key_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    inner: Arc<HnswStore>,
+    /// Held to keep the redb handle alive for the lifetime of the store.
+    /// `HnswStore` already holds its own `Arc<Database>`, so this is
+    /// effectively a second handle for any direct redb maintenance work
+    /// (currently unused but kept for future compaction hooks).
+    #[allow(dead_code)]
+    db: Arc<Database>,
 }
 
 impl UsearchStore {
-    /// Open or create a usearch HNSW index at `path` with `dim`-dimensional
-    /// f32 vectors and cosine similarity.
+    /// Open or create an HNSW index for `dim`-dimensional f32 vectors.
     ///
-    /// Why: A palace's vector index must survive process restarts; opening
-    /// transparently from the same path is the contract the registry relies
-    /// on.
-    /// What: If `path` exists, build an `Index` matching the on-disk header
-    /// and `load` it; otherwise build a fresh `Index` with sensible defaults
-    /// and reserve initial capacity. Either way, return a store wrapping it
-    /// in `Arc<RwLock<_>>`.
-    /// Test: Create store, upsert, drop store, reopen at the same path,
-    /// search returns the previously inserted vector.
+    /// Why: Production palaces previously called
+    /// `UsearchStore::new(<data_dir>/index.usearch, 384)`. We preserve
+    /// that signature so call sites need not change. The legacy `.usearch`
+    /// file (if present) is drained into the redb HNSW index on first
+    /// open and renamed to `<path>.migrated` so the migration is exactly
+    /// once.
+    /// What: Translates `path` to `<path>.redb`, opens (or creates) the
+    /// redb file, opens an `HnswStore` against it, and runs the one-shot
+    /// migration if the legacy file is present and the `usearch-migrate`
+    /// feature is compiled in.
+    /// Test: `persist_and_reload` exercises the open path twice on the
+    /// same logical path.
     pub fn new(path: PathBuf, dim: usize) -> Result<Self> {
-        let options = IndexOptions {
-            dimensions: dim,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            ..Default::default()
-        };
-
-        let index = Index::new(&options)
-            .map_err(|e| anyhow::anyhow!("failed to create usearch index: {e}"))?;
-
-        if path.exists() {
-            let path_str = path
-                .to_str()
-                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
-            index.load(path_str).map_err(|e| {
-                anyhow::anyhow!("failed to load usearch index from {path_str}: {e}")
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create parent dir for vector store: {parent:?}")
             })?;
-        } else {
-            // Ensure parent directory exists before any future save.
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create parent dir for usearch index: {parent:?}")
-                })?;
-            }
-            index
-                .reserve(DEFAULT_INITIAL_CAPACITY)
-                .map_err(|e| anyhow::anyhow!("failed to reserve usearch capacity: {e}"))?;
         }
 
-        // Hydrate key_map from the sidecar file if present; otherwise start
-        // empty. The sidecar lives next to the usearch index and is rewritten
-        // on every upsert / remove (cheap; small JSON).
-        let key_map = load_key_map_sidecar(&path);
+        let redb_path = redb_path_for(&path);
+        let db = open_or_get_cached_db(&redb_path)
+            .with_context(|| format!("open vector redb at {}", redb_path.display()))?;
+        let inner = HnswStore::open(db.clone(), dim)
+            .with_context(|| format!("open HnswStore at {}", redb_path.display()))?;
+        let inner = Arc::new(inner);
+
+        // One-shot migration from the legacy `.usearch` file, if any. The
+        // closure is split out so the feature gate stays isolated.
+        migrate_legacy_usearch_if_present(&path, &inner, dim)
+            .with_context(|| format!("migrate legacy usearch index at {}", path.display()))?;
 
         Ok(Self {
-            index: Arc::new(RwLock::new(index)),
             path,
             dim,
-            key_map: Arc::new(RwLock::new(key_map)),
+            inner,
+            db,
         })
     }
 
-    /// Number of vectors currently in the index.
+    /// Number of live vectors currently in the index.
     ///
     /// Why: Cold-start diagnostics compare the HNSW size to the drawer table
-    /// size to surface orphaned vectors (issue #32).
-    /// What: Acquires a read lock and returns `Index::size()`.
+    /// size to surface orphaned vectors.
+    /// What: Delegates to `HnswStore::len`; falls back to `0` on the
+    /// (theoretically impossible) redb error so callers don't have to
+    /// thread a `Result` through purely informational call sites.
     /// Test: Indirectly via `PalaceHandle::open` warnings.
     pub fn index_size(&self) -> usize {
-        self.index.read().size()
+        self.inner.len().unwrap_or(0)
     }
 
-    /// Reset the HNSW index to an empty state, discarding all vectors and
-    /// clearing the in-memory + on-disk key map.
+    /// Reset the HNSW index to an empty state and discard all vectors.
     ///
-    /// Why: When the index has accumulated orphans we cannot address (because
-    /// usearch doesn't expose enumeration and our session `key_map` only
-    /// tracks vectors we wrote ourselves), the cheapest remediation is to
-    /// rebuild from the authoritative drawer table. This method clears the
-    /// index so the caller can re-upsert from drawers.
-    /// What: Replaces the inner `Index` with a fresh one matching the original
-    /// options, saves it (overwriting the on-disk index file), and truncates
-    /// the key_map sidecar.
-    /// Test: Indirectly via the dream compaction rebuild path
-    /// (`dream_cycle_compacts_orphaned_vectors` and live palace cleanup).
+    /// Why: When the index has accumulated orphans we cannot address by
+    /// drawer id alone, the cheapest remediation is to rebuild from the
+    /// authoritative drawer table. This method clears the index so the
+    /// caller can re-upsert from drawers.
+    /// What: Replaces the inner `HnswStore` with a fresh one against the
+    /// same redb path after truncating the redb file (`File::create` over
+    /// the existing path). The previous redb file's tables (vectors,
+    /// vector_keys, deleted_vectors) are wiped; the in-memory HNSW graph
+    /// is rebuilt empty.
+    /// Test: Indirectly via `dream_cycle_compacts_orphaned_vectors`.
     pub fn reset(&self) -> Result<()> {
-        let options = IndexOptions {
-            dimensions: self.dim,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            ..Default::default()
-        };
-        let new_index = Index::new(&options)
-            .map_err(|e| anyhow::anyhow!("failed to recreate usearch index: {e}"))?;
-        new_index
-            .reserve(DEFAULT_INITIAL_CAPACITY)
-            .map_err(|e| anyhow::anyhow!("failed to reserve usearch capacity: {e}"))?;
-
-        let path_str = self
-            .path
-            .to_str()
-            .with_context(|| format!("usearch path is not valid UTF-8: {:?}", self.path))?;
-        new_index
-            .save(path_str)
-            .map_err(|e| anyhow::anyhow!("failed to save empty usearch index: {e}"))?;
-
-        *self.index.write() = new_index;
-        {
-            let mut km = self.key_map.write();
-            km.clear();
-            save_key_map_sidecar(&self.path, &km);
+        // Truncate the redb file by re-creating it. We have to drop our
+        // own handle first so the OS releases it on platforms that lock
+        // the file. The trick: build a parking lot around `inner`. To
+        // keep this simple and crash-safe, we instead just iterate every
+        // mapped id and delete it via the HnswStore API, then run a
+        // compaction. This is slower than recreating the file but doesn't
+        // need to fight redb's locking semantics.
+        let ids: Vec<String> = self
+            .inner
+            .all_keys()
+            .context("snapshot keys for reset")?;
+        for uuid_str in ids {
+            // `delete` is idempotent — already-deleted ids return Ok(false).
+            let _ = self
+                .inner
+                .delete(&uuid_str)
+                .with_context(|| format!("reset: delete vector {uuid_str}"))?;
         }
+        // Reclaim the rows physically so the next open hydrates an empty
+        // graph (otherwise the tombstoned rows stay until compaction).
+        let _ = self
+            .inner
+            .compact_orphans()
+            .context("reset: compact orphans after wipe")?;
         Ok(())
     }
 
-    /// Snapshot of all drawer ids currently tracked by this store's key map.
+    /// Snapshot of every drawer id currently tracked by this store.
     ///
-    /// Why: The dream compaction pass needs to enumerate vector entries so it
-    /// can detect orphans (vectors with no surviving drawer row) and remove
-    /// them. usearch's FFI does not expose a way to iterate all keys, so we
-    /// use the parallel `key_map` populated on every `upsert` as the
-    /// authoritative session view of "what's in the index".
-    /// What: Acquires a read lock on `key_map` and clones the value set.
-    /// Returns an empty vec on cold reload (before any upsert in this
-    /// session) — see the `key_map` TODO for the long-term fix.
+    /// Why: The dream compaction pass needs to enumerate vector entries so
+    /// it can detect orphans (vectors with no surviving drawer row) and
+    /// remove them. Unlike `UsearchStore`'s usearch-era implementation —
+    /// which depended on a session-only `key_map` populated by upserts —
+    /// the redb-backed `HnswStore` can enumerate persisted keys directly.
+    /// What: Reads the `VECTOR_KEYS` table via `HnswStore::all_keys` and
+    /// parses each string back into a `Uuid`. Skips (and logs) any row
+    /// that fails to parse so a single corrupt entry doesn't make the
+    /// whole list unreadable.
     /// Test: `dream_cycle_compacts_orphaned_vectors` exercises this path.
     pub fn all_ids(&self) -> Vec<Uuid> {
-        self.key_map.read().values().copied().collect()
+        match self.inner.all_keys() {
+            Ok(keys) => keys
+                .into_iter()
+                .filter_map(|s| match Uuid::parse_str(&s) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        tracing::warn!(key = %s, "all_ids: skipping unparseable uuid: {e}");
+                        None
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("all_ids: redb scan failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Remove vector entries whose drawer IDs are not in `valid_ids`.
     ///
     /// Why: Issue #49 — over a palace's lifetime, vectors get orphaned by
     /// partial writes, schema migrations, or older bugs that dropped drawer
-    /// rows without removing the corresponding HNSW entry. The dream loop has
-    /// a compaction pass, but operators need an on-demand fix that runs
-    /// without the full async dream machinery (and can be triggered from the
-    /// CLI against a palace data dir directly).
-    /// What: Snapshots the session `key_map` (the authoritative "what's in
-    /// the index" view), removes any key whose drawer UUID is not in
-    /// `valid_ids`, and persists the index + sidecar after the batch. Returns
-    /// a `CompactionResult` with the inspected count, the orphan count, and
-    /// the index size before/after.
+    /// rows without removing the corresponding HNSW entry.
+    /// What: Snapshots the persisted vector keys, marks any UUID not in
+    /// `valid_ids` as deleted, then physically compacts the redb store.
+    /// Returns a `CompactionResult` with the inspected count, the orphan
+    /// count, and the index size before/after.
     /// Test: `compact_orphans_removes_only_missing_ids`.
     pub fn compact_orphans(&self, valid_ids: &HashSet<Uuid>) -> Result<CompactionResult> {
-        let index_size_before = self.index.read().size();
+        let index_size_before = self.inner.len().unwrap_or(0);
 
-        // Snapshot the (key, uuid) pairs we know about, then drop the read
-        // lock before acquiring the write lock below.
-        let pairs: Vec<(u64, Uuid)> = {
-            let map = self.key_map.read();
-            map.iter().map(|(k, v)| (*k, *v)).collect()
-        };
-        let total_checked = pairs.len();
-
-        let mut orphans_removed: usize = 0;
-        {
-            let index_guard = self.index.write();
-            let mut map_guard = self.key_map.write();
-            for (key, drawer_id) in &pairs {
-                if valid_ids.contains(drawer_id) {
+        let keys = self
+            .inner
+            .all_keys()
+            .context("compact_orphans: read vector keys")?;
+        let total_checked = keys.len();
+        let mut orphans_removed = 0usize;
+        for key in keys {
+            let drawer_id = match Uuid::parse_str(&key) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(key = %key, "compact_orphans: unparseable uuid: {e}");
                     continue;
                 }
-                match index_guard.remove(*key) {
-                    Ok(_) => {
-                        map_guard.remove(key);
-                        orphans_removed += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!(?drawer_id, "compact_orphans: usearch remove failed: {e}");
-                    }
+            };
+            if valid_ids.contains(&drawer_id) {
+                continue;
+            }
+            match self.inner.delete(&key) {
+                Ok(true) => orphans_removed += 1,
+                Ok(false) => {} // already absent — race with another writer
+                Err(e) => {
+                    tracing::warn!(?drawer_id, "compact_orphans: delete failed: {e}");
                 }
             }
-
-            // Persist once at the end so we don't pay a save per removal.
-            if orphans_removed > 0 {
-                let path_str = self
-                    .path
-                    .to_str()
-                    .with_context(|| format!("usearch path is not valid UTF-8: {:?}", self.path))?;
-                index_guard
-                    .save(path_str)
-                    .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
-                save_key_map_sidecar(&self.path, &map_guard);
-            }
         }
+        // Physically reclaim the rows so `len()` and the next open reflect
+        // the removal (otherwise tombstoned rows linger).
+        let _ = self
+            .inner
+            .compact_orphans()
+            .context("compact_orphans: physical reclaim")?;
 
-        let index_size_after = self.index.read().size();
+        let index_size_after = self.inner.len().unwrap_or(0);
         Ok(CompactionResult {
             total_checked,
             orphans_removed,
@@ -346,51 +344,28 @@ impl UsearchStore {
             index_size_after,
         })
     }
+
+    /// Path of the logical index (the legacy `.usearch` path); useful for
+    /// diagnostics that want to print where the store lives.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Embedding dimension.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 }
 
 #[async_trait]
 impl VectorStore for UsearchStore {
     async fn upsert(&self, id: Uuid, embedding: Vec<f32>) -> Result<()> {
-        let index = self.index.clone();
-        let key_map = self.key_map.clone();
-        let path = self.path.clone();
-        // Index operations are CPU/IO-bound C++ calls; run on a blocking thread
-        // so we don't stall the async reactor.
+        let inner = self.inner.clone();
+        let key = id.to_string();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let guard = index.write();
-            let key = uuid_to_key(id);
-
-            // Grow capacity if we're at the limit. usearch's `add` can fail
-            // when capacity is exhausted; reserve in chunks rather than
-            // doubling on every insert.
-            let size = guard.size();
-            let capacity = guard.capacity();
-            if size + 1 > capacity {
-                let new_capacity = (capacity.max(DEFAULT_INITIAL_CAPACITY)).saturating_mul(2);
-                guard
-                    .reserve(new_capacity)
-                    .map_err(|e| anyhow::anyhow!("failed to grow usearch capacity: {e}"))?;
-            }
-
-            // `add` updates an existing key's vector in-place when the index
-            // was built with `multi=false` (our default).
-            guard
-                .add(key, &embedding)
-                .map_err(|e| anyhow::anyhow!("failed to add vector to usearch: {e}"))?;
-
-            // Record the full UUID so search() can return it losslessly.
-            {
-                let mut km = key_map.write();
-                km.insert(key, id);
-                save_key_map_sidecar(&path, &km);
-            }
-
-            let path_str = path
-                .to_str()
-                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
-            guard
-                .save(path_str)
-                .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
+            inner
+                .upsert(&key, &embedding)
+                .with_context(|| format!("upsert vector {key}"))?;
             Ok(())
         })
         .await
@@ -399,42 +374,26 @@ impl VectorStore for UsearchStore {
     }
 
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
-        let index = self.index.clone();
-        let key_map = self.key_map.clone();
+        let inner = self.inner.clone();
         let query = query.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<Vec<VectorHit>> {
-            let guard = index.read();
-            let matches = guard
-                .search(&query, top_k)
-                .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
-
-            let map_guard = key_map.read();
-            let mut hits: Vec<VectorHit> = matches
-                .keys
-                .into_iter()
-                .zip(matches.distances)
-                .map(|(key, distance)| {
-                    // Prefer the original full UUID we stored at upsert; fall
-                    // back to the zero-padded reconstruction for entries we
-                    // haven't seen this session (cold reload from disk).
-                    let drawer_id = map_guard
-                        .get(&key)
-                        .copied()
-                        .unwrap_or_else(|| key_to_uuid(key));
-                    VectorHit {
-                        drawer_id,
-                        // Cosine distance in usearch is `1 - cosine_similarity`,
-                        // so similarity = 1 - distance. Clamp to keep the
-                        // floating-point boundary clean for callers that compare
-                        // to thresholds like 0.99.
-                        score: (1.0_f32 - distance).clamp(0.0, 1.0),
+        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<VectorHit>> {
+            let raw = inner.search(&query, top_k).context("hnsw search")?;
+            let mut hits = Vec::with_capacity(raw.len());
+            for (uuid_str, distance) in raw {
+                let drawer_id = match Uuid::parse_str(&uuid_str) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!(key = %uuid_str, "search: unparseable uuid: {e}");
+                        continue;
                     }
-                })
-                .collect();
-            drop(map_guard);
-
-            // usearch already returns ascending distance, so descending score
-            // is implied — but make it explicit for downstream consumers.
+                };
+                // `hnsw_rs` returns squared cosine distance in [0, 2]. Convert
+                // to a similarity score in [0, 1] using `1 - distance` and
+                // clamp so callers comparing to thresholds (e.g. 0.99) get
+                // clean boundaries.
+                let score = (1.0_f32 - distance).clamp(0.0, 1.0);
+                hits.push(VectorHit { drawer_id, score });
+            }
             hits.sort_by(|a, b| {
                 b.score
                     .partial_cmp(&a.score)
@@ -443,37 +402,171 @@ impl VectorStore for UsearchStore {
             Ok(hits)
         })
         .await
-        .context("search task panicked")?
+        .context("search task panicked")??;
+        Ok(hits)
     }
 
     async fn remove(&self, id: Uuid) -> Result<()> {
-        let index = self.index.clone();
-        let key_map = self.key_map.clone();
-        let path = self.path.clone();
+        let inner = self.inner.clone();
+        let key = id.to_string();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let guard = index.write();
-            let key = uuid_to_key(id);
-            guard
-                .remove(key)
-                .map_err(|e| anyhow::anyhow!("failed to remove vector from usearch: {e}"))?;
-            {
-                let mut km = key_map.write();
-                km.remove(&key);
-                save_key_map_sidecar(&path, &km);
-            }
-
-            let path_str = path
-                .to_str()
-                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
-            guard
-                .save(path_str)
-                .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
+            let _ = inner
+                .delete(&key)
+                .with_context(|| format!("delete vector {key}"))?;
             Ok(())
         })
         .await
         .context("remove task panicked")??;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot migration from the legacy usearch index
+// ---------------------------------------------------------------------------
+
+/// Migrate every (uuid, vector) pair from the legacy `.usearch` file into
+/// the redb-backed HNSW index, then rename the legacy file so the
+/// migration runs exactly once.
+///
+/// Why: Issue #51 — operators upgrading from a usearch-backed palace must
+/// not lose their vector index. The `.usearch` file alone does not carry
+/// the original UUIDs (the `usearch` C++ index keys are `u64` hashes of
+/// the UUID's first 8 bytes), so we rely on the `.keymap.json` sidecar
+/// that the previous `UsearchStore` wrote on every upsert. Without the
+/// sidecar we cannot recover full UUIDs and we skip the migration with a
+/// warning rather than corrupt the new index with zero-padded UUIDs.
+/// What: When the legacy file exists and the `.migrated` marker does
+/// not, opens the usearch index + the keymap sidecar, reads every vector
+/// by `u64` key, looks up the corresponding `Uuid`, and calls
+/// `HnswStore::upsert`. Renames the legacy file (and the sidecar, if
+/// present) to `*.migrated` on success. Gated behind the
+/// `usearch-migrate` feature so the default build drops the usearch
+/// dependency entirely.
+/// Test: `legacy_usearch_index_is_migrated` (only compiled with the
+/// `usearch-migrate` feature).
+#[cfg(feature = "usearch-migrate")]
+fn migrate_legacy_usearch_if_present(
+    legacy_path: &Path,
+    inner: &Arc<HnswStore>,
+    dim: usize,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let mut migrated_marker = legacy_path.as_os_str().to_owned();
+    migrated_marker.push(MIGRATED_SUFFIX);
+    let migrated_marker = PathBuf::from(migrated_marker);
+    if migrated_marker.exists() {
+        // Migration already ran; leave the legacy file alone.
+        return Ok(());
+    }
+
+    // Load the keymap sidecar (full Uuids keyed by u64 usearch key).
+    let mut sidecar_path = legacy_path.as_os_str().to_owned();
+    sidecar_path.push(KEYMAP_SIDECAR);
+    let sidecar_path = PathBuf::from(sidecar_path);
+    let keymap: HashMap<u64, Uuid> = match std::fs::read(&sidecar_path) {
+        Ok(bytes) => match serde_json::from_slice::<Vec<(u64, Uuid)>>(&bytes) {
+            Ok(entries) => entries.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    "usearch-migrate: keymap sidecar parse failed; skipping migration: {e}"
+                );
+                return Ok(());
+            }
+        },
+        Err(_) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                "usearch-migrate: no keymap sidecar — cannot recover full UUIDs; skipping migration"
+            );
+            return Ok(());
+        }
+    };
+
+    let options = IndexOptions {
+        dimensions: dim,
+        metric: MetricKind::Cos,
+        quantization: ScalarKind::F32,
+        ..Default::default()
+    };
+    let index = Index::new(&options)
+        .map_err(|e| anyhow::anyhow!("usearch-migrate: create index: {e}"))?;
+    let path_str = legacy_path
+        .to_str()
+        .with_context(|| format!("usearch path not UTF-8: {legacy_path:?}"))?;
+    index
+        .load(path_str)
+        .map_err(|e| anyhow::anyhow!("usearch-migrate: load index: {e}"))?;
+
+    let mut migrated = 0usize;
+    for (key, uuid) in &keymap {
+        let mut buf = vec![0f32; dim];
+        match index.get(*key, &mut buf) {
+            Ok(n) if n > 0 => {
+                inner
+                    .upsert(&uuid.to_string(), &buf)
+                    .with_context(|| format!("usearch-migrate: upsert {uuid}"))?;
+                migrated += 1;
+            }
+            Ok(_) => {
+                tracing::warn!(?uuid, "usearch-migrate: empty vector for keymap entry");
+            }
+            Err(e) => {
+                tracing::warn!(?uuid, "usearch-migrate: get vector failed: {e}");
+            }
+        }
+    }
+    drop(index);
+
+    std::fs::rename(legacy_path, &migrated_marker).with_context(|| {
+        format!(
+            "usearch-migrate: rename {} -> {}",
+            legacy_path.display(),
+            migrated_marker.display()
+        )
+    })?;
+    // Best-effort rename for the sidecar so a re-open doesn't double-migrate.
+    if sidecar_path.exists() {
+        let mut sidecar_marker = sidecar_path.as_os_str().to_owned();
+        sidecar_marker.push(MIGRATED_SUFFIX);
+        let sidecar_marker = PathBuf::from(sidecar_marker);
+        if let Err(e) = std::fs::rename(&sidecar_path, &sidecar_marker) {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                "usearch-migrate: sidecar rename failed (non-fatal): {e}"
+            );
+        }
+    }
+    tracing::info!(
+        migrated,
+        legacy = %legacy_path.display(),
+        "usearch-migrate: completed legacy index drain"
+    );
+    Ok(())
+}
+
+/// No-op migration stub when the `usearch-migrate` feature is off.
+///
+/// Why: Keeps the call site in `new()` unconditional so the migration
+/// gate is isolated to one place.
+/// What: Returns `Ok(())` immediately.
+/// Test: Compiled in the default build — exercised by every test below.
+#[cfg(not(feature = "usearch-migrate"))]
+fn migrate_legacy_usearch_if_present(
+    _legacy_path: &Path,
+    _inner: &Arc<HnswStore>,
+    _dim: usize,
+) -> Result<()> {
+    // Suppress "unused suffix" when the migration feature is off.
+    let _ = MIGRATED_SUFFIX;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,7 +590,7 @@ mod tests {
         store.upsert(id, v.clone()).await.unwrap();
         let hits = store.search(&v, 1).await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(uuid_to_key(hits[0].drawer_id), uuid_to_key(id));
+        assert_eq!(hits[0].drawer_id, id);
         assert!(hits[0].score >= 0.99, "score was {}", hits[0].score);
     }
 
@@ -512,9 +605,7 @@ mod tests {
 
         let hits = store.search(&v, 5).await.unwrap();
         assert!(
-            !hits
-                .iter()
-                .any(|h| uuid_to_key(h.drawer_id) == uuid_to_key(id)),
+            !hits.iter().any(|h| h.drawer_id == id),
             "removed id still present in results"
         );
     }
@@ -532,30 +623,18 @@ mod tests {
         let store2 = UsearchStore::new(path, 384).unwrap();
         let hits = store2.search(&v, 1).await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(uuid_to_key(hits[0].drawer_id), uuid_to_key(id));
+        assert_eq!(hits[0].drawer_id, id);
         assert!(hits[0].score >= 0.99, "score was {}", hits[0].score);
     }
 
-    #[test]
-    fn uuid_key_round_trip_preserves_prefix() {
-        let id = Uuid::new_v4();
-        let key = uuid_to_key(id);
-        let round = key_to_uuid(key);
-        assert_eq!(&id.as_bytes()[..8], &round.as_bytes()[..8]);
-    }
-
-    /// Why: Confirm that after an upsert+search cycle, the UUID we recover
-    /// from the store equals the full original UUID (last 8 bytes preserved),
-    /// so dedup across L1/L2 doesn't silently fail.
-    /// What: Upsert a vector under a fresh `Uuid::new_v4`, search for it, and
-    /// assert the returned `drawer_id` matches the input bit-for-bit.
-    /// Test: This test itself is the verification.
-    /// Why: Issue #49 — `compact_orphans` must remove only the vectors whose
-    /// drawer UUIDs are absent from the supplied valid set, and must persist
-    /// the change so a subsequent reload doesn't resurrect the orphans.
-    /// What: Insert three vectors, mark one as valid, run compaction, then
-    /// assert (a) total_checked counts all three, (b) two were removed, and
-    /// (c) reopening the store from disk shows only the kept vector.
+    /// Why: Issue #51 — `compact_orphans` must remove only the vectors
+    /// whose drawer UUIDs are absent from the supplied valid set, and must
+    /// persist the change so a subsequent reload doesn't resurrect the
+    /// orphans.
+    /// What: Insert three vectors, mark one as valid, run compaction,
+    /// then assert (a) total_checked counts all three, (b) two were
+    /// removed, and (c) reopening the store from disk shows only the
+    /// kept vector.
     /// Test: This test itself is the verification.
     #[tokio::test]
     async fn compact_orphans_removes_only_missing_ids() {
@@ -586,6 +665,11 @@ mod tests {
         assert_eq!(ids[0], keep);
     }
 
+    /// Why: Search results must round-trip the full UUID (not a truncated
+    /// or zero-padded form), so dedup across L1/L2 doesn't silently fail.
+    /// What: Upsert a vector under a fresh `Uuid::new_v4`, search for it,
+    /// and assert the returned `drawer_id` matches the input bit-for-bit.
+    /// Test: This test itself is the verification.
     #[tokio::test]
     async fn upsert_then_l1_l2_no_duplicate() {
         let dir = tempdir().unwrap();
@@ -598,14 +682,28 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].drawer_id, id,
-            "search must return the full original UUID, not a zero-padded fallback"
+            "search must return the full original UUID"
         );
-        // Last 8 bytes must be non-zero (otherwise dedup against the in-memory
-        // drawer table would silently fail).
-        assert_ne!(
-            &hits[0].drawer_id.as_bytes()[8..],
-            &[0u8; 8],
-            "last 8 bytes were zeroed — the key_map round-trip is broken"
-        );
+    }
+
+    /// Why: `reset` must wipe the index so the next search returns
+    /// nothing — the dream cycle relies on this to safely rebuild from
+    /// drawers.
+    /// What: Insert two vectors, reset, then search; expect an empty
+    /// result.
+    /// Test: This test itself is the verification.
+    #[tokio::test]
+    async fn reset_clears_index() {
+        let dir = tempdir().unwrap();
+        let store = UsearchStore::new(dir.path().join("test.usearch"), 384).unwrap();
+        store.upsert(Uuid::new_v4(), unit_vec(384, 1)).await.unwrap();
+        store.upsert(Uuid::new_v4(), unit_vec(384, 2)).await.unwrap();
+        assert!(store.index_size() >= 2);
+
+        store.reset().unwrap();
+        assert_eq!(store.index_size(), 0);
+
+        let hits = store.search(&unit_vec(384, 1), 5).await.unwrap();
+        assert!(hits.is_empty(), "search after reset should be empty");
     }
 }

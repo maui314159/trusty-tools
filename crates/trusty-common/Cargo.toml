@@ -83,11 +83,15 @@ quote = { version = "1.0", optional = true }
 genco = { version = "0.19", optional = true }
 
 # Optional: enabled by the `memory-core` feature (formerly the
-# `trusty-memory-core` crate). Memory Palace storage engine — usearch
-# vector index, SQLite-backed knowledge graph, fastembed embeddings,
-# git-history extraction, dream/decay analytics. Heavy deps gated behind
-# the feature so downstream crates that only want chat / mcp / symgraph
-# pay zero cost.
+# `trusty-memory-core` crate). Memory Palace storage engine — HNSW
+# vector index (pure-Rust `hnsw_rs`), redb-backed knowledge graph,
+# fastembed embeddings, git-history extraction, dream/decay analytics.
+# Heavy deps gated behind the feature so downstream crates that only
+# want chat / mcp / symgraph pay zero cost.
+#
+# `usearch` is only pulled in by the opt-in `usearch-migrate` feature
+# (issue #51) for the one-shot drain of legacy `.usearch` index files.
+# Default builds no longer link the C++ FFI dependency.
 usearch = { workspace = true, optional = true }
 hnsw_rs = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
@@ -234,7 +238,6 @@ symgraph-server = ["symgraph-parser", "axum-server"]
 # feature — all stores migrated to redb (#44, #45, #46, #56, #57). The
 # `sqlite-kg` feature still pulls them in for the legacy migration helpers.
 memory-core = [
-    "dep:usearch",
     "dep:hnsw_rs",
     "dep:git2",
     "dep:dashmap",
@@ -254,6 +257,12 @@ memory-core = [
 # feature. Pulls in the `kuzu` crate. Off by default because kuzu adds a
 # large native dependency.
 memory-core-kuzu = ["memory-core", "dep:kuzu"]
+# Issue #51: one-shot drain of legacy `.usearch` index files on palace
+# open. Pulls in the `usearch` C++ FFI crate temporarily so operators
+# upgrading from the pre-redb backend can migrate without losing data.
+# After all production palaces have been upgraded this feature (and the
+# `usearch` dep) can be removed entirely.
+usearch-migrate = ["memory-core", "dep:usearch"]
 # Legacy SQLite KG read path (the pre-#44 backend). Kept compilable so the
 # one-shot SQLite → redb migration tool can read old `kg.db` / `recall.db`
 # / `payloads.db` / `chat_sessions.db` files. Pulls in rusqlite + r2d2 +
