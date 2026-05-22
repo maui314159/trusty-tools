@@ -31,6 +31,12 @@ use crate::tools::tool_definitions_with;
 mod scopes {
     pub const MEMORY_READ: &str = "memory.read";
     pub const MEMORY_WRITE: &str = "memory.write";
+    /// Why (issue #60): `kg_bootstrap` writes triples derived from the
+    /// project filesystem, not just the palace's own data. Operators may
+    /// want to authorise it separately from generic memory.write tools
+    /// (which only mutate the palace). The dedicated `knowledge.write`
+    /// scope makes that distinction explicit.
+    pub const KNOWLEDGE_WRITE: &str = "knowledge.write";
 }
 
 /// Return the logical scopes a given memory tool requires.
@@ -55,6 +61,10 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
         "memory_remember" | "memory_note" | "memory_forget" | "palace_create"
         | "palace_compact" | "kg_assert" | "add_alias" | "remove_prompt_fact"
         | "discover_aliases" => &[MEMORY_WRITE],
+
+        // Bootstrap mutates the KG from external project files; it belongs
+        // in the dedicated knowledge.write scope (issue #60).
+        "kg_bootstrap" => &[KNOWLEDGE_WRITE],
 
         _ => &[],
     };

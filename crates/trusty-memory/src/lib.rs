@@ -21,6 +21,7 @@ use trusty_common::memory_core::store::ChatSessionStore;
 use trusty_common::memory_core::PalaceRegistry;
 use trusty_common::ChatProvider;
 
+pub mod bootstrap;
 pub mod commands;
 pub mod discovery;
 pub mod openrpc;
@@ -565,7 +566,12 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
                 Err(e) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": -32603, "message": e.to_string()}
+                    // Why: anyhow's `{:#}` alternate format walks the full
+                    // `Caused by:` chain so MCP clients see actionable
+                    // detail (e.g. "PalaceHandle::remember_with_options:
+                    // filter rejected: too short") instead of just the
+                    // outermost context label.
+                    "error": {"code": -32603, "message": format!("{e:#}")}
                 }),
             }
         }
@@ -940,7 +946,7 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
     }
 
     #[tokio::test]

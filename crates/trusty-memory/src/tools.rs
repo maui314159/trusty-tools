@@ -341,6 +341,17 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                 }
             },
             {
+                "name": "kg_bootstrap",
+                "description": "Seed the knowledge graph from well-known project files (Cargo.toml, package.json, pyproject.toml, go.mod, CLAUDE.md, .git/config). Asserts structured triples (has_language, has_version, source_repo, ...) plus temporal metadata (created_at, bootstrapped_at). Idempotent: re-running refreshes bootstrapped_at without disturbing created_at. See issue #60.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace":       {"type": "string", "description": "Palace ID (optional if server started with --palace)"},
+                        "project_path": {"type": "string", "description": "Filesystem path to scan. Omit to scan the palace's own data dir (temporal metadata only)."}
+                    }
+                }
+            },
+            {
                 "name": "memory_recall_all",
                 "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
                 "inputSchema": {
@@ -549,7 +560,32 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 .registry
                 .create_palace(&state.data_root, palace)
                 .context("create_palace")?;
-            Ok(json!({"palace_id": palace_name, "status": "created"}))
+            // Issue #60: auto-seed the KG with temporal metadata so every
+            // new palace has at least `created_at` + `bootstrapped_at`
+            // triples anchored to the palace name. We deliberately do NOT
+            // pass a project_path here — that requires an explicit user
+            // decision (which directory belongs to this palace?). Failures
+            // are non-fatal: the palace was already created, and the user
+            // can re-run `kg_bootstrap` manually if needed.
+            let bootstrap_summary =
+                match crate::bootstrap::bootstrap_palace(state, palace_name, None).await {
+                    Ok(r) => Some(serde_json::json!({
+                        "triples_asserted": r.triples_asserted,
+                        "project_subject": r.project_subject,
+                    })),
+                    Err(e) => {
+                        tracing::warn!(
+                            palace = %palace_name,
+                            "auto-bootstrap on palace_create failed: {e:#}",
+                        );
+                        None
+                    }
+                };
+            Ok(json!({
+                "palace_id": palace_name,
+                "status": "created",
+                "bootstrap": bootstrap_summary,
+            }))
         }
         "palace_list" => {
             let root = state.data_root.clone();
@@ -732,7 +768,16 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                     })
                 })
                 .collect();
-            Ok(json!({"subject": subject, "triples": payload}))
+            // Issue #60: surface a hint when the requested subject has no
+            // active triples so the model knows `kg_bootstrap` and
+            // `kg_assert` exist. Empty payload is the only signal we have
+            // at the per-subject query layer; that's the user-visible
+            // "nothing here" case the hint is for.
+            let mut response = json!({"subject": subject, "triples": payload});
+            if crate::bootstrap::is_kg_empty_for_subject(&triples) {
+                response["hint"] = Value::String(crate::bootstrap::KG_EMPTY_HINT.to_string());
+            }
+            Ok(response)
         }
         "memory_list" => {
             let palace = resolve_palace(state, &args, "memory_list")?;
@@ -1024,6 +1069,28 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 "palace": palace,
             }))
         }
+        "kg_bootstrap" => {
+            // Issue #60: scan well-known project files and seed the KG with
+            // structured triples + temporal metadata. The handler resolves
+            // the palace (explicit arg or daemon default) and forwards the
+            // optional `project_path` to the bootstrap helper.
+            let palace = resolve_palace(state, &args, "kg_bootstrap")?;
+            let project_path = args
+                .get("project_path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from);
+            let result =
+                crate::bootstrap::bootstrap_palace(state, &palace, project_path.as_deref())
+                    .await
+                    .context("bootstrap_palace")?;
+            // Rebuild the prompt cache: bootstrap can land hot predicates
+            // (descriptions, language tags) that affect the prompt-facts
+            // surface. Cache failures are non-fatal.
+            if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(state).await {
+                tracing::warn!("rebuild_prompt_cache after kg_bootstrap failed: {e:#}");
+            }
+            crate::bootstrap::result_to_json(&result)
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -1112,7 +1179,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -1137,6 +1204,7 @@ mod tests {
             "remove_prompt_fact",
             "get_prompt_context",
             "discover_aliases",
+            "kg_bootstrap",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -1537,6 +1605,133 @@ mod tests {
             already_known >= new_count,
             "expected already_known >= {new_count}, got {already_known}"
         );
+    }
+
+    /// Why (issue #60): `palace_create` must auto-seed temporal metadata so
+    /// every new palace has at least `created_at` + `bootstrapped_at`
+    /// triples — without auto-bootstrap, brand-new palaces had a zero-triple
+    /// KG and no signal to users that they were supposed to seed it.
+    /// Test: create a palace, then query the seeded subject (the palace id)
+    /// and confirm the temporal triples are present.
+    #[tokio::test]
+    async fn palace_create_auto_seeds_temporal_metadata() {
+        let state = test_state();
+        let created = dispatch_tool(&state, "palace_create", json!({"name": "auto"}))
+            .await
+            .expect("palace_create");
+        assert_eq!(created["palace_id"], "auto");
+        // bootstrap summary is present on success
+        let summary = &created["bootstrap"];
+        assert!(summary.is_object(), "expected bootstrap summary object");
+        assert!(summary["triples_asserted"].as_u64().unwrap_or(0) >= 2);
+
+        let queried = dispatch_tool(
+            &state,
+            "kg_query",
+            json!({"palace": "auto", "subject": "auto"}),
+        )
+        .await
+        .expect("kg_query");
+        let triples = queried["triples"].as_array().expect("triples");
+        let predicates: Vec<&str> = triples
+            .iter()
+            .filter_map(|t| t["predicate"].as_str())
+            .collect();
+        assert!(
+            predicates.contains(&"created_at"),
+            "expected created_at after palace_create; got {predicates:?}",
+        );
+        assert!(
+            predicates.contains(&"bootstrapped_at"),
+            "expected bootstrapped_at after palace_create; got {predicates:?}",
+        );
+        // Hint must NOT appear when triples are present.
+        assert!(
+            queried.get("hint").is_none(),
+            "hint should be absent when triples exist"
+        );
+    }
+
+    /// Why (issue #60): `kg_query` against a subject with no triples must
+    /// surface a `hint` field pointing the user at `kg_bootstrap` /
+    /// `kg_assert`. Without the hint, brand-new palaces returned empty
+    /// arrays with no breadcrumb back to the seeding tools.
+    #[tokio::test]
+    async fn kg_query_emits_hint_when_palace_empty() {
+        let state = test_state();
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "hinted"}))
+            .await
+            .expect("palace_create");
+        // Query a subject that auto-bootstrap did NOT seed.
+        let queried = dispatch_tool(
+            &state,
+            "kg_query",
+            json!({"palace": "hinted", "subject": "unrelated-subject"}),
+        )
+        .await
+        .expect("kg_query");
+        assert_eq!(queried["triples"].as_array().unwrap().len(), 0);
+        let hint = queried["hint"].as_str().expect("hint field present");
+        assert!(hint.contains("kg_bootstrap"));
+        assert!(hint.contains("kg_assert"));
+    }
+
+    /// Why (issue #60): `kg_bootstrap` against the live workspace root must
+    /// extract Cargo facts (language, version, rust-version) and the git
+    /// origin URL, then make them queryable through `kg_query`.
+    #[tokio::test]
+    async fn kg_bootstrap_seeds_workspace_facts() {
+        let state = test_state();
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "ws"}))
+            .await
+            .expect("palace_create");
+
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+
+        let result = dispatch_tool(
+            &state,
+            "kg_bootstrap",
+            json!({"palace": "ws", "project_path": workspace_root.to_string_lossy()}),
+        )
+        .await
+        .expect("kg_bootstrap");
+        assert!(result["triples_asserted"].as_u64().unwrap() > 0);
+        let subject = result["project_subject"]
+            .as_str()
+            .expect("project_subject")
+            .to_string();
+
+        // Verify the workspace facts are queryable.
+        let queried = dispatch_tool(
+            &state,
+            "kg_query",
+            json!({"palace": "ws", "subject": subject}),
+        )
+        .await
+        .expect("kg_query");
+        let triples = queried["triples"].as_array().expect("triples");
+        let predicates: Vec<&str> = triples
+            .iter()
+            .filter_map(|t| t["predicate"].as_str())
+            .collect();
+        // Either Rust language (single-crate manifest) or workspace member
+        // triples must appear; the trusty-tools root manifest is a workspace
+        // so we expect has_workspace_member.
+        assert!(
+            predicates.contains(&"has_workspace_member") || predicates.contains(&"has_language"),
+            "expected workspace/language fact; got {predicates:?}",
+        );
+        // source_repo from .git/config.
+        assert!(
+            predicates.contains(&"source_repo"),
+            "expected source_repo from .git/config; got {predicates:?}",
+        );
+        // Temporal metadata always.
+        assert!(predicates.contains(&"bootstrapped_at"));
     }
 
     #[tokio::test]
