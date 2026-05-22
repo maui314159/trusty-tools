@@ -1428,6 +1428,12 @@ fn format_count_suffix(n: u64, suffix: char) -> String {
 /// the search-vs-memory title label.
 /// What: draws the list inside a bordered block titled `COLLECTIONS (n)` for
 /// search or `PALACES (n)` for memory; the highlighted row uses bold blue.
+/// Each row is right-padded to the block's inner width so the selection
+/// highlight (and any future per-row styling) covers the full row instead of
+/// leaving an unstyled "gutter" on the right where the row text ends short of
+/// the border.
+/// Test: `render_health_smoke` exercises the layout; row formatting is covered
+/// by `collections_lines_format_each_row` and friends.
 fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
     let rows = screen.focused_collections();
     let label = match screen.focus {
@@ -1436,20 +1442,34 @@ fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &H
     };
     let title = format!(" {label} ({}) ", rows.len());
     let lines = collections_lines(screen);
+    // Inner content width = area width minus the two border columns. Saturating
+    // sub so a degenerate 0/1-wide area cannot underflow.
+    let inner_width = area.width.saturating_sub(2) as usize;
     let body: Vec<Line> = lines
         .into_iter()
         .enumerate()
         .map(|(i, text)| {
+            // Right-pad with spaces so the line spans the full inner width.
+            // Truncate using char count to avoid splitting at byte boundaries
+            // in the middle of a multi-byte glyph (e.g. ✓ / ✗).
+            let char_count = text.chars().count();
+            let padded = if char_count >= inner_width {
+                text.chars().take(inner_width).collect::<String>()
+            } else {
+                let mut s = text;
+                s.extend(std::iter::repeat(' ').take(inner_width - char_count));
+                s
+            };
             if i == screen.selected_collection && !rows.is_empty() {
                 Line::from(Span::styled(
-                    text,
+                    padded,
                     Style::default()
                         .fg(Color::White)
                         .bg(Color::Blue)
                         .add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(text)
+                Line::from(padded)
             }
         })
         .collect();
