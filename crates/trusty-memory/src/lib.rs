@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::{broadcast, OnceCell};
 use tracing::info;
 use trusty_common::mcp::{error_codes, initialize_response, Request, Response};
@@ -23,6 +23,7 @@ use trusty_common::ChatProvider;
 
 pub mod commands;
 pub mod openrpc;
+pub mod prompt_facts;
 pub mod service;
 pub mod tools;
 pub mod web;
@@ -188,6 +189,21 @@ pub struct AppState {
     /// (`None` from `get()`) on the stdio path where no listener exists.
     /// Test: `health_endpoint_reports_bound_addr` (added below).
     pub bound_addr: Arc<OnceLock<SocketAddr>>,
+    /// Cached Markdown block returned by the MCP `prompts/get
+    /// project_context` call (issue #42).
+    ///
+    /// Why: MCP hosts (Claude Code) read `prompts/list` + `prompts/get` once
+    /// at session init, so the cost of formatting hot-predicate triples
+    /// should be paid on *writes*, not on every connection. The cache is
+    /// rebuilt by `prompt_facts::rebuild_prompt_cache` after any write that
+    /// touches a hot predicate (`kg_assert`, `add_alias`,
+    /// `remove_prompt_fact`).
+    /// What: An `Arc<RwLock<String>>` so the hot read path (one short clone
+    /// per `prompts/get`) takes a read lock and never blocks concurrent
+    /// readers; rebuilds take a brief write lock for the assignment only.
+    /// Empty string ↔ "no context stored yet" (the handler renders a hint).
+    /// Test: `prompts_get_returns_cached_context_or_hint`.
+    pub prompt_context_cache: Arc<RwLock<String>>,
 }
 
 impl AppState {
@@ -223,6 +239,7 @@ impl AppState {
                 trusty_common::sys_metrics::SysMetrics::new(),
             )),
             bound_addr: Arc::new(OnceLock::new()),
+            prompt_context_cache: Arc::new(RwLock::new(String::new())),
         }
     }
 
@@ -447,12 +464,45 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
                 .default_palace
                 .as_ref()
                 .map(|dp| json!({ "default_palace": dp }));
-            let result = initialize_response("trusty-memory", &state.version, extra);
+            let mut result = initialize_response("trusty-memory", &state.version, extra);
+            // Advertise the `prompts` capability so MCP hosts will issue
+            // `prompts/list` + `prompts/get` at session init (issue #42).
+            if let Some(caps) = result
+                .get_mut("capabilities")
+                .and_then(|c| c.as_object_mut())
+            {
+                caps.insert("prompts".to_string(), json!({}));
+            }
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": result,
             })
+        }
+        "prompts/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": prompt_facts::prompts_list_response(),
+        }),
+        "prompts/get" => {
+            let params = msg.get("params").cloned().unwrap_or_default();
+            let name = params
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            match prompt_facts::prompts_get_response(state, &name) {
+                Ok(result) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }),
+                Err(e) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": e.to_string()},
+                }),
+            }
         }
         // Notifications must NOT receive a response.
         "notifications/initialized" | "notifications/cancelled" => Value::Null,
@@ -867,7 +917,7 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 15);
     }
 
     #[tokio::test]
@@ -1214,6 +1264,88 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert!(addr.port() > 0, "port must be non-zero after bind");
+    }
+
+    /// Why: Issue #42 — MCP hosts (Claude Code) read `prompts/list` once on
+    /// connect. The trusty-memory server must advertise the single
+    /// `project_context` prompt so hosts know to fetch it.
+    #[tokio::test]
+    async fn prompts_list_returns_project_context() {
+        let state = test_state();
+        let req = json!({"jsonrpc": "2.0", "id": 10, "method": "prompts/list"});
+        let resp = handle_message(&state, req).await;
+        let prompts = resp["result"]["prompts"].as_array().expect("prompts array");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["name"], "project_context");
+    }
+
+    /// Why: Issue #42 — `prompts/get project_context` must return the cached
+    /// markdown when populated, and a helpful fallback hint when the cache is
+    /// empty. The initialize handshake must also advertise the `prompts`
+    /// capability so hosts know to dispatch the call at all.
+    #[tokio::test]
+    async fn prompts_get_returns_cached_context_or_hint() {
+        let state = test_state();
+
+        // initialize advertises the prompts capability.
+        let init = handle_message(
+            &state,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        )
+        .await;
+        assert!(
+            init["result"]["capabilities"]["prompts"].is_object(),
+            "initialize must advertise the prompts capability; got {init}"
+        );
+
+        // Empty cache -> hint message.
+        let resp = handle_message(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompts/get",
+                "params": {"name": "project_context"},
+            }),
+        )
+        .await;
+        let text = resp["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompts/get text");
+        assert!(text.contains("No project context stored yet"));
+
+        // Populate the cache directly and re-fetch.
+        {
+            let mut guard = state.prompt_context_cache.write().expect("write lock");
+            *guard = "## Project Context\n\n### Aliases\n- tga → trusty-git-analytics\n".into();
+        }
+        let resp = handle_message(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "prompts/get",
+                "params": {"name": "project_context"},
+            }),
+        )
+        .await;
+        let text = resp["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompts/get text after populate");
+        assert!(text.contains("tga → trusty-git-analytics"));
+
+        // Unknown prompt name returns an error.
+        let resp = handle_message(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "prompts/get",
+                "params": {"name": "nope"},
+            }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602);
     }
 
     /// Why: `AppState::new` must initialise `bound_addr` to an empty

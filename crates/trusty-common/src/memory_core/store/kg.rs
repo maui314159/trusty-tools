@@ -181,6 +181,41 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Close the active triple (set `valid_to = now()`) for a given
+    /// (subject, predicate) pair without inserting a replacement.
+    ///
+    /// Why: `assert` always closes-and-replaces, so it cannot express "this
+    /// fact is no longer true and has no successor". The prompt-facts surface
+    /// (`remove_prompt_fact`) needs exactly that — retract an alias/fact so it
+    /// stops appearing in the session-init prompt without leaving a tombstone.
+    /// What: Runs `UPDATE triples SET valid_to = now() WHERE subject = ?1 AND
+    /// predicate = ?2 AND valid_to IS NULL`. Returns the number of rows closed
+    /// (0 when nothing was active, typically 1 when a fact was retracted).
+    /// Test: `retract_closes_active_interval` (added below) asserts a triple,
+    /// retracts it, and confirms `query_active` returns empty and `valid_to`
+    /// is populated.
+    pub async fn retract(&self, subject: &str, predicate: &str) -> Result<usize> {
+        let pool = self.pool.clone();
+        let subject = subject.to_string();
+        let predicate = predicate.to_string();
+        let now = Utc::now().to_rfc3339();
+        let closed = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = pool.get().context("failed to get sqlite connection")?;
+            let n = conn
+                .execute(
+                    "UPDATE triples
+                        SET valid_to = ?1
+                        WHERE subject = ?2 AND predicate = ?3 AND valid_to IS NULL",
+                    rusqlite::params![now, subject, predicate],
+                )
+                .context("failed to close active interval for retract")?;
+            Ok(n)
+        })
+        .await
+        .context("retract spawn_blocking join error")??;
+        Ok(closed)
+    }
+
     /// Return all currently active triples (`valid_to IS NULL`) for a subject.
     ///
     /// Why: Most queries want "what is true *now*" — filtering on
@@ -628,6 +663,39 @@ mod tests {
         let active = kg.query_active("alice").await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].object, "Acme Corp");
+    }
+
+    /// Why: `retract` is the prompt-facts surface's way to remove an alias
+    /// without inserting a replacement. The active interval must be closed
+    /// (`valid_to` set, `query_active` empty afterwards) and the returned
+    /// count must reflect rows touched (1 on success, 0 when there was no
+    /// active row).
+    #[tokio::test]
+    async fn retract_closes_active_interval() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        let t = Triple {
+            subject: "tga".to_string(),
+            predicate: "is_alias_for".to_string(),
+            object: "trusty-git-analytics".to_string(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        };
+        kg.assert(t).await.unwrap();
+        assert_eq!(kg.query_active("tga").await.unwrap().len(), 1);
+
+        let closed = kg.retract("tga", "is_alias_for").await.unwrap();
+        assert_eq!(closed, 1, "should close exactly one active row");
+        assert!(
+            kg.query_active("tga").await.unwrap().is_empty(),
+            "retract must drop the active triple"
+        );
+
+        // Second retract is a no-op (no active row).
+        let again = kg.retract("tga", "is_alias_for").await.unwrap();
+        assert_eq!(again, 0);
     }
 
     #[tokio::test]

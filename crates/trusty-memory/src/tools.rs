@@ -237,6 +237,36 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                 }
             },
             {
+                "name": "add_alias",
+                "description": "Add a short→full alias (e.g. tga → trusty-git-analytics) to the prompt-facts surface. Asserts the alias as a hot KG triple and refreshes the session-init prompt cache.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "short": {"type": "string", "description": "Short name / alias (subject)"},
+                        "full":  {"type": "string", "description": "Full / canonical name (object)"},
+                        "extra": {"type": "string", "description": "Optional extra context appended to the full name"}
+                    },
+                    "required": ["short", "full"],
+                }
+            },
+            {
+                "name": "list_prompt_facts",
+                "description": "List every active prompt-fact triple (aliases, conventions, facts, shorthands) across all palaces.",
+                "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "remove_prompt_fact",
+                "description": "Retract the active triple for a (subject, predicate) pair from the prompt-facts surface. Closes the interval without inserting a replacement.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "subject":   {"type": "string"},
+                        "predicate": {"type": "string", "description": "One of is_alias_for, has_convention, is_fact, is_shorthand_for"}
+                    },
+                    "required": ["subject", "predicate"],
+                }
+            },
+            {
                 "name": "memory_recall_all",
                 "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
                 "inputSchema": {
@@ -449,8 +479,112 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 confidence,
                 provenance,
             };
+            let is_hot = crate::prompt_facts::is_hot_predicate(&triple.predicate);
             handle.kg.assert(triple).await.context("kg.assert")?;
+            // Rebuild the prompt cache if this assertion touched a hot
+            // predicate; otherwise the cache stays valid and we skip the
+            // gather/format pass. Failures are logged but non-fatal — the
+            // write succeeded, the cache is only a denormalisation.
+            if is_hot {
+                if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(state).await {
+                    tracing::warn!("rebuild_prompt_cache after kg_assert failed: {e:#}");
+                }
+            }
             Ok(json!({"status": "asserted"}))
+        }
+        "add_alias" => {
+            let short = args
+                .get("short")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("add_alias: missing 'short'"))?
+                .to_string();
+            let full = args
+                .get("full")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("add_alias: missing 'full'"))?
+                .to_string();
+            let extra = args
+                .get("extra")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // `add_alias` is bound to the default palace when configured;
+            // otherwise it lands in whatever palace the caller names. This
+            // mirrors `resolve_palace`'s rule but without the helpful error
+            // — aliases are typically project-scoped via `--palace`.
+            let palace = resolve_palace(state, &args, "add_alias")?;
+            let handle = open_palace_handle(state, &palace)?;
+            // Compose the object: "<full>" or "<full> (<extra>)".
+            let object = match extra.as_deref() {
+                Some(e) if !e.is_empty() => format!("{full} ({e})"),
+                _ => full.clone(),
+            };
+            let triple = Triple {
+                subject: short.clone(),
+                predicate: "is_alias_for".to_string(),
+                object,
+                valid_from: chrono::Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: Some("add_alias".to_string()),
+            };
+            handle
+                .kg
+                .assert(triple)
+                .await
+                .context("kg.assert (alias)")?;
+            if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(state).await {
+                tracing::warn!("rebuild_prompt_cache after add_alias failed: {e:#}");
+            }
+            Ok(json!({"asserted": true, "short": short, "full": full}))
+        }
+        "list_prompt_facts" => {
+            let triples = crate::prompt_facts::gather_hot_triples(state).await?;
+            let payload: Vec<Value> = triples
+                .into_iter()
+                .map(|(subject, predicate, object)| {
+                    json!({"subject": subject, "predicate": predicate, "object": object})
+                })
+                .collect();
+            Ok(json!({"facts": payload}))
+        }
+        "remove_prompt_fact" => {
+            let subject = args
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("remove_prompt_fact: missing 'subject'"))?
+                .to_string();
+            let predicate = args
+                .get("predicate")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("remove_prompt_fact: missing 'predicate'"))?
+                .to_string();
+
+            // The prompt-fact surface spans every palace, so try retracting
+            // across all of them and report `true` if any palace closed an
+            // active interval. This matches `list_prompt_facts`' scope so
+            // round-tripping list→remove never silently no-ops because the
+            // caller didn't name the right palace.
+            let mut closed_total: usize = 0;
+            for palace_id in state.registry.list() {
+                if let Some(handle) = state.registry.get(&palace_id) {
+                    match handle.kg.retract(&subject, &predicate).await {
+                        Ok(n) => closed_total += n,
+                        Err(e) => tracing::warn!(
+                            palace = %palace_id.as_str(),
+                            "retract failed: {e:#}",
+                        ),
+                    }
+                }
+            }
+            if closed_total > 0 {
+                if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(state).await {
+                    tracing::warn!("rebuild_prompt_cache after remove_prompt_fact failed: {e:#}");
+                }
+                Ok(json!({"removed": true, "closed": closed_total}))
+            } else {
+                Ok(json!({"removed": false, "reason": "not found"}))
+            }
         }
         "kg_query" => {
             let palace = resolve_palace(state, &args, "kg_query")?;
@@ -693,7 +827,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -711,6 +845,9 @@ mod tests {
             "kg_assert",
             "kg_query",
             "memory_recall_all",
+            "add_alias",
+            "list_prompt_facts",
+            "remove_prompt_fact",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -807,6 +944,106 @@ mod tests {
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0]["object"], "Acme");
         assert_eq!(triples[0]["predicate"], "works_at");
+    }
+
+    /// Why: Issue #42 — `add_alias` must (a) assert the triple in the KG,
+    /// (b) cause `list_prompt_facts` to surface it, (c) refresh the prompt
+    /// cache so `prompts/get` returns it, and (d) be reversible via
+    /// `remove_prompt_fact`.
+    #[tokio::test]
+    async fn add_alias_round_trip_through_prompt_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let state = AppState::new(root).with_default_palace(Some("ctx".to_string()));
+
+        // Pre-create the default palace.
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "ctx"}))
+            .await
+            .expect("palace_create");
+
+        // (a) add_alias asserts the triple.
+        let added = dispatch_tool(
+            &state,
+            "add_alias",
+            json!({"short": "tga", "full": "trusty-git-analytics"}),
+        )
+        .await
+        .expect("add_alias");
+        assert_eq!(added["asserted"], true);
+        assert_eq!(added["short"], "tga");
+
+        // (b) list_prompt_facts surfaces it.
+        let listed = dispatch_tool(&state, "list_prompt_facts", json!({}))
+            .await
+            .expect("list_prompt_facts");
+        let facts = listed["facts"].as_array().expect("facts array");
+        assert!(
+            facts.iter().any(|f| f["subject"] == "tga"
+                && f["predicate"] == "is_alias_for"
+                && f["object"] == "trusty-git-analytics"),
+            "expected tga alias in facts; got {facts:?}"
+        );
+
+        // (c) prompt cache has been refreshed with the formatted block.
+        {
+            let guard = state.prompt_context_cache.read().expect("read lock");
+            assert!(
+                guard.contains("tga → trusty-git-analytics"),
+                "prompt cache should contain alias; got: {}",
+                *guard
+            );
+        }
+
+        // add_alias with `extra` appends parenthetical context.
+        let _ = dispatch_tool(
+            &state,
+            "add_alias",
+            json!({"short": "tm", "full": "trusty-memory", "extra": "the MCP frontend"}),
+        )
+        .await
+        .expect("add_alias with extra");
+        {
+            let guard = state.prompt_context_cache.read().expect("read lock");
+            assert!(
+                guard.contains("tm → trusty-memory (the MCP frontend)"),
+                "alias with extra not formatted; got: {}",
+                *guard
+            );
+        }
+
+        // (d) remove_prompt_fact retracts and refreshes.
+        let removed = dispatch_tool(
+            &state,
+            "remove_prompt_fact",
+            json!({"subject": "tga", "predicate": "is_alias_for"}),
+        )
+        .await
+        .expect("remove_prompt_fact");
+        assert_eq!(removed["removed"], true);
+        {
+            let guard = state.prompt_context_cache.read().expect("read lock");
+            assert!(
+                !guard.contains("tga → trusty-git-analytics"),
+                "retracted alias still in cache: {}",
+                *guard
+            );
+            assert!(
+                guard.contains("tm → trusty-memory"),
+                "non-retracted alias missing from cache: {}",
+                *guard
+            );
+        }
+
+        // Removing a non-existent fact reports not found.
+        let missing = dispatch_tool(
+            &state,
+            "remove_prompt_fact",
+            json!({"subject": "nope", "predicate": "is_alias_for"}),
+        )
+        .await
+        .expect("remove_prompt_fact missing");
+        assert_eq!(missing["removed"], false);
     }
 
     #[tokio::test]

@@ -48,12 +48,11 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
     let s: &[&str] = match name {
         // Read-only / query
         "memory_recall" | "memory_recall_deep" | "memory_recall_all" | "memory_list"
-        | "palace_list" | "palace_info" | "kg_query" => &[MEMORY_READ],
+        | "palace_list" | "palace_info" | "kg_query" | "list_prompt_facts" => &[MEMORY_READ],
 
         // Mutating
-        "memory_remember" | "memory_forget" | "palace_create" | "palace_compact" | "kg_assert" => {
-            &[MEMORY_WRITE]
-        }
+        "memory_remember" | "memory_forget" | "palace_create" | "palace_compact" | "kg_assert"
+        | "add_alias" | "remove_prompt_fact" => &[MEMORY_WRITE],
 
         _ => &[],
     };
