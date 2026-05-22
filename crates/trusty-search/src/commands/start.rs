@@ -101,6 +101,31 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
 /// accepted. Force a failure (e.g. delete the model cache while offline)
 /// and the daemon must exit non-zero, not start in BM25 mode.
 async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
+    // Issue #41 phase 4: when the candle feature is compiled in AND the
+    // operator opts in via `TRUSTY_EMBEDDER=candle`, build a `CandleEmbedder`
+    // instead of the ONNX/fastembed path. This bypasses the CoreML jetsam
+    // risk on Apple Silicon while keeping the embedding contract identical
+    // (384-dim L2-normalised f32).
+    #[cfg(feature = "candle")]
+    {
+        if std::env::var("TRUSTY_EMBEDDER")
+            .ok()
+            .as_deref()
+            == Some("candle")
+        {
+            let candle = tokio::task::spawn_blocking(
+                crate::service::candle_embedder::CandleEmbedder::new,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("candle embedder init task panicked: {e}"))??;
+            let dim = candle.dimension();
+            tracing::info!(
+                "embedder initialized: model=all-MiniLM-L6-v2 dim={dim} backend=candle"
+            );
+            return Ok(std::sync::Arc::new(candle));
+        }
+    }
+
     let embedder = crate::core::FastEmbedder::new().await.map_err(|e| {
         tracing::error!("FastEmbedder init failed: {e:#}");
         anyhow::anyhow!("FastEmbedder init failed: {e}")
