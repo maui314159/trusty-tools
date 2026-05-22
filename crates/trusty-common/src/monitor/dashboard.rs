@@ -70,6 +70,41 @@ pub struct IndexRow {
     pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[cfg(feature = "monitor-tui")]
+impl crate::monitor::tui_common::ListItem for IndexRow {
+    /// Why: navigation maps cursor ↔ id via this stable handle.
+    /// What: returns `&self.id`.
+    /// Test: covered through `tui_common::tests::test_visible_ids_and_navigation`.
+    fn id(&self) -> &str {
+        &self.id
+    }
+    /// Why: the search TUI filters and sorts by index id (its display name).
+    /// What: returns `&self.id` (index rows have no separate name field).
+    /// Test: covered through the search_tui filter / sort tests.
+    fn name(&self) -> &str {
+        &self.id
+    }
+    /// Why: grouping bucket keyed off the inferred project basename.
+    /// What: delegates to [`IndexRow::project`].
+    /// Test: covered through the search_tui grouping tests.
+    fn project(&self) -> &str {
+        self.project()
+    }
+    /// Why: the Activity sort key reads this timestamp; the trait surface
+    /// keeps memory and search interchangeable.
+    /// What: returns `self.last_indexed`.
+    /// Test: covered through `test_apply_sort_activity` in search_tui.
+    fn activity_ts(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_indexed
+    }
+    /// Why: the Count sort key reads this; for indexes that means chunks.
+    /// What: returns `self.chunk_count`.
+    /// Test: covered through `test_apply_sort_chunks` in search_tui.
+    fn count(&self) -> u64 {
+        self.chunk_count
+    }
+}
+
 impl IndexRow {
     /// Infer the project this index belongs to.
     ///
@@ -136,6 +171,40 @@ pub struct PalaceRow {
     pub last_write_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The palace description; used to infer the originating project.
     pub description: Option<String>,
+}
+
+#[cfg(feature = "monitor-tui")]
+impl crate::monitor::tui_common::ListItem for PalaceRow {
+    /// Why: navigation maps cursor ↔ id via this stable handle.
+    /// What: returns `&self.id`.
+    /// Test: covered through `tui_common::tests::test_visible_ids_and_navigation`.
+    fn id(&self) -> &str {
+        &self.id
+    }
+    /// Why: filter / sort by display name; the memory TUI prefers `name`.
+    /// What: returns `&self.name`.
+    /// Test: covered through the memory_tui filter / sort tests.
+    fn name(&self) -> &str {
+        &self.name
+    }
+    /// Why: grouping bucket keyed off the inferred project basename.
+    /// What: delegates to [`PalaceRow::project`].
+    /// Test: covered through the memory_tui grouping tests.
+    fn project(&self) -> &str {
+        self.project()
+    }
+    /// Why: the Activity sort key reads this timestamp.
+    /// What: returns `self.last_write_at`.
+    /// Test: covered through `test_apply_sort_activity` in memory_tui.
+    fn activity_ts(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_write_at
+    }
+    /// Why: the Count sort key reads this; for palaces that means vectors.
+    /// What: returns `self.vector_count`.
+    /// Test: covered through `test_apply_sort_vectors` in memory_tui.
+    fn count(&self) -> u64 {
+        self.vector_count
+    }
 }
 
 impl PalaceRow {

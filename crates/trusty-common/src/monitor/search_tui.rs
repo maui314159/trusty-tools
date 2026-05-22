@@ -20,23 +20,21 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc;
 
 use crate::monitor::dashboard::{IndexRow, format_count};
 use crate::monitor::search_client::{ReindexEvent, SearchClient, resolve_search_url};
+use crate::monitor::tui_common::{
+    self, ListFocus, ThreeWaySortKey, enter_tui, leave_tui, left_panel_width, panel_block, truncate,
+};
 use crate::monitor::utils::{ActivityLog, DaemonStatus, fmt_uptime};
 
 /// Data-refresh interval: how often the daemon is polled.
@@ -48,60 +46,38 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 /// Number of results requested per search query.
 const SEARCH_TOP_K: usize = 5;
 
-/// Maximum width (in columns) of the left INDEXES panel.
-const LEFT_PANEL_MAX: u16 = 28;
-
 /// Crate version, surfaced in the title bar.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line key hint shown along the bottom of the UI.
 pub const KEY_HINT: &str = "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
 
-/// Sort order applied to the index list.
+/// Domain-specific labels for the search TUI's three sort orders.
 ///
-/// Why: operators want to flip between most-recently-active, alphabetical,
-/// and chunk-count-heavy views without leaving the TUI; a small enum keeps the
-/// renderer and the key handler agreed on the available options.
-/// What: `Activity` (default — last_indexed desc, nulls last; chunk_count desc
-/// as tiebreak), `Name` (alphabetical asc by id), `Chunks` (chunk_count desc).
-/// Test: `test_index_sort_key_cycle`, `test_apply_sort_*`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IndexSortKey {
-    /// Sort by last_indexed desc; chunk_count desc as tiebreak; nulls last.
-    #[default]
-    Activity,
-    /// Sort alphabetically by index id (ascending).
-    Name,
-    /// Sort by chunk_count desc.
-    Chunks,
-}
+/// Why: the renderer surfaces the current sort key in the panel title; this
+/// array maps the shared [`ThreeWaySortKey`] variants to search-domain text
+/// (the third variant reads as "Chunks" here, "Vectors" in memory).
+/// What: `["Activity", "Name", "Chunks"]`.
+/// Test: covered indirectly by `test_index_sort_key_cycle` via [`sort_label`].
+const SORT_LABELS: &[&str; 3] = &["Activity", "Name", "Chunks"];
 
-impl IndexSortKey {
-    /// Advance to the next sort key in the cycle.
-    ///
-    /// Why: `[s]` cycles through the three sort orders.
-    /// What: `Activity → Name → Chunks → Activity`.
-    /// Test: `test_index_sort_key_cycle`.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Activity => Self::Name,
-            Self::Name => Self::Chunks,
-            Self::Chunks => Self::Activity,
-        }
-    }
+/// Sort key cycled by `[s]` in the index list.
+///
+/// Why: kept as a re-export alias so external callers and tests that reference
+/// `IndexSortKey` continue to compile after the type was consolidated into
+/// the shared [`ThreeWaySortKey`].
+/// What: type alias for [`ThreeWaySortKey`].
+/// Test: `test_index_sort_key_cycle`.
+pub type IndexSortKey = ThreeWaySortKey;
 
-    /// One-word label for the status bar / panel title.
-    ///
-    /// Why: the panel header shows the current sort key.
-    /// What: returns `"Activity"`, `"Name"`, or `"Chunks"`.
-    /// Test: `test_index_sort_key_cycle`.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Activity => "Activity",
-            Self::Name => "Name",
-            Self::Chunks => "Chunks",
-        }
-    }
+/// Search-domain label for the current sort key.
+///
+/// Why: the renderer needs `"Activity"` / `"Name"` / `"Chunks"`; the shared
+/// enum is domain-agnostic so we map it through [`SORT_LABELS`].
+/// What: delegates to [`ThreeWaySortKey::label`] with the search labels.
+/// Test: `test_index_sort_key_cycle`.
+pub fn sort_label(key: ThreeWaySortKey) -> &'static str {
+    key.label(SORT_LABELS)
 }
 
 /// Label for the synthetic "All indexes" entry at the top of the list.
@@ -114,18 +90,12 @@ pub const ALL_LABEL: &str = "All indexes";
 
 /// Which zone of the search UI currently holds keyboard focus.
 ///
-/// Why: `[Tab]` cycles focus; the index list and the query bar consume keys
-/// differently (navigation vs. text entry).
-/// What: `List` (the default — the INDEXES panel) or `Input` (the SEARCH bar).
+/// Why: re-export alias for [`ListFocus`] so existing callers and tests that
+/// reference `SearchFocus` continue to compile after the type was consolidated
+/// into the shared module.
+/// What: type alias for [`ListFocus`].
 /// Test: `test_toggle_focus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SearchFocus {
-    /// The INDEXES list panel has focus; arrows move the selection.
-    #[default]
-    List,
-    /// The SEARCH input bar has focus; typed characters edit the query.
-    Input,
-}
+pub type SearchFocus = ListFocus;
 
 /// All mutable state the search UI renders and mutates.
 ///
@@ -166,7 +136,7 @@ pub struct SearchTuiState {
     /// Whether the inline filter bar is focused (captures typed chars).
     pub filter_active: bool,
     /// Current index-list sort order.
-    pub sort_key: IndexSortKey,
+    pub sort_key: ThreeWaySortKey,
     /// Whether the index list is grouped by inferred project.
     pub group_by_project: bool,
 }
@@ -187,11 +157,11 @@ impl SearchTuiState {
             scroll_offset: 0,
             log: ActivityLog::new(),
             input: String::new(),
-            focus: SearchFocus::List,
+            focus: ListFocus::List,
             show_help: false,
             filter: String::new(),
             filter_active: false,
-            sort_key: IndexSortKey::default(),
+            sort_key: ThreeWaySortKey::default(),
             group_by_project: false,
         }
     }
@@ -200,14 +170,10 @@ impl SearchTuiState {
     ///
     /// Why: `[Tab]` decides whether arrows navigate the list or whether typed
     /// characters edit the search query.
-    /// What: flips [`Self::focus`] between [`SearchFocus::List`] and
-    /// [`SearchFocus::Input`].
+    /// What: flips [`Self::focus`] via [`ListFocus::toggled`].
     /// Test: `test_toggle_focus`.
     pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            SearchFocus::List => SearchFocus::Input,
-            SearchFocus::Input => SearchFocus::List,
-        };
+        self.focus = self.focus.toggled();
     }
 
     /// Move the index selection up one row, saturating at the top.
@@ -372,17 +338,9 @@ pub async fn run_with_url(base_url: String) -> anyhow::Result<()> {
     let mut client = SearchClient::new(base_url.clone());
     let mut state = SearchTuiState::new(base_url);
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
+    let mut terminal = enter_tui()?;
     let result = run_loop(&mut terminal, &mut state, &mut client).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    leave_tui(&mut terminal)?;
     result
 }
 
@@ -770,16 +728,6 @@ pub fn help_text() -> String {
     .join("\n")
 }
 
-/// Compute the width of the left INDEXES panel for a given terminal width.
-///
-/// Why: the layout caps the index panel so the activity log gets the bulk of
-/// the width on wide terminals, but a narrow terminal must still leave room.
-/// What: returns `min(LEFT_PANEL_MAX, width / 3)`.
-/// Test: `test_left_panel_width`.
-pub fn left_panel_width(width: u16) -> u16 {
-    LEFT_PANEL_MAX.min(width / 3)
-}
-
 /// One rendered row of the INDEXES panel.
 ///
 /// Why: the renderer styles four row kinds differently — the "All" row is
@@ -838,155 +786,57 @@ fn index_row_indented(idx: &IndexRow, selected: bool) -> String {
 /// Apply [`SearchTuiState::filter`] and [`SearchTuiState::sort_key`] to the
 /// state's indexes, returning the visible subset in display order.
 ///
-/// Why: filtering and sorting are pure functions of the state — extracting
-/// them keeps [`index_lines`] terse and makes both behaviours unit-testable
-/// without a terminal.
-/// What: case-insensitive substring match against `id` and `project()`; then
-/// sort per `sort_key`. The returned `Vec` borrows from `state.indexes`.
-/// Test: `test_apply_filter`, `test_apply_sort_activity`,
-/// `test_apply_sort_name`, `test_apply_sort_chunks`.
-pub fn filtered_sorted_indexes(state: &SearchTuiState) -> Vec<&IndexRow> {
-    let filter_lower = state.filter.to_lowercase();
-    let mut rows: Vec<&IndexRow> = state
-        .indexes
-        .iter()
-        .filter(|i| {
-            if filter_lower.is_empty() {
-                return true;
-            }
-            i.id.to_lowercase().contains(&filter_lower)
-                || i.project().to_lowercase().contains(&filter_lower)
-        })
-        .collect();
-    match state.sort_key {
-        IndexSortKey::Activity => {
-            // last_indexed desc, None last; chunk_count desc as tiebreak.
-            rows.sort_by(|a, b| match (a.last_indexed, b.last_indexed) {
-                (Some(x), Some(y)) => y.cmp(&x).then_with(|| b.chunk_count.cmp(&a.chunk_count)),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => b.chunk_count.cmp(&a.chunk_count),
-            });
-        }
-        IndexSortKey::Name => rows.sort_by(|a, b| a.id.cmp(&b.id)),
-        IndexSortKey::Chunks => rows.sort_by(|a, b| b.chunk_count.cmp(&a.chunk_count)),
-    }
-    rows
+/// Why: delegates to the shared [`tui_common::filtered_sorted`] so memory and
+/// search apply identical filter / sort rules. Kept as a search-named wrapper
+/// for the existing tests and callers.
+/// What: thin wrapper over [`tui_common::filtered_sorted`].
+/// Test: `test_apply_filter`, `test_apply_sort_*`.
+pub fn filtered_sorted_indexes(state: &SearchTuiState) -> Vec<IndexRow> {
+    tui_common::filtered_sorted(&state.indexes, &state.filter, state.sort_key)
 }
-
-/// Sentinel id representing the synthetic "All indexes" row in the visible
-/// id list.
-///
-/// Why: arrow navigation walks the *visible* (filtered + sorted) row order
-/// rather than the original `state.indexes` ordering; the "All" row has no
-/// real index id so a sentinel string is used to occupy its slot.
-/// What: `"__all__"` — chosen to not collide with any real index id.
-/// Test: `test_visible_index_ids`, `test_navigate_visible`.
-const ALL_SENTINEL: &str = "__all__";
 
 /// Ids of the rows the user can navigate between, in visible display order.
 ///
-/// Why: when a filter, sort, or grouping is active the displayed row order no
-/// longer matches `state.indexes`; arrow keys must step through the visible
-/// order or they appear to skip rows. The leading sentinel keeps the "All
-/// indexes" row reachable.
-/// What: returns `[ALL_SENTINEL, …visible index ids…]`. Order matches
-/// [`index_lines`] exactly — flat filtered+sorted order, or grouped by project
-/// when [`SearchTuiState::group_by_project`] is set (projects are visited in
-/// the order they first appear in the sorted list). Group headers are not
-/// included (they are non-selectable).
+/// Why: thin wrapper over the shared [`tui_common::visible_ids`].
+/// What: delegates to the shared helper with the search state's fields.
 /// Test: `test_visible_index_ids`, `test_navigate_visible`.
 pub fn visible_index_ids(state: &SearchTuiState) -> Vec<String> {
-    let visible = filtered_sorted_indexes(state);
-    let mut ids = Vec::with_capacity(visible.len() + 1);
-    ids.push(ALL_SENTINEL.to_string());
-    if state.group_by_project {
-        // Walk projects in first-seen order, then each project's indexes in
-        // sorted order — mirroring `index_lines` exactly so arrow keys follow
-        // on-screen order.
-        let mut seen: Vec<String> = Vec::new();
-        for i in &visible {
-            let proj = i.project().to_string();
-            if !seen.iter().any(|s| s == &proj) {
-                seen.push(proj);
-            }
-        }
-        for project in &seen {
-            for idx in visible.iter().filter(|i| i.project() == project) {
-                ids.push(idx.id.clone());
-            }
-        }
-    } else {
-        for row in &visible {
-            ids.push(row.id.clone());
-        }
-    }
-    ids
-}
-
-/// Resolve the currently selected row's id within the visible list.
-fn current_visible_id(state: &SearchTuiState) -> String {
-    if state.selected == 0 {
-        ALL_SENTINEL.to_string()
-    } else {
-        state
-            .indexes
-            .get(state.selected - 1)
-            .map(|i| i.id.clone())
-            .unwrap_or_else(|| ALL_SENTINEL.to_string())
-    }
-}
-
-/// Set `state.selected` to point at `target_id` in the original index array.
-fn select_visible_id(state: &mut SearchTuiState, target_id: &str) {
-    if target_id == ALL_SENTINEL {
-        state.selected = 0;
-        return;
-    }
-    if let Some(pos) = state.indexes.iter().position(|i| i.id == target_id) {
-        state.selected = pos + 1;
-    }
+    tui_common::visible_ids(
+        &state.indexes,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    )
 }
 
 /// Move the cursor up one row in the visible (filtered + sorted) list.
 ///
-/// Why: `state.select_up` walks the original `state.indexes` order, so when a
-/// filter hides rows the arrow keys appear to skip or stall; this version
-/// walks the visible order instead.
-/// What: finds the current id in [`visible_index_ids`] and steps to the
-/// previous visible id, then maps that back to `state.selected`. A no-op when
-/// already at the top.
+/// Why: thin wrapper over the shared [`tui_common::navigate_up`].
+/// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_up_visible(state: &mut SearchTuiState) {
-    let ids = visible_index_ids(state);
-    let current = current_visible_id(state);
-    let Some(pos) = ids.iter().position(|id| id == &current) else {
-        state.selected = 0;
-        return;
-    };
-    if pos > 0 {
-        let new_id = ids[pos - 1].clone();
-        select_visible_id(state, &new_id);
-    }
+    state.selected = tui_common::navigate_up(
+        &state.indexes,
+        state.selected,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    );
 }
 
 /// Move the cursor down one row in the visible (filtered + sorted) list.
 ///
-/// Why: mirrors [`navigate_up_visible`] for the `↓` arrow.
-/// What: finds the current id in [`visible_index_ids`] and steps to the next
-/// visible id, then maps that back to `state.selected`. A no-op at the bottom.
+/// Why: thin wrapper over the shared [`tui_common::navigate_down`].
+/// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_down_visible(state: &mut SearchTuiState) {
-    let ids = visible_index_ids(state);
-    let current = current_visible_id(state);
-    let Some(pos) = ids.iter().position(|id| id == &current) else {
-        state.selected = 0;
-        return;
-    };
-    if pos + 1 < ids.len() {
-        let new_id = ids[pos + 1].clone();
-        select_visible_id(state, &new_id);
-    }
+    state.selected = tui_common::navigate_down(
+        &state.indexes,
+        state.selected,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    );
 }
 
 /// Row index — within the rendered `index_lines` output — that the cursor
@@ -1208,21 +1058,6 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Truncate a string to `max` characters, appending an ellipsis when cut.
-///
-/// Why: index ids can be long; the fixed-width left panel needs bounded labels.
-/// What: returns `s` unchanged when short enough, else its first `max - 1`
-/// characters plus `…`.
-/// Test: `test_truncate`.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
-}
-
 /// Build the title-bar line for the search UI.
 ///
 /// Why: the top row shows the daemon name, version, liveness badge, and uptime
@@ -1243,14 +1078,6 @@ pub fn title_line(state: &SearchTuiState) -> String {
         ),
     }
 }
-
-/// Vertical split of the right-hand pane: ACTIVITY over STATISTICS.
-///
-/// Why: the right side shows two things — a live event feed and the selected
-/// index's stats; isolating the split as a named constant keeps `render` terse
-/// and documents the 60 / 40 ratio.
-/// What: the ACTIVITY panel takes the top 60 %, STATISTICS the bottom 40 %.
-const ACTIVITY_PERCENT: u16 = 60;
 
 /// Draw the search TUI frame.
 ///
@@ -1382,7 +1209,7 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
     let mut index_state = ListState::default()
         .with_offset(state.scroll_offset)
         .with_selected(Some(visible_row));
-    let index_title = format!("INDEXES [{}]", state.sort_key.label());
+    let index_title = format!("INDEXES [{}]", sort_label(state.sort_key));
     frame.render_stateful_widget(
         List::new(index_items).block(panel_block(&index_title, list_focused)),
         list_area,
@@ -1393,8 +1220,8 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(ACTIVITY_PERCENT),
-            Constraint::Percentage(100 - ACTIVITY_PERCENT),
+            Constraint::Percentage(tui_common::ACTIVITY_PERCENT),
+            Constraint::Percentage(100 - tui_common::ACTIVITY_PERCENT),
         ])
         .split(split[1]);
 
@@ -1453,59 +1280,8 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
     );
 
     if state.show_help {
-        render_help_overlay(frame);
+        tui_common::render_help_overlay(frame, &help_text());
     }
-}
-
-/// Build a bordered block for a UI panel, highlighting it when focused.
-///
-/// Why: the focused panel must be visually distinct; both panels share this.
-/// What: returns a [`Block`] titled `name` with a thick cyan border when
-/// `focused`, a dim gray border otherwise.
-fn panel_block(name: &str, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
-            format!(" {name} "),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-}
-
-/// Render the centred help overlay listing every key binding.
-///
-/// Why: the `?` key shows a floating reference of every binding.
-/// What: clears a centred rectangle and draws [`help_text`] in a block.
-fn render_help_overlay(frame: &mut Frame) {
-    let area = frame.area();
-    let w = 60.min(area.width);
-    let h = 9.min(area.height);
-    let rect = ratatui::layout::Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w,
-        height: h,
-    };
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(help_text())
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Help — press ? or Esc to close "),
-            ),
-        rect,
-    );
 }
 
 #[cfg(test)]
@@ -1740,7 +1516,7 @@ mod tests {
     #[test]
     fn test_left_panel_width() {
         // Wide terminals cap the panel at LEFT_PANEL_MAX.
-        assert_eq!(left_panel_width(200), LEFT_PANEL_MAX);
+        assert_eq!(left_panel_width(200), tui_common::LEFT_PANEL_MAX);
         // Narrow terminals get a third of the width.
         assert_eq!(left_panel_width(60), 20);
     }
@@ -1810,11 +1586,11 @@ mod tests {
     fn test_index_sort_key_cycle() {
         assert_eq!(IndexSortKey::default(), IndexSortKey::Activity);
         assert_eq!(IndexSortKey::Activity.next(), IndexSortKey::Name);
-        assert_eq!(IndexSortKey::Name.next(), IndexSortKey::Chunks);
-        assert_eq!(IndexSortKey::Chunks.next(), IndexSortKey::Activity);
-        assert_eq!(IndexSortKey::Activity.label(), "Activity");
-        assert_eq!(IndexSortKey::Name.label(), "Name");
-        assert_eq!(IndexSortKey::Chunks.label(), "Chunks");
+        assert_eq!(IndexSortKey::Name.next(), IndexSortKey::Count);
+        assert_eq!(IndexSortKey::Count.next(), IndexSortKey::Activity);
+        assert_eq!(sort_label(IndexSortKey::Activity), "Activity");
+        assert_eq!(sort_label(IndexSortKey::Name), "Name");
+        assert_eq!(sort_label(IndexSortKey::Count), "Chunks");
     }
 
     /// State with four indexes spanning two projects, varied chunk counts,
@@ -1884,7 +1660,7 @@ mod tests {
     #[test]
     fn test_apply_sort_chunks() {
         let mut state = diverse_state();
-        state.sort_key = IndexSortKey::Chunks;
+        state.sort_key = IndexSortKey::Count;
         let rows = filtered_sorted_indexes(&state);
         assert_eq!(rows[0].id, "claude-mpm");
         assert_eq!(rows[1].id, "trusty-memory");
@@ -2014,7 +1790,7 @@ mod tests {
         let mut state = diverse_state();
         state.sort_key = IndexSortKey::Name;
         let ids = visible_index_ids(&state);
-        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids[0], tui_common::ALL_SENTINEL);
         assert_eq!(
             &ids[1..],
             &[
@@ -2027,7 +1803,7 @@ mod tests {
 
         state.filter = "trusty".into();
         let ids = visible_index_ids(&state);
-        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids[0], tui_common::ALL_SENTINEL);
         assert_eq!(ids.len(), 3, "All + 2 trusty-* indexes");
     }
 
@@ -2098,7 +1874,7 @@ mod tests {
         // With Chunks sort the displayed order is:
         //   0 All, 1 claude-mpm, 2 trusty-memory, 3 notes, 4 trusty-search
         // so notes must land on row 3.
-        state.sort_key = IndexSortKey::Chunks;
+        state.sort_key = IndexSortKey::Count;
         let pos = state
             .indexes
             .iter()

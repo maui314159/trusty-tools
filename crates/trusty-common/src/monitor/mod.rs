@@ -23,4 +23,6 @@ pub mod memory_client;
 pub mod memory_tui;
 pub mod search_client;
 pub mod search_tui;
+#[cfg(feature = "monitor-tui")]
+pub mod tui_common;
 pub mod utils;

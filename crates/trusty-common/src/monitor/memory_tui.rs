@@ -20,23 +20,21 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc;
 
 use crate::monitor::dashboard::{MemoryData, PalaceRow, format_count};
 use crate::monitor::memory_client::{MemoryClient, MemoryEvent, RecallHit, resolve_memory_url};
+use crate::monitor::tui_common::{
+    self, ListFocus, ThreeWaySortKey, enter_tui, leave_tui, left_panel_width, panel_block, truncate,
+};
 use crate::monitor::utils::{ActivityLog, DaemonStatus};
 
 /// Data-refresh interval: how often the daemon is polled.
@@ -48,60 +46,38 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 /// Number of results requested per recall query.
 const RECALL_TOP_K: usize = 5;
 
-/// Maximum width (in columns) of the left PALACES panel.
-const LEFT_PANEL_MAX: u16 = 28;
-
 /// Crate version, surfaced in the title bar.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line key hint shown along the bottom of the UI.
 pub const KEY_HINT: &str = "[Tab] focus  [d] dream  [↑↓] select  [Enter] recall  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
 
-/// Sort order applied to the palace list.
+/// Domain-specific labels for the memory TUI's three sort orders.
 ///
-/// Why: operators want to flip between most-recently-active, alphabetical, and
-/// vector-count-heavy views without leaving the TUI; a small enum keeps the
-/// renderer and the key handler agreed on the available options.
-/// What: `Activity` (default — last write desc, vectors as tiebreak), `Name`
-/// (alphabetical asc), `Vectors` (vector_count desc).
-/// Test: `test_palace_sort_key_cycle`, `test_apply_sort_*`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PalaceSortKey {
-    /// Sort by last write timestamp desc; vector_count desc as tiebreak.
-    #[default]
-    Activity,
-    /// Sort alphabetically by palace name (ascending).
-    Name,
-    /// Sort by vector_count desc.
-    Vectors,
-}
+/// Why: the renderer surfaces the current sort key in the panel title; this
+/// array maps the shared [`ThreeWaySortKey`] variants to memory-domain text
+/// (the third variant reads as "Vectors" here, "Chunks" in search).
+/// What: `["Activity", "Name", "Vectors"]`.
+/// Test: covered indirectly by `test_palace_sort_key_cycle` via [`sort_label`].
+const SORT_LABELS: &[&str; 3] = &["Activity", "Name", "Vectors"];
 
-impl PalaceSortKey {
-    /// Advance to the next sort key in the cycle.
-    ///
-    /// Why: `[s]` cycles through the three sort orders.
-    /// What: `Activity → Name → Vectors → Activity`.
-    /// Test: `test_palace_sort_key_cycle`.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Activity => Self::Name,
-            Self::Name => Self::Vectors,
-            Self::Vectors => Self::Activity,
-        }
-    }
+/// Sort key cycled by `[s]` in the palace list.
+///
+/// Why: kept as a re-export alias so external callers and tests that reference
+/// `PalaceSortKey` continue to compile after the type was consolidated into
+/// the shared [`ThreeWaySortKey`].
+/// What: type alias for [`ThreeWaySortKey`].
+/// Test: `test_palace_sort_key_cycle`.
+pub type PalaceSortKey = ThreeWaySortKey;
 
-    /// One-word label for the status bar / panel title.
-    ///
-    /// Why: the panel header shows the current sort key.
-    /// What: returns `"Activity"`, `"Name"`, or `"Vectors"`.
-    /// Test: `test_palace_sort_key_cycle`.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Activity => "Activity",
-            Self::Name => "Name",
-            Self::Vectors => "Vectors",
-        }
-    }
+/// Memory-domain label for the current sort key.
+///
+/// Why: the renderer needs `"Activity"` / `"Name"` / `"Vectors"`; the shared
+/// enum is domain-agnostic so we map it through [`SORT_LABELS`].
+/// What: delegates to [`ThreeWaySortKey::label`] with the memory labels.
+/// Test: `test_palace_sort_key_cycle`.
+pub fn sort_label(key: ThreeWaySortKey) -> &'static str {
+    key.label(SORT_LABELS)
 }
 
 /// Label for the synthetic "All palaces" entry at the top of the list.
@@ -114,18 +90,12 @@ pub const ALL_LABEL: &str = "All palaces";
 
 /// Which zone of the memory UI currently holds keyboard focus.
 ///
-/// Why: `[Tab]` cycles focus; the palace list and the recall bar consume keys
-/// differently (navigation vs. text entry).
-/// What: `List` (the default — the PALACES panel) or `Input` (the RECALL bar).
+/// Why: re-export alias for [`ListFocus`] so existing callers and tests that
+/// reference `MemoryFocus` continue to compile after the type was consolidated
+/// into the shared module.
+/// What: type alias for [`ListFocus`].
 /// Test: `test_toggle_focus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MemoryFocus {
-    /// The PALACES list panel has focus; arrows move the selection.
-    #[default]
-    List,
-    /// The RECALL input bar has focus; typed characters edit the query.
-    Input,
-}
+pub type MemoryFocus = ListFocus;
 
 /// All mutable state the memory UI renders and mutates.
 ///
@@ -161,7 +131,7 @@ pub struct MemoryTuiState {
     /// The in-progress recall query buffer.
     pub input: String,
     /// Which zone currently holds keyboard focus.
-    pub focus: MemoryFocus,
+    pub focus: ListFocus,
     /// Whether the help overlay is visible (toggled with `?`).
     pub show_help: bool,
     /// Case-insensitive filter applied to palace name / project; empty disables.
@@ -169,7 +139,7 @@ pub struct MemoryTuiState {
     /// Whether the inline filter bar is focused (captures typed chars).
     pub filter_active: bool,
     /// Current palace-list sort order.
-    pub sort_key: PalaceSortKey,
+    pub sort_key: ThreeWaySortKey,
     /// Whether the palace list is grouped by inferred project.
     pub group_by_project: bool,
 }
@@ -191,11 +161,11 @@ impl MemoryTuiState {
             scroll_offset: 0,
             log: ActivityLog::new(),
             input: String::new(),
-            focus: MemoryFocus::List,
+            focus: ListFocus::List,
             show_help: false,
             filter: String::new(),
             filter_active: false,
-            sort_key: PalaceSortKey::default(),
+            sort_key: ThreeWaySortKey::default(),
             group_by_project: false,
         }
     }
@@ -204,14 +174,10 @@ impl MemoryTuiState {
     ///
     /// Why: `[Tab]` decides whether arrows navigate the list or whether typed
     /// characters edit the recall query.
-    /// What: flips [`Self::focus`] between [`MemoryFocus::List`] and
-    /// [`MemoryFocus::Input`].
+    /// What: flips [`Self::focus`] via [`ListFocus::toggled`].
     /// Test: `test_toggle_focus`.
     pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            MemoryFocus::List => MemoryFocus::Input,
-            MemoryFocus::Input => MemoryFocus::List,
-        };
+        self.focus = self.focus.toggled();
     }
 
     /// Move the palace selection up one row, saturating at the top.
@@ -376,17 +342,9 @@ pub async fn run_with_url(base_url: String) -> anyhow::Result<()> {
     let mut client = MemoryClient::new(base_url.clone());
     let mut state = MemoryTuiState::new(base_url);
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
+    let mut terminal = enter_tui()?;
     let result = run_loop(&mut terminal, &mut state, &mut client).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    leave_tui(&mut terminal)?;
     result
 }
 
@@ -682,16 +640,6 @@ pub fn help_text() -> String {
     .join("\n")
 }
 
-/// Compute the width of the left PALACES panel for a given terminal width.
-///
-/// Why: the layout caps the palace panel so the activity log gets the bulk of
-/// the width on wide terminals.
-/// What: returns `min(LEFT_PANEL_MAX, width / 3)`.
-/// Test: `test_left_panel_width`.
-pub fn left_panel_width(width: u16) -> u16 {
-    LEFT_PANEL_MAX.min(width / 3)
-}
-
 /// Format one palace as a fixed-width table row.
 ///
 /// Why: the PALACES panel lists every palace with its vector count in aligned
@@ -757,174 +705,60 @@ fn palace_row_indented(palace: &PalaceRow, selected: bool) -> String {
     )
 }
 
-/// Apply [`MemoryTuiState::filter`] and [`MemoryTuiState::sort_key`] to a slice
-/// of palaces, returning the visible subset in display order.
+/// Apply [`MemoryTuiState::filter`] and [`MemoryTuiState::sort_key`] to the
+/// state's palaces, returning the visible subset in display order.
 ///
-/// Why: filtering and sorting are pure functions of the state — extracting
-/// them keeps [`palace_lines`] terse and makes both behaviours unit-testable
-/// without a terminal.
-/// What: case-insensitive substring match against `name` and `project()`; then
-/// sort per `sort_key`. The original palace ordering is preserved when the
-/// sort comparator returns `Equal`.
-/// Test: `test_apply_filter`, `test_apply_sort_activity`,
-/// `test_apply_sort_name`, `test_apply_sort_vectors`.
+/// Why: delegates to the shared [`tui_common::filtered_sorted`] so memory and
+/// search apply identical filter / sort rules. Kept as a memory-named wrapper
+/// for the existing tests and callers.
+/// What: thin wrapper over [`tui_common::filtered_sorted`].
+/// Test: `test_apply_filter`, `test_apply_sort_*`.
 pub fn filtered_sorted_palaces(state: &MemoryTuiState) -> Vec<PalaceRow> {
-    let filter_lower = state.filter.to_lowercase();
-    let mut rows: Vec<PalaceRow> = state
-        .palaces
-        .iter()
-        .filter(|p| {
-            if filter_lower.is_empty() {
-                return true;
-            }
-            p.name.to_lowercase().contains(&filter_lower)
-                || p.project().to_lowercase().contains(&filter_lower)
-        })
-        .cloned()
-        .collect();
-    match state.sort_key {
-        PalaceSortKey::Activity => {
-            // last_write_at desc, None last; vector_count desc as tiebreak.
-            rows.sort_by(|a, b| match (a.last_write_at, b.last_write_at) {
-                (Some(x), Some(y)) => y.cmp(&x).then_with(|| b.vector_count.cmp(&a.vector_count)),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => b.vector_count.cmp(&a.vector_count),
-            });
-        }
-        PalaceSortKey::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
-        PalaceSortKey::Vectors => rows.sort_by(|a, b| b.vector_count.cmp(&a.vector_count)),
-    }
-    rows
+    tui_common::filtered_sorted(&state.palaces, &state.filter, state.sort_key)
 }
-
-/// Sentinel id representing the synthetic "All palaces" row in the visible
-/// id list.
-///
-/// Why: arrow navigation walks the *visible* (filtered + sorted) row order
-/// rather than the original `state.palaces` ordering; the "All" row has no
-/// real palace id so a sentinel string is used to occupy its slot.
-/// What: `"__all__"` — chosen to not collide with any real palace id.
-/// Test: `test_visible_palace_ids`, `test_navigate_visible`.
-const ALL_SENTINEL: &str = "__all__";
 
 /// Ids of the rows the user can navigate between, in visible display order.
 ///
-/// Why: when a filter, sort, or grouping is active the displayed row order no
-/// longer matches `state.palaces`; arrow keys must step through the visible
-/// order or they appear to skip rows. The leading sentinel keeps the "All
-/// palaces" row reachable.
-/// What: returns `[ALL_SENTINEL, …visible palace ids…]`. Order matches
-/// [`palace_lines`] exactly — flat filtered+sorted order, or grouped by
-/// project when [`MemoryTuiState::group_by_project`] is set (projects are
-/// visited in the order they first appear in the sorted list). Group headers
-/// are not included (they are non-selectable).
+/// Why: thin wrapper over the shared [`tui_common::visible_ids`].
+/// What: delegates to the shared helper with the memory state's fields.
 /// Test: `test_visible_palace_ids`, `test_navigate_visible`.
 pub fn visible_palace_ids(state: &MemoryTuiState) -> Vec<String> {
-    let visible = filtered_sorted_palaces(state);
-    let mut ids = Vec::with_capacity(visible.len() + 1);
-    ids.push(ALL_SENTINEL.to_string());
-    if state.group_by_project {
-        // Walk projects in first-seen order, then each project's palaces in
-        // sorted order — mirroring `palace_lines` exactly so arrow keys follow
-        // on-screen order.
-        let mut seen: Vec<String> = Vec::new();
-        for p in &visible {
-            let proj = p.project().to_string();
-            if !seen.iter().any(|s| s == &proj) {
-                seen.push(proj);
-            }
-        }
-        for project in &seen {
-            for palace in visible.iter().filter(|p| p.project() == project) {
-                ids.push(palace.id.clone());
-            }
-        }
-    } else {
-        for row in &visible {
-            ids.push(row.id.clone());
-        }
-    }
-    ids
-}
-
-/// Resolve the currently selected row's id within the visible list.
-///
-/// Why: the cursor stores an index into `state.palaces` (cursor 0 = "All",
-/// cursor n = palaces[n-1]); navigation needs to translate that back into a
-/// position within the visible id list.
-/// What: returns the [`ALL_SENTINEL`] when `selected == 0` or the palace's id
-/// otherwise; falls back to the sentinel when the index is out of range.
-fn current_visible_id(state: &MemoryTuiState) -> String {
-    if state.selected == 0 {
-        ALL_SENTINEL.to_string()
-    } else {
-        state
-            .palaces
-            .get(state.selected - 1)
-            .map(|p| p.id.clone())
-            .unwrap_or_else(|| ALL_SENTINEL.to_string())
-    }
-}
-
-/// Set `state.selected` to point at `target_id` in the original palace array.
-///
-/// Why: navigation works in visible order, but downstream code (scroll sync,
-/// activity scope) reads `state.selected` as an index into `state.palaces`;
-/// after picking the next visible id we must convert it back.
-/// What: `ALL_SENTINEL` → `selected = 0`; any other id is looked up in
-/// `state.palaces` and `selected` is set to its position + 1. A missing id
-/// leaves the cursor unchanged so the user never lands on an invisible row.
-fn select_visible_id(state: &mut MemoryTuiState, target_id: &str) {
-    if target_id == ALL_SENTINEL {
-        state.selected = 0;
-        return;
-    }
-    if let Some(pos) = state.palaces.iter().position(|p| p.id == target_id) {
-        state.selected = pos + 1;
-    }
+    tui_common::visible_ids(
+        &state.palaces,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    )
 }
 
 /// Move the cursor up one row in the visible (filtered + sorted) list.
 ///
-/// Why: `state.select_up` walks the original `state.palaces` order, so when a
-/// filter hides rows the arrow keys appear to skip or stall; this version
-/// walks the visible order instead.
-/// What: finds the current id in [`visible_palace_ids`] and steps to the
-/// previous visible id, then maps that back to `state.selected`. A no-op when
-/// already at the top.
+/// Why: thin wrapper over the shared [`tui_common::navigate_up`].
+/// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_up_visible(state: &mut MemoryTuiState) {
-    let ids = visible_palace_ids(state);
-    let current = current_visible_id(state);
-    let Some(pos) = ids.iter().position(|id| id == &current) else {
-        // Current selection is not visible — drop back to "All".
-        state.selected = 0;
-        return;
-    };
-    if pos > 0 {
-        let new_id = ids[pos - 1].clone();
-        select_visible_id(state, &new_id);
-    }
+    state.selected = tui_common::navigate_up(
+        &state.palaces,
+        state.selected,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    );
 }
 
 /// Move the cursor down one row in the visible (filtered + sorted) list.
 ///
-/// Why: mirrors [`navigate_up_visible`] for the `↓` arrow.
-/// What: finds the current id in [`visible_palace_ids`] and steps to the next
-/// visible id, then maps that back to `state.selected`. A no-op at the bottom.
+/// Why: thin wrapper over the shared [`tui_common::navigate_down`].
+/// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_down_visible(state: &mut MemoryTuiState) {
-    let ids = visible_palace_ids(state);
-    let current = current_visible_id(state);
-    let Some(pos) = ids.iter().position(|id| id == &current) else {
-        state.selected = 0;
-        return;
-    };
-    if pos + 1 < ids.len() {
-        let new_id = ids[pos + 1].clone();
-        select_visible_id(state, &new_id);
-    }
+    state.selected = tui_common::navigate_down(
+        &state.palaces,
+        state.selected,
+        &state.filter,
+        state.sort_key,
+        state.group_by_project,
+    );
 }
 
 /// Row index — within the rendered `palace_lines` output — that the cursor
@@ -1114,22 +948,6 @@ pub fn stats_lines(state: &MemoryTuiState) -> Vec<String> {
     }
 }
 
-/// Truncate a string to `max` characters, appending an ellipsis when cut.
-///
-/// Why: palace names can be long; the fixed-width left panel needs bounded
-/// labels.
-/// What: returns `s` unchanged when short enough, else its first `max - 1`
-/// characters plus `…`.
-/// Test: `test_truncate`.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
-}
-
 /// Build the title-bar line for the memory UI.
 ///
 /// Why: the top row shows the daemon name, version, and liveness badge at a
@@ -1149,14 +967,6 @@ pub fn title_line(state: &MemoryTuiState) -> String {
         ),
     }
 }
-
-/// Vertical split of the right-hand pane: ACTIVITY over STATISTICS.
-///
-/// Why: the right side shows two things — a live event feed and the selected
-/// palace's stats; isolating the split as a named constant keeps `render`
-/// terse and documents the 60 / 40 ratio.
-/// What: the ACTIVITY panel takes the top 60 %, STATISTICS the bottom 40 %.
-const ACTIVITY_PERCENT: u16 = 60;
 
 /// Draw the memory TUI frame.
 ///
@@ -1288,7 +1098,7 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
     let mut palace_state = ListState::default()
         .with_offset(state.scroll_offset)
         .with_selected(Some(visible_row));
-    let palace_title = format!("PALACES [{}]", state.sort_key.label());
+    let palace_title = format!("PALACES [{}]", sort_label(state.sort_key));
     frame.render_stateful_widget(
         List::new(palace_items).block(panel_block(&palace_title, list_focused)),
         list_area,
@@ -1299,8 +1109,8 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(ACTIVITY_PERCENT),
-            Constraint::Percentage(100 - ACTIVITY_PERCENT),
+            Constraint::Percentage(tui_common::ACTIVITY_PERCENT),
+            Constraint::Percentage(100 - tui_common::ACTIVITY_PERCENT),
         ])
         .split(split[1]);
 
@@ -1359,59 +1169,8 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
     );
 
     if state.show_help {
-        render_help_overlay(frame);
+        tui_common::render_help_overlay(frame, &help_text());
     }
-}
-
-/// Build a bordered block for a UI panel, highlighting it when focused.
-///
-/// Why: the focused panel must be visually distinct; both panels share this.
-/// What: returns a [`Block`] titled `name` with a thick cyan border when
-/// `focused`, a dim gray border otherwise.
-fn panel_block(name: &str, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
-            format!(" {name} "),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-}
-
-/// Render the centred help overlay listing every key binding.
-///
-/// Why: the `?` key shows a floating reference of every binding.
-/// What: clears a centred rectangle and draws [`help_text`] in a block.
-fn render_help_overlay(frame: &mut Frame) {
-    let area = frame.area();
-    let w = 60.min(area.width);
-    let h = 9.min(area.height);
-    let rect = ratatui::layout::Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w,
-        height: h,
-    };
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(help_text())
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Help — press ? or Esc to close "),
-            ),
-        rect,
-    );
 }
 
 #[cfg(test)]
@@ -1727,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_left_panel_width() {
-        assert_eq!(left_panel_width(200), LEFT_PANEL_MAX);
+        assert_eq!(left_panel_width(200), tui_common::LEFT_PANEL_MAX);
         assert_eq!(left_panel_width(60), 20);
     }
 
@@ -1757,11 +1516,11 @@ mod tests {
     fn test_palace_sort_key_cycle() {
         assert_eq!(PalaceSortKey::default(), PalaceSortKey::Activity);
         assert_eq!(PalaceSortKey::Activity.next(), PalaceSortKey::Name);
-        assert_eq!(PalaceSortKey::Name.next(), PalaceSortKey::Vectors);
-        assert_eq!(PalaceSortKey::Vectors.next(), PalaceSortKey::Activity);
-        assert_eq!(PalaceSortKey::Activity.label(), "Activity");
-        assert_eq!(PalaceSortKey::Name.label(), "Name");
-        assert_eq!(PalaceSortKey::Vectors.label(), "Vectors");
+        assert_eq!(PalaceSortKey::Name.next(), PalaceSortKey::Count);
+        assert_eq!(PalaceSortKey::Count.next(), PalaceSortKey::Activity);
+        assert_eq!(sort_label(PalaceSortKey::Activity), "Activity");
+        assert_eq!(sort_label(PalaceSortKey::Name), "Name");
+        assert_eq!(sort_label(PalaceSortKey::Count), "Vectors");
     }
 
     /// State with four palaces spanning two projects, varied vector counts,
@@ -1839,7 +1598,7 @@ mod tests {
     #[test]
     fn test_apply_sort_vectors() {
         let mut state = diverse_state();
-        state.sort_key = PalaceSortKey::Vectors;
+        state.sort_key = PalaceSortKey::Count;
         let rows = filtered_sorted_palaces(&state);
         assert_eq!(rows[0].id, "claude-mpm");
         assert_eq!(rows[1].id, "trusty-memory");
@@ -1970,7 +1729,7 @@ mod tests {
         let mut state = diverse_state();
         state.sort_key = PalaceSortKey::Name;
         let ids = visible_palace_ids(&state);
-        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids[0], tui_common::ALL_SENTINEL);
         // Alphabetical: claude-mpm, notes, trusty-memory, trusty-search.
         assert_eq!(
             &ids[1..],
@@ -1985,7 +1744,7 @@ mod tests {
         // A filter shrinks the visible list.
         state.filter = "trusty".into();
         let ids = visible_palace_ids(&state);
-        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids[0], tui_common::ALL_SENTINEL);
         assert_eq!(ids.len(), 3, "All + 2 trusty-* palaces");
     }
 
@@ -2065,7 +1824,7 @@ mod tests {
         //   0 All, 1 claude-mpm (6163), 2 trusty-memory (3775),
         //   3 notes (100), 4 trusty-search (12)
         // so notes must land on row 3.
-        state.sort_key = PalaceSortKey::Vectors;
+        state.sort_key = PalaceSortKey::Count;
         let pos = state
             .palaces
             .iter()
