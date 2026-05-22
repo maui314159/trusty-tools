@@ -90,6 +90,26 @@ pub(crate) const KG_EDGES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition:
 pub(crate) const KG_EDGES_REV_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("kg_edges_rev");
 
+/// redb table holding persisted Louvain community records, keyed by
+/// community id (issue #41 phase 3).
+///
+/// Why: offline community detection produces a stable partition of the
+/// symbol graph; persisting it lets agents query knowledge gaps and topology
+/// without re-running Louvain on every restart.
+/// What: `community_id (u64) → &[u8]` where the value is `serde_json`-encoded
+/// [`crate::core::community::CommunityRecord`].
+pub(crate) const KG_COMMUNITIES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("kg_communities");
+
+/// redb table mapping symbol name → community id (issue #41 phase 3).
+///
+/// Why: the search hot path needs O(1) "what community does this symbol live
+/// in?" lookups so search results can carry a `community_id` field. A separate
+/// table keeps that lookup cheap without parsing the full community record.
+/// What: `symbol (str) → community_id (u64)`.
+pub(crate) const KG_SYMBOL_COMMUNITY_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("kg_symbol_community");
+
 /// Durable, redb-backed store for an index's chunk corpus + entity lists.
 ///
 /// Why: see module docs — replaces the full-rewrite `chunks.json` snapshot
@@ -148,6 +168,13 @@ impl CorpusStore {
                     .context("init kg_edges table")?;
                 txn.open_table(KG_EDGES_REV_TABLE)
                     .context("init kg_edges_rev table")?;
+                // Issue #41 phase 3: materialize the community persistence
+                // tables alongside the KG tables so warm-boot reads never race
+                // a missing-table error on a fresh database.
+                txn.open_table(KG_COMMUNITIES_TABLE)
+                    .context("init kg_communities table")?;
+                txn.open_table(KG_SYMBOL_COMMUNITY_TABLE)
+                    .context("init kg_symbol_community table")?;
             }
             txn.commit().context("commit corpus init txn")?;
         }
@@ -582,6 +609,88 @@ impl CorpusStore {
         let txn = self.db.begin_read().context("begin kg count txn")?;
         let table = txn.open_table(KG_NODES_TABLE)?;
         Ok(table.len().context("count kg_nodes")? as usize)
+    }
+
+    /// Replace the persisted community records + symbol→community map in one
+    /// atomic transaction (issue #41 phase 3).
+    ///
+    /// Why: community detection runs offline after a full reindex; persisting
+    /// the partition lets the search hot path attach a `community_id` field to
+    /// every result without re-running Louvain. Doing both writes under one
+    /// transaction guarantees readers never observe a half-rewritten partition.
+    /// What: clears the two community tables then re-inserts the supplied
+    /// records (keyed by `id`) and per-symbol mappings.
+    /// Test: `save_load_communities_roundtrip` round-trips a synthetic
+    /// partition through this method and `load_communities`.
+    pub fn save_communities(
+        &self,
+        records: &[(u64, Vec<u8>)],
+        symbol_to_community: &[(String, u64)],
+    ) -> Result<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .context("begin communities upsert txn")?;
+        {
+            let mut comm_tbl = txn.open_table(KG_COMMUNITIES_TABLE)?;
+            comm_tbl
+                .retain(|_, _| false)
+                .context("clear kg_communities")?;
+            for (id, bytes) in records {
+                comm_tbl
+                    .insert(id, bytes.as_slice())
+                    .with_context(|| format!("insert community {id}"))?;
+            }
+            let mut sym_tbl = txn.open_table(KG_SYMBOL_COMMUNITY_TABLE)?;
+            sym_tbl
+                .retain(|_, _| false)
+                .context("clear kg_symbol_community")?;
+            for (sym, id) in symbol_to_community {
+                sym_tbl
+                    .insert(sym.as_str(), id)
+                    .with_context(|| format!("insert symbol→community for {sym}"))?;
+            }
+        }
+        txn.commit().context("commit communities upsert txn")?;
+        Ok(())
+    }
+
+    /// Load persisted community records (issue #41 phase 3).
+    ///
+    /// Why: warm-boot / HTTP `/communities` endpoint reads the partition
+    /// without re-running Louvain. Returning the raw bytes keeps this layer
+    /// type-agnostic — the caller decodes to its `CommunityRecord` type.
+    /// What: returns `Vec<(community_id, serialized_record_bytes)>`.
+    /// Test: `save_load_communities_roundtrip`.
+    pub fn load_communities(&self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let txn = self.db.begin_read().context("begin communities read txn")?;
+        let table = txn.open_table(KG_COMMUNITIES_TABLE)?;
+        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        for entry in table.iter().context("iterate kg_communities table")? {
+            let (key, value) = entry.context("read kg_communities row")?;
+            out.push((key.value(), value.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Look up the community id for a single symbol (issue #41 phase 3).
+    ///
+    /// Why: the search materialisation tail calls this once per result chunk
+    /// to attach a `community_id`. Keeping this as a point-read avoids
+    /// loading the full mapping into memory per query.
+    /// What: returns `Ok(Some(id))` when the symbol has a community,
+    /// `Ok(None)` when not (unknown symbol or communities not yet computed).
+    /// Test: `save_load_communities_roundtrip` asserts point reads.
+    pub fn symbol_community(&self, symbol: &str) -> Result<Option<u64>> {
+        let txn = self
+            .db
+            .begin_read()
+            .context("begin symbol_community read txn")?;
+        let table = txn.open_table(KG_SYMBOL_COMMUNITY_TABLE)?;
+        Ok(table
+            .get(symbol)
+            .context("get symbol_community row")?
+            .map(|v| v.value()))
     }
 }
 

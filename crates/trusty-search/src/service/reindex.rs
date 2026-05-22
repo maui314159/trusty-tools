@@ -844,6 +844,58 @@ async fn rebuild_symbol_graph_for_reindex(handle: &IndexHandle) -> KgRebuildOutc
     }
 }
 
+/// Spawn Louvain community detection on a blocking thread (issue #41 phase 3).
+///
+/// Why: detection on a 100k-node graph can take several seconds. Running it
+/// inline in the reindex tail would delay the `complete` SSE event for every
+/// reindex; running it inside the async runtime would block the executor.
+/// `tokio::task::spawn_blocking` keeps both surfaces responsive.
+/// What: snapshots the in-memory `SymbolGraph` + the corpus store, then runs
+/// `detect_and_save_communities` on a blocking thread. Logs the resulting
+/// community count + modularity on success; a failure is `warn`-logged so the
+/// reindex still completes cleanly.
+/// Test: covered indirectly via the persistence round-trip in
+/// `symbol_graph::tests::test_detect_and_save_communities_round_trip`.
+fn spawn_community_detection(handle: &IndexHandle) {
+    let indexer_arc = Arc::clone(&handle.indexer);
+    tokio::spawn(async move {
+        let (graph, corpus, index_id) = {
+            let indexer = indexer_arc.read().await;
+            (
+                indexer.snapshot_symbol_graph().await,
+                indexer.corpus_store(),
+                indexer.index_id.clone(),
+            )
+        };
+        let Some(corpus) = corpus else {
+            tracing::debug!(
+                "index '{index_id}': skipping community detection — no corpus store wired"
+            );
+            return;
+        };
+        if graph.node_count() == 0 {
+            tracing::debug!(
+                "index '{index_id}': skipping community detection — empty symbol graph"
+            );
+            return;
+        }
+        let join =
+            tokio::task::spawn_blocking(move || graph.detect_and_save_communities(&corpus)).await;
+        match join {
+            Ok(Ok(communities)) => tracing::info!(
+                index = %index_id,
+                communities = communities.community_count,
+                modularity = communities.modularity,
+                "community detection complete"
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!("index '{index_id}': community detection failed: {e:#}")
+            }
+            Err(e) => tracing::warn!("index '{index_id}': community detection task panicked: {e}"),
+        }
+    });
+}
+
 /// Run-level timing + memory totals collected across every batch.
 struct RunTotals {
     parse_ms: u64,
@@ -1368,6 +1420,13 @@ pub fn spawn_reindex_with_cleanup(
         // construction is bounded by `TRUSTY_MAX_KG_NODES` and independent of
         // the embedding spike. See `rebuild_symbol_graph_for_reindex`.
         let kg = rebuild_symbol_graph_for_reindex(&handle).await;
+        // Issue #41 phase 3: run Louvain community detection on the freshly
+        // rebuilt KG so agents can query topology. Fire-and-forget on a
+        // blocking thread: detection can take seconds on a 100k-node graph
+        // and we don't want it to delay the `complete` SSE event. A failure
+        // is logged at `warn` — searches still work, they just won't carry a
+        // `community_id` until the next successful reindex.
+        spawn_community_detection(&handle);
         if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
             tracing::warn!(
                 "reindex: memory limit was breached during batch processing for \

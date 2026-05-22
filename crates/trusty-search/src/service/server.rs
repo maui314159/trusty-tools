@@ -689,6 +689,11 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/{id}/status", get(index_status_handler))
         .route("/indexes/{id}/graph", get(graph_handler))
         .route("/indexes/{id}/graph/stats", get(graph_stats_handler))
+        .route("/indexes/{id}/communities", get(communities_handler))
+        .route(
+            "/indexes/{id}/communities/{symbol}",
+            get(community_for_symbol_handler),
+        )
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
         .route(
@@ -2018,6 +2023,130 @@ async fn graph_stats_handler(
         "node_count": graph.node_count(),
         "edge_count": graph.edge_count(),
         "edge_kinds": serde_json::Value::Object(edge_kinds),
+    })))
+}
+
+/// Maximum number of members surfaced inline per community in the HTTP
+/// response (issue #41 phase 3).
+///
+/// Why: large communities can contain hundreds of symbols. The HTTP payload
+/// would explode without a cap. The full member list always survives in redb
+/// — clients that need every member can hit
+/// `GET /indexes/:id/communities/:symbol` for any anchor in the community.
+/// What: hard cap of 50 members per community in `GET /indexes/:id/communities`.
+const COMMUNITIES_HTTP_MEMBER_CAP: usize = 50;
+
+/// `GET /indexes/{id}/communities` — list Louvain communities for an index
+/// (issue #41 phase 3).
+///
+/// Why: agents and dashboards use this to map the codebase's topology — the
+/// natural subsystems Louvain discovered, their dominant files, and modularity
+/// of the partition. Server-side truncation of the `members` array keeps
+/// payloads bounded; the full list always lives in redb.
+/// What: loads communities via `SymbolGraph::load_communities`, snapshots the
+/// in-memory partition's modularity from any one record's contribution sum,
+/// and returns `{ community_count, modularity, communities: [...] }`. Returns
+/// `Ok(Json(...))` with an empty community list when communities haven't been
+/// computed yet — agents poll this endpoint after triggering a reindex.
+/// Test: covered by `communities_handler_returns_empty_before_detection` in
+/// this module.
+async fn communities_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let corpus = {
+        let indexer = handle.indexer.read().await;
+        indexer.corpus_store()
+    };
+    let records = match corpus {
+        Some(corpus) => {
+            // Run the read off the async executor — redb is sync.
+            tokio::task::spawn_blocking(move || crate::core::SymbolGraph::load_communities(&corpus))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        }
+        None => Vec::new(),
+    };
+    let modularity: f64 = records.iter().map(|r| r.modularity_contribution).sum();
+    let communities: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            let members_truncated: Vec<&String> =
+                r.members.iter().take(COMMUNITIES_HTTP_MEMBER_CAP).collect();
+            serde_json::json!({
+                "id": r.id,
+                "member_count": r.member_count,
+                "centroid_symbol": r.centroid_symbol,
+                "dominant_files": r.dominant_files,
+                "members": members_truncated,
+                "modularity_contribution": r.modularity_contribution,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "community_count": records.len(),
+        "modularity": modularity,
+        "communities": communities,
+    })))
+}
+
+/// `GET /indexes/{id}/communities/{symbol}` — look up the community that
+/// contains a given symbol (issue #41 phase 3).
+///
+/// Why: agents that find a hit in search results often want the surrounding
+/// community to expand their context. This endpoint is a single point-read
+/// keyed by symbol name (URL-encoded for safety with `::` qualifiers).
+/// What: resolves the symbol to a community id via
+/// `CorpusStore::symbol_community`, loads the matching `CommunityRecord`, and
+/// returns siblings (excluding the requested symbol) plus the centroid.
+/// Returns 404 when the symbol is unknown or communities haven't been
+/// computed yet.
+/// Test: covered indirectly via `test_detect_and_save_communities_round_trip`
+/// in `symbol_graph::tests`.
+async fn community_for_symbol_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path((id, symbol_encoded)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    // Axum's `Path` extractor already URL-decodes path segments, so the
+    // captured `symbol_encoded` is already the raw symbol name (e.g.
+    // `Foo::bar`). We keep the variable name for clarity at the call site.
+    let symbol = symbol_encoded.clone();
+    let corpus = {
+        let indexer = handle.indexer.read().await;
+        indexer.corpus_store().ok_or(StatusCode::NOT_FOUND)?
+    };
+    let symbol_clone = symbol.clone();
+    let cid_opt = tokio::task::spawn_blocking(move || corpus.symbol_community(&symbol_clone))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(cid) = cid_opt else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let corpus2 = {
+        let indexer = handle.indexer.read().await;
+        indexer.corpus_store().ok_or(StatusCode::NOT_FOUND)?
+    };
+    let records =
+        tokio::task::spawn_blocking(move || crate::core::SymbolGraph::load_communities(&corpus2))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(record) = records.iter().find(|r| r.id as u64 == cid) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let siblings: Vec<&String> = record.members.iter().filter(|m| **m != symbol).collect();
+    Ok(Json(serde_json::json!({
+        "community_id": record.id,
+        "community_size": record.member_count,
+        "symbol": symbol,
+        "siblings": siblings,
+        "centroid_symbol": record.centroid_symbol,
     })))
 }
 
