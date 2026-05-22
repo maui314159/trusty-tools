@@ -198,10 +198,15 @@ mod tests {
 
     #[test]
     fn print_palace_detail_errors_on_unknown_id() {
+        // Why: PalaceRow gained `drawer_count`, `last_write_at`, and
+        // `description` fields after this test was written. Use struct-
+        // update syntax with `Default::default()` so future additions don't
+        // re-break the test.
         let rows = vec![PalaceRow {
             id: "default".into(),
             name: "default".into(),
             vector_count: 8_400,
+            ..Default::default()
         }];
         assert!(print_palace_detail(&rows, "missing", false).is_err());
         assert!(print_palace_detail(&rows, "default", true).is_ok());

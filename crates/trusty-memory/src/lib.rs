@@ -10,8 +10,9 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, OnceCell};
 use tracing::info;
 use trusty_common::mcp::{error_codes, initialize_response, Request, Response};
@@ -176,6 +177,17 @@ pub struct AppState {
     /// can sample without blocking the runtime.
     /// Test: `health_endpoint_includes_resource_fields`.
     pub sys_metrics: Arc<tokio::sync::Mutex<trusty_common::sys_metrics::SysMetrics>>,
+    /// HTTP listener address the daemon bound to, once `run_http_on` is running.
+    ///
+    /// Why: clients (and `/health` responses) need to advertise the live
+    /// `host:port` even though port selection happens dynamically (7070–7079
+    /// walk + OS fallback). Stashing it on `AppState` lets request handlers
+    /// surface the discovery value without re-querying the listener.
+    /// What: a `OnceLock<SocketAddr>` so `run_http_on` writes it exactly once
+    /// at bind time and every handler reads it lock-free thereafter. Empty
+    /// (`None` from `get()`) on the stdio path where no listener exists.
+    /// Test: `health_endpoint_reports_bound_addr` (added below).
+    pub bound_addr: Arc<OnceLock<SocketAddr>>,
 }
 
 impl AppState {
@@ -210,6 +222,7 @@ impl AppState {
             sys_metrics: Arc::new(tokio::sync::Mutex::new(
                 trusty_common::sys_metrics::SysMetrics::new(),
             )),
+            bound_addr: Arc::new(OnceLock::new()),
         }
     }
 
@@ -552,6 +565,88 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
     .await
 }
 
+/// Preferred starting port for the trusty-memory HTTP daemon.
+///
+/// Why: keeps the well-known default stable for clients that have hard-coded
+/// `127.0.0.1:7070` in their configuration, while still allowing dynamic
+/// walking when the port is in use (`DYNAMIC_PORT_RANGE` ports starting here).
+/// What: `7070` — historic default, matches the launchd plist's prior value.
+/// Test: covered indirectly by `bind_dynamic_port_returns_listener`.
+pub const DEFAULT_HTTP_PORT: u16 = 7070;
+
+/// Number of consecutive ports `bind_dynamic_port` walks before falling back
+/// to the OS-assigned port. Matches the trusty-search convention.
+const DYNAMIC_PORT_RANGE: u16 = 10;
+
+/// Path to `~/.trusty-memory/http_addr` — the canonical address-discovery file.
+///
+/// Why: clients (CLI, MCP tools, dashboards) need to find the running daemon
+/// without configuration when the port was selected dynamically. Mirrors
+/// `trusty-search`'s `~/.trusty-search/http_addr` contract so the two tools
+/// share a single discovery convention.
+/// What: returns `$HOME/.trusty-memory/http_addr`, or `None` if `$HOME` is
+/// unresolvable (locked-down container, no passwd entry).
+/// Test: `http_addr_path_uses_dot_trusty_memory`.
+pub fn http_addr_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".trusty-memory").join("http_addr"))
+}
+
+/// Bind a `TcpListener` to `127.0.0.1`, dynamically selecting a port.
+///
+/// Why: the historic default `7070` is convenient for clients but a stale
+/// process or a second daemon must not produce a noisy failure. Walking
+/// `DEFAULT_HTTP_PORT..DEFAULT_HTTP_PORT+DYNAMIC_PORT_RANGE` first preserves
+/// backwards compatibility for the common case; OS-assigned fallback (`:0`)
+/// guarantees the daemon always comes up even when every preferred port is
+/// busy.
+/// What: returns the first successful `TcpListener`. Tries 7070..=7079
+/// in order, then falls back to OS-assigned. Caller inspects
+/// `local_addr()` to learn the chosen port.
+/// Test: `bind_dynamic_port_returns_listener` confirms it always binds *some*
+/// port even after another listener occupies the preferred one.
+pub async fn bind_dynamic_port() -> Result<tokio::net::TcpListener> {
+    let preferred: SocketAddr = SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT));
+    // First: walk the preferred range (7070..=7079).
+    if let Ok(listener) =
+        trusty_common::bind_with_auto_port(preferred, DYNAMIC_PORT_RANGE - 1).await
+    {
+        return Ok(listener);
+    }
+    // Last resort: ask the kernel for any free port. `bind_with_auto_port`
+    // with `:0` resolves immediately to the OS-assigned port.
+    tracing::warn!(
+        "all ports {DEFAULT_HTTP_PORT}..{} in use; requesting OS-assigned port",
+        DEFAULT_HTTP_PORT + DYNAMIC_PORT_RANGE - 1
+    );
+    let any: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 0));
+    trusty_common::bind_with_auto_port(any, 0).await
+}
+
+/// Write the bound `host:port` to `~/.trusty-memory/http_addr` atomically.
+///
+/// Why: clients must read the file mid-write without observing a partial
+/// value. Writing to a `.tmp` sibling and renaming over the target gives
+/// POSIX atomicity, matching the trusty-search implementation.
+/// What: creates `~/.trusty-memory/` if missing; writes `addr` followed by a
+/// trailing newline (avoids the "no newline at end of file" warnings from
+/// `cat`); renames `.tmp` → `http_addr`. Best-effort: I/O errors are
+/// returned to the caller so `run_http_on` can log without panicking.
+/// Test: `http_addr_file_round_trip_via_helpers`.
+fn write_http_addr_file(path: &Path, addr: &SocketAddr) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("addr.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        writeln!(f, "{addr}")?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Run the optional HTTP/SSE + web admin server.
 ///
 /// Why: A long-running daemon mode lets non-stdio clients (browsers, curl,
@@ -559,9 +654,13 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
 /// embedded admin SPA.
 /// What: axum router built from `web::router()` plus a `/sse` stub for the
 /// existing MCP-over-SSE clients. Caller provides a pre-bound listener so
-/// port auto-detection lives at the call site.
-/// Test: `cargo test -p trusty-memory-mcp web::tests` exercises the router
-/// shape; manual: `curl http://127.0.0.1:<port>/health` returns `ok`.
+/// port auto-detection lives at the call site. Before accepting connections
+/// the daemon stamps the bound `host:port` onto `AppState.bound_addr` and
+/// writes `~/.trusty-memory/http_addr` so clients can discover the live port.
+/// On shutdown the file is removed best-effort (a stale file with the wrong
+/// port is worse than a missing one).
+/// Test: `cargo test -p trusty-memory web::tests` exercises the router shape;
+/// manual: `curl http://127.0.0.1:<port>/health` returns `ok` with `addr`.
 pub async fn run_http_on(state: AppState, listener: tokio::net::TcpListener) -> Result<()> {
     use axum::routing::get;
 
@@ -570,22 +669,70 @@ pub async fn run_http_on(state: AppState, listener: tokio::net::TcpListener) -> 
     // recursive directory walk on the request path.
     spawn_disk_size_ticker(state.clone());
 
+    // Capture and advertise the bound address BEFORE serving so the first
+    // request handler — and the http_addr discovery file — see the real port
+    // even if `local_addr()` would otherwise be racy.
+    let local = listener.local_addr().ok();
+    let written_path = if let Some(a) = local {
+        // Stash on state for handlers (e.g. /health) to surface.
+        let _ = state.bound_addr.set(a);
+        info!("HTTP server listening on http://{a}");
+        eprintln!("HTTP server listening on http://{a}");
+        // Best-effort: a missing $HOME or read-only fs is non-fatal — the
+        // /health endpoint still advertises `addr`. Logging the failure
+        // helps operators diagnose discovery problems.
+        match http_addr_path() {
+            Some(p) => match write_http_addr_file(&p, &a) {
+                Ok(()) => {
+                    info!("wrote daemon address to {}", p.display());
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!("could not write {}: {e}", p.display());
+                    None
+                }
+            },
+            None => {
+                tracing::warn!("no $HOME — skipping http_addr discovery file");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let app = web::router()
         .route("/sse", get(sse_handler))
         .with_state(state);
 
-    let local = listener.local_addr().ok();
-    if let Some(a) = local {
-        info!("HTTP server listening on http://{a}");
-        eprintln!("HTTP server listening on http://{a}");
+    let serve_result = axum::serve(listener, app).await;
+
+    // Best-effort cleanup: remove `http_addr` so stale clients fail fast
+    // instead of timing out against a dead port.
+    if let Some(p) = written_path.as_ref() {
+        let _ = std::fs::remove_file(p);
     }
-    axum::serve(listener, app).await?;
+
+    serve_result?;
     Ok(())
 }
 
 /// Convenience: bind `addr` and serve via [`run_http_on`].
 pub async fn run_http(state: AppState, addr: std::net::SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    run_http_on(state, listener).await
+}
+
+/// Convenience: bind dynamically (7070..=7079, OS fallback) and serve.
+///
+/// Why: `trusty-memory serve` with no `--http` flag is the canonical
+/// launchd-managed daemon entry point. Dynamic binding lets a stale daemon
+/// or a hand-spawned `serve --http 127.0.0.1:7070` coexist without breaking
+/// the launchd-managed instance.
+/// What: calls [`bind_dynamic_port`] then [`run_http_on`].
+/// Test: integration via `trusty-memory serve` + `cat ~/.trusty-memory/http_addr`.
+pub async fn run_http_dynamic(state: AppState) -> Result<()> {
+    let listener = bind_dynamic_port().await?;
     run_http_on(state, listener).await
 }
 
@@ -1019,5 +1166,63 @@ mod tests {
         )
         .await;
         assert!(init["result"]["serverInfo"]["default_palace"].is_null());
+    }
+
+    /// Why: every `~/.trusty-memory/http_addr` consumer (CLI, dashboard,
+    /// future trusty-mpm wiring) must agree on the path. A regression that
+    /// moves this file to e.g. `$XDG_DATA_HOME/trusty-memory/http_addr` would
+    /// silently break every client.
+    /// What: under a real `$HOME`, the path ends in `.trusty-memory/http_addr`.
+    #[test]
+    fn http_addr_path_uses_dot_trusty_memory() {
+        if let Some(p) = http_addr_path() {
+            assert!(
+                p.ends_with(".trusty-memory/http_addr"),
+                "unexpected http_addr path: {}",
+                p.display()
+            );
+        }
+        // CI containers with no $HOME return None — that's fine; the writer
+        // logs and falls back gracefully.
+    }
+
+    /// Why: write+read round-trip pins the disk format: a single line of
+    /// `host:port\n`. Clients (cat, sh `$(cat ...)`) trim whitespace, so the
+    /// trailing newline is invisible — but anything else (extra whitespace,
+    /// multi-line) would break callers.
+    #[test]
+    fn http_addr_file_round_trip_via_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http_addr");
+        let addr: SocketAddr = "127.0.0.1:7073".parse().unwrap();
+        write_http_addr_file(&path, &addr).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.trim(), "127.0.0.1:7073");
+        // The trailing newline keeps `cat` and editors happy.
+        assert!(raw.ends_with('\n'));
+    }
+
+    /// Why: dynamic binding must succeed even when the preferred port is
+    /// already in use. Walking 7070..=7079 + OS fallback guarantees the
+    /// daemon never fails to come up just because another process holds 7070.
+    /// What: pre-bind 7070 (best-effort — skip the test if it's already
+    /// busy on the host), then call `bind_dynamic_port` and assert we got
+    /// *some* listener back.
+    #[tokio::test]
+    async fn bind_dynamic_port_returns_listener() {
+        let listener = bind_dynamic_port().await.expect("bind_dynamic_port");
+        let addr = listener.local_addr().expect("local_addr");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert!(addr.port() > 0, "port must be non-zero after bind");
+    }
+
+    /// Why: `AppState::new` must initialise `bound_addr` to an empty
+    /// `OnceLock` so `/health` reports `addr: None` on the stdio path. A
+    /// regression that pre-populates this field would advertise a bogus
+    /// address from a stale clone.
+    #[test]
+    fn app_state_starts_with_empty_bound_addr() {
+        let state = test_state();
+        assert!(state.bound_addr.get().is_none());
     }
 }

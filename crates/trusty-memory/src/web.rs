@@ -138,6 +138,13 @@ struct HealthResponse {
     cpu_pct: f32,
     /// Seconds elapsed since the daemon started (issue #35).
     uptime_secs: u64,
+    /// Bound `host:port` of the HTTP listener. Why: dynamic port selection
+    /// (7070..=7079 + OS fallback) means clients cannot assume `7070`; this
+    /// field advertises the real port without forcing them to read
+    /// `~/.trusty-memory/http_addr`. `None` when the daemon was constructed
+    /// without ever binding (tests that drive the router with `TestServer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addr: Option<String>,
 }
 
 /// `GET /health` — unauthenticated liveness probe.
@@ -158,6 +165,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     };
     let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let addr = state.bound_addr.get().map(|a| a.to_string());
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -165,6 +173,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         disk_bytes,
         cpu_pct,
         uptime_secs,
+        addr,
     })
 }
 

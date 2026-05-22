@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use trusty_memory::commands::migrate::{handle_migrate, MigrateTarget};
 use trusty_memory::commands::service::{handle_service, ServiceAction};
 use trusty_memory::commands::setup::handle_setup;
-use trusty_memory::{resolve_palace_registry_dir, run_http, run_stdio, AppState};
+use trusty_memory::{resolve_palace_registry_dir, run_http, run_http_dynamic, run_stdio, AppState};
 
 /// Top-level CLI for `trusty-memory`.
 #[derive(Debug, Parser)]
@@ -48,11 +48,25 @@ struct Cli {
 /// Test: clap's `--help` output enumerates both.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the MCP server (stdio by default, HTTP/SSE with `--http`).
+    /// Run the daemon.
+    ///
+    /// Default mode is HTTP/SSE with dynamic port selection (7070..=7079, OS
+    /// fallback). Pass `--http <ADDR>` to bind a specific address, or
+    /// `--stdio` to speak MCP over stdin/stdout for direct Claude Code
+    /// integration.
     Serve {
-        /// Bind an HTTP/SSE server instead of speaking MCP over stdio.
+        /// Bind the HTTP/SSE server to a specific address. When omitted (and
+        /// `--stdio` is not set), the daemon binds dynamically.
         #[arg(long, value_name = "ADDR")]
         http: Option<SocketAddr>,
+
+        /// Speak MCP over stdin/stdout instead of binding an HTTP server.
+        ///
+        /// Why: Claude Code launches MCP servers as child processes and
+        /// expects JSON-RPC on stdio. This flag preserves that mode while
+        /// letting the default `serve` invocation run the HTTP daemon.
+        #[arg(long, conflicts_with = "http")]
+        stdio: bool,
 
         /// Bind every MCP tool call to this palace when the caller omits the
         /// `palace` argument.
@@ -152,7 +166,11 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Serve { http, palace } => run_serve(http, palace, log_buffer).await,
+        Command::Serve {
+            http,
+            stdio,
+            palace,
+        } => run_serve(http, stdio, palace, log_buffer).await,
         Command::Migrate {
             target,
             dry_run,
@@ -209,6 +227,7 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
 /// `cargo run -p trusty-memory -- serve` and the parent integration tests.
 async fn run_serve(
     http: Option<SocketAddr>,
+    stdio: bool,
     palace: Option<String>,
     log_buffer: trusty_common::log_buffer::LogBuffer,
 ) -> Result<()> {
@@ -218,6 +237,16 @@ async fn run_serve(
     // palace_create, load_palaces_from_disk) pointed at the same place.
     let data_dir = trusty_common::resolve_data_dir("trusty-memory")?;
     let data_root = resolve_palace_registry_dir(data_dir);
+
+    // Determine mode: `--stdio` wins (explicit MCP stdio), `--http <addr>`
+    // binds that exact address, otherwise we bind dynamically (the launchd
+    // plist path).
+    if stdio {
+        let state = AppState::new(data_root).with_default_palace(palace);
+        let count = state.load_palaces_from_disk().await?;
+        tracing::info!("Loaded {count} palaces from disk");
+        return run_stdio(state).await;
+    }
 
     if let Some(addr) = http {
         let state = AppState::new(data_root)
@@ -257,9 +286,28 @@ async fn run_serve(
         });
         run_http(state, addr).await
     } else {
-        let state = AppState::new(data_root).with_default_palace(palace);
-        let count = state.load_palaces_from_disk().await?;
-        tracing::info!("Loaded {count} palaces from disk");
-        run_stdio(state).await
+        // Default: dynamic-port HTTP daemon. Mirrors the explicit `--http`
+        // branch above (log buffer, background hydration) but lets the
+        // library pick a port from 7070..=7079 (OS-fallback) and write
+        // `~/.trusty-memory/http_addr` for clients to discover.
+        let state = AppState::new(data_root)
+            .with_default_palace(palace)
+            .with_log_buffer(log_buffer);
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            tracing::info!("starting background palace hydration");
+            match bg_state.load_palaces_from_disk().await {
+                Ok(count) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "background palace hydration complete: {count} palaces loaded"
+                ),
+                Err(e) => tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "background palace hydration failed: {e:#}"
+                ),
+            }
+        });
+        run_http_dynamic(state).await
     }
 }
