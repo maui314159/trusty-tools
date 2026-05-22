@@ -923,6 +923,19 @@ impl CodeIndexer {
     pub async fn symbol_graph(&self) -> Arc<SymbolGraph> {
         Arc::clone(&*self.symbol_graph.read().await)
     }
+
+    /// Borrow the durable redb corpus (issue #41 phase 4).
+    ///
+    /// Why: The `SearchAppState::graph_scorer` cache needs the persisted
+    /// community records to build a scorer; exposing the `Arc<CorpusStore>`
+    /// keeps the caller decoupled from the indexer's internal lock layout.
+    /// What: Returns `None` for BM25-only / test indexers that have no
+    /// on-disk corpus wired; `Some(Arc::clone)` otherwise.
+    /// Test: covered indirectly by the search integration tests that exercise
+    /// the post-MMR graph-bonus blend.
+    pub fn corpus_arc(&self) -> Option<Arc<crate::core::corpus::CorpusStore>> {
+        self.corpus.as_ref().map(Arc::clone)
+    }
 }
 
 #[cfg(test)]

@@ -253,6 +253,19 @@ pub struct SearchAppState {
     /// it. The render itself is lock-free (PrometheusHandle is Clone).
     /// Test: covered by `metrics_handler_returns_prometheus_text`.
     pub metrics: Option<crate::service::metrics::MetricsState>,
+    /// Per-index cached `GraphScorer` (issue #41 phase 4).
+    ///
+    /// Why: Graph-expanded retrieval blends RRF scores with degree centrality
+    /// and community-centroid status. Computing those tables on every search
+    /// request would dwarf the search cost itself; caching one `Arc<GraphScorer>`
+    /// per index lets each search take O(1) point-lookups per result chunk.
+    /// What: `DashMap<IndexId, Arc<GraphScorer>>` populated lazily on first
+    /// search for an index and invalidated after each reindex (see
+    /// `invalidate_graph_scorer`).
+    /// Test: covered by the search integration tests that exercise the
+    /// post-MMR ranking blend.
+    pub graph_scorers:
+        Arc<DashMap<IndexId, Arc<crate::core::indexer::graph_score::GraphScorer>>>,
 }
 
 impl SearchAppState {
@@ -297,7 +310,73 @@ impl SearchAppState {
             )),
             embed_pool: Arc::new(RwLock::new(None)),
             metrics: None,
+            graph_scorers: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Resolve a cached `GraphScorer` for `index_id`, building it on demand.
+    ///
+    /// Why: Graph scoring needs both the symbol graph and the Louvain
+    /// communities. Both are persisted in redb, so the first lookup pays one
+    /// snapshot + one redb scan; subsequent calls are O(1) `Arc` clones.
+    /// Returns `None` when the index isn't registered, when the symbol graph
+    /// is empty (no useful centrality signal), or when communities haven't
+    /// been computed yet (Louvain runs as a post-reindex pass).
+    /// What: deserialises the persisted community records using `serde_json`
+    /// to match the `save_communities` writer. All errors are swallowed
+    /// (logged at `debug`) — search must never block on a phase-4 enrichment.
+    /// Test: covered indirectly via the `search_handler` integration tests.
+    pub async fn graph_scorer(
+        &self,
+        index_id: &IndexId,
+    ) -> Option<Arc<crate::core::indexer::graph_score::GraphScorer>> {
+        if let Some(scorer) = self.graph_scorers.get(index_id) {
+            return Some(scorer.clone());
+        }
+        let handle = self.registry.get(index_id)?;
+        let indexer = handle.indexer.read().await;
+        let graph = indexer.symbol_graph().await;
+        if graph.node_count() == 0 {
+            return None;
+        }
+        let corpus = indexer.corpus_arc()?;
+        drop(indexer);
+
+        let communities = match corpus.load_communities() {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|(_, bytes)| {
+                    serde_json::from_slice::<crate::core::community::CommunityRecord>(&bytes).ok()
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::debug!(
+                    "graph_scorer: failed to load communities for '{index_id}': {e}"
+                );
+                Vec::new()
+            }
+        };
+
+        let scorer = Arc::new(crate::core::indexer::graph_score::GraphScorer::build(
+            &graph,
+            &communities,
+        ));
+        self.graph_scorers
+            .insert(index_id.clone(), Arc::clone(&scorer));
+        Some(scorer)
+    }
+
+    /// Drop any cached `GraphScorer` for `index_id` so the next search request
+    /// rebuilds it against the post-reindex graph + community state.
+    ///
+    /// Why: After a reindex the symbol graph and community partition can both
+    /// change; serving a stale scorer would give wrong centrality bonuses.
+    /// What: One `DashMap::remove` per call; safe to invoke even when no
+    /// scorer is cached.
+    /// Test: covered by `graph_scorer_cache_invalidates_on_reindex` (see
+    /// reindex handler tests).
+    pub fn invalidate_graph_scorer(&self, index_id: &IndexId) {
+        self.graph_scorers.remove(index_id);
     }
 
     /// Builder-style: attach a pre-built embedder worker pool (issue #41
@@ -1302,6 +1381,7 @@ async fn delete_index_handler(
     let index_id = IndexId::new(id.clone());
     let removed = state.registry.unregister(&index_id);
     state.reindex_progress.remove(&index_id);
+    state.invalidate_graph_scorer(&index_id);
     if removed {
         // Issue #85: drop the on-disk footprint so the index doesn't come
         // back on the next daemon restart. Best-effort — log on failure.
@@ -1331,10 +1411,60 @@ async fn search_handler(
     let intent = QueryClassifier::classify_with_domain(&query.text, &handle.domain_terms);
     let started = std::time::Instant::now();
     let indexer = handle.indexer.read().await;
-    let results = indexer
+    let mut results = indexer
         .search(&query)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Snapshot the symbol graph for primary-symbol resolution before dropping
+    // the read lock. Cheap `Arc::clone`.
+    let graph_snapshot = indexer.symbol_graph().await;
+    drop(indexer);
+
+    // Issue #41 phase 4: blend graph centrality + centroid bonus into the
+    // post-MMR ranking. Cohesion = fraction of top-10 results sharing the top
+    // result's community. Both are best-effort — search must never block on a
+    // missing scorer.
+    let (graph_scoring, community_cohesion) = match state.graph_scorer(&index_id).await {
+        Some(scorer) => {
+            for result in results.iter_mut() {
+                if let Some(sym) = graph_snapshot.symbol_for_chunk(&result.id) {
+                    result.score += scorer.bonus(sym);
+                }
+            }
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_n = results.iter().take(10).collect::<Vec<_>>();
+            let cohesion = if let Some(head) = top_n.first() {
+                if let Some(head_sym) = graph_snapshot.symbol_for_chunk(&head.id) {
+                    let total = top_n.len() as f32;
+                    let matches = top_n
+                        .iter()
+                        .filter(|r| {
+                            graph_snapshot
+                                .symbol_for_chunk(&r.id)
+                                .map(|s| scorer.same_community(head_sym, s))
+                                .unwrap_or(false)
+                        })
+                        .count() as f32;
+                    if total > 0.0 {
+                        matches / total
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            (true, cohesion)
+        }
+        None => (false, 0.0_f32),
+    };
+
     let latency_ms = started.elapsed().as_millis() as u64;
     tracing::info!(
         index_id = %index_id,
@@ -1348,6 +1478,10 @@ async fn search_handler(
         "results": results,
         "intent": format!("{:?}", intent),
         "latency_ms": latency_ms,
+        "meta": {
+            "graph_scoring": graph_scoring,
+            "community_cohesion": community_cohesion,
+        },
     })))
 }
 
@@ -2342,6 +2476,10 @@ async fn reindex_handler(
     state
         .reindex_progress
         .insert(index_id.clone(), Arc::clone(&progress));
+
+    // Issue #41 phase 4: invalidate the cached GraphScorer so the next search
+    // rebuilds it against the post-reindex symbol graph + community partition.
+    state.invalidate_graph_scorer(&index_id);
 
     spawn_reindex_with_cleanup(
         handle,

@@ -1,3 +1,5 @@
+#[cfg(feature = "candle")]
+pub mod candle_embedder;
 pub mod client;
 pub mod concurrency;
 pub mod config;

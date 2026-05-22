@@ -918,6 +918,28 @@ impl SymbolGraph {
         self.chunk_to_symbol.get(chunk_id).map(|s| s.as_str())
     }
 
+    /// Compute total degree (in + out) for every symbol node.
+    ///
+    /// Why: graph-expanded retrieval (issue #41 phase 4) blends RRF scores with
+    /// normalised degree centrality so heavily-connected symbols (subsystem
+    /// entry points, frequently called utilities) surface alongside purely
+    /// semantic matches. Exposing degrees once per built graph lets the
+    /// `GraphScorer` precompute a `symbol → degree/max_degree` table cheaply.
+    /// What: returns `symbol → total_degree` where total_degree = in_degree +
+    /// out_degree across all edge kinds. Symbols with no edges are present
+    /// with value 0.
+    /// Test: covered by `graph_score::tests::high_degree_node_scores_higher`
+    /// which builds a graph with asymmetric degrees and asserts ordering.
+    pub fn degrees(&self) -> HashMap<String, usize> {
+        let mut out: HashMap<String, usize> = HashMap::with_capacity(self.graph.node_count());
+        for (sym, &idx) in self.by_symbol.iter() {
+            let d_in = self.graph.edges_directed(idx, Direction::Incoming).count();
+            let d_out = self.graph.edges_directed(idx, Direction::Outgoing).count();
+            out.insert(sym.clone(), d_in + d_out);
+        }
+        out
+    }
+
     /// Iterate all nodes, returning `(symbol, chunk_id, file)` tuples.
     ///
     /// Why: the `GET /indexes/{id}/graph` endpoint (issue #128) needs to export

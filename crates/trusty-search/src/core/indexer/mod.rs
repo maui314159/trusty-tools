@@ -35,6 +35,7 @@ use crate::core::store::VectorStore;
 use crate::core::symbol_graph::SymbolGraph;
 
 mod files;
+pub mod graph_score;
 mod ingest;
 mod persist;
 mod search;

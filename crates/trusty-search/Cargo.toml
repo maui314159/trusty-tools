@@ -143,6 +143,15 @@ include_dir = "0.7"
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 
+# ── Optional Candle embedder (issue #41 phase 4, feature-gated) ────────────
+# Why: bypasses the ONNX/CoreML jetsam-kill risk on Apple Silicon by running
+# the all-MiniLM-L6-v2 BERT forward pass on Metal directly via candle. Opt-in
+# only — default builds keep the fastembed/ONNX path.
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+hf-hub = { version = "0.3", optional = true, features = ["tokio"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user"] }
 
@@ -202,3 +211,14 @@ coreml = ["trusty-common/embedder-coreml"]
 # `cargo build --features clustering` when ConceptCluster entities are
 # desired in the KG / BM25 enrichment passes.
 clustering = ["dep:linfa", "dep:linfa-clustering", "dep:ndarray", "dep:ndarray-rand"]
+# Candle embedder (issue #41 phase 4): alternative to the ONNX/fastembed
+# path, running all-MiniLM-L6-v2 on Metal (Apple Silicon) via candle. Opt-in
+# via `--features candle` AND `TRUSTY_EMBEDDER=candle` at runtime. Default
+# builds keep the fastembed/ONNX path untouched.
+candle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:hf-hub",
+    "dep:tokenizers",
+]
