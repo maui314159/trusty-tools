@@ -1235,7 +1235,7 @@ pub fn render(frame: &mut Frame, screen: &HealthScreen) {
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(32), // collections list
+            Constraint::Length(30), // collections list
             Constraint::Min(20),    // tabbed panel
         ])
         .split(outer[1]);
