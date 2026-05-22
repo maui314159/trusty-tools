@@ -2,17 +2,29 @@
 //!
 //! Why: Without feedback, importance scores are static. RecallLog closes the
 //! loop — frequently recalled drawers are demonstrably more useful.
-//! What: SQLite-backed event log with hit_count, miss_rate, top_drawers queries.
+//! What: redb-backed event log with hit_count, miss_rate, top_drawers queries.
+//! Issue #57 migrates the storage layer from rusqlite + r2d2 to redb so the
+//! analytics sidecar drops the heavy SQLite dependency chain and lines up with
+//! the rest of the Memory Palace (`kg_redb.rs`, payload_store). The public
+//! `RecallLog` API is unchanged — callers that previously pointed at
+//! `<data_dir>/recall.db` keep working; the file on disk becomes
+//! `<data_dir>/recall.redb`, with a one-shot SQLite → redb migration on first
+//! open when the `sqlite-kg` feature is enabled.
 //! NLP: Query normalization via stop-word removal + FNV-1a hash. Zero inference.
-//! Test: record then hit_count, miss_rate 1.0 when all miss, top_drawers ordering.
+//! Test: record then hit_count, miss_rate 1.0 when all miss, top_drawers ordering,
+//! plus reopen round-trip (events survive across reopens) and (gated on
+//! `sqlite-kg`) one-shot migration from a legacy `recall.db` SQLite file.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
+use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
+
+use crate::memory_core::store::kg_store::RECALL_LOG;
 
 // ── Query normalization (NLP — no inference) ─────────────────────────────────
 
@@ -75,6 +87,14 @@ pub fn query_hash(text: &str) -> u64 {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/// One recall event row, postcard-encoded as the value in the RECALL_LOG table.
+///
+/// Why: Persisting the structured event (rather than ad-hoc columns) lets us
+/// add fields without a schema migration — postcard reads ignore missing
+/// trailing fields. The serde derives are required for postcard encoding.
+/// What: Same fields the SQLite implementation carried, with `serde::Serialize`
+/// / `Deserialize` added.
+/// Test: `record_then_hit_count`, `roundtrip_persists_across_reopen`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallEvent {
     pub palace_id: String,
@@ -88,69 +108,149 @@ pub struct RecallEvent {
 
 // ── RecallLog ────────────────────────────────────────────────────────────────
 
+/// redb-backed hit/miss event log.
+///
+/// Why: Provides durable analytics for the Memory Palace without the rusqlite
+/// dependency chain. The public surface (`record`, `hit_count`, `miss_rate`,
+/// `top_drawers`, `missed_queries`) is preserved as-is so retrieval.rs and the
+/// CLI/MCP plumbing keep working unchanged.
+/// What: Owns an `Arc<redb::Database>` over a single `recall.redb` file. Each
+/// `record` writes one row into the RECALL_LOG table; the read methods range-
+/// scan the whole table (the log is bounded by retention windows / palace
+/// sizes; if it ever grows enough to matter we'll add secondary indexes).
+/// Test: see the `tests` module below — round-trip persistence, hit/miss/
+/// drawer/missed-query queries, and (gated on `sqlite-kg`) the one-shot
+/// migration from a legacy `recall.db` SQLite file.
 pub struct RecallLog {
-    pool: Pool<SqliteConnectionManager>,
+    db: Arc<Database>,
+    path: PathBuf,
+    /// Monotonic event-id source — guarantees unique keys even when multiple
+    /// `record` calls land inside the same millisecond.
+    next_id: AtomicU64,
 }
 
 impl RecallLog {
     /// Open (or create) a recall log at `path`.
     ///
-    /// Why: Sharing the palace directory keeps everything in one place.
-    /// What: WAL-mode SQLite pool + schema migration.
-    /// Test: open on tempdir then record + query roundtrips.
+    /// Why: Sharing the palace directory keeps everything in one place. The
+    /// legacy SQLite path (`recall.db`) is silently rewritten to `recall.redb`
+    /// so retrieval.rs's existing call site (`<data_dir>/recall.db`) keeps
+    /// working without churn. When the `sqlite-kg` feature is enabled and a
+    /// legacy `recall.db` is present, its rows are copied across in a one-shot
+    /// migration and the SQLite file is renamed `recall.db.migrated` so the
+    /// next open is a no-op.
+    /// What: Resolves the redb path, creates parent dirs, runs the migration
+    /// (feature-gated), opens the redb database, touches the RECALL_LOG table
+    /// so range scans on a fresh file succeed, then seeds the `next_id`
+    /// counter from the highest existing key so monotonicity holds across
+    /// reopens.
+    /// Test: `record_then_hit_count`, `roundtrip_persists_across_reopen`,
+    /// `migrates_legacy_sqlite_rows` (gated).
     pub fn open(path: &Path) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(path);
-        let pool = Pool::builder()
-            .max_size(4)
-            .build(manager)
-            .context("failed to build recall log pool")?;
+        let redb_path = resolve_redb_path(path);
 
-        let conn = pool.get().context("failed to get connection")?;
-        conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
-            .context("failed to set WAL mode")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS recall_events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                palace_id   TEXT    NOT NULL,
-                query_hash  INTEGER NOT NULL,
-                layer       INTEGER NOT NULL,
-                drawer_id   TEXT,
-                score       REAL    NOT NULL,
-                occurred_at TEXT    NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_recall_drawer
-                ON recall_events(drawer_id) WHERE drawer_id IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_recall_query
-                ON recall_events(query_hash, occurred_at);",
-        )
-        .context("failed to create recall_events schema")?;
+        if let Some(parent) = redb_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create recall log parent dir {}", parent.display())
+                })?;
+            }
+        }
 
-        Ok(Self { pool })
+        // One-shot migration must run *before* we open the long-lived db
+        // handle — the migrator opens redb itself.
+        #[cfg(feature = "sqlite-kg")]
+        migrate_from_sqlite_if_present(path, &redb_path)?;
+
+        let db = Database::create(&redb_path).with_context(|| {
+            format!("failed to open redb recall log at {}", redb_path.display())
+        })?;
+
+        // Touch the table and discover the highest existing event id in one
+        // write transaction so subsequent reads on a brand-new file succeed
+        // and so we can seed the in-process monotonic counter.
+        let mut max_seen: u64 = 0;
+        {
+            let wtx = db
+                .begin_write()
+                .context("failed to begin write txn for recall log init")?;
+            {
+                let table = wtx
+                    .open_table(RECALL_LOG)
+                    .context("failed to open RECALL_LOG table")?;
+                // redb's BTreeMap-backed tables sort numerically for u64 keys,
+                // so the last entry has the max id.
+                if let Some(entry) = table
+                    .last()
+                    .context("failed to read last key from RECALL_LOG")?
+                {
+                    max_seen = entry.0.value();
+                }
+            }
+            wtx.commit().context("failed to commit recall log init")?;
+        }
+
+        Ok(Self {
+            db: Arc::new(db),
+            path: redb_path,
+            next_id: AtomicU64::new(max_seen),
+        })
+    }
+
+    /// Allocate the next monotonic event id.
+    ///
+    /// Why: Multiple recall events can land in the same millisecond. Using the
+    /// wall-clock alone would collide and overwrite previously persisted rows;
+    /// combining the wall-clock with an in-process counter keeps keys unique
+    /// while still preserving sort-by-insertion-order for range scans.
+    /// What: Returns `max(now_ms, last_id + 1)`. The counter persists across
+    /// inserts via `next_id` and is seeded from the highest existing key on
+    /// open.
+    /// Test: covered indirectly by `record_then_hit_count` (multiple records
+    /// in the same ms) and `roundtrip_persists_across_reopen`.
+    fn alloc_id(&self) -> u64 {
+        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+        loop {
+            let current = self.next_id.load(Ordering::Acquire);
+            let candidate = now_ms.max(current + 1);
+            if self
+                .next_id
+                .compare_exchange(current, candidate, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
     }
 
     /// Record a recall event.
     ///
-    /// Why: Persist hit/miss feedback to drive importance updates and gap detection.
-    /// What: spawn_blocking insert into recall_events.
-    /// Test: record then hit_count returns 1.
+    /// Why: Persist hit/miss feedback to drive importance updates and gap
+    /// detection. `tokio::task::spawn_blocking` preserves the original async
+    /// signature so retrieval.rs and friends are unaffected by the redb
+    /// migration.
+    /// What: Allocates a unique event id, postcard-encodes the event, and
+    /// writes one row into the RECALL_LOG table under a single write txn.
+    /// Test: `record_then_hit_count`, `roundtrip_persists_across_reopen`.
     pub async fn record(&self, event: RecallEvent) -> Result<()> {
-        let pool = self.pool.clone();
+        let id = self.alloc_id();
+        let bytes =
+            postcard::to_allocvec(&event).context("failed to postcard-encode RecallEvent")?;
+        let db = self.db.clone();
+        let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get connection")?;
-            conn.execute(
-                "INSERT INTO recall_events
-                    (palace_id, query_hash, layer, drawer_id, score, occurred_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    event.palace_id,
-                    event.query_hash as i64,
-                    event.layer,
-                    event.drawer_id.map(|id| id.to_string()),
-                    event.score,
-                    event.occurred_at.to_rfc3339(),
-                ],
-            )
-            .context("failed to insert recall event")?;
+            let wtx = db
+                .begin_write()
+                .with_context(|| format!("begin_write recall log {}", path.display()))?;
+            {
+                let mut table = wtx
+                    .open_table(RECALL_LOG)
+                    .context("open RECALL_LOG table")?;
+                table
+                    .insert(id, bytes.as_slice())
+                    .context("insert RecallEvent row")?;
+            }
+            wtx.commit().context("commit RecallEvent write")?;
             Ok(())
         })
         .await
@@ -158,25 +258,47 @@ impl RecallLog {
         Ok(())
     }
 
+    /// Snapshot every event currently in the log.
+    ///
+    /// Why: All read methods are full scans — bounded by retention/window — so
+    /// we share a single snapshot helper rather than duplicate the txn / decode
+    /// dance per method.
+    /// What: Opens a read transaction, decodes each row into `RecallEvent`,
+    /// returns them in key order (insertion order).
+    /// Test: covered by every public read method's tests.
+    fn snapshot(&self) -> Result<Vec<RecallEvent>> {
+        let db = self.db.clone();
+        let path = self.path.clone();
+        let rtx = db
+            .begin_read()
+            .with_context(|| format!("begin_read recall log {}", path.display()))?;
+        let table = rtx
+            .open_table(RECALL_LOG)
+            .context("open RECALL_LOG table (read)")?;
+        let mut out = Vec::new();
+        for entry in table.iter().context("iter RECALL_LOG")? {
+            let (_k, v) = entry.context("decode RECALL_LOG row")?;
+            let ev: RecallEvent = postcard::from_bytes(v.value())
+                .context("postcard decode RecallEvent")?;
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
     /// Total hit count for a specific drawer.
     ///
     /// Why: Frequently recalled drawers should bubble up in importance.
-    /// What: COUNT(*) WHERE drawer_id = ?.
+    /// What: Snapshot then count events whose `drawer_id == Some(drawer_id)`.
     /// Test: record twice for same drawer → hit_count == 2.
     pub async fn hit_count(&self, drawer_id: Uuid) -> Result<u64> {
-        let pool = self.pool.clone();
-        let id_str = drawer_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<u64> {
-            let conn = pool.get()?;
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM recall_events WHERE drawer_id = ?1",
-                rusqlite::params![id_str],
-                |r| r.get(0),
-            )?;
-            Ok(count as u64)
-        })
-        .await
-        .context("hit_count task join error")?
+        let events = self.snapshot_async().await?;
+        let mut count: u64 = 0;
+        for ev in events {
+            if ev.drawer_id == Some(drawer_id) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Fraction of distinct queries in last `window_days` that returned 0 results.
@@ -185,91 +307,258 @@ impl RecallLog {
     /// What: distinct miss queries / distinct total queries within window.
     /// Test: only-miss events → 1.0; only-hit events → 0.0.
     pub async fn miss_rate(&self, palace_id: &str, window_days: u32) -> Result<f32> {
-        let pool = self.pool.clone();
-        let palace_id = palace_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<f32> {
-            let conn = pool.get()?;
-            let since = (Utc::now() - chrono::Duration::days(window_days as i64)).to_rfc3339();
-            let total: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT query_hash) FROM recall_events
-                 WHERE palace_id = ?1 AND occurred_at >= ?2",
-                rusqlite::params![palace_id, since],
-                |r| r.get(0),
-            )?;
-            if total == 0 {
-                return Ok(0.0);
+        let events = self.snapshot_async().await?;
+        let since = Utc::now() - chrono::Duration::days(window_days as i64);
+        use std::collections::HashSet;
+        let mut total: HashSet<u64> = HashSet::new();
+        let mut misses: HashSet<u64> = HashSet::new();
+        for ev in events {
+            if ev.palace_id != palace_id || ev.occurred_at < since {
+                continue;
             }
-            let misses: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT query_hash) FROM recall_events
-                 WHERE palace_id = ?1 AND occurred_at >= ?2 AND drawer_id IS NULL",
-                rusqlite::params![palace_id, since],
-                |r| r.get(0),
-            )?;
-            Ok(misses as f32 / total as f32)
-        })
-        .await
-        .context("miss_rate task join error")?
+            total.insert(ev.query_hash);
+            if ev.drawer_id.is_none() {
+                misses.insert(ev.query_hash);
+            }
+        }
+        if total.is_empty() {
+            return Ok(0.0);
+        }
+        Ok(misses.len() as f32 / total.len() as f32)
     }
 
     /// Top drawers by hit count.
     ///
     /// Why: Identify the most-valuable drawers to promote in L1.
-    /// What: GROUP BY drawer_id ORDER BY hits DESC LIMIT ?.
+    /// What: Group events by drawer_id (palace-filtered), sort by hit count
+    /// descending, return top `limit`.
     /// Test: drawer with 3 hits ranks above drawer with 1 hit.
     pub async fn top_drawers(&self, palace_id: &str, limit: usize) -> Result<Vec<(Uuid, u64)>> {
-        let pool = self.pool.clone();
-        let palace_id = palace_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Vec<(Uuid, u64)>> {
-            let conn = pool.get()?;
-            let mut stmt = conn.prepare(
-                "SELECT drawer_id, COUNT(*) as hits FROM recall_events
-                 WHERE palace_id = ?1 AND drawer_id IS NOT NULL
-                 GROUP BY drawer_id ORDER BY hits DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![palace_id, limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (id_str, count) = row?;
-                if let Ok(id) = Uuid::parse_str(&id_str) {
-                    out.push((id, count as u64));
-                }
+        let events = self.snapshot_async().await?;
+        use std::collections::HashMap;
+        let mut counts: HashMap<Uuid, u64> = HashMap::new();
+        for ev in events {
+            if ev.palace_id != palace_id {
+                continue;
             }
-            Ok(out)
-        })
-        .await
-        .context("top_drawers task join error")?
+            if let Some(id) = ev.drawer_id {
+                *counts.entry(id).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<(Uuid, u64)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(limit);
+        Ok(out)
     }
 
     /// Most-missed query hashes (queries that returned 0 results).
     ///
     /// Why: Surfaces knowledge gaps so users can fill them.
-    /// What: GROUP BY query_hash WHERE drawer_id IS NULL ORDER BY count DESC.
+    /// What: Group events where `drawer_id is None` by `query_hash`
+    /// (palace-filtered), sort by miss count descending, return top `limit`.
     /// Test: query missed 3 times ranks above query missed 1 time.
     pub async fn missed_queries(&self, palace_id: &str, limit: usize) -> Result<Vec<(u64, u64)>> {
-        let pool = self.pool.clone();
-        let palace_id = palace_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Vec<(u64, u64)>> {
-            let conn = pool.get()?;
-            let mut stmt = conn.prepare(
-                "SELECT query_hash, COUNT(*) as misses FROM recall_events
-                 WHERE palace_id = ?1 AND drawer_id IS NULL
-                 GROUP BY query_hash ORDER BY misses DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![palace_id, limit as i64], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?;
+        let events = self.snapshot_async().await?;
+        use std::collections::HashMap;
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for ev in events {
+            if ev.palace_id != palace_id || ev.drawer_id.is_some() {
+                continue;
+            }
+            *counts.entry(ev.query_hash).or_insert(0) += 1;
+        }
+        let mut out: Vec<(u64, u64)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Async-friendly snapshot helper.
+    ///
+    /// Why: Keep blocking redb work off the async runtime; the read methods
+    /// remain `async fn` so retrieval.rs callers are unchanged.
+    /// What: Wraps `snapshot()` in `tokio::task::spawn_blocking`.
+    /// Test: indirectly covered by every public read-method test.
+    async fn snapshot_async(&self) -> Result<Vec<RecallEvent>> {
+        let db = self.db.clone();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<RecallEvent>> {
+            let rtx = db
+                .begin_read()
+                .with_context(|| format!("begin_read recall log {}", path.display()))?;
+            let table = rtx
+                .open_table(RECALL_LOG)
+                .context("open RECALL_LOG table (read)")?;
             let mut out = Vec::new();
-            for row in rows {
-                let (hash, count) = row?;
-                out.push((hash as u64, count as u64));
+            for entry in table.iter().context("iter RECALL_LOG")? {
+                let (_k, v) = entry.context("decode RECALL_LOG row")?;
+                let ev: RecallEvent = postcard::from_bytes(v.value())
+                    .context("postcard decode RecallEvent")?;
+                out.push(ev);
             }
             Ok(out)
         })
         .await
-        .context("missed_queries task join error")?
+        .context("snapshot task join error")?
     }
+}
+
+/// Internal: callers historically passed `<data_root>/recall.db` for the
+/// SQLite sidecar. Now that the store is redb-backed, accept that same path
+/// and silently rewrite it to `recall.redb` so existing call sites continue
+/// to work. Paths with any other extension (or no extension) are kept as-is.
+///
+/// Why: keeps retrieval.rs's `<data_dir>/recall.db` join unchanged.
+/// What: rewrites `.db` → `.redb`, leaves everything else alone.
+/// Test: `callers_passing_recall_db_get_redb_sibling`.
+fn resolve_redb_path(path: &Path) -> PathBuf {
+    if path.extension().is_some_and(|e| e == "db") {
+        path.with_extension("redb")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// One-shot migration from a legacy SQLite `recall.db` event log.
+///
+/// Why: Issue #57 — existing deployments have a `recall.db` populated by the
+/// pre-redb store. We copy every row across on the first redb open, then
+/// rename the legacy file so subsequent opens are a no-op.
+/// What: Opens the SQLite file read-only, dumps every `recall_events` row,
+/// writes them into the redb RECALL_LOG table under a single write txn, then
+/// renames `recall.db` → `recall.db.migrated`. No-op if the SQLite file is
+/// absent or its `recall_events` table is missing.
+/// Test: `migrates_legacy_sqlite_rows` (gated on the `sqlite-kg` feature).
+#[cfg(feature = "sqlite-kg")]
+fn migrate_from_sqlite_if_present(orig_path: &Path, redb_path: &Path) -> Result<()> {
+    let sqlite_path = if orig_path.extension().is_some_and(|e| e == "db") {
+        orig_path.to_path_buf()
+    } else {
+        // Caller passed the redb path directly — look for a sibling
+        // `recall.db` to migrate.
+        let parent = redb_path.parent().unwrap_or(Path::new("."));
+        parent.join("recall.db")
+    };
+
+    if !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    let migrated_marker = sqlite_path.with_extension("db.migrated");
+    if migrated_marker.exists() && !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    use rusqlite::Connection;
+
+    let conn = Connection::open_with_flags(
+        &sqlite_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| {
+        format!(
+            "open legacy sqlite recall log read-only: {}",
+            sqlite_path.display()
+        )
+    })?;
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recall_events'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        let _ = std::fs::rename(&sqlite_path, &migrated_marker);
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT palace_id, query_hash, layer, drawer_id, score, occurred_at \
+             FROM recall_events ORDER BY id ASC",
+        )
+        .context("prepare legacy recall_events select")?;
+    let rows_iter = stmt
+        .query_map([], |row| {
+            let palace_id: String = row.get(0)?;
+            let query_hash_i: i64 = row.get(1)?;
+            let layer_i: i64 = row.get(2)?;
+            let drawer_id: Option<String> = row.get(3)?;
+            let score: f64 = row.get(4)?;
+            let occurred_at: String = row.get(5)?;
+            Ok((palace_id, query_hash_i, layer_i, drawer_id, score, occurred_at))
+        })
+        .context("query legacy recall_events rows")?;
+
+    let mut staged: Vec<RecallEvent> = Vec::new();
+    for row in rows_iter {
+        let (palace_id, qh_i, layer_i, drawer_id_str, score, occurred_at_s) =
+            row.context("read legacy recall_events row")?;
+        let drawer_id = match drawer_id_str {
+            Some(s) => Some(
+                Uuid::parse_str(&s)
+                    .map_err(|e| anyhow!("invalid uuid in legacy recall row: {e}"))?,
+            ),
+            None => None,
+        };
+        let occurred_at = DateTime::parse_from_rfc3339(&occurred_at_s)
+            .map_err(|e| anyhow!("invalid occurred_at in legacy recall row: {e}"))?
+            .with_timezone(&Utc);
+        staged.push(RecallEvent {
+            palace_id,
+            query_hash: qh_i as u64,
+            layer: layer_i as u8,
+            drawer_id,
+            score: score as f32,
+            occurred_at,
+        });
+    }
+
+    // Drop the prepared statement / connection before renaming so SQLite
+    // releases the file handle.
+    drop(stmt);
+    drop(conn);
+
+    // Open redb separately so the write happens before we register the long-
+    // lived `Database` handle in `open`.
+    let db = Database::create(redb_path).with_context(|| {
+        format!(
+            "open redb recall log for migration write: {}",
+            redb_path.display()
+        )
+    })?;
+    let wtx = db
+        .begin_write()
+        .context("begin_write redb for recall migration")?;
+    {
+        let mut table = wtx
+            .open_table(RECALL_LOG)
+            .context("open RECALL_LOG table for migration")?;
+        // Use sequential ids starting at 1 so the migrated rows sort in their
+        // original insertion order regardless of clock skew.
+        for (i, ev) in staged.iter().enumerate() {
+            let id = (i as u64).saturating_add(1);
+            let bytes = postcard::to_allocvec(ev)
+                .context("postcard encode migrated RecallEvent")?;
+            table
+                .insert(id, bytes.as_slice())
+                .context("insert migrated RecallEvent row")?;
+        }
+    }
+    wtx.commit().context("commit migrated recall rows")?;
+    drop(db);
+
+    std::fs::rename(&sqlite_path, &migrated_marker).with_context(|| {
+        format!(
+            "rename legacy recall db {} -> {}",
+            sqlite_path.display(),
+            migrated_marker.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -422,5 +711,133 @@ mod tests {
         let missed = log.missed_queries("test", 5).await.unwrap();
         assert_eq!(missed[0].0, h1);
         assert_eq!(missed[0].1, 3);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_persists_across_reopen() {
+        // Why: redb migration is only useful if events survive a reopen — the
+        // SQLite implementation did, the new one must too.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall.db");
+        let id = Uuid::new_v4();
+        {
+            let log = RecallLog::open(&path).unwrap();
+            log.record(RecallEvent {
+                palace_id: "test".into(),
+                query_hash: 42,
+                layer: 2,
+                drawer_id: Some(id),
+                score: 0.5,
+                occurred_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        }
+        // Reopen — the persisted event must still be there.
+        let log2 = RecallLog::open(&path).unwrap();
+        assert_eq!(log2.hit_count(id).await.unwrap(), 1);
+        // And new inserts must not collide with the seeded id.
+        log2.record(RecallEvent {
+            palace_id: "test".into(),
+            query_hash: 42,
+            layer: 2,
+            drawer_id: Some(id),
+            score: 0.7,
+            occurred_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(log2.hit_count(id).await.unwrap(), 2);
+    }
+
+    #[test]
+    fn callers_passing_recall_db_get_redb_sibling() {
+        // Existing callers pass `recall.db`; the resolver must redirect to
+        // `recall.redb` so on-disk storage is actually redb.
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("recall.db");
+        let _log = RecallLog::open(&legacy).unwrap();
+        let redb_path = dir.path().join("recall.redb");
+        assert!(
+            redb_path.exists(),
+            "expected redb sibling to be created at {}",
+            redb_path.display()
+        );
+    }
+
+    #[cfg(feature = "sqlite-kg")]
+    #[tokio::test]
+    async fn migrates_legacy_sqlite_rows() {
+        use rusqlite::params;
+
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("recall.db");
+        let drawer_a = Uuid::new_v4();
+
+        // Build a legacy SQLite recall log with two rows (one hit, one miss).
+        {
+            let conn = rusqlite::Connection::open(&legacy).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE recall_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    palace_id   TEXT    NOT NULL,
+                    query_hash  INTEGER NOT NULL,
+                    layer       INTEGER NOT NULL,
+                    drawer_id   TEXT,
+                    score       REAL    NOT NULL,
+                    occurred_at TEXT    NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO recall_events
+                    (palace_id, query_hash, layer, drawer_id, score, occurred_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "test",
+                    123_i64,
+                    2_i64,
+                    drawer_a.to_string(),
+                    0.9_f64,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO recall_events
+                    (palace_id, query_hash, layer, drawer_id, score, occurred_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "test",
+                    456_i64,
+                    3_i64,
+                    Option::<String>::None,
+                    0.0_f64,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Open the redb-backed log at the legacy path — migration must run.
+        let log = RecallLog::open(&legacy).unwrap();
+
+        // The hit row should be queryable.
+        assert_eq!(log.hit_count(drawer_a).await.unwrap(), 1);
+        // The miss row should drive miss_rate > 0 (1 miss query, 2 total).
+        let rate = log.miss_rate("test", 7).await.unwrap();
+        assert!(rate > 0.0, "expected non-zero miss rate, got {rate}");
+
+        // Legacy file should be renamed.
+        assert!(!legacy.exists(), "legacy recall.db should be renamed");
+        assert!(
+            dir.path().join("recall.db.migrated").exists(),
+            "expected migration marker file"
+        );
+
+        // Reopen — must be a no-op (no duplicate rows).
+        drop(log);
+        let log2 = RecallLog::open(&legacy).unwrap();
+        assert_eq!(log2.hit_count(drawer_a).await.unwrap(), 1);
     }
 }

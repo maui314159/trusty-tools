@@ -1323,9 +1323,12 @@ mod tests {
             handle.recall_log.is_some(),
             "PalaceHandle::open must auto-attach a RecallLog (issue #53)"
         );
+        // Issue #57 migrated RecallLog from SQLite to redb. The legacy
+        // `recall.db` path passed by retrieval.rs is silently rewritten to
+        // `recall.redb`; assert the redb file lands on disk after open.
         assert!(
-            palace.data_dir.join("recall.db").exists(),
-            "recall.db must exist on disk after open"
+            palace.data_dir.join("recall.redb").exists(),
+            "recall.redb must exist on disk after open"
         );
 
         // End-to-end: remember + recall should produce at least one logged hit.
