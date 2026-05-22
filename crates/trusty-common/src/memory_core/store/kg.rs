@@ -712,6 +712,59 @@ impl KnowledgeGraph {
         usize::try_from(n).unwrap_or(usize::MAX)
     }
 
+    /// Number of distinct entities (nodes) in the in-memory adjacency.
+    ///
+    /// Why: Per-palace dashboards want a node tally alongside the active
+    /// triple count to gauge graph breadth (many subjects ↔ many facts about
+    /// one). The adjacency is the authoritative node set for graph
+    /// operations because triples are deduplicated by `(subject, object)`
+    /// edges and entities can appear as either endpoint.
+    /// What: Acquires the adjacency read lock and returns
+    /// `StableGraph::node_count()`. Returns `0` if the lock is poisoned —
+    /// node counts are diagnostic, not critical, so we degrade gracefully
+    /// rather than propagating the error.
+    /// Test: `kg_graph_tests::node_and_edge_count_match_adjacency`.
+    pub fn node_count(&self) -> usize {
+        match self.adj.read() {
+            Ok(adj) => adj.graph.node_count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Number of directed edges in the in-memory adjacency.
+    ///
+    /// Why: Companion to [`node_count`] for dashboards that surface graph
+    /// density at a glance. Counted from the adjacency (not the redb
+    /// triple table) because parallel edges between the same pair of nodes
+    /// collapse into one petgraph edge; the adjacency view is what every
+    /// graph algorithm (BFS, A*, Louvain) sees.
+    /// What: Acquires the adjacency read lock and returns
+    /// `StableGraph::edge_count()`. Returns `0` on a poisoned lock.
+    /// Test: `kg_graph_tests::node_and_edge_count_match_adjacency`.
+    pub fn edge_count(&self) -> usize {
+        match self.adj.read() {
+            Ok(adj) => adj.graph.edge_count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Number of Louvain communities detected in the active graph.
+    ///
+    /// Why: The MEMORY tab in the operator TUI shows a community tally per
+    /// palace so operators can see clustering at a glance. Centralising the
+    /// call here avoids the TUI importing the `community` module directly.
+    /// What: Delegates to `community::partition(self)` and returns the
+    /// number of non-empty partition groups. Returns `0` for an empty
+    /// graph or when the adjacency snapshot fails (the partition function
+    /// itself returns an empty vec in those cases).
+    /// Test: `kg_graph_tests::community_count_returns_partition_size`.
+    pub fn community_count(&self) -> usize {
+        crate::memory_core::community::partition(self)
+            .iter()
+            .filter(|c| !c.is_empty())
+            .count()
+    }
+
     /// Compatibility shim for the old WAL checkpoint API.
     ///
     /// Why: The Dreamer cycle called this to bound SQLite's WAL. redb manages
@@ -1170,5 +1223,66 @@ mod tests {
         assert_eq!(window.len(), 2);
         assert_eq!(window[0].subject, "subj-1");
         assert_eq!(window[1].subject, "subj-0");
+    }
+
+    /// Why: Per-palace dashboards expose `node_count` / `edge_count` straight
+    /// from the in-memory adjacency, and both must agree with what graph
+    /// algorithms see (otherwise the dashboard lies).
+    /// What: Asserts three asserted triples between three distinct subjects
+    /// yield three nodes and three directed edges, matching petgraph's view.
+    /// Test: this test.
+    #[tokio::test]
+    async fn node_and_edge_count_match_adjacency() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        assert_eq!(kg.node_count(), 0);
+        assert_eq!(kg.edge_count(), 0);
+
+        for (s, o) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            kg.assert(Triple {
+                subject: s.into(),
+                predicate: "rel".into(),
+                object: o.into(),
+                valid_from: Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(kg.node_count(), 3);
+        assert_eq!(kg.edge_count(), 3);
+    }
+
+    /// Why: `community_count` powers the MEMORY tab community tally; an
+    /// empty graph must report zero, a populated graph must report at least
+    /// one non-empty partition.
+    /// What: Counts communities before and after asserting two triples in a
+    /// tightly-connected triangle. The exact partition shape depends on the
+    /// Louvain implementation, so we only assert non-zero on a populated
+    /// graph and zero on an empty one.
+    /// Test: this test.
+    #[tokio::test]
+    async fn community_count_returns_partition_size() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        assert_eq!(kg.community_count(), 0);
+
+        for (s, o) in [("x", "y"), ("y", "z"), ("z", "x")] {
+            kg.assert(Triple {
+                subject: s.into(),
+                predicate: "rel".into(),
+                object: o.into(),
+                valid_from: Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .unwrap();
+        }
+        assert!(kg.community_count() >= 1);
     }
 }

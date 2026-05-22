@@ -463,6 +463,41 @@ struct PalaceInfo {
     /// Null when the handle is unavailable or the palace has zero drawers.
     /// Test: `palace_list_includes_last_write_at` (web tests, added below).
     last_write_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Distinct-entity count in the KG adjacency (zero when no handle).
+    ///
+    /// Why: The operator TUI surfaces graph breadth alongside triple count;
+    /// a separate field avoids re-querying the KG for every dashboard tick.
+    /// What: `handle.kg.node_count()`. `#[serde(default)]` so older clients
+    /// that don't know the field still deserialise the payload.
+    /// Test: `palace_list_includes_graph_counts`.
+    #[serde(default)]
+    node_count: u64,
+    /// Directed-edge count in the KG adjacency (zero when no handle).
+    ///
+    /// Why: Companion to `node_count` for density at a glance.
+    /// What: `handle.kg.edge_count()`. `#[serde(default)]` for forward-compat.
+    /// Test: `palace_list_includes_graph_counts`.
+    #[serde(default)]
+    edge_count: u64,
+    /// Number of Louvain communities detected in the KG (zero when no handle).
+    ///
+    /// Why: The MEMORY tab shows a community tally so operators can spot
+    /// clustering at a glance without opening the KG explorer.
+    /// What: `handle.kg.community_count()`. `#[serde(default)]` for
+    /// forward-compat.
+    /// Test: `palace_list_includes_graph_counts`.
+    #[serde(default)]
+    community_count: u64,
+    /// `true` while a `Dreamer::dream_cycle` is running against this palace.
+    ///
+    /// Why: Drives the dreaming/compacting spinner in the operator TUI; the
+    /// dashboard polls `/api/v1/palaces` and needs a single boolean signal.
+    /// What: `handle.is_compacting()`, set by `CompactionGuard` in
+    /// `trusty_common::memory_core::dream`. `#[serde(default)]` so old clients
+    /// that don't expect the field deserialise as `false`.
+    /// Test: `palace_list_includes_graph_counts`.
+    #[serde(default)]
+    is_compacting: bool,
 }
 
 /// Build a `PalaceInfo` from a `Palace` row plus an optional opened handle.
@@ -475,21 +510,34 @@ struct PalaceInfo {
 /// is the closest proxy).
 /// Test: `palace_list_includes_richer_counts`.
 fn palace_info_from(palace: &Palace, handle: Option<&Arc<PalaceHandle>>) -> PalaceInfo {
-    let (drawer_count, vector_count, kg_triple_count, wing_count, last_write_at) =
-        if let Some(h) = handle {
-            let drawers = h.drawers.read();
-            let distinct_rooms: HashSet<Uuid> = drawers.iter().map(|d| d.room_id).collect();
-            let last_write = drawers.iter().map(|d| d.created_at).max();
-            (
-                drawers.len(),
-                h.vector_store.index_size(),
-                h.kg.count_active_triples(),
-                distinct_rooms.len(),
-                last_write,
-            )
-        } else {
-            (0, 0, 0, 0, None)
-        };
+    let (
+        drawer_count,
+        vector_count,
+        kg_triple_count,
+        wing_count,
+        last_write_at,
+        node_count,
+        edge_count,
+        community_count,
+        is_compacting,
+    ) = if let Some(h) = handle {
+        let drawers = h.drawers.read();
+        let distinct_rooms: HashSet<Uuid> = drawers.iter().map(|d| d.room_id).collect();
+        let last_write = drawers.iter().map(|d| d.created_at).max();
+        (
+            drawers.len(),
+            h.vector_store.index_size(),
+            h.kg.count_active_triples(),
+            distinct_rooms.len(),
+            last_write,
+            h.kg.node_count() as u64,
+            h.kg.edge_count() as u64,
+            h.kg.community_count() as u64,
+            h.is_compacting(),
+        )
+    } else {
+        (0, 0, 0, 0, None, 0, 0, 0, false)
+    };
     PalaceInfo {
         id: palace.id.0.clone(),
         name: palace.name.clone(),
@@ -500,6 +548,10 @@ fn palace_info_from(palace: &Palace, handle: Option<&Arc<PalaceHandle>>) -> Pala
         wing_count,
         created_at: palace.created_at,
         last_write_at,
+        node_count,
+        edge_count,
+        community_count,
+        is_compacting,
     }
 }
 
@@ -2762,6 +2814,56 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v.as_array().expect("array");
         assert!(arr.iter().any(|p| p["id"] == "web-test"));
+    }
+
+    /// Why: The operator TUI's MEMORY tab reads `node_count`, `edge_count`,
+    /// `community_count`, and `is_compacting` straight off the
+    /// `/api/v1/palaces` payload. If any of those fields disappear or change
+    /// type the spinner / counters break silently. Pin the shape here.
+    /// What: Creates a palace, lists `/api/v1/palaces`, and asserts every new
+    /// field is present and typed as expected (numbers default to 0, the
+    /// compacting flag defaults to false on a freshly-opened palace).
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn palace_list_includes_graph_counts() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+        let body = json!({"name": "graph-counts", "description": null}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("array");
+        let row = arr
+            .iter()
+            .find(|p| p["id"] == "graph-counts")
+            .expect("created palace must appear in list");
+        assert_eq!(row["node_count"].as_u64(), Some(0));
+        assert_eq!(row["edge_count"].as_u64(), Some(0));
+        assert_eq!(row["community_count"].as_u64(), Some(0));
+        assert_eq!(row["is_compacting"].as_bool(), Some(false));
     }
 
     /// Why: The enriched status payload backs the dashboard's top-row stats;

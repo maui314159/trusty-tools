@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -114,6 +114,39 @@ impl PersistedDreamStats {
         let raw = serde_json::to_string_pretty(self).context("serialize dream stats")?;
         std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
         Ok(())
+    }
+}
+
+/// RAII guard that toggles a palace's `is_compacting` flag for the lifetime
+/// of a dream cycle.
+///
+/// Why: A plain `flag.store(true)` at the top of `dream_cycle` and
+/// `flag.store(false)` at the bottom leaks `true` if any pass returns an
+/// error or panics, leaving the dashboard stuck on "dreaming". A Drop guard
+/// guarantees the flag clears on every exit path.
+/// What: Stores `true` in the supplied `AtomicBool` on construction and
+/// `false` on drop, both with `Relaxed` ordering (the dashboard read path
+/// uses the same ordering — exact happens-before semantics across tasks are
+/// not required for a UI indicator).
+/// Test: `dream::tests::dream_cycle_toggles_is_compacting`.
+struct CompactionGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl CompactionGuard {
+    /// Why: Centralises the "set flag, then return guard" pattern so callers
+    /// can't forget the drop side.
+    /// What: Stores `true` and returns the guard.
+    /// Test: `dream::tests::dream_cycle_toggles_is_compacting`.
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self { flag }
+    }
+}
+
+impl Drop for CompactionGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
     }
 }
 
@@ -260,6 +293,11 @@ impl Dreamer {
     pub async fn dream_cycle(&self, handle: &Arc<PalaceHandle>) -> Result<DreamStats> {
         let started = std::time::Instant::now();
         let budget = Duration::from_millis(self.config.max_cycle_ms);
+        // Mark the palace as compacting for the entirety of this cycle so the
+        // operator dashboard can render the dreaming spinner. The guard clears
+        // the flag on drop, which keeps it correct on early-return errors and
+        // panics alike.
+        let _compaction_guard = CompactionGuard::new(handle.is_compacting.clone());
 
         let merged = self
             .dedup_pass(handle, started, budget)
@@ -1024,6 +1062,36 @@ mod tests {
         assert!(
             entry.contains(&id),
             "closet entry must reference the source drawer"
+        );
+    }
+
+    /// Why: The operator dashboard depends on `is_compacting()` flipping to
+    /// `true` while a dream cycle runs and back to `false` once it's done;
+    /// otherwise the dreaming spinner would either never appear or never
+    /// clear.
+    /// What: Confirms the flag starts cleared, then runs a dream cycle and
+    /// asserts the flag is cleared again after completion. (Catching the
+    /// `true` window requires racy mid-cycle inspection; the drop-guard
+    /// semantics are also covered by direct construction below.)
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_cycle_toggles_is_compacting() {
+        let handle = open_test_handle("dream-compacting-flag").await;
+        assert!(!handle.is_compacting(), "flag must start cleared");
+
+        // Direct guard exercise — the in-flight `true` window.
+        {
+            let _g = CompactionGuard::new(handle.is_compacting.clone());
+            assert!(handle.is_compacting(), "guard must set the flag");
+        }
+        assert!(!handle.is_compacting(), "guard must clear on drop");
+
+        // Full cycle still clears the flag on exit.
+        let dreamer = Dreamer::new(DreamConfig::default());
+        let _stats = dreamer.dream_cycle(&handle).await.unwrap();
+        assert!(
+            !handle.is_compacting(),
+            "flag must be cleared after dream_cycle returns"
         );
     }
 }

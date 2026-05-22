@@ -186,6 +186,16 @@ pub struct CollectionRow {
     /// Test: `palace_activity_from_recent_write`,
     /// `project_palace_rows_reads_palaces`.
     pub last_write_at: Option<String>,
+    /// `true` while the palace is being compacted by the dream cycle.
+    ///
+    /// Why: The MEMORY tab renders the dreaming spinner when a palace is in
+    /// the middle of a Dreamer pass. Reading the signal off the row keeps
+    /// the activity classifier pure and unit-testable.
+    /// What: the `is_compacting` field from `GET /api/v1/palaces`; defaults
+    /// to `false` when absent (older daemons) or for search rows.
+    /// Test: `palace_activity_marks_compacting_as_dreaming`,
+    /// `project_palace_rows_reads_is_compacting`.
+    pub is_compacting: bool,
 }
 
 /// Activity state of a memory palace, derived from `last_write_at`.
@@ -197,8 +207,8 @@ pub struct CollectionRow {
 /// What: `Idle` is the default (no recent activity), `Indexing` covers very
 /// recent writes (within 10s) where the palace is likely still flushing
 /// vectors, `Active` covers writes within the last minute, `Dreaming` is
-/// reserved for compaction (the API does not yet expose this signal — kept so
-/// future work can wire it without a new enum variant), and `Error` is set
+/// returned when the row's `is_compacting` flag is set (the daemon flips it
+/// for the duration of every `Dreamer::dream_cycle`), and `Error` is set
 /// when a row's `ok` flag is false.
 /// Test: `palace_activity_from_recent_write`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -262,6 +272,11 @@ const DREAMING_SPINNER: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '�
 pub fn palace_activity(row: &CollectionRow) -> PalaceActivity {
     if !row.ok {
         return PalaceActivity::Error;
+    }
+    // A live compaction wins over the write-recency heuristic: the dream
+    // cycle is the explicit signal the dashboard cares most about.
+    if row.is_compacting {
+        return PalaceActivity::Dreaming;
     }
     let Some(ts) = row.last_write_at.as_deref() else {
         return PalaceActivity::Idle;
@@ -962,6 +977,16 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 .get("last_write_at")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let node_count = p.get("node_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let edge_count = p.get("edge_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let community_count = p
+                .get("community_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_compacting = p
+                .get("is_compacting")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // Skip palaces with no vectors and no graph triples: they hold
             // nothing the operator can act on and clutter the left pane.
             if count == 0 && kg_count == 0 {
@@ -974,6 +999,10 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 drawer_count,
                 wing_count,
                 last_write_at,
+                node_count,
+                edge_count,
+                community_count,
+                is_compacting,
                 // Note left empty: the row shows vector + graph counts inline
                 // (e.g. `12v 34g`), so a trailing badge would be redundant.
                 note: String::new(),
@@ -2991,6 +3020,62 @@ mod tests {
         // Unparseable timestamp → Idle.
         row.last_write_at = Some("not-a-date".into());
         assert_eq!(palace_activity(&row), PalaceActivity::Idle);
+    }
+
+    /// Why: When the memory daemon flags a palace as compacting the MEMORY
+    /// tab must render the dreaming spinner regardless of how recently the
+    /// palace was written to. The compacting flag must therefore dominate
+    /// the timestamp heuristic.
+    /// What: Sets `is_compacting = true` on a row with a fresh write and
+    /// asserts the activity classifier returns `Dreaming`.
+    /// Test: This test itself.
+    #[test]
+    fn palace_activity_marks_compacting_as_dreaming() {
+        let row = CollectionRow {
+            id: "p".into(),
+            count: 10,
+            ok: true,
+            is_compacting: true,
+            last_write_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        };
+        assert_eq!(palace_activity(&row), PalaceActivity::Dreaming);
+
+        // An unhealthy row still trumps the compaction flag — operators
+        // must see the error indicator first.
+        let bad = CollectionRow {
+            ok: false,
+            is_compacting: true,
+            ..row.clone()
+        };
+        assert_eq!(palace_activity(&bad), PalaceActivity::Error);
+    }
+
+    /// Why: The new wire fields (`node_count`, `edge_count`,
+    /// `community_count`, `is_compacting`) must surface verbatim through the
+    /// projection so the renderer can rely on the row alone.
+    /// What: Feeds a synthetic `/api/v1/palaces` payload carrying every new
+    /// field and asserts each surfaces with the expected typed value.
+    /// Test: This test itself.
+    #[test]
+    fn project_palace_rows_reads_is_compacting() {
+        let list = serde_json::json!([
+            {
+                "name": "main",
+                "vector_count": 100u64,
+                "kg_triple_count": 50u64,
+                "node_count": 42u64,
+                "edge_count": 84u64,
+                "community_count": 3u64,
+                "is_compacting": true,
+            },
+        ]);
+        let rows = project_palace_rows(&list);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_count, 42);
+        assert_eq!(rows[0].edge_count, 84);
+        assert_eq!(rows[0].community_count, 3);
+        assert!(rows[0].is_compacting);
     }
 
     #[test]

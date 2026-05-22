@@ -25,6 +25,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -138,9 +139,32 @@ pub struct PalaceHandle {
     /// concurrently with the (rare) dream-time rebuild.
     /// Test: `dream::tests::closet_refresh_builds_index`.
     pub closets: Arc<RwLock<HashMap<String, Vec<Uuid>>>>,
+    /// Set to `true` for the duration of an in-flight `Dreamer::dream_cycle`.
+    ///
+    /// Why: The operator dashboard surfaces a per-palace "compacting / dreaming"
+    /// spinner so writers can see when consolidation is active. A shared
+    /// `AtomicBool` is the cheapest cross-task signal — readers (HTTP handlers)
+    /// poll it with `Relaxed` ordering and writers (the dream loop) flip it on
+    /// entry / exit via a guard so panics don't strand the flag.
+    /// What: `Arc<AtomicBool>` initialised to `false`. Flipped by
+    /// `CompactionGuard::new` (defined in `dream.rs`) at the start of every
+    /// `dream_cycle` and cleared on drop.
+    /// Test: `dream::tests::dream_cycle_toggles_is_compacting`.
+    pub is_compacting: Arc<AtomicBool>,
 }
 
 impl PalaceHandle {
+    /// Read the current compaction flag without acquiring a lock.
+    ///
+    /// Why: HTTP handlers that build `PalaceInfo` responses need the live
+    /// compaction status without taking any lock that the dream cycle holds;
+    /// a cheap `load(Relaxed)` keeps the path contention-free.
+    /// What: Returns the current value of `is_compacting`.
+    /// Test: `dream::tests::dream_cycle_toggles_is_compacting`.
+    pub fn is_compacting(&self) -> bool {
+        self.is_compacting.load(Ordering::Relaxed)
+    }
+
     /// Construct a new `PalaceHandle` with empty drawer table and L1 cache.
     ///
     /// Why: The registry creates handles eagerly when a palace is opened; the
@@ -166,6 +190,7 @@ impl PalaceHandle {
             decay_config: DecayConfig::default(),
             recall_log: None,
             closets: Arc::new(RwLock::new(HashMap::new())),
+            is_compacting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -265,6 +290,7 @@ impl PalaceHandle {
             decay_config: DecayConfig::default(),
             recall_log,
             closets: Arc::new(RwLock::new(HashMap::new())),
+            is_compacting: Arc::new(AtomicBool::new(false)),
         };
         Ok(Arc::new(handle))
     }
