@@ -315,6 +315,22 @@ When publishing a crate to crates.io:
   the `ner` feature flag (`--features ner`).
 - Facts store persisted via redb at the daemon's working directory.
 
+## Abbreviations & Aliases
+
+When the user (or any agent) refers to a crate by abbreviation, resolve it using this table before taking any action.
+
+| Abbreviation | Full crate name | Cargo package flag | Directory |
+|---|---|---|---|
+| `tga` | trusty-git-analytics | `-p tga` | `crates/trusty-git-analytics/` |
+| `tm` | trusty-memory | `-p trusty-memory` | `crates/trusty-memory/` |
+| `ts` | trusty-search | `-p trusty-search` | `crates/trusty-search/` |
+| `tc` | trusty-common | `-p trusty-common` | `crates/trusty-common/` |
+| `ta` | trusty-analyze | `-p trusty-analyze` | `crates/trusty-analyze/` |
+| `mpm` | trusty-mpm-cli | `-p trusty-mpm-cli` | `crates/trusty-mpm-cli/` |
+| `open-mpm` | open-mpm | `-p open-mpm` | `crates/open-mpm/` |
+
+These abbreviations apply everywhere: ticket descriptions, build commands, references in conversation. Always expand before running `cargo` commands.
+
 ## Development Environment
 
 ### Required Tools
