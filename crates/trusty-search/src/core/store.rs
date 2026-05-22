@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -28,7 +28,17 @@ struct StoreKeyMap {
 }
 
 /// Initial reserved capacity for a new HNSW index. Grows geometrically on demand.
-const INITIAL_CAPACITY: usize = 1_024;
+///
+/// Why (memory fix): we register one HNSW index per project, and the daemon
+/// is expected to hold hundreds of them resident (~243 on the reference
+/// host). usearch's `reserve()` pre-allocates the HNSW arena tape for the
+/// requested slot count even when the index is empty — at ~20 MB of overhead
+/// per empty 1 024-slot arena, 238 unused indexes would burn ~4.8 GB of RSS
+/// before a single chunk is added. New indexes are almost always empty at
+/// creation time and grow on demand via `ensure_capacity` (geometric ×2
+/// growth), so a tiny initial reserve is enough to avoid pathological reserve
+/// churn on the first batch of inserts without burning RAM on cold indexes.
+const INITIAL_CAPACITY: usize = 64;
 
 /// Default hard cap on the HNSW index size. The usearch `IndexOptions` API
 /// (v2.25) does not expose a `max_elements` field directly, so we enforce the
@@ -151,6 +161,24 @@ pub struct UsearchStore {
     /// that may still hold a stale key can't accidentally collide with a fresh insert.
     next_key: Arc<AtomicU64>,
     dim: usize,
+    /// `true` when the underlying HNSW was opened via `Index::view` (mmap, read-only)
+    /// rather than `Index::load` (heap copy). Mutating operations must promote the
+    /// index to a mutable copy first via [`Self::promote_view_to_mutable`].
+    ///
+    /// Why (memory fix): warm-boot of N projects used to call `Index::load` for every
+    /// snapshot, copying the entire HNSW arena into heap RAM even though most indexes
+    /// are never written to in a given session (queries are read-only). Opening with
+    /// `view` keeps the file mapped and lets the OS page cache decide which pages
+    /// stay resident, dropping warm-boot RSS from ~40 GB to a small fraction of that.
+    /// What: read by [`Self::ensure_mutable`] before every write path (`upsert`,
+    /// `upsert_batch`, `remove`, `save`) so the first mutation transparently reloads
+    /// the index in mutable mode. Stored as `AtomicBool` so the read path needs no
+    /// extra lock.
+    is_view: Arc<AtomicBool>,
+    /// Path the index was loaded from (only set on `load_from`). Required so a
+    /// later mutation can promote a view-mode index to mutable by re-reading the
+    /// same file via `Index::load`.
+    hnsw_path: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl UsearchStore {
@@ -202,6 +230,10 @@ impl UsearchStore {
             key_to_id: Arc::new(RwLock::new(HashMap::new())),
             next_key: Arc::new(AtomicU64::new(1)), // start at 1; reserve 0 as sentinel
             dim,
+            // A fresh `new` / `with_capacity_hint` index is always mutable; only
+            // `load_from` flips this to `true`.
+            is_view: Arc::new(AtomicBool::new(false)),
+            hnsw_path: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -224,6 +256,28 @@ impl UsearchStore {
     /// Test: `tests::test_save_load_roundtrip` saves then loads into a fresh
     /// store and asserts a search still returns the original chunk_ids.
     pub async fn save(&self, hnsw_path: &Path) -> Result<()> {
+        // Fast path: in view mode the in-memory state is a mmap of the
+        // on-disk snapshot — there is nothing dirty to flush. Skipping the
+        // save here avoids rewriting the same bytes on every shutdown and
+        // sidesteps usearch's save path entirely while the index is mapped.
+        // The sidecar is also already on disk and matches the live keymap.
+        if self.is_view.load(Ordering::Acquire) {
+            let same_path = {
+                let guard = self.hnsw_path.read().await;
+                guard.as_deref() == Some(hnsw_path)
+            };
+            if same_path {
+                tracing::debug!(
+                    "usearch: skipping save for {} — index is in view mode, snapshot is clean",
+                    hnsw_path.display()
+                );
+                return Ok(());
+            }
+            // Save was requested to a different path than the view source.
+            // Promote first so we can actually write the index out.
+            self.ensure_mutable().await?;
+        }
+
         // Snapshot the key map under read locks so we can release them before
         // the (possibly slow) usearch save. The HNSW write lock is required
         // because usearch's save is `&self` but mutates internal serializer
@@ -273,13 +327,29 @@ impl UsearchStore {
     /// Why: counterpart of [`Self::save`]. On daemon startup or `create_index`
     /// the registered index can boot with its vectors restored — no re-embed
     /// pass required.
+    ///
+    /// Why (memory fix): the daemon holds one HNSW index per project resident
+    /// at the same time (~243 on the reference host). The previous
+    /// implementation called `Index::load`, which deserializes the entire
+    /// graph + vector arena into heap RAM. That pushed warm-boot RSS to ~40 GB
+    /// even though most of those indexes never serve a single write in a
+    /// given session. This path now uses `Index::view`, which memory-maps the
+    /// snapshot file and lets the OS page cache lazily fault in pages as
+    /// they're actually touched by search. The first write to any given index
+    /// transparently promotes its in-memory state back to a mutable copy via
+    /// [`Self::ensure_mutable`] (see `upsert`, `upsert_batch`, `remove`).
+    ///
     /// What: builds a fresh `Index` with options matching `with_capacity_hint`,
-    /// calls usearch's `load(path)`, then reads the sidecar to restore the
-    /// string ↔ key mappings and `next_key`. If either file is missing or
+    /// calls usearch's `view(path)`, then reads the sidecar to restore the
+    /// string ↔ key mappings and `next_key`. The store is marked
+    /// `is_view = true` and remembers the file path so a later mutation can
+    /// reload the index in mutable mode. If either file is missing or
     /// corrupt, returns `Ok(None)` so callers fall back to a fresh empty
     /// store instead of crashing the daemon.
     /// Test: `tests::test_save_load_roundtrip` covers the happy path; a
-    /// `tests::test_load_missing_returns_none` covers the absent-file branch.
+    /// `tests::test_load_missing_returns_none` covers the absent-file branch;
+    /// `tests::test_view_promotes_to_mutable_on_write` exercises the
+    /// view → mutable promotion when a load is followed by an upsert.
     pub async fn load_from(hnsw_path: &Path) -> Result<Option<Self>> {
         let sidecar = hnsw_path.with_extension("keys.json");
         if !hnsw_path.exists() || !sidecar.exists() {
@@ -321,20 +391,25 @@ impl UsearchStore {
         };
         {
             let index = store.index.write().await;
-            if let Err(e) = index.load(hnsw_str) {
+            // Use `view` instead of `load` so the snapshot is memory-mapped,
+            // not copied into heap RAM. The OS page cache then services
+            // read-only search traffic without inflating RSS. The first
+            // write transparently promotes the index back to a mutable copy
+            // via `ensure_mutable` / `promote_view_to_mutable`.
+            if let Err(e) = index.view(hnsw_str) {
                 tracing::warn!(
-                    "usearch failed to load {} ({e}) — discarding snapshot",
+                    "usearch failed to view {} ({e}) — discarding snapshot",
                     hnsw_path.display()
                 );
                 return Ok(None);
             }
-            // After load, reserve enough capacity for the restored size so
-            // the next insert doesn't immediately re-grow.
-            let size = index.size();
-            if index.capacity() < size {
-                let _ = index.reserve(size);
-            }
+            // NOTE: `reserve` is a mutation and would invalidate the view.
+            // We intentionally skip it here — the eventual `ensure_mutable`
+            // call will reload the file in mutable mode and reserve to the
+            // restored size on first write.
         }
+        store.is_view.store(true, Ordering::Release);
+        *store.hnsw_path.write().await = Some(hnsw_path.to_path_buf());
 
         // Rehydrate the mappings.
         {
@@ -349,6 +424,74 @@ impl UsearchStore {
             .next_key
             .store(key_map.next_key.max(1), Ordering::Relaxed);
         Ok(Some(store))
+    }
+
+    /// If the index is currently in view (mmap, read-only) mode, reload it
+    /// from its source file in mutable mode so subsequent writes can mutate
+    /// the graph.
+    ///
+    /// Why: `load_from` opens snapshots via `Index::view` so warm-boot RSS
+    /// stays small (see [`Self::load_from`] docs). usearch's view is
+    /// strictly read-only — calling `add` / `remove` / `reserve` on a
+    /// view-mode index will either error or undefined-behave. The first
+    /// mutating call must therefore promote the in-memory state by
+    /// re-reading the source file via `Index::load`, which deserialises the
+    /// graph into a heap-resident, mutable copy. From that point on this
+    /// store behaves identically to one built via `new` and never enters
+    /// view mode again.
+    /// What: relaxed-load the `is_view` flag (fast path). When set, acquire
+    /// the HNSW write lock, call `Index::load(hnsw_path)`, reserve enough
+    /// capacity for the restored size, and clear `is_view`. The flag is
+    /// double-checked under the write lock so concurrent writers race to
+    /// promote at most once. Returns `Err` if the file is no longer
+    /// readable or the source path was never recorded.
+    /// Test: `tests::test_view_promotes_to_mutable_on_write`.
+    async fn ensure_mutable(&self) -> Result<()> {
+        // Fast path — the overwhelmingly common case is a fresh / already
+        // promoted store. Acquire-load pairs with the `Release` store in
+        // `load_from` and in `promote_view_to_mutable`.
+        if !self.is_view.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.promote_view_to_mutable().await
+    }
+
+    /// Slow-path of [`Self::ensure_mutable`]. Pulled out so the hot read
+    /// path stays branch-light.
+    async fn promote_view_to_mutable(&self) -> Result<()> {
+        let path = {
+            let guard = self.hnsw_path.read().await;
+            guard.clone()
+        };
+        let path = path.ok_or_else(|| {
+            anyhow!("usearch index is in view mode but has no source path to promote from")
+        })?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 hnsw path: {}", path.display()))?
+            .to_string();
+
+        let index = self.index.write().await;
+        // Double-check under the write lock so racing writers promote once.
+        if !self.is_view.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        index
+            .load(&path_str)
+            .map_err(|e| anyhow!("usearch failed to promote view → mutable load: {e}"))?;
+        let size = index.size();
+        if index.capacity() < size {
+            index
+                .reserve(size.max(INITIAL_CAPACITY))
+                .map_err(|e| anyhow!("usearch reserve after promote failed: {e}"))?;
+        }
+        self.is_view.store(false, Ordering::Release);
+        tracing::info!(
+            "usearch: promoted view → mutable for {} ({} vectors)",
+            path.display(),
+            size
+        );
+        Ok(())
     }
 
     /// Ensure the underlying HNSW has room for at least one more vector.
@@ -388,6 +531,9 @@ impl VectorStore for UsearchStore {
                 self.dim
             ));
         }
+
+        // Promote view → mutable on first write. No-op when already mutable.
+        self.ensure_mutable().await?;
 
         // Resolve or allocate the u64 key under a write lock.
         let key = {
@@ -457,6 +603,8 @@ impl VectorStore for UsearchStore {
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
+        // Promote view → mutable on first write. No-op when already mutable.
+        self.ensure_mutable().await?;
         let key = {
             let mut id_to_key = self.id_to_key.write().await;
             match id_to_key.remove(id) {
@@ -524,6 +672,9 @@ impl VectorStore for UsearchStore {
         if items.is_empty() {
             return Ok(());
         }
+        // Promote view → mutable on first write. No-op when already mutable.
+        // Done before any other work so we never half-commit against a view.
+        self.ensure_mutable().await?;
         // Phase 1: validate dims up front so we don't half-commit on a bad batch.
         for (_, v) in items {
             if v.len() != self.dim {
@@ -930,6 +1081,91 @@ mod tests {
         std::fs::write(path.with_extension("keys.json"), b"not valid json").unwrap();
         let loaded = UsearchStore::load_from(&path).await.unwrap();
         assert!(loaded.is_none(), "corrupt sidecar must fall back to None");
+    }
+
+    #[tokio::test]
+    async fn test_view_promotes_to_mutable_on_write() {
+        // Why: warm-boot opens the snapshot via `Index::view` (mmap) to keep
+        // RSS low. The first write must transparently promote the index to a
+        // mutable copy via `ensure_mutable` so callers don't need to know
+        // which mode the store is in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hnsw.usearch");
+
+        // Save a snapshot with two vectors.
+        let store = UsearchStore::new(4).unwrap();
+        store
+            .upsert("alpha", vec![1.0, 0.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        store
+            .upsert("beta", vec![0.0, 1.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        store.save(&path).await.expect("save");
+        drop(store);
+
+        // Reopen via `load_from` — should land in view mode.
+        let loaded = UsearchStore::load_from(&path)
+            .await
+            .expect("load ok")
+            .expect("load returned Some");
+        assert!(
+            loaded.is_view.load(Ordering::Acquire),
+            "load_from must put the store in view mode for the memory fix"
+        );
+
+        // A read-only search must work without promotion.
+        let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).await.unwrap();
+        assert_eq!(hits[0].chunk_id, "alpha");
+        assert!(
+            loaded.is_view.load(Ordering::Acquire),
+            "search must not promote view → mutable"
+        );
+
+        // First write must promote, and the prior content must survive.
+        loaded
+            .upsert("gamma", vec![0.0, 0.0, 1.0, 0.0])
+            .await
+            .expect("upsert after view");
+        assert!(
+            !loaded.is_view.load(Ordering::Acquire),
+            "first write must promote view → mutable"
+        );
+        assert_eq!(loaded.len().await.unwrap(), 3);
+
+        // Subsequent writes must remain on the mutable path.
+        loaded
+            .upsert("delta", vec![0.0, 0.0, 0.0, 1.0])
+            .await
+            .expect("upsert after promote");
+        assert_eq!(loaded.len().await.unwrap(), 4);
+        let hits = loaded.search(&[0.0, 0.0, 1.0, 0.0], 1).await.unwrap();
+        assert_eq!(hits[0].chunk_id, "gamma");
+    }
+
+    #[tokio::test]
+    async fn test_view_batch_upsert_promotes() {
+        // Same as above but exercises the bulk-path `upsert_batch` seam.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hnsw.usearch");
+
+        let store = UsearchStore::new(4).unwrap();
+        store
+            .upsert_batch(&[("seed".to_string(), vec![1.0, 0.0, 0.0, 0.0])])
+            .await
+            .unwrap();
+        store.save(&path).await.unwrap();
+        drop(store);
+
+        let loaded = UsearchStore::load_from(&path).await.unwrap().unwrap();
+        assert!(loaded.is_view.load(Ordering::Acquire));
+        loaded
+            .upsert_batch(&[("more".to_string(), vec![0.0, 1.0, 0.0, 0.0])])
+            .await
+            .expect("batch upsert after view");
+        assert!(!loaded.is_view.load(Ordering::Acquire));
+        assert_eq!(loaded.len().await.unwrap(), 2);
     }
 
     #[tokio::test]
