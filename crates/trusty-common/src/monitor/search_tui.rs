@@ -55,8 +55,7 @@ const LEFT_PANEL_MAX: u16 = 28;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line key hint shown along the bottom of the UI.
-pub const KEY_HINT: &str =
-    "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
+pub const KEY_HINT: &str = "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
 
 /// Sort order applied to the index list.
 ///
@@ -297,6 +296,29 @@ impl SearchTuiState {
             return None;
         }
         self.indexes.get(self.selected - 1).map(|i| i.id.as_str())
+    }
+
+    /// Clamp the selection to the currently visible (filtered + sorted) list.
+    ///
+    /// Why: when the filter changes the selected index may no longer appear in
+    /// the visible subset, so arrow navigation would jump unpredictably; this
+    /// drops the cursor back to "All" (row 0) in that case so navigation always
+    /// starts from a visible row.
+    /// What: if `selected` is non-zero and the corresponding index id is not in
+    /// the visible id list, resets `selected` to 0.
+    /// Test: `test_clamp_to_visible`.
+    pub fn clamp_to_visible(&mut self) {
+        if self.selected == 0 {
+            return;
+        }
+        let Some(current_id) = self.indexes.get(self.selected - 1).map(|i| i.id.clone()) else {
+            self.selected = 0;
+            return;
+        };
+        let ids = visible_index_ids(self);
+        if !ids.iter().any(|id| id == &current_id) {
+            self.selected = 0;
+        }
     }
 
     /// The scope filter for the activity feed and statistics panels.
@@ -605,17 +627,22 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 }
                 (SearchFocus::List, KeyCode::Backspace) if state.filter_active => {
                     state.filter.pop();
+                    state.clamp_to_visible();
                 }
                 (SearchFocus::List, KeyCode::Char(c)) if state.filter_active => {
                     state.filter.push(c);
+                    state.clamp_to_visible();
                 }
+                // Tab is a no-op while the filter is active — otherwise it
+                // would steal focus away from the list and break filter input.
+                (SearchFocus::List, KeyCode::Tab) if state.filter_active => {}
                 (_, KeyCode::Char('?')) => state.show_help = true,
                 (_, KeyCode::Tab) => state.toggle_focus(),
                 (_, KeyCode::Esc) => return Ok(()),
                 // List-focus bindings.
                 (SearchFocus::List, KeyCode::Char('q')) => return Ok(()),
-                (SearchFocus::List, KeyCode::Up) => state.select_up(),
-                (SearchFocus::List, KeyCode::Down) => state.select_down(),
+                (SearchFocus::List, KeyCode::Up) => navigate_up_visible(state),
+                (SearchFocus::List, KeyCode::Down) => navigate_down_visible(state),
                 (SearchFocus::List, KeyCode::Char('/')) => {
                     state.filter_active = true;
                     state.filter.clear();
@@ -830,6 +857,100 @@ pub fn filtered_sorted_indexes(state: &SearchTuiState) -> Vec<&IndexRow> {
         IndexSortKey::Chunks => rows.sort_by(|a, b| b.chunk_count.cmp(&a.chunk_count)),
     }
     rows
+}
+
+/// Sentinel id representing the synthetic "All indexes" row in the visible
+/// id list.
+///
+/// Why: arrow navigation walks the *visible* (filtered + sorted) row order
+/// rather than the original `state.indexes` ordering; the "All" row has no
+/// real index id so a sentinel string is used to occupy its slot.
+/// What: `"__all__"` — chosen to not collide with any real index id.
+/// Test: `test_visible_index_ids`, `test_navigate_visible`.
+const ALL_SENTINEL: &str = "__all__";
+
+/// Ids of the rows the user can navigate between, in visible display order.
+///
+/// Why: when a filter or sort is active the displayed row order no longer
+/// matches `state.indexes`; arrow keys must step through the visible order or
+/// they appear to skip rows. The leading sentinel keeps the "All indexes" row
+/// reachable.
+/// What: returns `[ALL_SENTINEL, …visible index ids…]`, taking the visible
+/// subset from [`filtered_sorted_indexes`]. Group headers are not included
+/// (they are non-selectable).
+/// Test: `test_visible_index_ids`, `test_navigate_visible`.
+pub fn visible_index_ids(state: &SearchTuiState) -> Vec<String> {
+    let mut ids = Vec::with_capacity(state.indexes.len() + 1);
+    ids.push(ALL_SENTINEL.to_string());
+    for row in filtered_sorted_indexes(state) {
+        ids.push(row.id.clone());
+    }
+    ids
+}
+
+/// Resolve the currently selected row's id within the visible list.
+fn current_visible_id(state: &SearchTuiState) -> String {
+    if state.selected == 0 {
+        ALL_SENTINEL.to_string()
+    } else {
+        state
+            .indexes
+            .get(state.selected - 1)
+            .map(|i| i.id.clone())
+            .unwrap_or_else(|| ALL_SENTINEL.to_string())
+    }
+}
+
+/// Set `state.selected` to point at `target_id` in the original index array.
+fn select_visible_id(state: &mut SearchTuiState, target_id: &str) {
+    if target_id == ALL_SENTINEL {
+        state.selected = 0;
+        return;
+    }
+    if let Some(pos) = state.indexes.iter().position(|i| i.id == target_id) {
+        state.selected = pos + 1;
+    }
+}
+
+/// Move the cursor up one row in the visible (filtered + sorted) list.
+///
+/// Why: `state.select_up` walks the original `state.indexes` order, so when a
+/// filter hides rows the arrow keys appear to skip or stall; this version
+/// walks the visible order instead.
+/// What: finds the current id in [`visible_index_ids`] and steps to the
+/// previous visible id, then maps that back to `state.selected`. A no-op when
+/// already at the top.
+/// Test: `test_navigate_visible`.
+pub fn navigate_up_visible(state: &mut SearchTuiState) {
+    let ids = visible_index_ids(state);
+    let current = current_visible_id(state);
+    let Some(pos) = ids.iter().position(|id| id == &current) else {
+        state.selected = 0;
+        return;
+    };
+    if pos > 0 {
+        let new_id = ids[pos - 1].clone();
+        select_visible_id(state, &new_id);
+    }
+}
+
+/// Move the cursor down one row in the visible (filtered + sorted) list.
+///
+/// Why: mirrors [`navigate_up_visible`] for the `↓` arrow.
+/// What: finds the current id in [`visible_index_ids`] and steps to the next
+/// visible id, then maps that back to `state.selected`. A no-op at the bottom.
+/// Test: `test_navigate_visible`.
+pub fn navigate_down_visible(state: &mut SearchTuiState) {
+    let ids = visible_index_ids(state);
+    let current = current_visible_id(state);
+    let Some(pos) = ids.iter().position(|id| id == &current) else {
+        state.selected = 0;
+        return;
+    };
+    if pos + 1 < ids.len() {
+        let new_id = ids[pos + 1].clone();
+        select_visible_id(state, &new_id);
+    }
 }
 
 /// Build the rows for the INDEXES panel body.
@@ -1818,6 +1939,89 @@ mod tests {
             );
         }
         assert_eq!(state.scroll_offset, 0, "back at the top");
+    }
+
+    #[test]
+    fn test_visible_index_ids() {
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Name;
+        let ids = visible_index_ids(&state);
+        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(
+            &ids[1..],
+            &[
+                "claude-mpm".to_string(),
+                "notes".to_string(),
+                "trusty-memory".to_string(),
+                "trusty-search".to_string(),
+            ]
+        );
+
+        state.filter = "trusty".into();
+        let ids = visible_index_ids(&state);
+        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids.len(), 3, "All + 2 trusty-* indexes");
+    }
+
+    #[test]
+    fn test_navigate_visible() {
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Name;
+        // Visible order: All, claude-mpm, notes, trusty-memory, trusty-search.
+        assert_eq!(state.selected, 0);
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("claude-mpm"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("notes"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        navigate_up_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_up_visible(&mut state);
+        navigate_up_visible(&mut state);
+        navigate_up_visible(&mut state);
+        assert!(state.is_all_selected());
+        navigate_up_visible(&mut state);
+        assert!(state.is_all_selected());
+
+        // With a filter, navigation skips hidden rows.
+        state.filter = "trusty".into();
+        state.selected = 0;
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+    }
+
+    #[test]
+    fn test_clamp_to_visible() {
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Name;
+        let pos = state
+            .indexes
+            .iter()
+            .position(|i| i.id == "claude-mpm")
+            .expect("index");
+        state.selected = pos + 1;
+        state.filter = "trusty".into();
+        state.clamp_to_visible();
+        assert_eq!(state.selected, 0, "selection dropped to All");
+
+        state.filter = "trusty".into();
+        let pos = state
+            .indexes
+            .iter()
+            .position(|i| i.id == "trusty-memory")
+            .expect("index");
+        state.selected = pos + 1;
+        state.clamp_to_visible();
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
     }
 
     #[test]

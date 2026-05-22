@@ -302,6 +302,29 @@ impl MemoryTuiState {
         self.palaces.get(self.selected - 1).map(|p| p.id.as_str())
     }
 
+    /// Clamp the selection to the currently visible (filtered + sorted) list.
+    ///
+    /// Why: when the filter changes the selected palace may no longer appear in
+    /// the visible subset, so arrow navigation would jump unpredictably; this
+    /// drops the cursor back to "All" (row 0) in that case so navigation always
+    /// starts from a visible row.
+    /// What: if `selected` is non-zero and the corresponding palace id is not in
+    /// the visible id list, resets `selected` to 0.
+    /// Test: `test_clamp_to_visible`.
+    pub fn clamp_to_visible(&mut self) {
+        if self.selected == 0 {
+            return;
+        }
+        let Some(current_id) = self.palaces.get(self.selected - 1).map(|p| p.id.clone()) else {
+            self.selected = 0;
+            return;
+        };
+        let ids = visible_palace_ids(self);
+        if !ids.iter().any(|id| id == &current_id) {
+            self.selected = 0;
+        }
+    }
+
     /// The scope filter for the activity feed and statistics panels.
     ///
     /// Why: the right-hand panels render the selected palace's events / stats,
@@ -566,17 +589,22 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 }
                 (MemoryFocus::List, KeyCode::Backspace) if state.filter_active => {
                     state.filter.pop();
+                    state.clamp_to_visible();
                 }
                 (MemoryFocus::List, KeyCode::Char(c)) if state.filter_active => {
                     state.filter.push(c);
+                    state.clamp_to_visible();
                 }
+                // Tab is a no-op while the filter is active — otherwise it
+                // would steal focus away from the list and break filter input.
+                (MemoryFocus::List, KeyCode::Tab) if state.filter_active => {}
                 (_, KeyCode::Char('?')) => state.show_help = true,
                 (_, KeyCode::Tab) => state.toggle_focus(),
                 (_, KeyCode::Esc) => return Ok(()),
                 // List-focus bindings.
                 (MemoryFocus::List, KeyCode::Char('q')) => return Ok(()),
-                (MemoryFocus::List, KeyCode::Up) => state.select_up(),
-                (MemoryFocus::List, KeyCode::Down) => state.select_down(),
+                (MemoryFocus::List, KeyCode::Up) => navigate_up_visible(state),
+                (MemoryFocus::List, KeyCode::Down) => navigate_down_visible(state),
                 (MemoryFocus::List, KeyCode::Char('/')) => {
                     state.filter_active = true;
                     state.filter.clear();
@@ -753,6 +781,114 @@ pub fn filtered_sorted_palaces(state: &MemoryTuiState) -> Vec<PalaceRow> {
         PalaceSortKey::Vectors => rows.sort_by(|a, b| b.vector_count.cmp(&a.vector_count)),
     }
     rows
+}
+
+/// Sentinel id representing the synthetic "All palaces" row in the visible
+/// id list.
+///
+/// Why: arrow navigation walks the *visible* (filtered + sorted) row order
+/// rather than the original `state.palaces` ordering; the "All" row has no
+/// real palace id so a sentinel string is used to occupy its slot.
+/// What: `"__all__"` — chosen to not collide with any real palace id.
+/// Test: `test_visible_palace_ids`, `test_navigate_visible`.
+const ALL_SENTINEL: &str = "__all__";
+
+/// Ids of the rows the user can navigate between, in visible display order.
+///
+/// Why: when a filter or sort is active the displayed row order no longer
+/// matches `state.palaces`; arrow keys must step through the visible order or
+/// they appear to skip rows. The leading sentinel keeps the "All palaces" row
+/// reachable.
+/// What: returns `[ALL_SENTINEL, …visible palace ids…]`, taking the visible
+/// subset from [`filtered_sorted_palaces`]. Group headers are not included
+/// (they are non-selectable).
+/// Test: `test_visible_palace_ids`, `test_navigate_visible`.
+pub fn visible_palace_ids(state: &MemoryTuiState) -> Vec<String> {
+    let mut ids = Vec::with_capacity(state.palaces.len() + 1);
+    ids.push(ALL_SENTINEL.to_string());
+    for row in filtered_sorted_palaces(state) {
+        ids.push(row.id);
+    }
+    ids
+}
+
+/// Resolve the currently selected row's id within the visible list.
+///
+/// Why: the cursor stores an index into `state.palaces` (cursor 0 = "All",
+/// cursor n = palaces[n-1]); navigation needs to translate that back into a
+/// position within the visible id list.
+/// What: returns the [`ALL_SENTINEL`] when `selected == 0` or the palace's id
+/// otherwise; falls back to the sentinel when the index is out of range.
+fn current_visible_id(state: &MemoryTuiState) -> String {
+    if state.selected == 0 {
+        ALL_SENTINEL.to_string()
+    } else {
+        state
+            .palaces
+            .get(state.selected - 1)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| ALL_SENTINEL.to_string())
+    }
+}
+
+/// Set `state.selected` to point at `target_id` in the original palace array.
+///
+/// Why: navigation works in visible order, but downstream code (scroll sync,
+/// activity scope) reads `state.selected` as an index into `state.palaces`;
+/// after picking the next visible id we must convert it back.
+/// What: `ALL_SENTINEL` → `selected = 0`; any other id is looked up in
+/// `state.palaces` and `selected` is set to its position + 1. A missing id
+/// leaves the cursor unchanged so the user never lands on an invisible row.
+fn select_visible_id(state: &mut MemoryTuiState, target_id: &str) {
+    if target_id == ALL_SENTINEL {
+        state.selected = 0;
+        return;
+    }
+    if let Some(pos) = state.palaces.iter().position(|p| p.id == target_id) {
+        state.selected = pos + 1;
+    }
+}
+
+/// Move the cursor up one row in the visible (filtered + sorted) list.
+///
+/// Why: `state.select_up` walks the original `state.palaces` order, so when a
+/// filter hides rows the arrow keys appear to skip or stall; this version
+/// walks the visible order instead.
+/// What: finds the current id in [`visible_palace_ids`] and steps to the
+/// previous visible id, then maps that back to `state.selected`. A no-op when
+/// already at the top.
+/// Test: `test_navigate_visible`.
+pub fn navigate_up_visible(state: &mut MemoryTuiState) {
+    let ids = visible_palace_ids(state);
+    let current = current_visible_id(state);
+    let Some(pos) = ids.iter().position(|id| id == &current) else {
+        // Current selection is not visible — drop back to "All".
+        state.selected = 0;
+        return;
+    };
+    if pos > 0 {
+        let new_id = ids[pos - 1].clone();
+        select_visible_id(state, &new_id);
+    }
+}
+
+/// Move the cursor down one row in the visible (filtered + sorted) list.
+///
+/// Why: mirrors [`navigate_up_visible`] for the `↓` arrow.
+/// What: finds the current id in [`visible_palace_ids`] and steps to the next
+/// visible id, then maps that back to `state.selected`. A no-op at the bottom.
+/// Test: `test_navigate_visible`.
+pub fn navigate_down_visible(state: &mut MemoryTuiState) {
+    let ids = visible_palace_ids(state);
+    let current = current_visible_id(state);
+    let Some(pos) = ids.iter().position(|id| id == &current) else {
+        state.selected = 0;
+        return;
+    };
+    if pos + 1 < ids.len() {
+        let new_id = ids[pos + 1].clone();
+        select_visible_id(state, &new_id);
+    }
 }
 
 /// Build the rows for the PALACES panel body.
@@ -1757,6 +1893,106 @@ mod tests {
             );
         }
         assert_eq!(state.scroll_offset, 0, "back at the top");
+    }
+
+    #[test]
+    fn test_visible_palace_ids() {
+        // Visible ids lead with the "All" sentinel, then follow the filtered +
+        // sorted display order — not the original `state.palaces` order.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        let ids = visible_palace_ids(&state);
+        assert_eq!(ids[0], ALL_SENTINEL);
+        // Alphabetical: claude-mpm, notes, trusty-memory, trusty-search.
+        assert_eq!(
+            &ids[1..],
+            &[
+                "claude-mpm".to_string(),
+                "notes".to_string(),
+                "trusty-memory".to_string(),
+                "trusty-search".to_string(),
+            ]
+        );
+
+        // A filter shrinks the visible list.
+        state.filter = "trusty".into();
+        let ids = visible_palace_ids(&state);
+        assert_eq!(ids[0], ALL_SENTINEL);
+        assert_eq!(ids.len(), 3, "All + 2 trusty-* palaces");
+    }
+
+    #[test]
+    fn test_navigate_visible() {
+        // Navigation walks the visible (sorted) order, mapping back to
+        // `state.selected` which indexes the original `state.palaces` array.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        // Visible order: All, claude-mpm, notes, trusty-memory, trusty-search.
+        // Start at All.
+        assert_eq!(state.selected, 0);
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("claude-mpm"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("notes"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        // At the bottom: another Down is a no-op.
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        // Walk back up to All.
+        navigate_up_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_up_visible(&mut state);
+        navigate_up_visible(&mut state);
+        navigate_up_visible(&mut state);
+        assert!(state.is_all_selected());
+        // At the top: Up is a no-op.
+        navigate_up_visible(&mut state);
+        assert!(state.is_all_selected());
+
+        // With a filter, navigation skips hidden rows.
+        state.filter = "trusty".into();
+        state.selected = 0;
+        navigate_down_visible(&mut state);
+        // First visible after All is trusty-memory (alphabetical among trusty-*).
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
+        navigate_down_visible(&mut state);
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+        navigate_down_visible(&mut state);
+        // No more visible rows.
+        assert_eq!(state.selected_id(), Some("trusty-search"));
+    }
+
+    #[test]
+    fn test_clamp_to_visible() {
+        // When the filter hides the selected palace, clamp_to_visible drops
+        // back to the "All" row so arrows resume from a visible position.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        // Select "claude-mpm" (cursor 3 in original order).
+        let pos = state
+            .palaces
+            .iter()
+            .position(|p| p.id == "claude-mpm")
+            .expect("palace");
+        state.selected = pos + 1;
+        // Apply a filter that excludes it.
+        state.filter = "trusty".into();
+        state.clamp_to_visible();
+        assert_eq!(state.selected, 0, "selection dropped to All");
+
+        // When the selection is still visible, clamp_to_visible leaves it.
+        state.filter = "trusty".into();
+        let pos = state
+            .palaces
+            .iter()
+            .position(|p| p.id == "trusty-memory")
+            .expect("palace");
+        state.selected = pos + 1;
+        state.clamp_to_visible();
+        assert_eq!(state.selected_id(), Some("trusty-memory"));
     }
 
     #[test]
