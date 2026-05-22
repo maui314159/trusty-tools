@@ -1,6 +1,6 @@
 [package]
 name = "trusty-symgraph"
-version = "0.2.3"
+version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
 description = "Deprecated re-export shim: the symbol-graph engine moved into `trusty-common` behind the `symgraph` / `symgraph-parser` features."

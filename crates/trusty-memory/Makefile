@@ -9,11 +9,11 @@
 
 .PHONY: patch deploy smoke clean check clippy test help
 
-# ── Launchd plist paths ──────────────────────────────────────────────────────
+# -- Launchd plist paths ------------------------------------------------------
 PLIST_CANONICAL := $(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist
 PLIST_LEGACY    := $(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist
 
-# ── Health-check endpoints ───────────────────────────────────────────────────
+# -- Health-check endpoints ---------------------------------------------------
 # Primary: read the bound address from the runtime lock file.
 # Fallback: well-known default port used during first-run before lock exists.
 SUPPORT_DIR  := $(HOME)/Library/Application Support/trusty-memory
@@ -33,7 +33,7 @@ patch:
 	git tag "trusty-memory-v$$VERSION" && \
 	git push origin main && \
 	git push origin "trusty-memory-v$$VERSION" && \
-	echo ">> pushed trusty-memory-v$$VERSION — CI will publish to crates.io automatically" && \
+	echo ">> pushed trusty-memory-v$$VERSION -- CI will publish to crates.io automatically" && \
 	echo ">> run 'make deploy' once CI finishes to install the new binary locally"
 
 ## Install the locally-built binary and restart both launchd daemons.
@@ -43,10 +43,10 @@ patch:
 ## so stale daemons from either label cannot survive across deploys.
 ##
 ## Stop strategy (surgical):
-##   1. `launchctl unload` — stops the launchd-managed instance by label.
-##   2. `trusty-memory service stop` — SIGTERMs the process that wrote the
+##   1. `launchctl unload` -- stops the launchd-managed instance by label.
+##   2. `trusty-memory service stop` -- SIGTERMs the process that wrote the
 ##      PID lockfile; never matches by command-line string.
-##   3. `pkill -TERM -x trusty-memory` — matches argv[0] exactly; cannot
+##   3. `pkill -TERM -x trusty-memory` -- matches argv[0] exactly; cannot
 ##      accidentally match tmux, claude, or other processes.
 deploy:
 	-launchctl unload $(PLIST_CANONICAL) 2>/dev/null
@@ -78,14 +78,14 @@ smoke:
 	@echo ">> also probing fallback http://$(FALLBACK_ADDR)/health (no-op if same)"; \
 	curl -sf "http://$(FALLBACK_ADDR)/health" >/dev/null 2>&1 && \
 	  echo ">> $(FALLBACK_ADDR) reachable" || \
-	  echo "   ($(FALLBACK_ADDR) not reachable — OK if daemon bound elsewhere)"
+	  echo "   ($(FALLBACK_ADDR) not reachable -- OK if daemon bound elsewhere)"
 	@BIN_VERSION=$$(trusty-memory --version 2>&1 | awk '{print $$2}'); \
 	CARGO_VERSION=$$(cargo metadata --no-deps --format-version 1 \
 	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
 	echo ">> binary version:  $$BIN_VERSION"; \
 	echo ">> Cargo.toml version: $$CARGO_VERSION"; \
 	if [ "$$BIN_VERSION" = "$$CARGO_VERSION" ]; then \
-	  echo ">> versions match — smoke PASSED"; \
+	  echo ">> versions match -- smoke PASSED"; \
 	else \
 	  echo "WARNING: version mismatch (run 'make deploy' to update binary)"; \
 	fi
@@ -94,7 +94,7 @@ smoke:
 clean:
 	cargo clean
 
-## Quick local quality gate — type-check without full compilation.
+## Quick local quality gate -- type-check without full compilation.
 check:
 	cargo check --workspace
 
