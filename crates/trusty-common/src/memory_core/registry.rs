@@ -8,6 +8,7 @@
 //! [`crate::retrieval`] — there is exactly one `PalaceHandle` in the crate.
 //! Test: Register two palaces on separate tasks, assert both visible via `list()`.
 
+use crate::memory_core::community::KnowledgeGap;
 use crate::memory_core::palace::{Palace, PalaceId};
 use crate::memory_core::retrieval::PalaceHandle;
 use crate::memory_core::store::palace_store::PalaceStore;
@@ -19,6 +20,18 @@ use std::sync::Arc;
 #[derive(Default, Clone)]
 pub struct PalaceRegistry {
     palaces: Arc<DashMap<PalaceId, Arc<PalaceHandle>>>,
+    /// Per-palace knowledge-gap cache populated by the dream cycle.
+    ///
+    /// Why: Issue #53 — community detection on the KG is too expensive to run
+    /// on every `/kg/gaps` request (Louvain is O(|E|·passes) and the graph
+    /// snapshot allocates). The dream cycle already walks the whole graph for
+    /// dedup/decay, so it's the natural place to refresh the gap list once and
+    /// stash the result for cheap read access from HTTP / MCP handlers.
+    /// What: `DashMap<PalaceId, Vec<KnowledgeGap>>` so writers don't block
+    /// readers across palaces. Missing entry == "dream cycle hasn't run yet";
+    /// readers should treat that as an empty list, not an error.
+    /// Test: `gaps_cache_round_trip` in this module.
+    gaps_cache: Arc<DashMap<PalaceId, Vec<KnowledgeGap>>>,
 }
 
 impl PalaceRegistry {
@@ -60,6 +73,42 @@ impl PalaceRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.palaces.is_empty()
+    }
+
+    /// Store the latest knowledge-gap snapshot for `palace_id`.
+    ///
+    /// Why: The dream cycle computes gaps once per pass (issue #53); subsequent
+    /// `/kg/gaps` and `kg_gaps` MCP calls read this cached vec instead of
+    /// re-running Louvain on every request.
+    /// What: Inserts (replacing any prior snapshot) into the per-registry
+    /// `gaps_cache`. Cheap and lock-free at the per-palace granularity thanks
+    /// to `DashMap`.
+    /// Test: `gaps_cache_round_trip`.
+    pub fn set_gaps(&self, palace_id: PalaceId, gaps: Vec<KnowledgeGap>) {
+        self.gaps_cache.insert(palace_id, gaps);
+    }
+
+    /// Read the cached knowledge gaps for `palace_id`.
+    ///
+    /// Why: HTTP and MCP read paths must not pay the Louvain cost; they read
+    /// whatever the dream cycle last wrote. A `None` return is meaningful —
+    /// it means "no cycle has run yet" — and callers render an empty list
+    /// rather than a 404.
+    /// What: Clones the cached `Vec<KnowledgeGap>` so callers can serialize
+    /// without holding the DashMap entry guard.
+    /// Test: `gaps_cache_round_trip`.
+    pub fn get_gaps(&self, palace_id: &PalaceId) -> Option<Vec<KnowledgeGap>> {
+        self.gaps_cache.get(palace_id).map(|r| r.value().clone())
+    }
+
+    /// Drop the cached gaps for `palace_id` (e.g. on palace deletion).
+    ///
+    /// Why: Without explicit clearing the cache would retain entries for
+    /// removed palaces and surface stale community shapes in the dashboard.
+    /// What: Removes the entry; no-op when not present.
+    /// Test: `gaps_cache_round_trip` covers the inverse (insert then read).
+    pub fn clear_gaps(&self, palace_id: &PalaceId) {
+        self.gaps_cache.remove(palace_id);
     }
 
     /// Open a palace by id, hydrating from `<data_root>/<palace_id>/` on disk.
@@ -273,6 +322,33 @@ mod tests {
                 .any(|d| d.content.contains("quokka") && d.tags.contains(&"wildlife".to_string())),
             "persisted drawer content must survive restart; got {drawers:?}"
         );
+    }
+
+    #[test]
+    fn gaps_cache_round_trip() {
+        use crate::memory_core::community::KnowledgeGap;
+
+        let reg = PalaceRegistry::new();
+        let pid = PalaceId::new("gap-cache");
+
+        // Missing key returns None (not an error).
+        assert!(reg.get_gaps(&pid).is_none());
+
+        let gaps = vec![KnowledgeGap {
+            entities: vec!["alpha".to_string(), "beta".to_string()],
+            internal_density: 0.1,
+            external_bridges: 1,
+            suggested_exploration: "Explore connections between alpha and beta".to_string(),
+        }];
+        reg.set_gaps(pid.clone(), gaps.clone());
+
+        let read = reg.get_gaps(&pid).expect("cached value");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].entities, gaps[0].entities);
+        assert!((read[0].internal_density - 0.1).abs() < 1e-6);
+
+        reg.clear_gaps(&pid);
+        assert!(reg.get_gaps(&pid).is_none());
     }
 
     #[test]

@@ -290,6 +290,16 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                 }
             },
             {
+                "name": "kg_gaps",
+                "description": "List knowledge gaps detected in the memory palace graph. Returns communities (clusters of related entities) with low internal density that may benefit from additional knowledge. Populated by the dream cycle; an empty list means no cycle has run yet.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace": {"type": "string", "description": "Palace name (optional, defaults to the active palace)"}
+                    }
+                }
+            },
+            {
                 "name": "memory_recall_all",
                 "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
                 "inputSchema": {
@@ -711,6 +721,35 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 "index_size_after": res.index_size_after,
             }))
         }
+        "kg_gaps" => {
+            // Why (issue #53): Surface the cached community-detection output
+            // so the model can plan exploration without re-running Louvain.
+            // We deliberately do NOT recompute on the read path; the cache is
+            // refreshed by the dream cycle.
+            // What: Resolves the palace (explicit arg or daemon default),
+            // validates it exists by opening the handle, and returns the
+            // cached vec (an empty array when the dream cycle has not yet
+            // populated it).
+            // Test: `dispatch_kg_gaps_returns_cached`.
+            let palace = resolve_palace(state, &args, "kg_gaps")?;
+            // Ensure the palace exists; this also surfaces a useful error for
+            // typos in the palace argument.
+            let _handle = open_palace_handle(state, &palace)?;
+            let pid = PalaceId::new(&palace);
+            let cached = state.registry.get_gaps(&pid).unwrap_or_default();
+            let payload: Vec<Value> = cached
+                .into_iter()
+                .map(|g| {
+                    json!({
+                        "entities": g.entities,
+                        "internal_density": g.internal_density,
+                        "external_bridges": g.external_bridges,
+                        "suggested_exploration": g.suggested_exploration,
+                    })
+                })
+                .collect();
+            Ok(json!({ "palace": palace, "gaps": payload }))
+        }
         "memory_recall_all" => {
             let query = args
                 .get("q")
@@ -982,7 +1021,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -1000,6 +1039,7 @@ mod tests {
             "kg_assert",
             "kg_query",
             "memory_recall_all",
+            "kg_gaps",
             "add_alias",
             "list_prompt_facts",
             "remove_prompt_fact",
@@ -1101,6 +1141,52 @@ mod tests {
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0]["object"], "Acme");
         assert_eq!(triples[0]["predicate"], "works_at");
+    }
+
+    /// Why: Issue #53 — verify the MCP `kg_gaps` tool returns whatever was
+    /// last cached on the registry. Two cases: empty cache returns an empty
+    /// array, and a seeded cache returns the cached entries verbatim.
+    /// What: Creates a palace, dispatches `kg_gaps` (expects empty), then
+    /// directly seeds the registry cache via `set_gaps` and dispatches again
+    /// to confirm the entry round-trips through serialization.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dispatch_kg_gaps_returns_cached() {
+        use trusty_common::memory_core::community::KnowledgeGap;
+
+        let state = test_state();
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "delta"}))
+            .await
+            .expect("palace_create");
+
+        // Empty cache → empty gaps list (not an error).
+        let initial = dispatch_tool(&state, "kg_gaps", json!({"palace": "delta"}))
+            .await
+            .expect("kg_gaps empty");
+        let gaps = initial["gaps"].as_array().expect("gaps array");
+        assert_eq!(gaps.len(), 0);
+
+        // Seed the cache and re-dispatch.
+        state.registry.set_gaps(
+            PalaceId::new("delta"),
+            vec![KnowledgeGap {
+                entities: vec!["x".to_string(), "y".to_string()],
+                internal_density: 0.05,
+                external_bridges: 0,
+                suggested_exploration: "Explore connections between x and y".to_string(),
+            }],
+        );
+        let seeded = dispatch_tool(&state, "kg_gaps", json!({"palace": "delta"}))
+            .await
+            .expect("kg_gaps seeded");
+        let gaps = seeded["gaps"].as_array().expect("gaps array");
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["entities"][0], "x");
+        assert_eq!(gaps[0]["external_bridges"], 0);
+        assert!(gaps[0]["suggested_exploration"]
+            .as_str()
+            .unwrap()
+            .contains("x"));
     }
 
     /// Why: Issue #42 — `add_alias` must (a) assert the triple in the KG,

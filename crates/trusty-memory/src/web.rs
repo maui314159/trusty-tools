@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use trusty_common::memory_core::community::KnowledgeGap;
 use trusty_common::memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_common::memory_core::retrieval::{
@@ -88,6 +89,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/dream/status", get(dream_status))
         .route("/api/v1/dream/run", post(dream_run))
+        .route("/api/v1/kg/gaps", get(kg_gaps_handler))
         .route("/api/v1/chat", post(chat_handler))
         .route("/api/v1/chat/providers", get(list_providers))
         .route(
@@ -1039,6 +1041,11 @@ async fn dream_run(State(state): State<AppState>) -> Result<Json<DreamStatusPayl
             }
             Err(e) => tracing::warn!(palace = %p.id, "dream_run: cycle failed: {e:#}"),
         }
+        // Issue #53: refresh the community-detection cache after each
+        // successful or failed cycle. Even if the dedup/decay pass errored we
+        // still want a fresh gap snapshot — `knowledge_gaps()` reads the KG
+        // directly and is independent of the dream pass results.
+        refresh_gaps_cache(&state, &handle).await;
     }
     out.last_run_at = Some(chrono::Utc::now());
     state.emit(DaemonEvent::DreamCompleted {
@@ -1051,6 +1058,168 @@ async fn dream_run(State(state): State<AppState>) -> Result<Json<DreamStatusPayl
     });
     state.emit(aggregate_status_event(&state));
     Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge gaps — community detection cache (issue #53)
+// ---------------------------------------------------------------------------
+
+/// Wire shape for a single knowledge gap returned by `/api/v1/kg/gaps`.
+///
+/// Why: `KnowledgeGap` (in `trusty-common`) does not derive `Serialize`
+/// because that would force serde into the memory-core feature surface; the
+/// HTTP layer instead owns a narrow response struct mirroring its fields.
+/// What: One-for-one wire representation of `KnowledgeGap` — entities, the
+/// internal-density score, the cross-community bridge count, and the
+/// LLM/template exploration hint.
+/// Test: `kg_gaps_endpoint_returns_cached_gaps`.
+#[derive(Serialize, Debug, Clone)]
+pub struct KnowledgeGapResponse {
+    pub entities: Vec<String>,
+    pub internal_density: f32,
+    pub external_bridges: usize,
+    pub suggested_exploration: String,
+}
+
+impl From<KnowledgeGap> for KnowledgeGapResponse {
+    fn from(g: KnowledgeGap) -> Self {
+        Self {
+            entities: g.entities,
+            internal_density: g.internal_density,
+            external_bridges: g.external_bridges,
+            suggested_exploration: g.suggested_exploration,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct KgGapsQuery {
+    #[serde(default)]
+    palace: Option<String>,
+}
+
+/// `GET /api/v1/kg/gaps?palace=<name>` — return the cached knowledge gaps.
+///
+/// Why: Issue #53 — surfaces the community-detection output computed by the
+/// dream cycle so callers (dashboard, MCP tool, external tooling) can list
+/// the sparse-cluster targets the model should explore next. Reading from
+/// the in-memory cache means a `/kg/gaps` request never triggers a Louvain
+/// run; it just clones the latest snapshot.
+/// What: Resolves the palace from the optional `palace` query arg (falling
+/// back to the daemon's `default_palace`, then erroring with 400 if neither
+/// is set). Returns `[]` when the cache has no entry yet — the dream cycle
+/// simply hasn't populated it. Returns 404 only when the palace name is
+/// unknown to the registry (handle.open failed).
+/// Test: `kg_gaps_endpoint_returns_cached_gaps`,
+/// `kg_gaps_endpoint_returns_empty_when_uncached`.
+async fn kg_gaps_handler(
+    State(state): State<AppState>,
+    Query(q): Query<KgGapsQuery>,
+) -> Result<Json<Vec<KnowledgeGapResponse>>, ApiError> {
+    let palace_name = q
+        .palace
+        .clone()
+        .or_else(|| state.default_palace.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request("missing 'palace' query parameter (no default palace configured)")
+        })?;
+
+    // Validate the palace exists; we don't strictly need the handle for the
+    // cache lookup but we want a 404 rather than an empty-array masking a
+    // typo in the palace name.
+    let _handle = open_handle(&state, &palace_name)?;
+
+    let pid = PalaceId::new(&palace_name);
+    let gaps = state.registry.get_gaps(&pid).unwrap_or_default();
+    let body: Vec<KnowledgeGapResponse> =
+        gaps.into_iter().map(KnowledgeGapResponse::from).collect();
+    Ok(Json(body))
+}
+
+/// Recompute the gaps for `handle` and write them to the registry cache.
+///
+/// Why: Wraps the post-dream-cycle bookkeeping in one place so the HTTP
+/// `dream_run` handler and any future schedulers share the exact same
+/// enrichment path. Issue #53 also asks for an LLM-generated
+/// `suggested_exploration` when `OPENROUTER_API_KEY` is set — that step is
+/// best-effort and never blocks cache population.
+/// What: Calls `KnowledgeGraph::knowledge_gaps()`, optionally enriches the
+/// `suggested_exploration` field via `enrich_gap_exploration`, then stores
+/// the resulting vec on `state.registry`. Logs the gap count at `debug!`.
+/// Test: Indirect via `kg_gaps_endpoint_returns_cached_gaps` (which runs a
+/// dream cycle and then reads `/api/v1/kg/gaps`).
+async fn refresh_gaps_cache(state: &AppState, handle: &Arc<PalaceHandle>) {
+    let mut gaps = handle.kg.knowledge_gaps();
+    // LLM enrichment is best-effort. We only attempt it when an API key is
+    // present in the process environment; absence is the common case and the
+    // template `suggested_exploration` from `find_communities` is already a
+    // perfectly serviceable fallback.
+    if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
+        if !api_key.is_empty() {
+            for gap in gaps.iter_mut() {
+                if let Some(enriched) = enrich_gap_exploration(&api_key, gap).await {
+                    gap.suggested_exploration = enriched;
+                }
+            }
+        }
+    }
+    let gap_count = gaps.len();
+    state.registry.set_gaps(handle.id.clone(), gaps);
+    tracing::debug!(palace = %handle.id, gaps = gap_count, "community gaps updated");
+}
+
+/// Ask OpenRouter for a focused exploration question for a single gap.
+///
+/// Why: Issue #53 — when an API key is available the dream cycle should
+/// upgrade the templated `suggested_exploration` to a model-generated
+/// research question. The result is cached for cheap re-reads, so the LLM
+/// cost is paid at most once per dream cycle per gap rather than on every
+/// `/kg/gaps` request.
+/// What: Builds a short user prompt naming up to the first five entities in
+/// the gap, calls `openrouter_chat` (deprecated but still the simplest
+/// one-shot helper in `trusty-common`), and returns the trimmed completion
+/// on success. Returns `None` on any error so the caller can fall back to
+/// the template.
+/// Test: Network-dependent — not unit-tested. Behavioural coverage comes
+/// from manual runs of the dream cycle with `OPENROUTER_API_KEY` set.
+async fn enrich_gap_exploration(api_key: &str, gap: &KnowledgeGap) -> Option<String> {
+    // Limit the entity list we shove into the prompt so we don't blow the
+    // token budget on a 1k-node community.
+    let preview: Vec<&str> = gap.entities.iter().take(5).map(String::as_str).collect();
+    if preview.is_empty() {
+        return None;
+    }
+    let entities = preview.join(", ");
+    let user = format!(
+        "Given these related entities from a knowledge graph: {entities}. \
+         Suggest one specific research question (single sentence, under 25 words) \
+         that would help fill gaps in this knowledge cluster. Return only the question."
+    );
+    let messages = vec![trusty_common::ChatMessage {
+        role: "user".to_string(),
+        content: user,
+        tool_call_id: None,
+        tool_calls: None,
+    }];
+    // `openrouter_chat` is deprecated in favour of `OpenRouterProvider::chat_stream`,
+    // but the one-shot helper is the right tool for this background, best-effort
+    // enrichment — we don't need streaming and we explicitly tolerate failures.
+    #[allow(deprecated)]
+    let res = trusty_common::openrouter_chat(api_key, "openai/gpt-4o-mini", messages).await;
+    match res {
+        Ok(text) => {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(e) => {
+            tracing::debug!("openrouter gap enrichment failed (using template): {e:#}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2871,6 +3040,100 @@ mod tests {
             v["last_run_at"].is_string(),
             "last_run_at must be set by dream_run; got {v}"
         );
+    }
+
+    /// Why: Issue #53 — when the dream cycle has not yet run for a palace,
+    /// `/api/v1/kg/gaps` must return an empty array (200 OK), not 404 or
+    /// 500. The cache miss is a meaningful, non-error state.
+    /// What: Creates a palace, queries `/api/v1/kg/gaps?palace=...`, asserts
+    /// the response is `200` with body `[]`.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn kg_gaps_endpoint_returns_empty_when_uncached() {
+        let state = test_state();
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("gaps-empty"),
+            name: "gaps-empty".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("gaps-empty"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kg/gaps?palace=gaps-empty")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v.as_array().expect("array").len(), 0);
+    }
+
+    /// Why: Issue #53 — when the cache *has* been populated (by the dream
+    /// cycle in production, or by direct seeding here), the endpoint must
+    /// return each gap with the four wire fields.
+    /// What: Seeds the registry cache via `set_gaps` directly, then GETs
+    /// `/api/v1/kg/gaps?palace=...` and asserts the JSON shape.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn kg_gaps_endpoint_returns_cached_gaps() {
+        use trusty_common::memory_core::community::KnowledgeGap;
+
+        let state = test_state();
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("gaps-seed"),
+            name: "gaps-seed".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("gaps-seed"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        state.registry.set_gaps(
+            PalaceId::new("gaps-seed"),
+            vec![KnowledgeGap {
+                entities: vec!["foo".to_string(), "bar".to_string(), "baz".to_string()],
+                internal_density: 0.15,
+                external_bridges: 2,
+                suggested_exploration: "Explore connections between foo and related concepts"
+                    .to_string(),
+            }],
+        );
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kg/gaps?palace=gaps-seed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["entities"].as_array().unwrap().len(), 3);
+        assert_eq!(arr[0]["external_bridges"], 2);
+        assert!(arr[0]["suggested_exploration"]
+            .as_str()
+            .unwrap()
+            .contains("foo"));
     }
 
     /// Why: The KG Explorer UI calls `/api/v1/palaces/{id}/kg/subjects` to
