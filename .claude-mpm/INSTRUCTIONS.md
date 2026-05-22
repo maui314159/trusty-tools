@@ -1,3 +1,13 @@
+## Session Startup Protocol
+
+At the start of every session, before any other work, call the trusty-memory `get_prompt_context` MCP tool to load project aliases and conventions:
+
+1. Call `get_prompt_context()` (no query param) via trusty-memory MCP
+2. Apply all returned aliases immediately — any abbreviated crate name in user messages resolves via this table
+3. If trusty-memory is unavailable, proceed without blocking — log a warning and continue
+
+This call is mandatory and replaces manual context-setting. The result is used for the current session only and does not persist in the conversation history beyond the immediate turn.
+
 ## Ticket Source
 GitHub Issues is the ticket source. Use `gh issue list`, `gh issue view`, `gh issue create` via version-control or ticketing agent.
 

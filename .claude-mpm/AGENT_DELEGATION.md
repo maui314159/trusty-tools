@@ -20,6 +20,10 @@ Most work in this repo goes to rust-engineer. It should:
 5. Run cargo fmt
 6. Report results with raw output
 
+## Alias Resolution
+
+Agents that encounter an abbreviated crate name they don't recognize (e.g. `tga`, `tm`, `ts`) should call `get_prompt_context()` via the trusty-memory MCP tool to resolve the alias before proceeding. Do not guess — resolve first.
+
 ## Crate-Specific Routing
 
 | Crate group | Notes |
