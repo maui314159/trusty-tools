@@ -225,10 +225,11 @@ impl ChatSessionStore {
         #[cfg(feature = "sqlite-kg")]
         migrate_from_sqlite_if_present(path, &redb_path)?;
 
-        let db = redb::Database::create(&redb_path).map_err(|e| ChatSessionStoreError::Database {
-            path: redb_path.clone(),
-            source: Box::new(e),
-        })?;
+        let db =
+            redb::Database::create(&redb_path).map_err(|e| ChatSessionStoreError::Database {
+                path: redb_path.clone(),
+                source: Box::new(e),
+            })?;
 
         // Touch the SESSIONS table so it exists on disk before the first
         // read transaction. redb only persists a table once it is opened in
@@ -326,7 +327,8 @@ impl ChatSessionStore {
             // with a malformed JSON blob; preserve the historical SQLite
             // behaviour of treating an undecodable history as empty rather
             // than failing the entire list.
-            let history: Vec<ChatMessage> = serde_json::from_str(&record.history).unwrap_or_default();
+            let history: Vec<ChatMessage> =
+                serde_json::from_str(&record.history).unwrap_or_default();
             out.push(ChatSessionMeta {
                 id,
                 title: record.title,
@@ -365,12 +367,10 @@ impl ChatSessionStore {
                 path: self.path.clone(),
                 source: Box::new(e),
             })?;
-        let raw = table
-            .get(id)
-            .map_err(|e| ChatSessionStoreError::Storage {
-                path: self.path.clone(),
-                source: Box::new(e),
-            })?;
+        let raw = table.get(id).map_err(|e| ChatSessionStoreError::Storage {
+            path: self.path.clone(),
+            source: Box::new(e),
+        })?;
         let Some(guard) = raw else {
             return Ok(None);
         };
@@ -403,8 +403,10 @@ impl ChatSessionStore {
     }
 
     fn upsert_session_inner(&self, id: &str, history: &[ChatMessage]) -> Result<()> {
-        let history_json = serde_json::to_string(history)
-            .map_err(|e| ChatSessionStoreError::Json { source: Box::new(e) })?;
+        let history_json =
+            serde_json::to_string(history).map_err(|e| ChatSessionStoreError::Json {
+                source: Box::new(e),
+            })?;
         let now = Utc::now().to_rfc3339();
 
         // Preserve existing title / created_at if a row is already present.
@@ -422,12 +424,10 @@ impl ChatSessionStore {
                     path: self.path.clone(),
                     source: Box::new(e),
                 })?;
-            let raw = table
-                .get(id)
-                .map_err(|e| ChatSessionStoreError::Storage {
-                    path: self.path.clone(),
-                    source: Box::new(e),
-                })?;
+            let raw = table.get(id).map_err(|e| ChatSessionStoreError::Storage {
+                path: self.path.clone(),
+                source: Box::new(e),
+            })?;
             match raw {
                 Some(g) => {
                     let r: ChatSessionRecord = postcard::from_bytes(g.value())
@@ -513,12 +513,12 @@ impl ChatSessionStore {
                     path: self.path.clone(),
                     source: Box::new(e),
                 })?;
-            table
-                .insert(id, value_bytes.as_slice())
-                .map_err(|e| ChatSessionStoreError::Storage {
+            table.insert(id, value_bytes.as_slice()).map_err(|e| {
+                ChatSessionStoreError::Storage {
                     path: self.path.clone(),
                     source: Box::new(e),
-                })?;
+                }
+            })?;
         }
         wtx.commit().map_err(|e| ChatSessionStoreError::Commit {
             path: self.path.clone(),
@@ -835,10 +835,17 @@ mod tests {
         // Reopen via the redb sibling; the DB file should have moved from
         // `chat_sessions.db` to `chat_sessions.redb`.
         let redb_sibling = dir.path().join("chat_sessions.redb");
-        assert!(redb_sibling.exists(), "expected redb file at {}", redb_sibling.display());
+        assert!(
+            redb_sibling.exists(),
+            "expected redb file at {}",
+            redb_sibling.display()
+        );
 
         let store2 = ChatSessionStore::open(&path).unwrap();
-        let s = store2.get_session(&id).unwrap().expect("session survives reopen");
+        let s = store2
+            .get_session(&id)
+            .unwrap()
+            .expect("session survives reopen");
         assert_eq!(s.title.as_deref(), Some("Persisted"));
         assert_eq!(s.history.len(), 1);
         assert_eq!(s.history[0].content, "remember me");
@@ -889,16 +896,25 @@ mod tests {
         // run automatically.
         let store = ChatSessionStore::open(&legacy).unwrap();
 
-        let a = store.get_session("sess-1").unwrap().expect("sess-1 migrated");
+        let a = store
+            .get_session("sess-1")
+            .unwrap()
+            .expect("sess-1 migrated");
         assert_eq!(a.title.as_deref(), Some("Legacy A"));
         assert!(a.history.is_empty());
 
-        let b = store.get_session("sess-2").unwrap().expect("sess-2 migrated");
+        let b = store
+            .get_session("sess-2")
+            .unwrap()
+            .expect("sess-2 migrated");
         assert_eq!(b.title, None);
         assert_eq!(b.history.len(), 1);
         assert_eq!(b.history[0].content, "hello world");
 
-        assert!(!legacy.exists(), "legacy chat_sessions.db should be renamed");
+        assert!(
+            !legacy.exists(),
+            "legacy chat_sessions.db should be renamed"
+        );
         assert!(
             dir.path().join("chat_sessions.db.migrated").exists(),
             "expected marker file"

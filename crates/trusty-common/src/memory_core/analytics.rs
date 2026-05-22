@@ -152,7 +152,10 @@ impl RecallLog {
         if let Some(parent) = redb_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create recall log parent dir {}", parent.display())
+                    format!(
+                        "failed to create recall log parent dir {}",
+                        parent.display()
+                    )
                 })?;
             }
         }
@@ -278,8 +281,8 @@ impl RecallLog {
         let mut out = Vec::new();
         for entry in table.iter().context("iter RECALL_LOG")? {
             let (_k, v) = entry.context("decode RECALL_LOG row")?;
-            let ev: RecallEvent = postcard::from_bytes(v.value())
-                .context("postcard decode RecallEvent")?;
+            let ev: RecallEvent =
+                postcard::from_bytes(v.value()).context("postcard decode RecallEvent")?;
             out.push(ev);
         }
         Ok(out)
@@ -392,8 +395,8 @@ impl RecallLog {
             let mut out = Vec::new();
             for entry in table.iter().context("iter RECALL_LOG")? {
                 let (_k, v) = entry.context("decode RECALL_LOG row")?;
-                let ev: RecallEvent = postcard::from_bytes(v.value())
-                    .context("postcard decode RecallEvent")?;
+                let ev: RecallEvent =
+                    postcard::from_bytes(v.value()).context("postcard decode RecallEvent")?;
                 out.push(ev);
             }
             Ok(out)
@@ -488,7 +491,14 @@ fn migrate_from_sqlite_if_present(orig_path: &Path, redb_path: &Path) -> Result<
             let drawer_id: Option<String> = row.get(3)?;
             let score: f64 = row.get(4)?;
             let occurred_at: String = row.get(5)?;
-            Ok((palace_id, query_hash_i, layer_i, drawer_id, score, occurred_at))
+            Ok((
+                palace_id,
+                query_hash_i,
+                layer_i,
+                drawer_id,
+                score,
+                occurred_at,
+            ))
         })
         .context("query legacy recall_events rows")?;
 
@@ -540,8 +550,8 @@ fn migrate_from_sqlite_if_present(orig_path: &Path, redb_path: &Path) -> Result<
         // original insertion order regardless of clock skew.
         for (i, ev) in staged.iter().enumerate() {
             let id = (i as u64).saturating_add(1);
-            let bytes = postcard::to_allocvec(ev)
-                .context("postcard encode migrated RecallEvent")?;
+            let bytes =
+                postcard::to_allocvec(ev).context("postcard encode migrated RecallEvent")?;
             table
                 .insert(id, bytes.as_slice())
                 .context("insert migrated RecallEvent row")?;

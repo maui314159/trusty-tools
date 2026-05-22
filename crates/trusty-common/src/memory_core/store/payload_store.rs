@@ -251,8 +251,9 @@ impl PayloadStore {
     /// `serde_json::Value`'s internal representation.
     /// Test: `roundtrip_persists_across_reopen`.
     pub fn upsert(&self, segment: &str, id: &str, uuid: Uuid, payload: &Value) -> Result<()> {
-        let payload_json =
-            serde_json::to_string(payload).map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
+        let payload_json = serde_json::to_string(payload).map_err(|e| PayloadStoreError::Json {
+            source: Box::new(e),
+        })?;
         let record = PayloadRecord {
             uuid: *uuid.as_bytes(),
             payload: payload_json,
@@ -322,8 +323,10 @@ impl PayloadStore {
                 let record: PayloadRecord = postcard::from_bytes(g.value())
                     .map_err(|e| PayloadStoreError::Postcard { source: e })?;
                 let uuid = Uuid::from_bytes(record.uuid);
-                let value: Value = serde_json::from_str(&record.payload)
-                    .map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
+                let value: Value =
+                    serde_json::from_str(&record.payload).map_err(|e| PayloadStoreError::Json {
+                        source: Box::new(e),
+                    })?;
                 Ok(Some((uuid, value)))
             }
             None => Ok(None),
@@ -583,7 +586,9 @@ fn decode_row(key: &[u8], value: &[u8]) -> Result<Option<PayloadRow>> {
         postcard::from_bytes(value).map_err(|e| PayloadStoreError::Postcard { source: e })?;
     let uuid = Uuid::from_bytes(record.uuid);
     let payload: Value =
-        serde_json::from_str(&record.payload).map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
+        serde_json::from_str(&record.payload).map_err(|e| PayloadStoreError::Json {
+            source: Box::new(e),
+        })?;
     Ok(Some(PayloadRow {
         segment,
         id,
