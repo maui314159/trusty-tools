@@ -747,13 +747,13 @@ async fn run() -> Result<()> {
         Commands::Search {
             query,
             top_k,
-            full: _,
+            full,
             intent: _,
             no_kg: _,
             offset: _,
             budget: _,
         } => {
-            commands::search::handle_search(&cli.index, query, top_k).await?;
+            commands::search::handle_search(&cli.index, query, top_k, full).await?;
         }
 
         Commands::Watch { path } => {

@@ -1214,6 +1214,17 @@ async fn create_index_handler(
     Json(req): Json<CreateIndexRequest>,
 ) -> Response {
     let id = IndexId::new(req.id.clone());
+    // Issue #63: validate root_path is absolute and points at an existing
+    // directory before registering. Previously the handler accepted any
+    // `PathBuf` the client supplied, so a relative path (e.g. `claude-mpm`)
+    // was silently resolved against the daemon's startup CWD by every
+    // downstream walker / file reader — producing an index whose root
+    // pointed at the wrong project on disk. Rejecting non-absolute or
+    // non-directory paths up front gives the caller a clear error and
+    // prevents the bleed described in #64.
+    if let Err(resp) = validate_root_path(&req.root_path) {
+        return resp;
+    }
     if state.registry.get(&id).is_some() {
         return Json(serde_json::json!({
             "id": req.id,
@@ -1324,6 +1335,91 @@ async fn create_index_handler(
     Json(serde_json::json!({ "id": req.id, "created": true })).into_response()
 }
 
+/// Validate that a client-supplied `root_path` is absolute and points at an
+/// existing directory.
+///
+/// Why: issue #63 — `POST /indexes` and `POST /indexes/:id/reindex` used to
+/// accept arbitrary `PathBuf` values, including relative paths and
+/// non-existent directories. A relative path silently got resolved against
+/// the daemon's startup CWD by every downstream walker / file reader, which
+/// caused the wrong files to be indexed under the named id (e.g. a
+/// `claude-mpm` index pointing at `/Users/masa/Projects/trusty-tools`).
+/// Centralising the check here keeps both handlers honest.
+/// What: returns `Ok(())` when `path` is absolute and `is_dir()`; otherwise
+/// `Err(Response)` carrying `400 Bad Request` + a JSON `{ "error": "..." }`
+/// body explaining the failure mode.
+/// Test: `create_index_rejects_relative_root_path`,
+/// `create_index_rejects_nonexistent_root_path`,
+/// `reindex_rejects_relative_root_path`.
+fn validate_root_path(path: &std::path::Path) -> Result<(), Response> {
+    if path.as_os_str().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "root_path is required and must not be empty"
+            })),
+        )
+            .into_response());
+    }
+    if !path.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "root_path must be absolute (got {:?}); relative paths \
+                     would be resolved against the daemon's CWD which is \
+                     not the caller's CWD",
+                    path.display().to_string()
+                ),
+            })),
+        )
+            .into_response());
+    }
+    if !path.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "root_path {:?} does not exist or is not a directory",
+                    path.display().to_string()
+                ),
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Determine whether a chunk's stored `file` field falls within an index's
+/// registered root.
+///
+/// Why: issue #64 — even with `validate_root_path` (#63) preventing future
+/// misregistrations, a daemon that previously indexed under the wrong root
+/// can have persisted chunks whose `file` paths point at a different
+/// project. The search handler post-filters with this predicate so cross-
+/// index bleed cannot leak through to clients.
+/// What: returns `true` when `file` is either (a) a clean relative path
+/// (no leading `/`, no `..` segments) — the normal case, since the reindex
+/// walker stores chunk paths relative to the index root — or (b) an
+/// absolute path that starts with `root`. Everything else (relative path
+/// with `..`, absolute path pointing elsewhere) returns `false`. The check
+/// is purely lexical so it adds no syscalls to the hot search path.
+/// Test: `file_is_within_root_*` unit tests below.
+fn file_is_within_root(file: &str, root: &std::path::Path) -> bool {
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        return p.starts_with(root);
+    }
+    // Relative path: must not climb out via `..`. We accept `.` and any
+    // forward-only sequence of components. Empty paths are rejected
+    // defensively.
+    if file.is_empty() {
+        return false;
+    }
+    !p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Build a `503 Service Unavailable` response for handlers that require the
 /// embedder before the background init task has finished.
 ///
@@ -1412,6 +1508,28 @@ async fn search_handler(
         .search(&query)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Issue #64: defense-in-depth post-filter. Chunks are stored with `file`
+    // paths relative to the index root, so anything that escapes the root
+    // (absolute path pointing elsewhere, `..` traversal, or simply a path
+    // that's also absolute and outside `root_path`) is a sign of stale data
+    // from a previously-misregistered index (see #63) or a bug elsewhere in
+    // the pipeline. Drop those rows rather than returning cross-project
+    // results to the caller. `file_is_within_root` is intentionally cheap —
+    // it does not touch the filesystem.
+    let root = handle.root_path.clone();
+    let before = results.len();
+    results.retain(|r| file_is_within_root(&r.file, &root));
+    let filtered_out = before.saturating_sub(results.len());
+    if filtered_out > 0 {
+        tracing::warn!(
+            index_id = %index_id,
+            root = %root.display(),
+            dropped = filtered_out,
+            "search_handler: dropped {} result(s) whose file path falls outside the \
+             index root (likely stale data from a misregistered index — see #63/#64)",
+            filtered_out,
+        );
+    }
     // Snapshot the symbol graph for primary-symbol resolution before dropping
     // the read lock. Cheap `Arc::clone`.
     let graph_snapshot = indexer.symbol_graph().await;
@@ -2479,6 +2597,18 @@ async fn reindex_handler(
     if let Some(Json(req)) = body {
         force = req.force.unwrap_or(false);
         if let Some(new_root) = req.root_path {
+            // Issue #63: a caller-supplied override must pass the same
+            // absolute-existing-directory check as `POST /indexes`. Without
+            // this, `POST /indexes/:id/reindex { root_path: "." }` would
+            // silently re-point an existing index at the daemon's CWD.
+            if let Err(resp) = validate_root_path(&new_root) {
+                let (parts, body) = resp.into_parts();
+                let status = parts.status;
+                let body_bytes = axum::body::to_bytes(body, 4096).await.unwrap_or_default();
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+                return Err((status, Json(json)));
+            }
             if handle.root_path.as_os_str().is_empty() || handle.root_path != new_root {
                 let indexer = Arc::clone(&handle.indexer);
                 // Preserve the filter set / domain vocabulary recorded on the
@@ -3107,11 +3237,15 @@ mod tests {
             .install_embedder_error("init timed out after 60s")
             .await;
         let state_arc = Arc::new(state);
+        // Use a real tempdir so the issue #63 root_path validator (which now
+        // runs ahead of the embedder check) accepts the path and the
+        // handler proceeds to the embedder-error branch we're asserting on.
+        let tmp = tempfile::tempdir().expect("tempdir");
         let resp = create_index_handler(
             State(state_arc),
             Json(CreateIndexRequest {
                 id: "demo".to_string(),
-                root_path: std::path::PathBuf::from("/tmp/demo"),
+                root_path: tmp.path().to_path_buf(),
                 include_paths: None,
                 exclude_globs: None,
                 extensions: None,
@@ -3366,5 +3500,145 @@ mod tests {
         let Json(body) = admin_stop_handler(State(state)).await;
         assert_eq!(body["ok"], serde_json::Value::Bool(true));
         assert_eq!(body["message"].as_str(), Some("shutting down"));
+    }
+
+    // ── Issue #63 / #64: root_path validation + cross-index bleed guards ──
+
+    /// Issue #63: a relative `root_path` must be rejected with `400` and a
+    /// helpful message — silently resolving it against the daemon's CWD is
+    /// the exact bug we are fixing.
+    #[tokio::test]
+    async fn create_index_rejects_relative_root_path() {
+        use crate::core::registry::IndexRegistry;
+        use axum::body::to_bytes;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        // Install a working embedder so we get past the readiness gate and
+        // actually exercise the path validator.
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "rel-bad".into(),
+                root_path: std::path::PathBuf::from("claude-mpm"),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 4096).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    /// Issue #63: an absolute-but-nonexistent `root_path` must also be
+    /// rejected. Prevents creating an index that points at a directory that
+    /// has not been created yet (the reindex walker would see no files,
+    /// silently producing an empty index named after a real project).
+    #[tokio::test]
+    async fn create_index_rejects_nonexistent_root_path() {
+        use crate::core::registry::IndexRegistry;
+        use axum::body::to_bytes;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "ghost".into(),
+                root_path: std::path::PathBuf::from(
+                    "/this/path/should/never/exist/trusty-search-test-xyz",
+                ),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 4096).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    /// Issue #63: an absolute, existing directory must be accepted.
+    #[tokio::test]
+    async fn create_index_accepts_valid_absolute_root_path() {
+        use crate::core::registry::IndexRegistry;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resp = create_index_handler(
+            State(Arc::clone(&state_arc)),
+            Json(CreateIndexRequest {
+                id: "valid-abs".into(),
+                root_path: tmp.path().to_path_buf(),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Issue #64: `file_is_within_root` accepts clean relative paths (the
+    /// normal stored shape) and rejects path-traversal attempts.
+    #[test]
+    fn file_is_within_root_relative_ok() {
+        let root = std::path::Path::new("/Users/me/proj");
+        assert!(file_is_within_root("src/auth.rs", root));
+        assert!(file_is_within_root("./src/auth.rs", root));
+        assert!(file_is_within_root("Cargo.toml", root));
+    }
+
+    /// Issue #64: relative paths that climb out via `..` must be rejected,
+    /// even though they may resolve inside `root` for some `root` values.
+    #[test]
+    fn file_is_within_root_rejects_dotdot() {
+        let root = std::path::Path::new("/Users/me/proj");
+        assert!(!file_is_within_root("../other/file.rs", root));
+        assert!(!file_is_within_root("src/../../leak.rs", root));
+    }
+
+    /// Issue #64: absolute paths must literally start with the index root.
+    /// This is the load-bearing guard against cross-index bleed when the
+    /// daemon ever stores absolute file paths (e.g. legacy chunks from a
+    /// misregistered index — see #63).
+    #[test]
+    fn file_is_within_root_absolute_must_start_with_root() {
+        let root = std::path::Path::new("/Users/me/proj");
+        assert!(file_is_within_root("/Users/me/proj/src/auth.rs", root));
+        assert!(!file_is_within_root(
+            "/Users/me/other-proj/src/auth.rs",
+            root
+        ));
+        assert!(!file_is_within_root("/etc/passwd", root));
+    }
+
+    /// Issue #64: empty file strings are defensively rejected — they should
+    /// never occur in a valid chunk and we don't want them sneaking past
+    /// the filter as a benign-looking relative path.
+    #[test]
+    fn file_is_within_root_rejects_empty() {
+        let root = std::path::Path::new("/Users/me/proj");
+        assert!(!file_is_within_root("", root));
     }
 }
