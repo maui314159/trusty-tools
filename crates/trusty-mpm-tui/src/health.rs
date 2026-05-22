@@ -163,6 +163,179 @@ pub struct CollectionRow {
     /// Test: `project_palace_rows_reads_palaces`,
     /// `collections_lines_show_graph_count_for_memory`.
     pub kg_count: u64,
+    /// Drawer count for memory palaces (zero for search collections).
+    ///
+    /// Why: the INDEX tab on memory focus surfaces drawer + wing counts as
+    /// part of the palace's graph/storage stats; centralising the read on the
+    /// row keeps the renderer pure.
+    /// What: the `drawer_count` field from `GET /api/v1/palaces`.
+    /// Test: `project_palace_rows_reads_palaces`.
+    pub drawer_count: u64,
+    /// Wing count for memory palaces (zero for search collections).
+    ///
+    /// Why: distinct rooms across drawers — surfaced in the INDEX detail panel.
+    /// What: the `wing_count` field from `GET /api/v1/palaces`.
+    /// Test: `project_palace_rows_reads_palaces`.
+    pub wing_count: u64,
+    /// RFC 3339 timestamp of the most recent palace write, if any.
+    ///
+    /// Why: drives the per-palace activity indicator (idle / active / indexing)
+    /// in the left pane and the "Last write" row in the detail panel.
+    /// What: the `last_write_at` field from `GET /api/v1/palaces`; `None` for
+    /// search rows or when the palace has never been written.
+    /// Test: `palace_activity_from_recent_write`,
+    /// `project_palace_rows_reads_palaces`.
+    pub last_write_at: Option<String>,
+}
+
+/// Activity state of a memory palace, derived from `last_write_at`.
+///
+/// Why: operators want to see at a glance which palaces are doing something
+/// (being indexed, recently touched) vs. idle. A typed enum keeps the
+/// derivation logic, the spinner mapping, and the colour mapping exhaustive
+/// and unit-testable.
+/// What: `Idle` is the default (no recent activity), `Indexing` covers very
+/// recent writes (within 10s) where the palace is likely still flushing
+/// vectors, `Active` covers writes within the last minute, `Dreaming` is
+/// reserved for compaction (the API does not yet expose this signal — kept so
+/// future work can wire it without a new enum variant), and `Error` is set
+/// when a row's `ok` flag is false.
+/// Test: `palace_activity_from_recent_write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PalaceActivity {
+    /// Palace exists but nothing is happening — no recent writes.
+    #[default]
+    Idle,
+    /// Vectors are being built/updated (write within ~10s).
+    Indexing,
+    /// Palace compaction in progress (reserved for future API signal).
+    Dreaming,
+    /// Recently read/written (write within ~60s).
+    Active,
+    /// Row is in an error state (`ok == false`).
+    Error,
+}
+
+/// Threshold below which a palace is considered actively indexing.
+///
+/// Why: a write timestamp newer than this almost certainly reflects an
+/// in-flight ingestion path — the operator should see the spinner.
+/// What: 10 seconds.
+/// Test: `palace_activity_from_recent_write`.
+const INDEXING_WINDOW_SECS: i64 = 10;
+
+/// Threshold below which a palace is considered "recently active".
+///
+/// Why: writes within the last minute are still relevant to the operator
+/// even if the ingestion path has finished; the cyan indicator highlights
+/// the row without animating it.
+/// What: 60 seconds.
+/// Test: `palace_activity_from_recent_write`.
+const ACTIVE_WINDOW_SECS: i64 = 60;
+
+/// Frames of the indexing spinner (the canonical braille rotation).
+///
+/// Why: a rotating spinner communicates "this is changing right now" without
+/// reading a label. The braille frames are the same set ratatui's `Throbber`
+/// uses, kept inline here so the spinner stays self-contained.
+/// What: ten frames cycled at ~10 Hz by the render loop.
+/// Test: `spinner_frame_cycles_through_indexing_frames`.
+const INDEXING_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Frames of the dreaming/compacting spinner.
+///
+/// Why: a heavier glyph set distinguishes the compaction state from
+/// indexing at a glance.
+/// What: eight frames cycled at ~10 Hz by the render loop.
+/// Test: `spinner_frame_cycles_through_dreaming_frames`.
+const DREAMING_SPINNER: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+
+/// Derive a [`PalaceActivity`] from a collection row.
+///
+/// Why: the indicator/colour mapping needs one source of truth so the left
+/// pane and the (future) detail panel agree on what each palace is doing.
+/// What: returns `Error` for an unhealthy row, otherwise parses
+/// `last_write_at` and bins the resulting age against the [`INDEXING_WINDOW_SECS`]
+/// / [`ACTIVE_WINDOW_SECS`] thresholds. A missing or unparseable timestamp
+/// yields `Idle`.
+/// Test: `palace_activity_from_recent_write`.
+pub fn palace_activity(row: &CollectionRow) -> PalaceActivity {
+    if !row.ok {
+        return PalaceActivity::Error;
+    }
+    let Some(ts) = row.last_write_at.as_deref() else {
+        return PalaceActivity::Idle;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return PalaceActivity::Idle;
+    };
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(parsed.with_timezone(&chrono::Utc))
+        .num_seconds();
+    // Future / clock-skew timestamps are still treated as "right now".
+    if age_secs < INDEXING_WINDOW_SECS {
+        PalaceActivity::Indexing
+    } else if age_secs < ACTIVE_WINDOW_SECS {
+        PalaceActivity::Active
+    } else {
+        PalaceActivity::Idle
+    }
+}
+
+/// Pick a spinner / indicator character for a palace activity state.
+///
+/// Why: the left pane prefixes each row with a single glyph; centralising
+/// the lookup keeps the spinner-frame arithmetic in one place and lets the
+/// renderer stay terse.
+/// What: returns `None` for `Idle` (no prefix), `Some('✗')` for `Error`, a
+/// static `Some('⠿')` for `Active`, and a rotating frame for `Indexing` /
+/// `Dreaming` selected by `tick % frames.len()`.
+/// Test: `spinner_frame_for_each_state`,
+/// `spinner_frame_cycles_through_indexing_frames`.
+pub fn spinner_frame(activity: PalaceActivity, tick: usize) -> Option<char> {
+    match activity {
+        PalaceActivity::Idle => None,
+        PalaceActivity::Active => Some('⠿'),
+        PalaceActivity::Error => Some('✗'),
+        PalaceActivity::Indexing => Some(INDEXING_SPINNER[tick % INDEXING_SPINNER.len()]),
+        PalaceActivity::Dreaming => Some(DREAMING_SPINNER[tick % DREAMING_SPINNER.len()]),
+    }
+}
+
+/// Pick the colour for a palace activity state.
+///
+/// Why: alongside the glyph, each row carries an activity-driven colour so
+/// the operator can scan the pane at a glance.
+/// What: maps `Idle` to default (`Reset`), `Indexing` to yellow, `Dreaming`
+/// to magenta, `Active` to cyan, and `Error` to red.
+/// Test: `activity_colour_is_distinct_per_state`.
+pub fn activity_color(activity: PalaceActivity) -> Color {
+    match activity {
+        PalaceActivity::Idle => Color::Reset,
+        PalaceActivity::Indexing => Color::Yellow,
+        PalaceActivity::Dreaming => Color::Magenta,
+        PalaceActivity::Active => Color::Cyan,
+        PalaceActivity::Error => Color::Red,
+    }
+}
+
+/// Compute the current spinner-frame tick from wall-clock time.
+///
+/// Why: the render path is otherwise pure — passing a tick from the event
+/// loop would require threading state through every call site. Deriving the
+/// tick from wall time keeps the renderer self-contained while still
+/// animating predictably.
+/// What: returns the number of 100 ms slots elapsed since the unix epoch,
+/// modulo a large constant so it stays a small `usize`. The render path
+/// re-evaluates this every frame.
+/// Test: covered indirectly by `spinner_frame_cycles_through_indexing_frames`
+/// — the modular arithmetic is enough to ensure rotation.
+fn current_spinner_tick() -> usize {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 100) as usize)
+        .unwrap_or(0)
 }
 
 /// Ring buffer of recently-observed log lines for one service.
@@ -783,6 +956,12 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 .get("kg_triple_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let drawer_count = p.get("drawer_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let wing_count = p.get("wing_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let last_write_at = p
+                .get("last_write_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             // Skip palaces with no vectors and no graph triples: they hold
             // nothing the operator can act on and clutter the left pane.
             if count == 0 && kg_count == 0 {
@@ -792,6 +971,9 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 id,
                 count,
                 kg_count,
+                drawer_count,
+                wing_count,
+                last_write_at,
                 // Note left empty: the row shows vector + graph counts inline
                 // (e.g. `12v 34g`), so a trailing badge would be redundant.
                 note: String::new(),
@@ -1350,6 +1532,20 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, screen: &Health
 /// `collections_lines_show_graph_count_for_memory`,
 /// `collections_lines_show_dashes_for_zero_counts`.
 pub fn collections_lines(screen: &HealthScreen) -> Vec<String> {
+    collections_lines_at_tick(screen, current_spinner_tick())
+}
+
+/// Like [`collections_lines`] but with a caller-supplied spinner tick.
+///
+/// Why: unit tests want deterministic spinner output; passing the tick in
+/// keeps the tested function pure while `collections_lines` remains a
+/// convenience wrapper that samples wall-clock time.
+/// What: builds one line per row. Memory rows include an activity glyph
+/// prefix (driven by [`palace_activity`] + [`spinner_frame`]) so the
+/// operator can spot indexing / active / error palaces at a glance.
+/// Test: `collections_lines_at_tick_shows_indexing_spinner`,
+/// `collections_lines_at_tick_idle_palace_has_no_spinner`.
+pub fn collections_lines_at_tick(screen: &HealthScreen, tick: usize) -> Vec<String> {
     let rows = screen.focused_collections();
     if rows.is_empty() {
         return vec!["(none)".to_string()];
@@ -1364,7 +1560,7 @@ pub fn collections_lines(screen: &HealthScreen) -> Vec<String> {
                 " "
             };
             match focus {
-                Daemon::Memory => format_palace_row(marker, r),
+                Daemon::Memory => format_palace_row(marker, r, tick),
                 Daemon::Search => format_search_row(marker, r),
             }
         })
@@ -1410,10 +1606,16 @@ fn format_search_row(marker: &str, r: &CollectionRow) -> String {
 /// palaces missing vectors or a graph.
 /// Test: `collections_lines_show_graph_count_for_memory`,
 /// `collections_lines_show_dashes_for_zero_counts`.
-fn format_palace_row(marker: &str, r: &CollectionRow) -> String {
+fn format_palace_row(marker: &str, r: &CollectionRow, tick: usize) -> String {
     let vec_cell = format_count_suffix(r.count, 'v');
     let kg_cell = format_count_suffix(r.kg_count, 'g');
-    format!("{marker} {:<16} {:>4} {:>4}", r.id, vec_cell, kg_cell)
+    // The activity glyph occupies a fixed one-column slot so rows stay
+    // aligned whether or not a palace is active. Idle palaces get a space.
+    let glyph = spinner_frame(palace_activity(r), tick).unwrap_or(' ');
+    format!(
+        "{marker}{glyph} {:<15} {:>4} {:>4}",
+        r.id, vec_cell, kg_cell
+    )
 }
 
 /// Render a count plus a single-letter suffix, using `--` for zero.
@@ -1466,7 +1668,25 @@ fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &H
     // with the selected one. This eliminates the gutter at the rendering layer
     // instead of relying on the input text being exactly inner-width chars
     // wide.
-    let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
+    // Apply per-row activity colour for memory palaces; search rows stay
+    // default-styled. Idle palaces keep the default colour too, so only the
+    // "something is happening" rows light up against the rest of the list.
+    let items: Vec<ListItem<'static>> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let item = ListItem::new(line);
+            if matches!(screen.focus, Daemon::Memory)
+                && let Some(row) = rows.get(i)
+            {
+                let activity = palace_activity(row);
+                if !matches!(activity, PalaceActivity::Idle) {
+                    return item.style(Style::default().fg(activity_color(activity)));
+                }
+            }
+            item
+        })
+        .collect();
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
         Style::default()
@@ -1694,6 +1914,103 @@ fn render_search_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &He
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Format a count with comma thousands separators (e.g. `1,234,567`).
+///
+/// Why: the detail panel surfaces graph stats that often run into the tens
+/// of thousands; comma-grouping is easier to scan than a packed digit run.
+/// What: walks the digits right-to-left and inserts a comma every three.
+/// Test: `format_with_commas_groups_thousands`.
+pub fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Build the INDEX tab body lines for a memory-palace row (the detail panel).
+///
+/// Why: the right detail panel needs palace-appropriate stats — vectors,
+/// drawers, knowledge-graph triples, and the last-write time — rather than
+/// the search-index stats `index_tab_lines` was originally built for.
+/// What: returns a header section (`Vectors` / `Drawers` / `Wings`), a Graph
+/// section (`Triples` / `Communities` / `Nodes` / `Edges` — the latter two
+/// are best-effort and read from the row's KG-side fields if present), and
+/// a freshness section (`Last write`). Numbers are comma-grouped for
+/// readability; missing data renders as `N/A`.
+/// Test: `palace_index_tab_lines_shows_graph_section`,
+/// `palace_index_tab_lines_formats_last_write`.
+pub fn palace_index_tab_lines(row: &CollectionRow) -> Vec<String> {
+    let mut lines = Vec::with_capacity(12);
+
+    // Header: vector / drawer / wing counts.
+    lines.push(format!(
+        "Vectors:    {:<12} Drawers: {}",
+        format_with_commas(row.count),
+        format_with_commas(row.drawer_count),
+    ));
+    lines.push(format!(
+        "Wings:      {}",
+        format_with_commas(row.wing_count),
+    ));
+    lines.push(String::new());
+
+    // Graph section.
+    lines.push("-- Knowledge Graph ------------------------------------".to_string());
+    lines.push(format!("Triples:    {}", format_with_commas(row.kg_count),));
+    let node_cell = if row.node_count == 0 {
+        "N/A".to_string()
+    } else {
+        format_with_commas(row.node_count)
+    };
+    let edge_cell = if row.edge_count == 0 {
+        "N/A".to_string()
+    } else {
+        format_with_commas(row.edge_count)
+    };
+    lines.push(format!(
+        "Nodes:      {:<12} Edges: {}",
+        node_cell, edge_cell,
+    ));
+    let community_cell = if row.community_count == 0 {
+        "N/A".to_string()
+    } else {
+        format_with_commas(row.community_count)
+    };
+    lines.push(format!("Communities: {community_cell}"));
+    lines.push(String::new());
+
+    // Freshness section: last write timestamp + activity state.
+    lines.push("-- Activity -------------------------------------------".to_string());
+    let last_write_human = match row.last_write_at.as_deref() {
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => format!(
+                "{} ({})",
+                dt.format("%Y-%m-%d %H:%M"),
+                format_relative_time(Some(s)),
+            ),
+            Err(_) => s.to_string(),
+        },
+        None => "never".to_string(),
+    };
+    lines.push(format!("Last write: {last_write_human}"));
+    let state_label = match palace_activity(row) {
+        PalaceActivity::Idle => "idle",
+        PalaceActivity::Indexing => "indexing",
+        PalaceActivity::Dreaming => "dreaming (compacting)",
+        PalaceActivity::Active => "active (recent write)",
+        PalaceActivity::Error => "error",
+    };
+    lines.push(format!("State:      {state_label}"));
+
+    lines
+}
+
 /// Build the INDEX tab body lines for the currently-selected collection row.
 ///
 /// Why: keeping the body builder pure lets a unit test assert the rendered
@@ -1722,6 +2039,13 @@ pub fn index_tab_lines(screen: &HealthScreen) -> Vec<String> {
     let Some(row) = rows.get(screen.selected_collection) else {
         return vec!["(no collection selected)".to_string()];
     };
+
+    // Memory palaces have a different stat set than search indexes (no
+    // chunks, no edge-kind histogram); branch out into a dedicated builder
+    // so each focus stays readable.
+    if matches!(screen.focus, Daemon::Memory) {
+        return palace_index_tab_lines(row);
+    }
 
     let mut lines = Vec::with_capacity(12);
 
@@ -2634,6 +2958,283 @@ mod tests {
         let lines = index_tab_lines(&screen);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("no collection selected"));
+    }
+
+    #[test]
+    fn palace_activity_from_recent_write() {
+        // No timestamp → Idle.
+        let mut row = CollectionRow {
+            id: "p".into(),
+            count: 10,
+            ok: true,
+            ..Default::default()
+        };
+        assert_eq!(palace_activity(&row), PalaceActivity::Idle);
+
+        // !ok → Error (regardless of timestamp).
+        let mut bad = row.clone();
+        bad.ok = false;
+        assert_eq!(palace_activity(&bad), PalaceActivity::Error);
+
+        // Write within 10s → Indexing.
+        row.last_write_at = Some((chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339());
+        assert_eq!(palace_activity(&row), PalaceActivity::Indexing);
+
+        // Write within last minute (but >10s) → Active.
+        row.last_write_at = Some((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339());
+        assert_eq!(palace_activity(&row), PalaceActivity::Active);
+
+        // Write older than a minute → Idle.
+        row.last_write_at = Some((chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        assert_eq!(palace_activity(&row), PalaceActivity::Idle);
+
+        // Unparseable timestamp → Idle.
+        row.last_write_at = Some("not-a-date".into());
+        assert_eq!(palace_activity(&row), PalaceActivity::Idle);
+    }
+
+    #[test]
+    fn spinner_frame_for_each_state() {
+        assert_eq!(spinner_frame(PalaceActivity::Idle, 0), None);
+        assert_eq!(spinner_frame(PalaceActivity::Error, 0), Some('✗'));
+        assert_eq!(spinner_frame(PalaceActivity::Active, 0), Some('⠿'));
+        // Indexing and Dreaming both yield Some(frame).
+        assert!(spinner_frame(PalaceActivity::Indexing, 0).is_some());
+        assert!(spinner_frame(PalaceActivity::Dreaming, 0).is_some());
+    }
+
+    #[test]
+    fn spinner_frame_cycles_through_indexing_frames() {
+        // Each tick picks the next frame; the cycle wraps cleanly.
+        let f0 = spinner_frame(PalaceActivity::Indexing, 0).unwrap();
+        let f1 = spinner_frame(PalaceActivity::Indexing, 1).unwrap();
+        let f_wrap = spinner_frame(PalaceActivity::Indexing, INDEXING_SPINNER.len()).unwrap();
+        assert_ne!(f0, f1);
+        assert_eq!(f0, f_wrap);
+    }
+
+    #[test]
+    fn spinner_frame_cycles_through_dreaming_frames() {
+        let f0 = spinner_frame(PalaceActivity::Dreaming, 0).unwrap();
+        let f_wrap = spinner_frame(PalaceActivity::Dreaming, DREAMING_SPINNER.len()).unwrap();
+        assert_eq!(f0, f_wrap);
+    }
+
+    #[test]
+    fn activity_colour_is_distinct_per_state() {
+        // Idle is the only state that uses the terminal default.
+        assert_eq!(activity_color(PalaceActivity::Idle), Color::Reset);
+        // The other states each pick a non-default colour and none collide.
+        let colours = [
+            activity_color(PalaceActivity::Indexing),
+            activity_color(PalaceActivity::Dreaming),
+            activity_color(PalaceActivity::Active),
+            activity_color(PalaceActivity::Error),
+        ];
+        for c in &colours {
+            assert_ne!(*c, Color::Reset);
+        }
+        let mut sorted = colours.to_vec();
+        sorted.sort_by_key(|c| format!("{c:?}"));
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            4,
+            "every non-idle state needs a unique colour"
+        );
+    }
+
+    #[test]
+    fn collections_lines_at_tick_shows_indexing_spinner() {
+        // A memory palace whose last_write_at is in the indexing window
+        // gets a spinner glyph from the indexing frame set.
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.focus = Daemon::Memory;
+        screen.memory_collections = vec![CollectionRow {
+            id: "fresh".into(),
+            count: 1,
+            kg_count: 0,
+            ok: true,
+            last_write_at: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            ..Default::default()
+        }];
+        let lines = collections_lines_at_tick(&screen, 0);
+        assert_eq!(lines.len(), 1);
+        let expected = INDEXING_SPINNER[0];
+        assert!(
+            lines[0].contains(expected),
+            "expected indexing spinner {expected} in {line:?}",
+            line = lines[0],
+        );
+    }
+
+    #[test]
+    fn collections_lines_at_tick_idle_palace_has_no_spinner() {
+        // An idle palace renders with a space where the spinner would go,
+        // so none of the animated glyphs appear on the line.
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.focus = Daemon::Memory;
+        screen.memory_collections = vec![CollectionRow {
+            id: "idle".into(),
+            count: 1,
+            kg_count: 0,
+            ok: true,
+            last_write_at: None,
+            ..Default::default()
+        }];
+        let lines = collections_lines_at_tick(&screen, 0);
+        for ch in INDEXING_SPINNER.iter().chain(DREAMING_SPINNER.iter()) {
+            assert!(
+                !lines[0].contains(*ch),
+                "idle palace must not show spinner glyph {ch} in {line:?}",
+                line = lines[0],
+            );
+        }
+        // Nor the active / error markers.
+        assert!(!lines[0].contains('⠿'));
+        assert!(!lines[0].contains('✗'));
+    }
+
+    #[test]
+    fn format_with_commas_groups_thousands() {
+        assert_eq!(format_with_commas(0), "0");
+        assert_eq!(format_with_commas(42), "42");
+        assert_eq!(format_with_commas(1_234), "1,234");
+        assert_eq!(format_with_commas(1_234_567), "1,234,567");
+        assert_eq!(format_with_commas(1_000_000_000), "1,000,000,000");
+    }
+
+    #[test]
+    fn project_palace_rows_reads_extended_fields() {
+        // The wire shape exposes drawer_count, wing_count, and last_write_at
+        // alongside the existing fields. The projection must surface them so
+        // the detail panel can render them.
+        let ts = chrono::Utc::now().to_rfc3339();
+        let list = serde_json::json!([
+            {
+                "name": "main",
+                "vector_count": 100u64,
+                "kg_triple_count": 50u64,
+                "drawer_count": 7u64,
+                "wing_count": 3u64,
+                "last_write_at": ts,
+            },
+        ]);
+        let rows = project_palace_rows(&list);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].drawer_count, 7);
+        assert_eq!(rows[0].wing_count, 3);
+        assert_eq!(rows[0].last_write_at.as_deref(), Some(ts.as_str()));
+    }
+
+    #[test]
+    fn palace_index_tab_lines_shows_graph_section() {
+        // The memory detail panel surfaces vectors / drawers / wings on the
+        // header, then a Knowledge Graph section with triples, then an
+        // Activity section. Counts render with comma grouping.
+        let row = CollectionRow {
+            id: "main".into(),
+            count: 12_345,
+            kg_count: 6_789,
+            drawer_count: 42,
+            wing_count: 3,
+            ok: true,
+            ..Default::default()
+        };
+        let lines = palace_index_tab_lines(&row);
+        assert!(lines.iter().any(|l| l.starts_with("Vectors:")));
+        assert!(lines.iter().any(|l| l.contains("12,345")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Drawers:") && l.contains("42"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Wings:") && l.contains("3"))
+        );
+        assert!(lines.iter().any(|l| l.contains("Knowledge Graph")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Triples:") && l.contains("6,789"))
+        );
+        // Without graph nodes/edges/communities on the wire, those slots
+        // render as N/A rather than 0 so the operator knows they were absent.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Nodes:") && l.contains("N/A"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Communities:") && l.contains("N/A"))
+        );
+        assert!(lines.iter().any(|l| l.contains("Activity")));
+        assert!(lines.iter().any(|l| l.starts_with("State:")));
+    }
+
+    #[test]
+    fn palace_index_tab_lines_formats_last_write() {
+        // A recent write renders the relative + absolute time and the state
+        // line tracks it ("active" within 60s).
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let row = CollectionRow {
+            id: "main".into(),
+            count: 1,
+            ok: true,
+            last_write_at: Some(ts),
+            ..Default::default()
+        };
+        let lines = palace_index_tab_lines(&row);
+        let last_line = lines
+            .iter()
+            .find(|l| l.starts_with("Last write:"))
+            .expect("must include Last write line");
+        // The absolute date prefix and the relative badge both render.
+        assert!(last_line.contains("ago") || last_line.contains("just now"));
+        let state_line = lines
+            .iter()
+            .find(|l| l.starts_with("State:"))
+            .expect("must include State line");
+        assert!(state_line.contains("active"));
+
+        // No timestamp falls back to "never" and Idle.
+        let idle = CollectionRow {
+            id: "x".into(),
+            count: 1,
+            ok: true,
+            last_write_at: None,
+            ..Default::default()
+        };
+        let lines = palace_index_tab_lines(&idle);
+        assert!(lines.iter().any(|l| l.contains("never")));
+        assert!(lines.iter().any(|l| l.contains("idle")));
+    }
+
+    #[test]
+    fn index_tab_lines_routes_to_palace_when_focus_memory() {
+        // When focus is Memory, the dispatcher hands the row to the palace
+        // builder, which produces the Knowledge Graph header (not "-- Graph").
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.focus = Daemon::Memory;
+        screen.memory_collections = vec![CollectionRow {
+            id: "main".into(),
+            count: 10,
+            kg_count: 5,
+            ok: true,
+            ..Default::default()
+        }];
+        let lines = index_tab_lines(&screen);
+        assert!(lines.iter().any(|l| l.contains("Knowledge Graph")));
+        // The search-only edge-kind histogram header must NOT appear here.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l == "-- Graph ----------------------------------------------")
+        );
     }
 
     #[test]
