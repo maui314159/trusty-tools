@@ -30,20 +30,30 @@ use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 /// Machine-wide reindex serializer.
 ///
-/// Why: The ONNX fastembed model allocates large working buffers per session
-/// (~7–10 GB virtual mem per concurrent `embed()` call on a real codebase).
-/// When multiple `POST /indexes/:id/reindex` requests arrive concurrently
-/// (e.g. benchmark agents, parallel CLI runs), each `spawn_reindex` task
-/// races into `parse_and_embed_files` and the daemon balloons to 28–46 GB,
-/// triggering macOS Jetsam to kill the process.
+/// Why: Historically a 1-permit semaphore here protected the daemon from
+/// OOM when multiple reindexes raced (each ONNX session arena held 7–10 GB
+/// of working memory). As of issue #41 Phase 1 this is supplanted by the
+/// `EmbedPool`'s bounded priority channels + the HTTP-level concurrency
+/// limiter — both bound concurrent embedding work without serializing all
+/// reindex bookkeeping unnecessarily. The semaphore is retained at width
+/// `MAX_PARALLEL_REINDEXES` so a misconfigured caller can't fan out an
+/// unbounded number of reindex tasks (which would still race the redb
+/// + HNSW write locks even though embedding itself is bounded).
 ///
-/// What: A 1-permit semaphore. Waiting reindexes queue (the SSE stream is
-/// already connected and will start emitting events once the permit is held).
-/// The permit is released when the spawned task's async block returns.
+/// What: A small N-permit semaphore (default 2) sized to allow a few
+/// concurrent reindexes while still bounding peak memory. Waiting
+/// reindexes queue (the SSE stream is already connected and will start
+/// emitting events once the permit is held).
 fn reindex_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| Semaphore::new(1))
+    SEM.get_or_init(|| Semaphore::new(MAX_PARALLEL_REINDEXES))
 }
+
+/// Maximum number of concurrent reindex tasks (issue #41 Phase 1). Keeps a
+/// little headroom for an interactive reindex to start while a background
+/// one is running. The embedder pool already gates the actual embedding
+/// work, so the value here just bounds the redb + HNSW lock contention.
+const MAX_PARALLEL_REINDEXES: usize = 2;
 
 /// Files per parallel batch. Each batch is parsed in parallel via rayon and
 /// embedded in ONNX batches (`EMBED_BATCH_SIZE` chunks at a time inside the

@@ -430,11 +430,26 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
     // `init_tracing_with_buffer`) to the HTTP state so `GET /logs/tail`
     // serves the same lines the tracing subscriber captures. Without this
     // the endpoint would only ever see the empty default buffer.
-    let state = crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
-        .with_local_model(cfg.local_model)
-        .with_openrouter_model(cfg.openrouter_model)
-        .with_openrouter_api_key(cfg.openrouter_api_key)
-        .with_log_buffer(log_buffer);
+    // Issue #41 Phase 1: install the Prometheus recorder before constructing
+    // the AppState so every emit macro fired during state setup is captured.
+    // Failure to install is non-fatal — log and continue without /metrics.
+    let metrics_state = match crate::service::metrics::install_recorder() {
+        Ok(state) => Some(state),
+        Err(e) => {
+            tracing::warn!("could not install prometheus recorder: {e} (metrics disabled)");
+            None
+        }
+    };
+
+    let mut state =
+        crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
+            .with_local_model(cfg.local_model)
+            .with_openrouter_model(cfg.openrouter_model)
+            .with_openrouter_api_key(cfg.openrouter_api_key)
+            .with_log_buffer(log_buffer);
+    if let Some(m) = metrics_state {
+        state = state.with_metrics(m);
+    }
 
     // Spawn embedder load on a background task; the daemon's HTTP server
     // starts serving requests in parallel. On success, `install_embedder`
@@ -485,10 +500,25 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
         match init_result {
             Ok(Ok(Ok(embedder))) => {
                 install_state.install_embedder(Arc::clone(&embedder)).await;
+                // Issue #41 Phase 1: build the embedder worker pool now that
+                // the model is loaded. The pool shares the same `Arc<dyn
+                // Embedder>` so it does not double the model memory; what
+                // it adds is priority-aware dispatch (interactive search
+                // queries jump ahead of background reindex batches) and
+                // a bounded queue depth that protects the daemon from
+                // unbounded fan-out.
+                let pool = std::sync::Arc::new(
+                    crate::service::embed_pool::EmbedPool::with_autotune(Arc::clone(&embedder)),
+                );
+                install_state.install_embed_pool(pool).await;
                 tracing::info!("embedder ready — vector lane online");
                 // Issue #85: restore every index recorded in `indexes.toml`
                 // now that we have a fully-wired hybrid pipeline.
                 restore_indexes(&install_state, &embedder).await;
+                // Issue #41 Phase 1: prime the `trusty_index_count` gauge so
+                // /metrics reports the warm-boot index count before any
+                // mutating request arrives.
+                crate::service::metrics::set_index_count(install_state.registry.list().len());
                 // Issue #40: auto-discover Claude Code / git projects under
                 // the user's configured (or default) scan paths and index any
                 // not yet known to the daemon. Spawned as a separate task so

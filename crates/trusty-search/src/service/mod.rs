@@ -1,10 +1,13 @@
 pub mod client;
+pub mod concurrency;
 pub mod config;
 pub mod constants;
 pub mod context_inference;
 pub mod daemon;
+pub mod embed_pool;
 pub mod indexed_files;
 pub mod mcp_descriptor;
+pub mod metrics;
 pub mod persistence;
 pub mod persistence_loader;
 pub mod reindex;

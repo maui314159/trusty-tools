@@ -231,6 +231,28 @@ pub struct SearchAppState {
     /// intervals so lock contention is negligible.
     /// Test: `health_includes_resource_fields`.
     pub sys_metrics: Arc<tokio::sync::Mutex<trusty_common::sys_metrics::SysMetrics>>,
+    /// Embedder worker pool with priority lanes (issue #41 Phase 1).
+    ///
+    /// Why: Centralises every embedding call so interactive search queries
+    /// never wait behind a long-running reindex. Wrapped in
+    /// `Arc<RwLock<Option<…>>>` so the background embedder-init task can
+    /// install the pool after `run_daemon` has already started serving
+    /// requests — handlers observe the pool atomically via
+    /// `embed_pool.read().await.clone()`.
+    /// What: `None` until `install_embed_pool` is called; subsequent reads
+    /// see a cloneable `Arc<EmbedPool>`.
+    /// Test: covered indirectly — `start_brings_pool_online`.
+    pub embed_pool: Arc<RwLock<Option<Arc<crate::service::embed_pool::EmbedPool>>>>,
+    /// Prometheus recorder handle, populated by `start.rs` when the recorder
+    /// is installed. `None` in tests / when the recorder is skipped.
+    ///
+    /// Why: routes `/metrics` only when the recorder has been wired so tests
+    /// constructing an AppState without metrics don't accidentally surface
+    /// an empty metrics endpoint.
+    /// What: `Some(MetricsState)` enables the `/metrics` route; `None` skips
+    /// it. The render itself is lock-free (PrometheusHandle is Clone).
+    /// Test: covered by `metrics_handler_returns_prometheus_text`.
+    pub metrics: Option<crate::service::metrics::MetricsState>,
 }
 
 impl SearchAppState {
@@ -273,7 +295,49 @@ impl SearchAppState {
             sys_metrics: Arc::new(tokio::sync::Mutex::new(
                 trusty_common::sys_metrics::SysMetrics::new(),
             )),
+            embed_pool: Arc::new(RwLock::new(None)),
+            metrics: None,
         }
+    }
+
+    /// Builder-style: attach a pre-built embedder worker pool (issue #41
+    /// Phase 1). Production callers (`start.rs`) build the pool once the
+    /// background embedder-init task completes; tests can skip this.
+    #[must_use]
+    pub fn with_embed_pool(self, pool: Arc<crate::service::embed_pool::EmbedPool>) -> Self {
+        if let Ok(mut slot) = self.embed_pool.try_write() {
+            *slot = Some(pool);
+        }
+        self
+    }
+
+    /// Builder-style: attach the Prometheus recorder handle (issue #41
+    /// Phase 1). Calling this enables the `/metrics` route in `build_router`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: crate::service::metrics::MetricsState) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Install the pool after the deferred embedder init completes.
+    ///
+    /// Why: the embedder pool must be built *after* `install_embedder` has
+    /// populated `embedder_slot` — otherwise the pool's workers would hold a
+    /// reference to the unloaded model. Calling this from the spawned init
+    /// task keeps the wiring atomic from the caller's perspective.
+    /// What: writes the pool into the shared `Arc<RwLock<…>>`. Handlers
+    /// observe the change on their next `embed_pool.read().await.clone()`.
+    /// Test: hand-checked via the integration `start_brings_pool_online`
+    /// scenario.
+    pub async fn install_embed_pool(&self, pool: Arc<crate::service::embed_pool::EmbedPool>) {
+        let mut slot = self.embed_pool.write().await;
+        *slot = Some(pool);
+    }
+
+    /// Snapshot the currently-installed embed pool (or `None` while the
+    /// embedder is still warming up).
+    pub async fn current_embed_pool(&self) -> Option<Arc<crate::service::embed_pool::EmbedPool>> {
+        self.embed_pool.read().await.clone()
     }
 
     /// Builder-style: attach the daemon's shared [`LogBuffer`] so the
@@ -580,7 +644,33 @@ pub fn build_router(state: SearchAppState) -> Router {
     let state_arc = Arc::new(state);
     spawn_status_ticker(Arc::clone(&state_arc));
     spawn_disk_size_ticker(Arc::clone(&state_arc));
-    let router = Router::new()
+
+    // Issue #41 Phase 1: concurrency limiter applied selectively to expensive
+    // endpoints. Cheap endpoints (/health, /metrics, /indexes list, /ui/*)
+    // bypass it entirely. The limiter is constructed once per router build
+    // so its semaphore is shared across every request.
+    let limiter = crate::service::concurrency::ConcurrencyLimiter::from_env();
+
+    // "Expensive" subtree: search + reindex + index-file. These are routed
+    // through the concurrency limiter middleware. The limiter is injected as
+    // an Extension so the middleware fn can pull it out per-request.
+    let limited = Router::new()
+        .route("/search", post(global_search_handler))
+        .route("/indexes/{id}/search", post(search_handler))
+        .route("/indexes/{id}/search_similar", post(search_similar_handler))
+        .route("/indexes/{id}/index-file", post(index_file_handler))
+        .route("/indexes/{id}/remove-file", post(remove_file_handler))
+        .route("/indexes/{id}/reindex", post(reindex_handler))
+        .route_layer(axum::middleware::from_fn(
+            crate::service::concurrency::apply_limiter,
+        ))
+        .layer(axum::Extension(Arc::clone(&limiter)))
+        .with_state(Arc::clone(&state_arc));
+
+    // "Free" subtree: light endpoints + streaming endpoints that should not
+    // be queued behind heavy work (SSE streams hold the connection for the
+    // lifetime of a reindex, so wrapping them in the limiter would deadlock).
+    let free = Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
         .route("/health", get(health_handler))
         .route("/logs/tail", get(logs_tail_handler))
@@ -596,14 +686,8 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/ui/{*path}", get(ui_asset_handler))
         .route("/chat", post(chat_handler))
         .route("/api/chat/providers", get(list_chat_providers))
-        .route("/search", post(global_search_handler))
-        .route("/indexes/{id}/search", post(search_handler))
-        .route("/indexes/{id}/search_similar", post(search_similar_handler))
         .route("/indexes/{id}/status", get(index_status_handler))
         .route("/indexes/{id}/graph", get(graph_handler))
-        .route("/indexes/{id}/index-file", post(index_file_handler))
-        .route("/indexes/{id}/remove-file", post(remove_file_handler))
-        .route("/indexes/{id}/reindex", post(reindex_handler))
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
         .route(
@@ -611,6 +695,28 @@ pub fn build_router(state: SearchAppState) -> Router {
             get(get_config_handler).patch(patch_config_handler),
         )
         .with_state(Arc::clone(&state_arc));
+
+    let mut router = free.merge(limited);
+
+    // Issue #41 Phase 1: install Prometheus /metrics endpoint if the recorder
+    // has been wired into the state. Production callers (`start.rs`) install
+    // the recorder before constructing the AppState and stash the resulting
+    // handle here. Test/integration callers that skip the install simply
+    // don't expose /metrics.
+    if let Some(metrics_state) = state_arc.metrics.clone() {
+        router = router
+            .route("/metrics", get(crate::service::metrics::metrics_handler))
+            .layer(axum::Extension(metrics_state));
+    }
+
+    // Wrap the entire router in the per-request metrics middleware so every
+    // endpoint contributes to `trusty_requests_total` /
+    // `trusty_request_latency_ms`. The recorder is a global, so emit macros
+    // are no-ops when no recorder has been installed (test path).
+    router = router.layer(axum::middleware::from_fn(
+        crate::service::metrics::request_metrics_middleware,
+    ));
+
     // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
     // so every trusty-* daemon ships with the same defaults.
     trusty_common::server::with_standard_middleware(router)
@@ -1127,6 +1233,9 @@ async fn create_index_handler(
         context_summary: Arc::new(tokio::sync::RwLock::new(None)),
     };
     state.registry.register(handle);
+    // Issue #41 Phase 1: refresh the index-count gauge so /metrics reflects
+    // the registry size without a separate poll.
+    crate::service::metrics::set_index_count(state.registry.list().len());
     // Push event so connected dashboards refresh their index list without a
     // page reload (mirrors the trusty-memory `palace_created` pattern).
     state.emit(DaemonEvent::IndexRegistered { id: req.id.clone() });
@@ -1198,6 +1307,8 @@ async fn delete_index_handler(
         }
         // Push event so connected dashboards drop the row without refresh.
         state.emit(DaemonEvent::IndexRemoved { id: id.clone() });
+        // Issue #41 Phase 1: keep the index-count gauge in sync.
+        crate::service::metrics::set_index_count(state.registry.list().len());
     }
     Json(serde_json::json!({ "id": id, "removed": removed }))
 }
