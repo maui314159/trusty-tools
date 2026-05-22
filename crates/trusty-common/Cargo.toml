@@ -198,17 +198,18 @@ symgraph-parser = [
 symgraph-server = ["symgraph-parser", "axum-server"]
 # Enables the `memory_core` module: Memory Palace storage engine
 # (formerly the `trusty-memory-core` crate). Pulls in usearch (HNSW
-# vector index), rusqlite + r2d2 + r2d2_sqlite (SQLite-backed knowledge
-# graph), git2 (git history extraction), and dashmap / chrono / regex /
+# vector index), redb + postcard (knowledge graph + payload/chat stores),
+# git2 (git history extraction), and dashmap / chrono / regex /
 # parking_lot / thiserror / uuid utilities. Requires the bundled-ORT
 # embedder variant by default so FastEmbedder is available; downstream
 # consumers can switch to the load-dynamic or CUDA variants by enabling
 # `embedder-load-dynamic` / `embedder-cuda` explicitly.
+#
+# Issue #47: rusqlite / r2d2 / r2d2_sqlite are no longer pulled in by this
+# feature — all stores migrated to redb (#44, #45, #46, #56, #57). The
+# `sqlite-kg` feature still pulls them in for the legacy migration helpers.
 memory-core = [
     "dep:usearch",
-    "dep:rusqlite",
-    "dep:r2d2",
-    "dep:r2d2_sqlite",
     "dep:git2",
     "dep:dashmap",
     "dep:futures",
@@ -228,9 +229,15 @@ memory-core = [
 # large native dependency.
 memory-core-kuzu = ["memory-core", "dep:kuzu"]
 # Legacy SQLite KG read path (the pre-#44 backend). Kept compilable so the
-# #45 SQLite → redb migration tool can read old `kg.db` files. Issue #47
-# removes this feature and the dependency.
-sqlite-kg = ["memory-core"]
+# one-shot SQLite → redb migration tool can read old `kg.db` / `recall.db`
+# / `payloads.db` / `chat_sessions.db` files. Pulls in rusqlite + r2d2 +
+# r2d2_sqlite which are otherwise no longer needed by `memory-core` (#47).
+sqlite-kg = [
+    "memory-core",
+    "dep:rusqlite",
+    "dep:r2d2",
+    "dep:r2d2_sqlite",
+]
 # Enables the `monitor` module: the unified ratatui dashboard for the
 # trusty-search and trusty-memory daemons (formerly the `trusty-monitor-tui`
 # crate, and before that the standalone `trusty-monitor` binary). Pulls in
