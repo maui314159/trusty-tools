@@ -158,6 +158,17 @@ pub struct DrawerRecord {
     pub source_file: Option<String>,
     /// Unix epoch milliseconds when the drawer was created.
     pub created_at_ms: i64,
+    /// Issue #61: signal-vs-noise tag. `None` for rows written before the
+    /// field existed; readers fall back to `DrawerType::Unknown`. Stored as
+    /// the variant name string so the on-disk schema is stable across
+    /// future enum extensions (postcard would otherwise renumber variants).
+    #[serde(default)]
+    pub drawer_type: Option<String>,
+    /// Issue #61: optional TTL expressed as epoch milliseconds. The
+    /// `purge_expired` sweep at palace open drops rows where this value is
+    /// in the past.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
 }
 
 // ── Key encoding helpers ─────────────────────────────────────────────────
@@ -421,10 +432,37 @@ mod tests {
             tags: vec!["project".to_string(), "kickoff".to_string()],
             source_file: Some("notes/2025-01-01.md".to_string()),
             created_at_ms: 1_700_000_000_000,
+            drawer_type: Some("UserFact".to_string()),
+            expires_at_ms: Some(1_710_000_000_000),
         };
         let bytes = encode_value(&d).expect("encode");
         let decoded: DrawerRecord = decode_value(&bytes).expect("decode");
         assert_eq!(d, decoded);
+    }
+
+    #[test]
+    fn drawer_record_new_fields_default_to_none() {
+        // Issue #61: when the writer omits drawer_type / expires_at_ms (e.g.
+        // by constructing via `..Default::default()`-style flow), the
+        // decoded round-trip preserves `None`. (Postcard is positional so
+        // legacy on-disk bytes that omit the trailing fields must be
+        // migrated by the reader — see `LegacyDrawerRecord` in `kg_redb.rs`
+        // for that path.)
+        let d = DrawerRecord {
+            room_id: "room-1".to_string(),
+            content: "legacy".to_string(),
+            importance: 0.5,
+            tags: vec![],
+            source_file: None,
+            created_at_ms: 1,
+            drawer_type: None,
+            expires_at_ms: None,
+        };
+        let bytes = encode_value(&d).expect("encode");
+        let decoded: DrawerRecord = decode_value(&bytes).expect("decode");
+        assert_eq!(d, decoded);
+        assert!(decoded.drawer_type.is_none());
+        assert!(decoded.expires_at_ms.is_none());
     }
 
     #[test]

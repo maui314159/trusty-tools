@@ -836,6 +836,19 @@ impl KnowledgeGraph {
         self.writer.delete_drawer(id).await
     }
 
+    /// Synchronous drawer delete used by palace open-time pruning.
+    ///
+    /// Why: Issue #61's TTL sweep runs inside `PalaceHandle::open`, which is
+    /// synchronous and predates any tokio runtime context. The async writer
+    /// path requires an executor we don't have here; going straight to the
+    /// underlying redb store keeps the sweep contention-free at startup.
+    /// Outside of open we always prefer `delete_drawer` so writes coalesce.
+    /// What: Forwards directly to `KgStoreRedb::delete_drawer`.
+    /// Test: Covered indirectly by `purge_expired_drops_only_past_ttl`.
+    pub fn delete_drawer_sync(&self, id: Uuid) -> Result<()> {
+        self.store.delete_drawer(id)
+    }
+
     /// Load the set of drawer IDs currently stored.
     ///
     /// Why: Compaction only needs "is this UUID a live drawer?".

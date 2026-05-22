@@ -940,7 +940,7 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
     }
 
     #[tokio::test]
@@ -1037,7 +1037,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "memory_remember",
-                    "arguments": {"text": "default-palace test memory"},
+                    "arguments": {"text": "default palace test memory content with several tokens"},
                 },
             }),
         )

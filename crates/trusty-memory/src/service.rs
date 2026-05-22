@@ -87,8 +87,8 @@ mod tests {
         let tools = svc.tools();
         assert_eq!(
             tools.len(),
-            18,
-            "expected 18 memory tools, got {}",
+            19,
+            "expected 19 memory tools, got {}",
             tools.len()
         );
     }
@@ -111,7 +111,7 @@ mod tests {
         //      so we must confirm dynamic dispatch resolves correctly here.
         let svc: Box<dyn ServiceDescriptor> = Box::new(MemoryMcpService);
         assert_eq!(svc.name(), "trusty-memory");
-        assert_eq!(svc.tools().len(), 18);
+        assert_eq!(svc.tools().len(), 19);
         assert_eq!(svc.scopes_for("palace_create"), vec!["memory.write"]);
         assert_eq!(svc.scopes_for("palace_list"), vec!["memory.read"]);
     }

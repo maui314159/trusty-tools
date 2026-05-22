@@ -18,6 +18,7 @@ pub mod community;
 pub mod decay;
 pub mod dream;
 pub mod embed;
+pub mod filter;
 pub mod git;
 pub mod palace;
 pub mod registry;
@@ -25,6 +26,6 @@ pub mod retrieval;
 pub mod store;
 
 pub use community::{KnowledgeGap, find_communities};
-pub use palace::{Drawer, Palace, PalaceId, Room, RoomType, Wing};
+pub use palace::{Drawer, DrawerType, Palace, PalaceId, Room, RoomType, Wing};
 pub use registry::PalaceRegistry;
 pub use retrieval::PalaceHandle;

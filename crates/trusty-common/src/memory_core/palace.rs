@@ -99,6 +99,51 @@ pub struct Room {
     pub room_type: RoomType,
 }
 
+/// Signal-vs-noise classification for a drawer.
+///
+/// Why: Issue #61 — palaces accumulated thousands of low-value drawers from
+/// auto-capture hooks (tool-use events, raw prompts, commit SHAs). Tagging
+/// each drawer with its provenance lets recall, UIs, and TTL sweeps treat
+/// curated user facts (`UserFact`) differently from disposable session
+/// events (`SessionEvent`).
+/// What: An enum stored on every `Drawer`. `Unknown` is the migration
+/// default so legacy rows (written before this field existed) deserialize
+/// cleanly via `#[serde(default)]`.
+/// Test: `drawer_type_serde_default_is_unknown` confirms missing field
+/// round-trips to `Unknown`; the classifier tests live in `filter.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DrawerType {
+    /// Explicitly stored by user or model for long-term recall.
+    UserFact,
+    /// Auto-captured session/tool event (lower signal, TTL-eligible).
+    SessionEvent,
+    /// Written by an agent for inter-turn coordination.
+    AgentNote,
+    /// Git commit message captured by a hook.
+    Commit,
+    /// Legacy / unclassified (the serde default for backward compat).
+    #[default]
+    Unknown,
+}
+
+impl DrawerType {
+    /// String tag suitable for JSON serialization in MCP / HTTP responses.
+    ///
+    /// Why: Consumers want a stable, human-readable label without coupling
+    /// to serde's enum encoding.
+    /// What: Returns the variant name (`"UserFact"`, `"SessionEvent"`, etc.).
+    /// Test: `drawer_type_as_str_matches_variant`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DrawerType::UserFact => "UserFact",
+            DrawerType::SessionEvent => "SessionEvent",
+            DrawerType::AgentNote => "AgentNote",
+            DrawerType::Commit => "Commit",
+            DrawerType::Unknown => "Unknown",
+        }
+    }
+}
+
 /// Atomic memory unit: verbatim text plus metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drawer {
@@ -116,6 +161,15 @@ pub struct Drawer {
     /// Number of times this drawer has been returned in a recall result.
     #[serde(default)]
     pub access_count: u32,
+    /// Signal-vs-noise classification (issue #61). Legacy rows decode to
+    /// `DrawerType::Unknown` via `#[serde(default)]`.
+    #[serde(default)]
+    pub drawer_type: DrawerType,
+    /// Optional expiry timestamp. When set and in the past, the drawer is
+    /// pruned by `PalaceHandle::purge_expired` on open (issue #61). Session
+    /// events default to a 7-day TTL; user facts never expire.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl Drawer {
@@ -136,7 +190,28 @@ impl Drawer {
             tags: Vec::new(),
             last_accessed_at: None,
             access_count: 0,
+            drawer_type: DrawerType::Unknown,
+            expires_at: None,
         }
+    }
+
+    /// Builder helper: set the `drawer_type` and apply the matching default
+    /// expiry policy.
+    ///
+    /// Why: Issue #61 — `SessionEvent` drawers should auto-expire after 7
+    /// days so the dream/open sweep can reclaim them; `UserFact` /
+    /// `AgentNote` / `Commit` never expire by default. Centralising the
+    /// policy here keeps call sites from forgetting to set the TTL.
+    /// What: Stores the type and, when it is `SessionEvent`, sets
+    /// `expires_at = Some(created_at + 7 days)`. Other types leave
+    /// `expires_at` untouched.
+    /// Test: `drawer_with_type_sets_session_ttl`.
+    pub fn with_type(mut self, drawer_type: DrawerType) -> Self {
+        self.drawer_type = drawer_type;
+        if drawer_type == DrawerType::SessionEvent && self.expires_at.is_none() {
+            self.expires_at = Some(self.created_at + chrono::Duration::days(7));
+        }
+        self
     }
 
     /// Accumulated access boost for decay calculation.
@@ -180,6 +255,46 @@ mod tests {
         assert_eq!(RoomType::parse("docs"), RoomType::Documentation);
         assert_eq!(RoomType::parse("general"), RoomType::General);
         assert_eq!(RoomType::parse("ops"), RoomType::Custom("ops".to_string()));
+    }
+
+    #[test]
+    fn drawer_type_as_str_matches_variant() {
+        assert_eq!(DrawerType::UserFact.as_str(), "UserFact");
+        assert_eq!(DrawerType::SessionEvent.as_str(), "SessionEvent");
+        assert_eq!(DrawerType::AgentNote.as_str(), "AgentNote");
+        assert_eq!(DrawerType::Commit.as_str(), "Commit");
+        assert_eq!(DrawerType::Unknown.as_str(), "Unknown");
+    }
+
+    #[test]
+    fn drawer_with_type_sets_session_ttl() {
+        let d =
+            Drawer::new(Uuid::new_v4(), "auto-captured event").with_type(DrawerType::SessionEvent);
+        assert_eq!(d.drawer_type, DrawerType::SessionEvent);
+        let ttl = d.expires_at.expect("session events get a TTL");
+        let delta = ttl - d.created_at;
+        // 7 days ± 1 second tolerance.
+        assert!(delta.num_seconds() >= 6 * 24 * 3600);
+
+        let fact = Drawer::new(Uuid::new_v4(), "x").with_type(DrawerType::UserFact);
+        assert!(fact.expires_at.is_none(), "user facts must not expire");
+    }
+
+    #[test]
+    fn drawer_type_serde_default_is_unknown() {
+        // Legacy JSON without `drawer_type` / `expires_at` must deserialize.
+        let json = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "room_id": Uuid::new_v4(),
+            "content": "legacy",
+            "importance": 0.5,
+            "source_file": null,
+            "created_at": Utc::now().to_rfc3339(),
+            "tags": [],
+        });
+        let d: Drawer = serde_json::from_value(json).expect("legacy decode");
+        assert_eq!(d.drawer_type, DrawerType::Unknown);
+        assert!(d.expires_at.is_none());
     }
 
     #[test]

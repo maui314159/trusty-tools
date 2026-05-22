@@ -22,10 +22,32 @@
 use crate::AppState;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use trusty_common::memory_core::filter::{FilterConfig, MCP_MIN_TOKENS};
 use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
-use trusty_common::memory_core::retrieval::{recall, recall_across_palaces, recall_deep};
+use trusty_common::memory_core::retrieval::{
+    recall, recall_across_palaces, recall_deep, RememberOptions,
+};
 use trusty_common::memory_core::store::kg::Triple;
 use uuid::Uuid;
+
+/// Build the strict MCP-level `RememberOptions`.
+///
+/// Why: Issue #61 — the MCP boundary is where auto-capture hooks deposit
+/// raw tool/commit/prompt data; we want the 8-token threshold there even
+/// though the library default is more permissive for direct callers.
+/// What: Clones the default filter and bumps `min_tokens` to `MCP_MIN_TOKENS`.
+/// Test: `dispatch_remember_rejects_short_content`.
+fn mcp_remember_opts(force: bool) -> RememberOptions {
+    let filter = FilterConfig {
+        min_tokens: MCP_MIN_TOKENS,
+        ..FilterConfig::default()
+    };
+    RememberOptions {
+        filter,
+        force,
+        ..RememberOptions::default()
+    }
+}
 
 /// Marker server type. Reserved for future stateful MCP server impls.
 ///
@@ -100,21 +122,40 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
     };
     let palace_info_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
     let palace_compact_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
+    let memory_note_required: Vec<&str> = if has_default {
+        vec!["content"]
+    } else {
+        vec!["palace", "content"]
+    };
 
     json!({
         "tools": [
             {
                 "name": "memory_remember",
-                "description": "Store a memory (drawer) in a palace room.",
+                "description": "Store a memory (drawer) in a palace room. Content is filtered for signal vs. noise (issue #61): rejects empty/very short content, raw tool/commit output, and code-only blobs. Pass force=true to bypass filtering, or use memory_note for short curated facts.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "palace": {"type": "string", "description": "Palace ID (optional if server started with --palace)"},
                         "text":   {"type": "string", "description": "Memory content"},
                         "room":   {"type": "string", "description": "Room type (optional)"},
-                        "tags":   {"type": "array", "items": {"type": "string"}}
+                        "tags":   {"type": "array", "items": {"type": "string"}},
+                        "force":  {"type": "boolean", "description": "Bypass the signal/noise filter. Use sparingly — intended for explicit operator overrides.", "default": false}
                     },
                     "required": memory_remember_required,
+                }
+            },
+            {
+                "name": "memory_note",
+                "description": "Curated shortcut for short, high-signal facts (\"User prefers snake_case\", \"Deploy target is prod-east\"). Bypasses the token-length filter but still rejects auto-capture noise. Stored as DrawerType::UserFact with importance 1.0.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace":  {"type": "string"},
+                        "content": {"type": "string", "description": "Brief fact to remember"},
+                        "tags":    {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": memory_note_required,
                 }
             },
             {
@@ -401,15 +442,61 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 })
                 .unwrap_or_default();
 
+            let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
             let handle = open_palace_handle(state, palace)?;
+            let opts = mcp_remember_opts(force);
             let drawer_id = handle
-                .remember(text, room, tags, 0.5)
+                .remember_with_options(text, room, tags, 0.5, opts)
                 .await
-                .context("PalaceHandle::remember")?;
+                .context("PalaceHandle::remember_with_options")?;
             Ok(json!({
                 "drawer_id": drawer_id.to_string(),
                 "palace": palace,
                 "status": "stored",
+            }))
+        }
+        "memory_note" => {
+            // Issue #61: curated short-fact shortcut. Bypasses the token
+            // threshold (so "User prefers snake_case" is accepted) but still
+            // applies noise-pattern rejects so the tool can't be used to
+            // smuggle in auto-capture garbage. Pinned `DrawerType::UserFact`
+            // and `importance = 1.0` so the entry surfaces in L1 essentials.
+            let palace = resolve_palace(state, &args, "memory_note")?;
+            let palace = palace.as_str();
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_note: missing 'content'"))?
+                .to_string();
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let handle = open_palace_handle(state, palace)?;
+            // note() preset skips the token threshold; we keep the default
+            // filter for noise patterns. No MCP-stricter min_tokens override
+            // is needed because `enforce_min_tokens = false`.
+            let drawer_id = handle
+                .remember_with_options(
+                    content,
+                    RoomType::General,
+                    tags,
+                    1.0,
+                    RememberOptions::note(),
+                )
+                .await
+                .context("PalaceHandle::remember_with_options (note)")?;
+            Ok(json!({
+                "drawer_id": drawer_id.to_string(),
+                "palace": palace,
+                "status": "stored",
+                "drawer_type": "UserFact",
             }))
         }
         "memory_recall" => {
@@ -669,6 +756,8 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                         "importance": d.importance,
                         "tags": d.tags,
                         "created_at": d.created_at.to_rfc3339(),
+                        "drawer_type": d.drawer_type.as_str(),
+                        "expires_at": d.expires_at.map(|t| t.to_rfc3339()),
                     })
                 })
                 .collect();
@@ -797,6 +886,7 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                         "tags":       r.result.drawer.tags,
                         "score":      r.result.score,
                         "layer":      r.result.layer,
+                        "drawer_type": r.result.drawer.drawer_type.as_str(),
                     })
                 })
                 .collect();
@@ -954,6 +1044,7 @@ fn serialize_recall(
                 "layer":     r.layer,
                 "tags":      r.drawer.tags,
                 "importance": r.drawer.importance,
+                "drawer_type": r.drawer.drawer_type.as_str(),
             })
         })
         .collect();
@@ -1021,13 +1112,14 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
             .collect();
         for expected in [
             "memory_remember",
+            "memory_note",
             "memory_recall",
             "memory_recall_deep",
             "memory_list",
@@ -1081,7 +1173,7 @@ mod tests {
             "memory_remember",
             json!({
                 "palace": "beta",
-                "text": "Quokkas are the happiest marsupials in Australia",
+                "text": "Quokkas are the happiest marsupials in Australia by general consensus",
                 "room": "General",
                 "tags": ["wildlife"],
             }),

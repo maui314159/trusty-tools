@@ -29,6 +29,86 @@ use uuid::Uuid;
 
 use super::kg::Triple;
 
+/// Pre-#61 on-disk shape of a drawer row (without `drawer_type` /
+/// `expires_at_ms`).
+///
+/// Why: postcard is positional — it refuses to decode legacy rows as the
+/// new `DrawerRecord` because the trailing optional fields don't exist in
+/// the bytes. We try the current shape first and fall back to this struct
+/// to migrate the data forward on read.
+/// What: Mirrors the historical struct field-for-field; `From` lifts it
+/// into the modern `DrawerRecord` with the new fields defaulted.
+/// Test: `drawer_type_round_trips_through_redb` plus
+/// `drawer_record_legacy_decode_without_new_fields` in `kg_store`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LegacyDrawerRecord {
+    room_id: String,
+    content: String,
+    importance: f32,
+    tags: Vec<String>,
+    source_file: Option<String>,
+    created_at_ms: i64,
+}
+
+impl From<LegacyDrawerRecord> for DrawerRecord {
+    fn from(l: LegacyDrawerRecord) -> Self {
+        DrawerRecord {
+            room_id: l.room_id,
+            content: l.content,
+            importance: l.importance,
+            tags: l.tags,
+            source_file: l.source_file,
+            created_at_ms: l.created_at_ms,
+            drawer_type: None,
+            expires_at_ms: None,
+        }
+    }
+}
+
+/// Build a `DrawerRecord` from a live `Drawer`.
+///
+/// Why: Three call sites (single upsert, bulk import, batch upsert) all
+/// build the same record; centralising the construction keeps the
+/// drawer_type / expires_at_ms fields (issue #61) in sync across them.
+/// What: Copies the persisted fields and converts the optional
+/// `DrawerType` and `expires_at` into their on-disk representations.
+/// Test: Indirect via `upsert_drawer_then_load_drawers_round_trips` and
+/// the new `drawer_type_round_trips_through_redb`.
+fn drawer_to_record(drawer: &Drawer) -> DrawerRecord {
+    DrawerRecord {
+        room_id: drawer.room_id.to_string(),
+        content: drawer.content.clone(),
+        importance: drawer.importance,
+        tags: drawer.tags.clone(),
+        source_file: drawer
+            .source_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        created_at_ms: drawer.created_at.timestamp_millis(),
+        drawer_type: Some(drawer.drawer_type.as_str().to_string()),
+        expires_at_ms: drawer.expires_at.map(|d| d.timestamp_millis()),
+    }
+}
+
+/// Parse a `DrawerType` tag back from its on-disk string representation.
+///
+/// Why: We persist the variant name as a string so the schema stays stable
+/// when new variants are added; readers tolerate unknown / absent tags by
+/// returning `DrawerType::Unknown` (the migration default).
+/// What: Match against the known variant names; anything else falls back
+/// to `DrawerType::Unknown`.
+/// Test: Indirect via `drawer_type_round_trips_through_redb`.
+fn parse_drawer_type(tag: Option<&str>) -> crate::memory_core::palace::DrawerType {
+    use crate::memory_core::palace::DrawerType;
+    match tag {
+        Some("UserFact") => DrawerType::UserFact,
+        Some("SessionEvent") => DrawerType::SessionEvent,
+        Some("AgentNote") => DrawerType::AgentNote,
+        Some("Commit") => DrawerType::Commit,
+        _ => DrawerType::Unknown,
+    }
+}
+
 /// Sentinel returned by every write method when the store is in snapshot
 /// (read-only) mode.
 ///
@@ -692,17 +772,7 @@ impl KgStoreRedb {
     /// Test: `upsert_drawer_then_load_drawers_round_trips`.
     pub fn upsert_drawer(&self, drawer: &Drawer) -> Result<()> {
         self.check_writable()?;
-        let record = DrawerRecord {
-            room_id: drawer.room_id.to_string(),
-            content: drawer.content.clone(),
-            importance: drawer.importance,
-            tags: drawer.tags.clone(),
-            source_file: drawer
-                .source_file
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            created_at_ms: drawer.created_at.timestamp_millis(),
-        };
+        let record = drawer_to_record(drawer);
         let bytes = encode_value(&record).context("encode drawer record")?;
         let id_bytes = *drawer.id.as_bytes();
         let wtx = self.db().begin_write().context("begin upsert_drawer txn")?;
@@ -757,11 +827,20 @@ impl KgStoreRedb {
             let mut id_arr = [0u8; 16];
             id_arr.copy_from_slice(id_bytes);
             let id = Uuid::from_bytes(id_arr);
-            let record: DrawerRecord = match decode_value(v.value()) {
+            let record: DrawerRecord = match decode_value::<DrawerRecord>(v.value()) {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(id = %id, "skip drawer with malformed value: {e}");
-                    continue;
+                Err(_) => {
+                    // Issue #61: rows written before drawer_type /
+                    // expires_at_ms existed lack those trailing fields and
+                    // postcard refuses to decode them as the new struct.
+                    // Fall back to the legacy shape and lift it forward.
+                    match decode_value::<LegacyDrawerRecord>(v.value()) {
+                        Ok(legacy) => legacy.into(),
+                        Err(e) => {
+                            tracing::warn!(id = %id, "skip drawer with malformed value: {e}");
+                            continue;
+                        }
+                    }
                 }
             };
             let room_id = match Uuid::parse_str(&record.room_id) {
@@ -778,6 +857,10 @@ impl KgStoreRedb {
                     continue;
                 }
             };
+            let drawer_type = parse_drawer_type(record.drawer_type.as_deref());
+            let expires_at = record
+                .expires_at_ms
+                .and_then(DateTime::from_timestamp_millis);
             out.push(Drawer {
                 id,
                 room_id,
@@ -788,6 +871,8 @@ impl KgStoreRedb {
                 tags: record.tags,
                 last_accessed_at: None,
                 access_count: 0,
+                drawer_type,
+                expires_at,
             });
         }
         Ok(out)
@@ -971,17 +1056,7 @@ impl KgStoreRedb {
             // Drawers — straight upsert. UUID keys collide cleanly on duplicates.
             let mut drawers_t = wtx.open_table(DRAWERS).context("open drawers table")?;
             for drawer in &drawers {
-                let record = DrawerRecord {
-                    room_id: drawer.room_id.to_string(),
-                    content: drawer.content.clone(),
-                    importance: drawer.importance,
-                    tags: drawer.tags.clone(),
-                    source_file: drawer
-                        .source_file
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned()),
-                    created_at_ms: drawer.created_at.timestamp_millis(),
-                };
+                let record = drawer_to_record(drawer);
                 let bytes = encode_value(&record).context("encode drawer for import")?;
                 let id_bytes = *drawer.id.as_bytes();
                 drawers_t
@@ -1352,17 +1427,7 @@ fn batch_retract(
 
 /// In-transaction drawer upsert helper.
 fn batch_upsert_drawer(drawers: &mut Tbl<'_>, drawer: &Drawer) -> Result<()> {
-    let record = DrawerRecord {
-        room_id: drawer.room_id.to_string(),
-        content: drawer.content.clone(),
-        importance: drawer.importance,
-        tags: drawer.tags.clone(),
-        source_file: drawer
-            .source_file
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        created_at_ms: drawer.created_at.timestamp_millis(),
-    };
+    let record = drawer_to_record(drawer);
     let bytes = encode_value(&record).context("encode drawer record (batch)")?;
     let id_bytes = *drawer.id.as_bytes();
     drawers
@@ -1558,6 +1623,24 @@ mod tests {
         assert!((loaded[0].importance - 0.83).abs() < 1e-5);
         assert_eq!(loaded[0].tags, vec!["alpha".to_string(), "beta".into()]);
         assert_eq!(loaded[0].source_file, Some(PathBuf::from("/tmp/source.md")));
+    }
+
+    #[test]
+    fn drawer_type_round_trips_through_redb() {
+        // Issue #61: drawer_type + expires_at must survive a write/read.
+        use crate::memory_core::palace::DrawerType;
+        let (_d, kg) = open_kg();
+        let room_id = Uuid::new_v4();
+        let drawer =
+            Drawer::new(room_id, "session event content").with_type(DrawerType::SessionEvent);
+        kg.upsert_drawer(&drawer).unwrap();
+        let loaded = kg.load_drawers().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].drawer_type, DrawerType::SessionEvent);
+        assert!(
+            loaded[0].expires_at.is_some(),
+            "session events must carry a TTL"
+        );
     }
 
     #[test]

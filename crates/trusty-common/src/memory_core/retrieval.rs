@@ -15,7 +15,8 @@ const RECALL_LOG_FILENAME: &str = "recall.db";
 use crate::memory_core::decay::DecayConfig;
 use crate::memory_core::dream::extract_keywords;
 use crate::memory_core::embed::{Embedder, FastEmbedder};
-use crate::memory_core::palace::{Drawer, Palace, PalaceId, RoomType};
+use crate::memory_core::filter::{FilterConfig, FilterReject, classify};
+use crate::memory_core::palace::{Drawer, DrawerType, Palace, PalaceId, RoomType};
 use crate::memory_core::store::kg::KnowledgeGraph;
 use crate::memory_core::store::l1_cache::L1Cache;
 use crate::memory_core::store::palace_store::PalaceStore;
@@ -153,6 +154,65 @@ pub struct PalaceHandle {
     pub is_compacting: Arc<AtomicBool>,
 }
 
+/// Options for `PalaceHandle::remember_with_options` (issue #61).
+///
+/// Why: The signal/noise gate, the curated-fact escape hatch (`memory_note`),
+/// and the unconditional `force` override all share the same write pipeline.
+/// Bundling them lets future knobs (e.g. per-call decay overrides) attach
+/// without breaking the call surface again.
+/// What: `filter` defaults to `FilterConfig::default()`; `force` skips the
+/// gate entirely; `enforce_min_tokens` lets `memory_note` keep noise rejects
+/// while accepting short content; `classify_as` pins the resulting
+/// `DrawerType` (used by `memory_note` to force `UserFact`).
+/// Test: See `remember_force_bypasses_filter` and friends in this file.
+#[derive(Debug, Clone)]
+pub struct RememberOptions {
+    pub filter: FilterConfig,
+    pub force: bool,
+    pub enforce_min_tokens: bool,
+    pub classify_as: Option<DrawerType>,
+}
+
+impl Default for RememberOptions {
+    fn default() -> Self {
+        Self {
+            filter: FilterConfig::default(),
+            force: false,
+            enforce_min_tokens: true,
+            classify_as: None,
+        }
+    }
+}
+
+impl RememberOptions {
+    /// Preset for the `memory_note` curated-fact path.
+    ///
+    /// Why: `memory_note` stores short, high-signal facts ("User prefers
+    /// snake_case") that would otherwise trip the token threshold. The
+    /// noise-pattern rejects still apply so the tool can't be used to
+    /// silently store auto-capture garbage.
+    /// What: Disables `enforce_min_tokens` and pins `classify_as =
+    /// UserFact`. Leaves `filter` at the default so noise patterns still
+    /// reject.
+    /// Test: `note_options_skip_token_check_but_keep_noise_filter`.
+    pub fn note() -> Self {
+        Self {
+            filter: FilterConfig::default(),
+            force: false,
+            enforce_min_tokens: false,
+            classify_as: Some(DrawerType::UserFact),
+        }
+    }
+
+    /// Preset that bypasses every filter (the `force = true` MCP arg).
+    pub fn forced() -> Self {
+        Self {
+            force: true,
+            ..Self::default()
+        }
+    }
+}
+
 impl PalaceHandle {
     /// Read the current compaction flag without acquiring a lock.
     ///
@@ -263,6 +323,30 @@ impl PalaceHandle {
             if !all_drawers.iter().any(|d| d.id == l1.id) {
                 all_drawers.push(l1.clone());
             }
+        }
+
+        // Issue #61: prune expired session events at open. We delete the
+        // persistent row synchronously here (best-effort — failures are
+        // logged, never fatal) and drop the entry from the in-memory list
+        // so it never participates in recall. Vector tombstones are left
+        // for `palace_compact` since dropping them needs an async call.
+        let now = chrono::Utc::now();
+        let mut pruned = 0usize;
+        all_drawers.retain(|d| {
+            let expired = d.expires_at.is_some_and(|t| t < now);
+            if expired {
+                if let Err(e) = kg.delete_drawer_sync(d.id) {
+                    tracing::warn!(
+                        palace = %palace.id, id = %d.id,
+                        "purge_expired: delete_drawer failed: {e:#}"
+                    );
+                }
+                pruned += 1;
+            }
+            !expired
+        });
+        if pruned > 0 {
+            tracing::info!(palace = %palace.id, count = pruned, "purged expired drawers at open");
         }
 
         // Surface orphaned vectors so operators can re-ingest if needed.
@@ -400,6 +484,30 @@ impl PalaceHandle {
         tags: Vec<String>,
         importance: f32,
     ) -> Result<Uuid> {
+        self.remember_with_options(content, room, tags, importance, RememberOptions::default())
+            .await
+    }
+
+    /// Store a new memory with explicit filter / classification policy.
+    ///
+    /// Why: Issue #61 — `memory_remember` needs a `force` escape hatch and a
+    /// way for `memory_note` to bypass only the token-length gate (keeping
+    /// the noise patterns). Hoisting the policy into `RememberOptions` keeps
+    /// the surface explicit without forking three near-identical methods.
+    /// What: Applies the supplied `FilterConfig` (skipping it entirely when
+    /// `force == true`), classifies the content, sets the appropriate TTL
+    /// when the result is a `SessionEvent`, then runs the original
+    /// embed/upsert/persist pipeline.
+    /// Test: `remember_rejects_short_content`,
+    /// `remember_force_bypasses_filter`, `remember_classifies_session_events`.
+    pub async fn remember_with_options(
+        &self,
+        content: String,
+        room: RoomType,
+        tags: Vec<String>,
+        importance: f32,
+        opts: RememberOptions,
+    ) -> Result<Uuid> {
         // Issue #59: short-circuit before doing any embedding work when the
         // palace is opened read-only. The store layer already rejects the
         // eventual write, but returning here saves the cost of an embed
@@ -413,6 +521,20 @@ impl PalaceHandle {
                 self.id
             ));
         }
+
+        // Issue #61: signal/noise gate. `force == true` bypasses entirely.
+        // `enforce_min_tokens` lets `memory_note` keep the noise patterns
+        // while permitting short curated facts ("User prefers snake_case").
+        if !opts.force {
+            opts.filter
+                .apply(&content, opts.enforce_min_tokens)
+                .map_err(|reject| match reject {
+                    FilterReject::TooShort { .. }
+                    | FilterReject::NoisePattern { .. }
+                    | FilterReject::NonAlphabetic { .. } => anyhow::anyhow!("{reject}"),
+                })?;
+        }
+
         // Encode RoomType into the room_id deterministically by hashing the
         // debug repr. Until we wire a real Room table, this keeps the room
         // signal recoverable for `list_drawers` filtering.
@@ -421,6 +543,16 @@ impl PalaceHandle {
         let mut drawer = Drawer::new(room_id, content.clone());
         drawer.tags = tags;
         drawer.importance = importance.clamp(0.0, 1.0);
+        // Apply classification. The caller may pre-pin the type
+        // (`memory_note` always pins `UserFact`); otherwise we run the
+        // heuristic classifier with `Unknown` as the fallback so
+        // unclassified prose stays unlabelled rather than getting tagged
+        // as `SessionEvent` by accident.
+        let final_type = match opts.classify_as {
+            Some(t) => t,
+            None => classify(&content, DrawerType::Unknown),
+        };
+        drawer = drawer.with_type(final_type);
         let id = drawer.id;
 
         // Embed and upsert. Use the process-wide shared embedder so we don't
@@ -567,6 +699,41 @@ impl PalaceHandle {
         });
         filtered.truncate(limit);
         filtered
+    }
+
+    /// Drop every drawer whose `expires_at` has fallen into the past.
+    ///
+    /// Why: Issue #61 — `SessionEvent` drawers carry a 7-day TTL so palaces
+    /// don't permanently accumulate auto-capture noise. The sweep runs on
+    /// palace open (and may be invoked by future dream cycles); failures
+    /// are best-effort so a half-pruned palace still serves recalls.
+    /// What: Snapshots the drawer table, collects ids whose `expires_at`
+    /// is in the past, and routes each through `forget` so the vector
+    /// index and persistent metadata stay in sync. Returns the number of
+    /// drawers pruned. No-op on read-only handles.
+    /// Test: `purge_expired_drops_only_past_ttl`.
+    pub async fn purge_expired(&self) -> Result<usize> {
+        if self.is_read_only() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now();
+        let expired_ids: Vec<Uuid> = self
+            .drawers
+            .read()
+            .iter()
+            .filter(|d| d.expires_at.is_some_and(|t| t < now))
+            .map(|d| d.id)
+            .collect();
+        let count = expired_ids.len();
+        for id in expired_ids {
+            if let Err(e) = self.forget(id).await {
+                tracing::warn!(?id, "purge_expired: forget failed: {e:#}");
+            }
+        }
+        if count > 0 {
+            tracing::info!(palace = %self.id, count, "purged expired drawers");
+        }
+        Ok(count)
     }
 }
 
@@ -786,6 +953,8 @@ pub fn retrieve_l0_l1(handle: &PalaceHandle) -> Vec<RecallResult> {
             tags: Vec::new(),
             last_accessed_at: None,
             access_count: 0,
+            drawer_type: crate::memory_core::palace::DrawerType::UserFact,
+            expires_at: None,
         };
         out.push(RecallResult {
             drawer: identity_drawer,
@@ -1299,15 +1468,30 @@ mod tests {
         let handle = PalaceHandle::open(&palace).unwrap();
 
         handle
-            .remember("backend fact".into(), RoomType::Backend, vec![], 0.5)
+            .remember(
+                "backend fact about the test fixture".into(),
+                RoomType::Backend,
+                vec![],
+                0.5,
+            )
             .await
             .unwrap();
         handle
-            .remember("frontend fact".into(), RoomType::Frontend, vec![], 0.5)
+            .remember(
+                "frontend fact about the test fixture".into(),
+                RoomType::Frontend,
+                vec![],
+                0.5,
+            )
             .await
             .unwrap();
         handle
-            .remember("docs fact".into(), RoomType::Documentation, vec![], 0.5)
+            .remember(
+                "docs fact about the test fixture".into(),
+                RoomType::Documentation,
+                vec![],
+                0.5,
+            )
             .await
             .unwrap();
 
@@ -1733,5 +1917,156 @@ mod tests {
                 w[1].result.score
             );
         }
+    }
+
+    /// Issue #61: short content must be rejected with an actionable error.
+    #[tokio::test]
+    async fn remember_rejects_short_content() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        let err = handle
+            .remember("too short".to_string(), RoomType::General, vec![], 0.5)
+            .await
+            .expect_err("should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("too short")
+                || msg.contains("memory_note")
+                || msg.contains("tokens"),
+            "expected actionable error, got: {msg}"
+        );
+    }
+
+    /// Issue #61: known noise patterns must be rejected even when long.
+    #[tokio::test]
+    async fn remember_rejects_known_noise_patterns() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        let cases = [
+            "Tool use: search_files with query parameter very_long_string_here",
+            "feat(memory): add filter for noise patterns to reduce drawer clutter",
+            "Running cargo test --workspace --all-features for the entire monorepo...",
+        ];
+        for c in cases {
+            let err = handle
+                .remember(c.to_string(), RoomType::General, vec![], 0.5)
+                .await
+                .expect_err("should reject");
+            assert!(
+                format!("{err:#}").to_lowercase().contains("noise")
+                    || format!("{err:#}").to_lowercase().contains("low-signal"),
+                "expected noise-pattern reject for: {c}",
+            );
+        }
+    }
+
+    /// Issue #61: `force = true` bypasses every filter.
+    #[tokio::test]
+    async fn remember_force_bypasses_filter() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        let id = handle
+            .remember_with_options(
+                "x".to_string(),
+                RoomType::General,
+                vec![],
+                0.5,
+                RememberOptions::forced(),
+            )
+            .await
+            .expect("force should bypass filter");
+        assert_ne!(id, uuid::Uuid::nil());
+    }
+
+    /// Issue #61: `memory_note` preset accepts short curated facts but
+    /// classifies them as `UserFact`.
+    #[tokio::test]
+    async fn note_options_skip_token_check_but_keep_noise_filter() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        let id = handle
+            .remember_with_options(
+                "User prefers snake_case".to_string(),
+                RoomType::General,
+                vec![],
+                1.0,
+                RememberOptions::note(),
+            )
+            .await
+            .expect("note should accept short curated fact");
+        let drawers = handle.drawers.read();
+        let stored = drawers.iter().find(|d| d.id == id).expect("present");
+        assert_eq!(stored.drawer_type, DrawerType::UserFact);
+        drop(drawers);
+
+        // Noise still rejected even in note mode.
+        let err = handle
+            .remember_with_options(
+                "Tool use: x".to_string(),
+                RoomType::General,
+                vec![],
+                1.0,
+                RememberOptions::note(),
+            )
+            .await
+            .expect_err("note must still reject noise patterns");
+        assert!(format!("{err:#}").to_lowercase().contains("noise"));
+    }
+
+    /// Issue #61: commit-shaped content is classified as `Commit` when
+    /// passed through with `force` (so the classifier still fires).
+    #[tokio::test]
+    async fn remember_classifies_commit_messages() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        // Use force so the noise filter doesn't reject before classify runs.
+        let id = handle
+            .remember_with_options(
+                "feat(scope): non-empty long enough message body here please".to_string(),
+                RoomType::General,
+                vec![],
+                0.5,
+                RememberOptions::forced(),
+            )
+            .await
+            .expect("forced commit message");
+        let drawers = handle.drawers.read();
+        let stored = drawers.iter().find(|d| d.id == id).expect("present");
+        assert_eq!(stored.drawer_type, DrawerType::Commit);
+    }
+
+    /// Issue #61: TTL sweep only drops drawers whose expires_at is in the
+    /// past; future / `None` entries survive.
+    #[tokio::test]
+    async fn purge_expired_drops_only_past_ttl() {
+        let dir = tempdir().unwrap();
+        let handle = make_handle(dir.path());
+        let room_id = uuid::Uuid::new_v4();
+
+        // Expired drawer.
+        let mut expired = Drawer::new(room_id, "expired");
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        let expired_id = expired.id;
+
+        // Future-TTL drawer.
+        let mut future = Drawer::new(room_id, "future");
+        future.expires_at = Some(chrono::Utc::now() + chrono::Duration::days(7));
+        let future_id = future.id;
+
+        // Never-expires drawer.
+        let permanent = Drawer::new(room_id, "permanent");
+        let permanent_id = permanent.id;
+
+        handle.add_drawer(expired);
+        handle.add_drawer(future);
+        handle.add_drawer(permanent);
+
+        let pruned = handle.purge_expired().await.expect("purge");
+        assert_eq!(pruned, 1, "exactly one drawer should be pruned");
+
+        let remaining: Vec<uuid::Uuid> = handle.drawers.read().iter().map(|d| d.id).collect();
+        assert!(!remaining.contains(&expired_id));
+        assert!(remaining.contains(&future_id));
+        assert!(remaining.contains(&permanent_id));
     }
 }

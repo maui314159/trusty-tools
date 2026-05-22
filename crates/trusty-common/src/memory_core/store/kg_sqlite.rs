@@ -259,6 +259,8 @@ impl KnowledgeGraphSqlite {
                 tags,
                 last_accessed_at: None,
                 access_count: 0,
+                drawer_type: crate::memory_core::palace::DrawerType::Unknown,
+                expires_at: None,
             });
         }
         Ok(out)
