@@ -203,6 +203,28 @@ enum Commands {
         file: std::path::PathBuf,
     },
 
+    /// Remove stale empty index registrations (0 chunks)
+    ///
+    /// Lists every index registered with the daemon, finds those whose
+    /// `chunk_count` is 0 (never successfully indexed), and removes them via
+    /// `DELETE /indexes/:id`. Interactive by default — pass `--yes` to skip
+    /// the confirmation prompt, or `--dry-run` to preview without deleting.
+    ///
+    /// Examples:
+    ///   trusty-search cleanup
+    ///   trusty-search cleanup --yes
+    ///   trusty-search cleanup --dry-run
+    #[command(display_order = 13)]
+    Cleanup {
+        /// Skip the confirmation prompt and remove empty indexes immediately
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Show what would be removed without deleting anything (overrides --yes)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Full reindex of current project (see `index --force`)
     ///
     /// Streams progress via SSE and renders a live progress bar. Prefer
@@ -679,6 +701,10 @@ async fn run() -> Result<()> {
 
         Commands::Remove { file } => {
             commands::remove::handle_remove(&cli.index, file).await?;
+        }
+
+        Commands::Cleanup { yes, dry_run } => {
+            commands::cleanup::handle_cleanup(yes, dry_run).await?;
         }
 
         Commands::Reindex { path, timeout } => {

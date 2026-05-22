@@ -28,6 +28,7 @@ pub mod reindex_engine;
 
 // Per-subcommand handlers
 pub mod add;
+pub mod cleanup;
 pub mod config;
 pub mod convert;
 pub mod daemon_guard;
