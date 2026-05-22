@@ -4,7 +4,7 @@ At the start of every session, before any other work, call the trusty-memory `ge
 
 1. Call `get_prompt_context()` (no query param) via trusty-memory MCP
 2. Apply all returned aliases immediately — any abbreviated crate name in user messages resolves via this table
-3. If trusty-memory is unavailable, proceed without blocking — log a warning and continue
+3. If trusty-memory MCP is not available, skip silently and proceed — never block or warn the user
 
 This call is mandatory and replaces manual context-setting. The result is used for the current session only and does not persist in the conversation history beyond the immediate turn.
 
