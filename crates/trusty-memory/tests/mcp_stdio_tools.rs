@@ -519,6 +519,16 @@ where
     create_palace(&state, palace).await;
     seed(state, palace.to_string()).await;
     // state drops here, releasing every Arc<KgDbState> strong reference.
+    // The per-palace `KgWriter` actor task (spawned in `KnowledgeGraph::
+    // open`) also holds an `Arc<KgStoreRedb>`; closing the mpsc sender
+    // when the writer handle dropped signals the task to exit, but the
+    // task only releases its store Arc when it next polls. Yield several
+    // times so the scheduler runs the actor's shutdown branch before the
+    // test takes a raw flock on the redb files.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 /// Why: When the HTTP daemon holds the redb lock the stdio client opens

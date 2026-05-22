@@ -445,6 +445,7 @@ impl PalaceHandle {
         // cannot leave an in-memory drawer with no SQLite row backing it.
         self.kg
             .upsert_drawer(&drawer)
+            .await
             .context("persist drawer metadata")?;
 
         {
@@ -513,7 +514,7 @@ impl PalaceHandle {
 
         // Drop persistent metadata alongside the vector so cold restart
         // doesn't resurrect this drawer (issue #32).
-        if let Err(e) = self.kg.delete_drawer(id) {
+        if let Err(e) = self.kg.delete_drawer(id).await {
             tracing::warn!(?id, "drawer metadata delete failed: {e:#}");
         }
 

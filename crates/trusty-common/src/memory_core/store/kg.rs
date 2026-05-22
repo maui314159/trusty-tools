@@ -16,6 +16,7 @@
 
 use crate::memory_core::palace::Drawer;
 use crate::memory_core::store::kg_redb::KgStoreRedb;
+use crate::memory_core::store::kg_writer::KgWriter;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use petgraph::algo::{astar, dijkstra};
@@ -170,6 +171,22 @@ pub struct Triple {
 #[derive(Clone)]
 pub struct KnowledgeGraph {
     store: KgStoreRedb,
+    /// Coalescing write actor handle.
+    ///
+    /// Why: Issue #59 follow-up — every write must flow through the per-
+    /// palace `KgWriter` so a burst of `kg_assert` / `upsert_drawer` calls
+    /// is coalesced into a single redb commit / fsync. Holding the handle
+    /// here keeps the routing centralised: callers go through
+    /// `KnowledgeGraph::{assert,retract,upsert_drawer,delete_drawer}` and
+    /// never need to know whether they are talking to the actor or the
+    /// store directly.
+    /// What: For read-write palaces opened inside a tokio runtime this is a
+    /// spawned actor (`KgWriter::spawn`). For read-only palaces and for
+    /// synchronous test contexts this is a `KgWriter::bypass` handle that
+    /// degrades to direct synchronous store calls.
+    /// Test: `writer_serialises_concurrent_asserts` (in kg_writer.rs) and
+    /// every existing kg.rs test transitively.
+    writer: KgWriter,
     /// In-memory adjacency view of the active triples, hydrated on `open`
     /// and kept in sync by `assert` / `retract`. See [`Adjacency`].
     adj: Arc<RwLock<Adjacency>>,
@@ -310,8 +327,26 @@ impl KnowledgeGraph {
         }
         let adj = hydrate_adjacency(&store)
             .with_context(|| format!("hydrate KG adjacency from {}", redb_path.display()))?;
+
+        // Spawn the coalescing writer actor for read-write palaces opened
+        // inside a tokio runtime. Read-only palaces (HTTP daemon holds the
+        // write lock) and synchronous test contexts get a `bypass` handle
+        // that routes writes directly to the store — for read-only this
+        // means the underlying writes will fast-fail with the read-only
+        // error, and for sync tests it means no tokio task is required.
+        // Why: Issue #59 follow-up — every `kg_assert` / `upsert_drawer`
+        // call now picks up 10ms batch coalescing and single-fsync
+        // behaviour automatically, without callers needing to know.
+        let store_arc = Arc::new(store.clone());
+        let writer = if store.is_read_only() || tokio::runtime::Handle::try_current().is_err() {
+            KgWriter::bypass(store_arc)
+        } else {
+            KgWriter::spawn(store_arc)
+        };
+
         Ok(Self {
             store,
+            writer,
             adj: Arc::new(RwLock::new(adj)),
         })
     }
@@ -325,11 +360,10 @@ impl KnowledgeGraph {
     /// Test: `assert_then_query_active_returns_fact`,
     /// `second_assert_closes_prior_interval`.
     pub async fn assert(&self, triple: Triple) -> Result<()> {
-        let store = self.store.clone();
-        let triple_for_store = triple.clone();
-        tokio::task::spawn_blocking(move || store.assert(&triple_for_store))
-            .await
-            .context("assert spawn_blocking join error")??;
+        // Route through the coalescing writer so concurrent asserts share
+        // a single redb commit / fsync. The writer awaits the commit
+        // before returning, preserving the "no write loss" invariant.
+        self.writer.assert(triple.clone()).await?;
         // Sync the in-memory adjacency only after redb commit succeeds so a
         // failed write does not leave the cache ahead of the store.
         {
@@ -358,14 +392,14 @@ impl KnowledgeGraph {
     /// What: Delegates to `KgStoreRedb::retract` on the blocking pool.
     /// Test: `retract_closes_active_interval`.
     pub async fn retract(&self, subject: &str, predicate: &str) -> Result<usize> {
-        let store = self.store.clone();
         let subject_owned = subject.to_string();
         let predicate_owned = predicate.to_string();
-        let s_for_store = subject_owned.clone();
-        let p_for_store = predicate_owned.clone();
-        let closed = tokio::task::spawn_blocking(move || store.retract(&s_for_store, &p_for_store))
-            .await
-            .context("retract spawn_blocking join error")??;
+        // Route through the coalescing writer so a retract can land in
+        // the same batch as concurrent asserts / drawer ops.
+        let closed = self
+            .writer
+            .retract(subject_owned.clone(), predicate_owned.clone())
+            .await?;
         if closed > 0 {
             let mut adj = self
                 .adj
@@ -780,22 +814,26 @@ impl KnowledgeGraph {
 
     /// Persist a drawer's metadata. See [`KgStoreRedb::upsert_drawer`].
     ///
-    /// Why: HNSW only stores vectors; without the metadata persisted alongside
-    /// drawers cannot be reconstructed after restart.
-    /// What: Delegates to `KgStoreRedb::upsert_drawer`.
+    /// Why: HNSW only stores vectors; without the metadata persisted
+    /// alongside, drawers cannot be reconstructed after restart. Routing
+    /// through the coalescing writer means a `remember` burst (which calls
+    /// `upsert_drawer` per drawer) shares a single redb commit with any
+    /// concurrent `kg_assert` ops in the same window.
+    /// What: Forwards to `KgWriter::upsert_drawer`, which queues the op,
+    /// awaits the batched commit, and reports errors.
     /// Test: `upsert_drawer_then_load_drawers_round_trips`.
-    pub fn upsert_drawer(&self, drawer: &Drawer) -> Result<()> {
-        self.store.upsert_drawer(drawer)
+    pub async fn upsert_drawer(&self, drawer: &Drawer) -> Result<()> {
+        self.writer.upsert_drawer(drawer.clone()).await
     }
 
     /// Remove a drawer's metadata by ID.
     ///
     /// Why: Forgetting must clear both the vector index and the persistent
-    /// metadata row.
-    /// What: Delegates to `KgStoreRedb::delete_drawer`.
+    /// metadata row. Same coalescing rationale as `upsert_drawer`.
+    /// What: Forwards to `KgWriter::delete_drawer`.
     /// Test: `delete_drawer_removes_row`.
-    pub fn delete_drawer(&self, id: Uuid) -> Result<()> {
-        self.store.delete_drawer(id)
+    pub async fn delete_drawer(&self, id: Uuid) -> Result<()> {
+        self.writer.delete_drawer(id).await
     }
 
     /// Load the set of drawer IDs currently stored.
@@ -1004,8 +1042,8 @@ mod tests {
         assert_eq!(active[0].object, "Beta Inc");
     }
 
-    #[test]
-    fn upsert_drawer_then_load_drawers_round_trips() {
+    #[tokio::test]
+    async fn upsert_drawer_then_load_drawers_round_trips() {
         let dir = tempdir().unwrap();
         let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
         let room_id = Uuid::new_v4();
@@ -1013,7 +1051,7 @@ mod tests {
         d.importance = 0.83;
         d.tags = vec!["alpha".into(), "beta".into()];
         d.source_file = Some(PathBuf::from("/tmp/source.md"));
-        kg.upsert_drawer(&d).unwrap();
+        kg.upsert_drawer(&d).await.unwrap();
 
         let loaded = kg.load_drawers().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1028,15 +1066,15 @@ mod tests {
     /// Why: Issue #49 — compaction needs a cheap "is this UUID a live drawer?"
     /// check; `load_drawer_ids` returns the set of all stored IDs without the
     /// overhead of materializing full `Drawer` rows.
-    #[test]
-    fn load_drawer_ids_matches_load_drawers() {
+    #[tokio::test]
+    async fn load_drawer_ids_matches_load_drawers() {
         let dir = tempdir().unwrap();
         let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
         let room = Uuid::new_v4();
         let d1 = Drawer::new(room, "one");
         let d2 = Drawer::new(room, "two");
-        kg.upsert_drawer(&d1).unwrap();
-        kg.upsert_drawer(&d2).unwrap();
+        kg.upsert_drawer(&d1).await.unwrap();
+        kg.upsert_drawer(&d2).await.unwrap();
 
         let ids = kg.load_drawer_ids().unwrap();
         assert_eq!(ids.len(), 2);
@@ -1044,26 +1082,26 @@ mod tests {
         assert!(ids.contains(&d2.id));
     }
 
-    #[test]
-    fn delete_drawer_removes_row() {
+    #[tokio::test]
+    async fn delete_drawer_removes_row() {
         let dir = tempdir().unwrap();
         let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
         let d = Drawer::new(Uuid::new_v4(), "to be deleted");
-        kg.upsert_drawer(&d).unwrap();
-        kg.delete_drawer(d.id).unwrap();
+        kg.upsert_drawer(&d).await.unwrap();
+        kg.delete_drawer(d.id).await.unwrap();
         let loaded = kg.load_drawers().unwrap();
         assert!(loaded.is_empty());
     }
 
-    #[test]
-    fn upsert_drawer_replaces_existing_row() {
+    #[tokio::test]
+    async fn upsert_drawer_replaces_existing_row() {
         let dir = tempdir().unwrap();
         let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
         let mut d = Drawer::new(Uuid::new_v4(), "original");
-        kg.upsert_drawer(&d).unwrap();
+        kg.upsert_drawer(&d).await.unwrap();
         d.content = "updated".into();
         d.importance = 0.95;
-        kg.upsert_drawer(&d).unwrap();
+        kg.upsert_drawer(&d).await.unwrap();
         let loaded = kg.load_drawers().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "updated");

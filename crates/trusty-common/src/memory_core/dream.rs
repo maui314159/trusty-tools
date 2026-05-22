@@ -965,8 +965,8 @@ mod tests {
             let mut drawers = handle.drawers.write();
             drawers.retain(|d| d.id == id_keep);
         }
-        let _ = handle.kg.delete_drawer(id_orphan_a);
-        let _ = handle.kg.delete_drawer(id_orphan_b);
+        let _ = handle.kg.delete_drawer(id_orphan_a).await;
+        let _ = handle.kg.delete_drawer(id_orphan_b).await;
 
         // Dedup threshold high enough that the surviving drawer's L3 hits
         // don't trigger an accidental merge against the orphan vectors.
