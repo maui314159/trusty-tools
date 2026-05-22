@@ -219,6 +219,7 @@ memory-core = [
     "dep:uuid",
     "dep:redb",
     "dep:postcard",
+    "dep:petgraph",
     "embedder",
     "embedder-bundled-ort",
 ]

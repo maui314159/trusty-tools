@@ -18,9 +18,131 @@ use crate::memory_core::palace::Drawer;
 use crate::memory_core::store::kg_redb::KgStoreRedb;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use petgraph::algo::dijkstra;
+use petgraph::graph::NodeIndex;
+use petgraph::stable_graph::StableGraph;
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+
+/// In-memory edge payload mirroring a knowledge-graph triple.
+///
+/// Why: The redb TRIPLES table is optimised for transactional persistence and
+/// point/range lookups; it is not a graph. For multi-hop reasoning (issue #48,
+/// blocking #7 and #10) we maintain a parallel `petgraph::StableGraph` in
+/// memory so neighbour scans and shortest-path queries run without touching
+/// disk. `KgEdge` is the per-edge payload that travels with each graph edge —
+/// it carries the same temporal / confidence / provenance metadata the
+/// underlying `Triple` does so callers can rank or filter edges in-flight.
+/// What: A plain data struct with the subset of `Triple` fields that vary per
+/// edge (subject and object live on the graph endpoints).
+/// Test: Indirect — every `kg_graph_tests.rs` test asserts on `KgEdge` values
+/// returned by `KnowledgeGraph::neighbors`.
+#[derive(Debug, Clone)]
+pub struct KgEdge {
+    pub predicate: String,
+    pub confidence: f32,
+    pub provenance: Option<String>,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+}
+
+/// In-memory adjacency cache backing the public graph API.
+///
+/// Why: Mutating the graph and its `node_index` lookup must happen atomically;
+/// holding them in a single struct lets a single `RwLock` guard cover both.
+/// What: `StableGraph` so removing an edge does not invalidate other
+/// `NodeIndex` values, plus the `String -> NodeIndex` lookup so callers can
+/// resolve an entity name to its node in O(1).
+/// Test: Indirect — exercised by every adjacency-related test.
+#[derive(Default)]
+struct Adjacency {
+    graph: StableGraph<String, KgEdge>,
+    node_index: HashMap<String, NodeIndex<u32>>,
+}
+
+impl Adjacency {
+    /// Why: Adding the same entity twice would create duplicate nodes; this
+    /// helper returns the existing node when the entity is already mapped.
+    /// What: Looks up `entity` in `node_index`; on miss adds a node and
+    /// records the new mapping.
+    /// Test: Indirect via `hydration_populates_graph` and `assert_adds_edge`.
+    fn ensure_node(&mut self, entity: &str) -> NodeIndex<u32> {
+        if let Some(idx) = self.node_index.get(entity) {
+            return *idx;
+        }
+        let idx = self.graph.add_node(entity.to_string());
+        self.node_index.insert(entity.to_string(), idx);
+        idx
+    }
+
+    /// Why: Building a `KgEdge` from a `Triple` is needed both during
+    /// hydration and on every `assert`; centralise the conversion.
+    /// What: Copies the temporal / scoring metadata into a new `KgEdge`.
+    /// Test: Indirect via `hydration_populates_graph`.
+    fn edge_from_triple(t: &Triple) -> KgEdge {
+        KgEdge {
+            predicate: t.predicate.clone(),
+            confidence: t.confidence,
+            provenance: t.provenance.clone(),
+            valid_from: t.valid_from,
+            valid_to: t.valid_to,
+        }
+    }
+
+    /// Why: `assert` must keep the graph in sync with the store; doing it
+    /// here keeps the lock-management in one place.
+    /// What: Removes any prior edge for `(subject, predicate)` between the
+    /// existing subject and object nodes, then inserts the new edge using
+    /// the provided triple's metadata. Nodes are created if absent.
+    /// Test: `assert_adds_edge`, `retract_removes_edge`.
+    fn upsert_edge(&mut self, triple: &Triple) {
+        let s_idx = self.ensure_node(&triple.subject);
+        let o_idx = self.ensure_node(&triple.object);
+        // Remove any existing edge with the same predicate between the
+        // existing subject and any object (matches the temporal invariant
+        // "at most one active edge per (subject, predicate)").
+        let to_remove: Vec<_> = self
+            .graph
+            .edges(s_idx)
+            .filter(|e| e.weight().predicate == triple.predicate)
+            .map(|e| e.id())
+            .collect();
+        for eid in to_remove {
+            self.graph.remove_edge(eid);
+        }
+        self.graph
+            .add_edge(s_idx, o_idx, Self::edge_from_triple(triple));
+    }
+
+    /// Why: `retract` closes the active interval at `(subject, predicate)`;
+    /// the in-memory graph should drop the corresponding edge so subsequent
+    /// `neighbors` calls do not see stale links. Nodes are intentionally
+    /// preserved because StableGraph indices stay stable and the entity may
+    /// be referenced by other edges.
+    /// What: Removes every edge from the subject's node whose predicate
+    /// matches `predicate`. Returns the number of edges dropped.
+    /// Test: `retract_removes_edge`.
+    fn remove_edges(&mut self, subject: &str, predicate: &str) -> usize {
+        let Some(&s_idx) = self.node_index.get(subject) else {
+            return 0;
+        };
+        let to_remove: Vec<_> = self
+            .graph
+            .edges(s_idx)
+            .filter(|e| e.weight().predicate == predicate)
+            .map(|e| e.id())
+            .collect();
+        let n = to_remove.len();
+        for eid in to_remove {
+            self.graph.remove_edge(eid);
+        }
+        n
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Triple {
@@ -46,6 +168,9 @@ pub struct Triple {
 #[derive(Clone)]
 pub struct KnowledgeGraph {
     store: KgStoreRedb,
+    /// In-memory adjacency view of the active triples, hydrated on `open`
+    /// and kept in sync by `assert` / `retract`. See [`Adjacency`].
+    adj: Arc<RwLock<Adjacency>>,
 }
 
 /// Why: Callers historically pass `data_dir.join("kg.db")` (SQLite filename).
@@ -145,6 +270,28 @@ fn migrate_from_sqlite_if_needed(_data_dir: &Path, _redb_store: &KgStoreRedb) ->
     Ok(())
 }
 
+/// Build the in-memory adjacency cache from every active triple in the store.
+///
+/// Why: On `open` the in-memory graph must reflect every triple already in
+/// redb so the first `neighbors` / `shortest_path` query is correct without
+/// any prior I/O. For typical palaces (≤10K triples) this completes in well
+/// under 50ms — `list_active` is a single redb table scan with no random
+/// disk seeks.
+/// What: Pulls every active triple via `KgStoreRedb::list_active` and
+/// inserts each as an edge in a fresh `Adjacency`.
+/// Test: `hydration_populates_graph` (and indirectly every neighbors test
+/// after reopening a palace).
+fn hydrate_adjacency(store: &KgStoreRedb) -> Result<Adjacency> {
+    let mut adj = Adjacency::default();
+    let triples = store
+        .list_active(usize::MAX, 0)
+        .context("list active triples for adjacency hydration")?;
+    for t in &triples {
+        adj.upsert_edge(t);
+    }
+    Ok(adj)
+}
+
 impl KnowledgeGraph {
     /// Open or create the redb-backed KG at the path derived from `path`.
     ///
@@ -159,7 +306,12 @@ impl KnowledgeGraph {
             migrate_from_sqlite_if_needed(data_dir, &store)
                 .with_context(|| format!("migrate legacy SQLite KG at {}", data_dir.display()))?;
         }
-        Ok(Self { store })
+        let adj = hydrate_adjacency(&store)
+            .with_context(|| format!("hydrate KG adjacency from {}", redb_path.display()))?;
+        Ok(Self {
+            store,
+            adj: Arc::new(RwLock::new(adj)),
+        })
     }
 
     /// Assert a fact, closing any prior active interval for the same
@@ -172,9 +324,26 @@ impl KnowledgeGraph {
     /// `second_assert_closes_prior_interval`.
     pub async fn assert(&self, triple: Triple) -> Result<()> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.assert(&triple))
+        let triple_for_store = triple.clone();
+        tokio::task::spawn_blocking(move || store.assert(&triple_for_store))
             .await
             .context("assert spawn_blocking join error")??;
+        // Sync the in-memory adjacency only after redb commit succeeds so a
+        // failed write does not leave the cache ahead of the store.
+        {
+            let mut adj = self
+                .adj
+                .write()
+                .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+            // Closed-on-arrival triples (assert with valid_to=Some) should
+            // not contribute an active edge — drop any existing edge for
+            // (subject, predicate) and return.
+            if triple.valid_to.is_some() {
+                adj.remove_edges(&triple.subject, &triple.predicate);
+            } else {
+                adj.upsert_edge(&triple);
+            }
+        }
         Ok(())
     }
 
@@ -188,12 +357,134 @@ impl KnowledgeGraph {
     /// Test: `retract_closes_active_interval`.
     pub async fn retract(&self, subject: &str, predicate: &str) -> Result<usize> {
         let store = self.store.clone();
-        let subject = subject.to_string();
-        let predicate = predicate.to_string();
-        let closed = tokio::task::spawn_blocking(move || store.retract(&subject, &predicate))
+        let subject_owned = subject.to_string();
+        let predicate_owned = predicate.to_string();
+        let s_for_store = subject_owned.clone();
+        let p_for_store = predicate_owned.clone();
+        let closed = tokio::task::spawn_blocking(move || store.retract(&s_for_store, &p_for_store))
             .await
             .context("retract spawn_blocking join error")??;
+        if closed > 0 {
+            let mut adj = self
+                .adj
+                .write()
+                .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+            adj.remove_edges(&subject_owned, &predicate_owned);
+        }
         Ok(closed)
+    }
+
+    /// Return every entity directly connected to `entity` plus the edge
+    /// payload that links them.
+    ///
+    /// Why: Fast single-hop traversal without redb I/O. Used by graph-aware
+    /// retrieval and reasoning paths (issues #7, #10) that need to expand
+    /// a seed set of entities by one hop without paying for a disk scan.
+    /// What: Acquires a read lock on the in-memory adjacency, collects
+    /// every outgoing *and* incoming edge incident to `entity`'s node, and
+    /// returns `(other_entity, edge)` pairs. Returns an empty vec when the
+    /// entity is unknown.
+    /// Test: `neighbors_returns_connected`.
+    pub fn neighbors(&self, entity: &str) -> Result<Vec<(String, KgEdge)>> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let Some(&idx) = adj.node_index.get(entity) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        // Outgoing edges (entity -> other).
+        for e in adj.graph.edges(idx) {
+            let other = adj
+                .graph
+                .node_weight(e.target())
+                .cloned()
+                .unwrap_or_default();
+            out.push((other, e.weight().clone()));
+        }
+        // Incoming edges (other -> entity).
+        for e in adj.graph.edges_directed(idx, petgraph::Direction::Incoming) {
+            let other = adj
+                .graph
+                .node_weight(e.source())
+                .cloned()
+                .unwrap_or_default();
+            out.push((other, e.weight().clone()));
+        }
+        Ok(out)
+    }
+
+    /// Return the shortest path of entity names from `from` to `to`, if any.
+    ///
+    /// Why: Multi-hop reasoning needs a "is there a route, and what is it?"
+    /// primitive for paths like "alice -knows-> bob -manages-> carol".
+    /// Computing this from the live in-memory graph avoids the per-hop
+    /// query latency of repeated redb scans.
+    /// What: Runs `petgraph::algo::dijkstra` with unit edge weights on the
+    /// outgoing-edge graph (edges follow subject→object direction). When a
+    /// finite distance to `to` exists, reconstructs the path by greedy
+    /// predecessor walk: at each step pick a neighbour whose distance is
+    /// exactly one less than the current node. Returns `None` when either
+    /// endpoint is unknown or no path exists.
+    /// Test: `shortest_path_finds_route`.
+    pub fn shortest_path(&self, from: &str, to: &str) -> Result<Option<Vec<String>>> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let Some(&from_idx) = adj.node_index.get(from) else {
+            return Ok(None);
+        };
+        let Some(&to_idx) = adj.node_index.get(to) else {
+            return Ok(None);
+        };
+        if from_idx == to_idx {
+            return Ok(Some(vec![from.to_string()]));
+        }
+
+        let distances = dijkstra(&adj.graph, from_idx, Some(to_idx), |_| 1usize);
+        let Some(&total) = distances.get(&to_idx) else {
+            return Ok(None);
+        };
+
+        // Reconstruct path: walk from `to` back to `from`, at each hop
+        // pick any neighbour with distance == current - 1. Use undirected
+        // adjacency for reconstruction so we can step backwards along the
+        // directed edges found by Dijkstra.
+        let mut path_rev = vec![to_idx];
+        let mut current = to_idx;
+        let mut current_dist = total;
+        while current_dist > 0 {
+            let mut next: Option<NodeIndex<u32>> = None;
+            for e in adj
+                .graph
+                .edges_directed(current, petgraph::Direction::Incoming)
+            {
+                let src = e.source();
+                if let Some(&d) = distances.get(&src)
+                    && d + 1 == current_dist
+                {
+                    next = Some(src);
+                    break;
+                }
+            }
+            let Some(prev) = next else {
+                // No predecessor found — graph mutated between dijkstra
+                // and reconstruction, or Dijkstra returned a distance for
+                // an unreachable node (defensive guard).
+                return Ok(None);
+            };
+            path_rev.push(prev);
+            current = prev;
+            current_dist -= 1;
+        }
+        path_rev.reverse();
+        let path: Vec<String> = path_rev
+            .into_iter()
+            .filter_map(|i| adj.graph.node_weight(i).cloned())
+            .collect();
+        Ok(Some(path))
     }
 
     /// Return all currently active triples (`valid_to is None`) for `subject`.
