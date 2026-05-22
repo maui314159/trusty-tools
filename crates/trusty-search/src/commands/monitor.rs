@@ -209,6 +209,7 @@ mod tests {
             id: "known".into(),
             chunk_count: 10,
             root_path: "/tmp/known".into(),
+            ..Default::default()
         }];
         assert!(print_index_detail(&rows, "missing", false).is_err());
         assert!(print_index_detail(&rows, "known", true).is_ok());

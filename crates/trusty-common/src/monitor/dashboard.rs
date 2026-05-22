@@ -50,9 +50,12 @@ pub enum Focus {
 /// One trusty-search index row rendered in the search panel's table.
 ///
 /// Why: the search panel lists every registered index with its chunk count so
-/// the operator can see corpus sizes at a glance.
-/// What: the index id, its chunk count, and the indexed root path.
-/// Test: `test_search_panel_renders`.
+/// the operator can see corpus sizes at a glance; the TUI also uses
+/// `disk_bytes` and `last_indexed` to drive its sort / stats panels and the
+/// inferred project name (from `root_path`) to group rows.
+/// What: the index id, its chunk count, indexed root path, optional on-disk
+/// size, and optional last-indexed timestamp.
+/// Test: `test_search_panel_renders`, `test_index_row_project`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexRow {
     /// The index identifier.
@@ -61,6 +64,27 @@ pub struct IndexRow {
     pub chunk_count: u64,
     /// Filesystem root the index covers.
     pub root_path: String,
+    /// Approximate on-disk size of the index in bytes, when reported.
+    pub disk_bytes: Option<u64>,
+    /// The last time the index was (re)built, when reported.
+    pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl IndexRow {
+    /// Infer the project this index belongs to.
+    ///
+    /// Why: indexing typically tracks one project per `root_path`; surfacing
+    /// the basename lets the TUI group rows under their originating repo.
+    /// What: extracts the basename of `root_path`, falling back to the index
+    /// id when the path is empty or has no terminal segment.
+    /// Test: `test_index_row_project`.
+    pub fn project(&self) -> &str {
+        std::path::Path::new(&self.root_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.id)
+    }
 }
 
 /// The polled trusty-search panel payload.
@@ -660,11 +684,13 @@ mod tests {
                     id: "cto".into(),
                     chunk_count: 1_200,
                     root_path: "/tmp/cto".into(),
+                    ..Default::default()
                 },
                 IndexRow {
                     id: "trusty".into(),
                     chunk_count: 18_994,
                     root_path: "/tmp/trusty".into(),
+                    ..Default::default()
                 },
             ],
         }
@@ -952,6 +978,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(trailing.project(), "fallback");
+    }
+
+    #[test]
+    fn test_index_row_project() {
+        // A populated root_path yields its basename.
+        let row = IndexRow {
+            id: "trusty".into(),
+            root_path: "/Users/masa/Projects/trusty-tools".into(),
+            ..Default::default()
+        };
+        assert_eq!(row.project(), "trusty-tools");
+
+        // An empty root_path falls back to the index id.
+        let bare = IndexRow {
+            id: "p1".into(),
+            ..Default::default()
+        };
+        assert_eq!(bare.project(), "p1");
+
+        // A trailing-slash root should still resolve to the directory name.
+        let trailing = IndexRow {
+            id: "p2".into(),
+            root_path: "/tmp/repo/".into(),
+            ..Default::default()
+        };
+        assert_eq!(trailing.project(), "repo");
     }
 
     #[test]

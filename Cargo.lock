@@ -4255,7 +4255,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -6944,7 +6944,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6981,7 +6981,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10230,7 +10230,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10554,7 +10554,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.3.69"
+version = "0.3.70"
 dependencies = [
  "anyhow",
  "async-trait",

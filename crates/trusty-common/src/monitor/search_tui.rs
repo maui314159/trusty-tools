@@ -56,7 +56,54 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line key hint shown along the bottom of the UI.
 pub const KEY_HINT: &str =
-    "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [q] quit  [?] help";
+    "[Tab] focus  [r] reindex  [↑↓] select  [Enter] search  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
+
+/// Sort order applied to the index list.
+///
+/// Why: operators want to flip between most-recently-active, alphabetical,
+/// and chunk-count-heavy views without leaving the TUI; a small enum keeps the
+/// renderer and the key handler agreed on the available options.
+/// What: `Activity` (default — last_indexed desc, nulls last; chunk_count desc
+/// as tiebreak), `Name` (alphabetical asc by id), `Chunks` (chunk_count desc).
+/// Test: `test_index_sort_key_cycle`, `test_apply_sort_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexSortKey {
+    /// Sort by last_indexed desc; chunk_count desc as tiebreak; nulls last.
+    #[default]
+    Activity,
+    /// Sort alphabetically by index id (ascending).
+    Name,
+    /// Sort by chunk_count desc.
+    Chunks,
+}
+
+impl IndexSortKey {
+    /// Advance to the next sort key in the cycle.
+    ///
+    /// Why: `[s]` cycles through the three sort orders.
+    /// What: `Activity → Name → Chunks → Activity`.
+    /// Test: `test_index_sort_key_cycle`.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Activity => Self::Name,
+            Self::Name => Self::Chunks,
+            Self::Chunks => Self::Activity,
+        }
+    }
+
+    /// One-word label for the status bar / panel title.
+    ///
+    /// Why: the panel header shows the current sort key.
+    /// What: returns `"Activity"`, `"Name"`, or `"Chunks"`.
+    /// Test: `test_index_sort_key_cycle`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Name => "Name",
+            Self::Chunks => "Chunks",
+        }
+    }
+}
 
 /// Label for the synthetic "All indexes" entry at the top of the list.
 ///
@@ -115,6 +162,14 @@ pub struct SearchTuiState {
     pub focus: SearchFocus,
     /// Whether the help overlay is visible (toggled with `?`).
     pub show_help: bool,
+    /// Case-insensitive filter applied to index id / project; empty disables.
+    pub filter: String,
+    /// Whether the inline filter bar is focused (captures typed chars).
+    pub filter_active: bool,
+    /// Current index-list sort order.
+    pub sort_key: IndexSortKey,
+    /// Whether the index list is grouped by inferred project.
+    pub group_by_project: bool,
 }
 
 impl SearchTuiState {
@@ -135,6 +190,10 @@ impl SearchTuiState {
             input: String::new(),
             focus: SearchFocus::List,
             show_help: false,
+            filter: String::new(),
+            filter_active: false,
+            sort_key: IndexSortKey::default(),
+            group_by_project: false,
         }
     }
 
@@ -535,6 +594,21 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 continue;
             }
             match (state.focus, key.code) {
+                // Filter-active bindings come first — they capture characters,
+                // backspace, Esc, and Enter before the general handlers.
+                (SearchFocus::List, KeyCode::Esc) if state.filter_active => {
+                    // Keep the filter text so the user can re-activate.
+                    state.filter_active = false;
+                }
+                (SearchFocus::List, KeyCode::Enter) if state.filter_active => {
+                    state.filter_active = false;
+                }
+                (SearchFocus::List, KeyCode::Backspace) if state.filter_active => {
+                    state.filter.pop();
+                }
+                (SearchFocus::List, KeyCode::Char(c)) if state.filter_active => {
+                    state.filter.push(c);
+                }
                 (_, KeyCode::Char('?')) => state.show_help = true,
                 (_, KeyCode::Tab) => state.toggle_focus(),
                 (_, KeyCode::Esc) => return Ok(()),
@@ -542,6 +616,16 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 (SearchFocus::List, KeyCode::Char('q')) => return Ok(()),
                 (SearchFocus::List, KeyCode::Up) => state.select_up(),
                 (SearchFocus::List, KeyCode::Down) => state.select_down(),
+                (SearchFocus::List, KeyCode::Char('/')) => {
+                    state.filter_active = true;
+                    state.filter.clear();
+                }
+                (SearchFocus::List, KeyCode::Char('s')) => {
+                    state.sort_key = state.sort_key.next();
+                }
+                (SearchFocus::List, KeyCode::Char('g')) => {
+                    state.group_by_project = !state.group_by_project;
+                }
                 (SearchFocus::List, KeyCode::Char('r')) => {
                     let targets: Vec<String> = if state.is_all_selected() {
                         state.indexes.iter().map(|i| i.id.clone()).collect()
@@ -633,6 +717,9 @@ pub fn help_text() -> String {
         "  Tab     switch focus between the index list and the search bar",
         "  ↑ / ↓   move the index selection (when the list has focus)",
         "  All     the top list row fans queries / stats across every index",
+        "  /       activate the inline index filter (Esc / Enter close)",
+        "  s       cycle index sort: Activity → Name → Chunks",
+        "  g       toggle grouping by inferred project",
         "  r       reindex the selected index — or all, when 'All' is selected",
         "  Enter   run a search against the selected index — or all of them",
         "  ?       toggle this help overlay",
@@ -653,12 +740,14 @@ pub fn left_panel_width(width: u16) -> u16 {
 
 /// One rendered row of the INDEXES panel.
 ///
-/// Why: the renderer styles three row kinds differently — the "All" row is
-/// bold, the selected row is highlighted, ordinary rows are plain — so the line
-/// builder must surface which kind each row is rather than just a bool.
-/// What: the row `text`, whether it is `selected`, and whether it is the
-/// synthetic `is_all` ("All indexes") row.
-/// Test: `test_index_lines`, `test_all_selector`.
+/// Why: the renderer styles four row kinds differently — the "All" row is
+/// bold, group headers are bold yellow and non-selectable, the selected row
+/// is highlighted, ordinary rows are plain — so the line builder must surface
+/// which kind each row is rather than just a bool.
+/// What: the row `text`, whether it is `selected`, whether it is the
+/// synthetic `is_all` ("All indexes") row, and whether it is a group header
+/// (non-selectable when grouping by project).
+/// Test: `test_index_lines`, `test_all_selector`, `test_index_lines_grouped`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexListRow {
     /// The fully-formatted row text.
@@ -667,6 +756,80 @@ pub struct IndexListRow {
     pub selected: bool,
     /// Whether this row is the synthetic "All indexes" entry.
     pub is_all: bool,
+    /// Whether this row is a non-selectable group header.
+    pub is_header: bool,
+}
+
+/// Format one index as a fixed-width table row.
+///
+/// Why: kept separate from the loop body to mirror the memory TUI's
+/// `palace_row` helper and keep alignment unit-testable.
+/// What: returns `> <id padded to 12> <count> ✓`, with `>` replacing the
+/// leading space when `selected`.
+/// Test: covered indirectly via `test_index_lines`.
+fn index_row_flat(idx: &IndexRow, selected: bool) -> String {
+    let marker = if selected { ">" } else { " " };
+    format!(
+        "{marker} {:<12} {:>8} ✓",
+        truncate(&idx.id, 12),
+        format_count(idx.chunk_count),
+    )
+}
+
+/// Format an indented index row for use under a group header.
+///
+/// Why: when the list is grouped, index rows are inset one extra space and
+/// the id column shrinks by one to keep the count column aligned with the
+/// flat layout.
+/// What: returns `"  <id padded to 11> <count> ✓"`, with `>` replacing the
+/// leading space when `selected`.
+/// Test: `test_index_lines_grouped`.
+fn index_row_indented(idx: &IndexRow, selected: bool) -> String {
+    let marker = if selected { ">" } else { " " };
+    format!(
+        "{marker}  {:<11} {:>8} ✓",
+        truncate(&idx.id, 11),
+        format_count(idx.chunk_count),
+    )
+}
+
+/// Apply [`SearchTuiState::filter`] and [`SearchTuiState::sort_key`] to the
+/// state's indexes, returning the visible subset in display order.
+///
+/// Why: filtering and sorting are pure functions of the state — extracting
+/// them keeps [`index_lines`] terse and makes both behaviours unit-testable
+/// without a terminal.
+/// What: case-insensitive substring match against `id` and `project()`; then
+/// sort per `sort_key`. The returned `Vec` borrows from `state.indexes`.
+/// Test: `test_apply_filter`, `test_apply_sort_activity`,
+/// `test_apply_sort_name`, `test_apply_sort_chunks`.
+pub fn filtered_sorted_indexes(state: &SearchTuiState) -> Vec<&IndexRow> {
+    let filter_lower = state.filter.to_lowercase();
+    let mut rows: Vec<&IndexRow> = state
+        .indexes
+        .iter()
+        .filter(|i| {
+            if filter_lower.is_empty() {
+                return true;
+            }
+            i.id.to_lowercase().contains(&filter_lower)
+                || i.project().to_lowercase().contains(&filter_lower)
+        })
+        .collect();
+    match state.sort_key {
+        IndexSortKey::Activity => {
+            // last_indexed desc, None last; chunk_count desc as tiebreak.
+            rows.sort_by(|a, b| match (a.last_indexed, b.last_indexed) {
+                (Some(x), Some(y)) => y.cmp(&x).then_with(|| b.chunk_count.cmp(&a.chunk_count)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.chunk_count.cmp(&a.chunk_count),
+            });
+        }
+        IndexSortKey::Name => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        IndexSortKey::Chunks => rows.sort_by(|a, b| b.chunk_count.cmp(&a.chunk_count)),
+    }
+    rows
 }
 
 /// Build the rows for the INDEXES panel body.
@@ -674,14 +837,17 @@ pub struct IndexListRow {
 /// Why: separating row construction from the ratatui widgets lets a test
 /// assert the rendered content without a terminal backend.
 /// What: returns the synthetic "All indexes" row first (carrying the summed
-/// chunk count across every index), then one row per index — id, chunk count,
-/// and a `✓` marker. With no indexes registered the "All" row is still shown
+/// chunk count across every index), then either a flat list of filtered +
+/// sorted index rows, or — when [`SearchTuiState::group_by_project`] is set —
+/// non-selectable `── <project> ──` group headers interleaved with their
+/// member indexes. With no indexes registered the "All" row is still shown
 /// followed by a placeholder line.
-/// Test: `test_index_lines`, `test_all_selector`.
+/// Test: `test_index_lines`, `test_all_selector`, `test_index_lines_grouped`.
 pub fn index_lines(state: &SearchTuiState) -> Vec<IndexListRow> {
     let mut rows: Vec<IndexListRow> = Vec::with_capacity(state.indexes.len() + 1);
 
-    // The synthetic "All indexes" row always leads the list.
+    // The synthetic "All indexes" row always leads the list — including when
+    // filtering or grouping is active.
     let total_chunks: u64 = state.indexes.iter().map(|i| i.chunk_count).sum();
     let all_selected = state.selected == 0;
     let all_marker = if all_selected { ">" } else { " " };
@@ -693,6 +859,7 @@ pub fn index_lines(state: &SearchTuiState) -> Vec<IndexListRow> {
         ),
         selected: all_selected,
         is_all: true,
+        is_header: false,
     });
 
     if state.indexes.is_empty() {
@@ -700,24 +867,71 @@ pub fn index_lines(state: &SearchTuiState) -> Vec<IndexListRow> {
             text: "  (no indexes registered)".to_string(),
             selected: false,
             is_all: false,
+            is_header: false,
         });
         return rows;
     }
 
-    for (i, idx) in state.indexes.iter().enumerate() {
-        // Row 0 is "All", so index `i` lives at cursor row `i + 1`.
-        let row = i + 1;
-        let selected = row == state.selected;
-        let marker = if selected { ">" } else { " " };
+    let visible = filtered_sorted_indexes(state);
+    if visible.is_empty() {
         rows.push(IndexListRow {
-            text: format!(
-                "{marker} {:<12} {:>8} ✓",
-                truncate(&idx.id, 12),
-                format_count(idx.chunk_count),
-            ),
-            selected,
+            text: "  (no matches)".to_string(),
+            selected: false,
             is_all: false,
+            is_header: false,
         });
+        return rows;
+    }
+
+    // The cursor addresses the *original* `state.indexes` indices (cursor n →
+    // indexes[n-1]) so we look up each visible index's original position by id.
+    let cursor_for = |idx: &IndexRow| -> usize {
+        state
+            .indexes
+            .iter()
+            .position(|orig| orig.id == idx.id)
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    };
+
+    if state.group_by_project {
+        // Collect distinct projects in the order they first appear in `visible`.
+        let mut seen: Vec<String> = Vec::new();
+        for i in &visible {
+            let proj = i.project().to_string();
+            if !seen.iter().any(|s| s == &proj) {
+                seen.push(proj);
+            }
+        }
+        for project in &seen {
+            rows.push(IndexListRow {
+                text: format!("── {project} ─────"),
+                selected: false,
+                is_all: false,
+                is_header: true,
+            });
+            for idx in visible.iter().filter(|i| i.project() == project) {
+                let cursor = cursor_for(idx);
+                let selected = cursor == state.selected;
+                rows.push(IndexListRow {
+                    text: index_row_indented(idx, selected),
+                    selected,
+                    is_all: false,
+                    is_header: false,
+                });
+            }
+        }
+    } else {
+        for idx in &visible {
+            let cursor = cursor_for(idx);
+            let selected = cursor == state.selected;
+            rows.push(IndexListRow {
+                text: index_row_flat(idx, selected),
+                selected,
+                is_all: false,
+                is_header: false,
+            });
+        }
     }
     rows
 }
@@ -756,19 +970,57 @@ pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
     }
 
     match state.indexes.get(state.selected.saturating_sub(1)) {
-        Some(idx) => vec![
-            format!("Index:        {}", idx.id),
-            format!("Chunks:       {}", format_count(idx.chunk_count)),
-            format!(
-                "Root path:    {}",
-                if idx.root_path.is_empty() {
-                    "(unknown)"
-                } else {
-                    idx.root_path.as_str()
-                }
-            ),
-        ],
+        Some(idx) => {
+            let mut lines = vec![
+                format!("Index:        {}", idx.id),
+                format!("Chunks:       {}", format_count(idx.chunk_count)),
+                format!(
+                    "Root path:    {}",
+                    if idx.root_path.is_empty() {
+                        "(unknown)"
+                    } else {
+                        idx.root_path.as_str()
+                    }
+                ),
+            ];
+            if let Some(bytes) = idx.disk_bytes {
+                lines.push(format!("Disk size:    {}", format_bytes(bytes)));
+            }
+            if let Some(when) = idx.last_indexed {
+                lines.push(format!(
+                    "Last indexed: {}",
+                    when.format("%Y-%m-%d %H:%M UTC")
+                ));
+            }
+            lines
+        }
         None => vec!["(no index selected)".to_string()],
+    }
+}
+
+/// Format a byte count as a compact human-readable string.
+///
+/// Why: the STATISTICS panel surfaces an index's on-disk size; raw bytes are
+/// hard to scan at a glance.
+/// What: returns one of `B`, `KB`, `MB`, `GB`, `TB` with one decimal place
+/// above 1 KB; below that returns the exact byte count.
+/// Test: `test_format_bytes`.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let n = bytes as f64;
+    if n < KB {
+        format!("{bytes} B")
+    } else if n < MB {
+        format!("{:.1} KB", n / KB)
+    } else if n < GB {
+        format!("{:.1} MB", n / MB)
+    } else if n < TB {
+        format!("{:.1} GB", n / GB)
+    } else {
+        format!("{:.1} TB", n / TB)
     }
 }
 
@@ -867,6 +1119,11 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if row.is_header {
+                // Group headers — bold yellow, non-selectable.
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else if row.is_all {
                 // The unselected "All" row stays distinct — bold yellow.
                 Style::default()
@@ -878,16 +1135,68 @@ pub fn render(frame: &mut Frame, state: &mut SearchTuiState) {
             ListItem::new(Line::from(Span::styled(row.text, style)))
         })
         .collect();
+
+    // When the inline filter is active or carries text, split the left column
+    // vertically so the filter input renders above the index list.
+    let show_filter_bar = state.filter_active || !state.filter.is_empty();
+    let (filter_area, list_area) = if show_filter_bar {
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(split[0]);
+        (Some(inner[0]), inner[1])
+    } else {
+        (None, split[0])
+    };
+
+    if let Some(area) = filter_area {
+        let border_color = if state.filter_active {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    state.filter.as_str().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    if state.filter_active { "_" } else { "" },
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(
+                        Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .title(Span::styled(
+                        " FILTER ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            ),
+            area,
+        );
+    }
+
     // Scroll the INDEXES list so the selected row stays visible: the panel
     // height minus its two border rows is the visible window.
-    let index_visible = split[0].height.saturating_sub(2) as usize;
+    let index_visible = list_area.height.saturating_sub(2) as usize;
     state.sync_scroll(index_visible);
     let mut index_state = ListState::default()
         .with_offset(state.scroll_offset)
         .with_selected(Some(state.selected));
+    let index_title = format!("INDEXES [{}]", state.sort_key.label());
     frame.render_stateful_widget(
-        List::new(index_items).block(panel_block("INDEXES", list_focused)),
-        split[0],
+        List::new(index_items).block(panel_block(&index_title, list_focused)),
+        list_area,
         &mut index_state,
     );
 
@@ -1028,16 +1337,19 @@ mod tests {
                 id: "cto".into(),
                 chunk_count: 1_200,
                 root_path: "/tmp/cto".into(),
+                ..Default::default()
             },
             IndexRow {
                 id: "trusty".into(),
                 chunk_count: 18_994,
                 root_path: "/tmp/trusty".into(),
+                ..Default::default()
             },
             IndexRow {
                 id: "duetto".into(),
                 chunk_count: 900,
                 root_path: "/tmp/duetto".into(),
+                ..Default::default()
             },
         ];
         state
@@ -1122,7 +1434,10 @@ mod tests {
         assert!(state.is_all_selected());
         assert_eq!(state.scope_filter(), None);
 
-        // The index list always leads with the "All" row.
+        // The index list always leads with the "All" row. Sort by Name so the
+        // assertion below sees indexes in alphabetical order regardless of the
+        // default Activity-with-chunk-count tiebreak.
+        state.sort_key = IndexSortKey::Name;
         let rows = index_lines(&state);
         assert_eq!(rows.len(), 4, "1 'All' row + 3 indexes");
         assert!(rows[0].is_all);
@@ -1243,7 +1558,10 @@ mod tests {
 
     #[test]
     fn test_index_lines() {
-        let state = sample_state();
+        // Sort by Name so the assertions below see indexes in alphabetical
+        // order regardless of the default Activity-with-chunk-count tiebreak.
+        let mut state = sample_state();
+        state.sort_key = IndexSortKey::Name;
         let rows = index_lines(&state);
         // 1 "All" row + 3 index rows.
         assert_eq!(rows.len(), 4);
@@ -1252,12 +1570,12 @@ mod tests {
         assert!(rows[0].selected);
         assert!(rows[0].text.starts_with('>'));
         assert!(rows[0].text.contains(ALL_LABEL));
-        // Row 1 is the first index, unselected.
+        // Row 1 is the first index alphabetically, unselected.
         assert!(!rows[1].is_all && !rows[1].selected);
         assert!(rows[1].text.contains("cto"));
-        // Row 2 carries its chunk count.
-        assert!(rows[2].text.contains("trusty"));
-        assert!(rows[2].text.contains("19.0k"));
+        // Row 3 is "trusty" (after "cto" and "duetto") and carries its chunk count.
+        assert!(rows[3].text.contains("trusty"));
+        assert!(rows[3].text.contains("19.0k"));
 
         // An empty index list still shows the "All" row plus a placeholder.
         let empty = SearchTuiState::new("http://x");
@@ -1294,9 +1612,165 @@ mod tests {
     #[test]
     fn test_help_text_lists_bindings() {
         let text = help_text();
-        for token in ["Tab", "r ", "Enter", "?", "q "] {
+        for token in ["Tab", "r ", "Enter", "?", "q ", "/", "s ", "g "] {
             assert!(text.contains(token), "help text missing {token}");
         }
+    }
+
+    #[test]
+    fn test_index_sort_key_cycle() {
+        assert_eq!(IndexSortKey::default(), IndexSortKey::Activity);
+        assert_eq!(IndexSortKey::Activity.next(), IndexSortKey::Name);
+        assert_eq!(IndexSortKey::Name.next(), IndexSortKey::Chunks);
+        assert_eq!(IndexSortKey::Chunks.next(), IndexSortKey::Activity);
+        assert_eq!(IndexSortKey::Activity.label(), "Activity");
+        assert_eq!(IndexSortKey::Name.label(), "Name");
+        assert_eq!(IndexSortKey::Chunks.label(), "Chunks");
+    }
+
+    /// State with four indexes spanning two projects, varied chunk counts,
+    /// and varied last_indexed timestamps. Used by the sort / filter / group
+    /// tests.
+    fn diverse_state() -> SearchTuiState {
+        use chrono::{TimeZone, Utc};
+        let mut state = SearchTuiState::new("http://127.0.0.1:7878");
+        state.indexes = vec![
+            IndexRow {
+                id: "trusty-search".into(),
+                chunk_count: 12,
+                root_path: "/Users/masa/Projects/trusty-tools/trusty-search".into(),
+                last_indexed: Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()),
+                ..Default::default()
+            },
+            IndexRow {
+                id: "trusty-memory".into(),
+                chunk_count: 3_775,
+                root_path: "/Users/masa/Projects/trusty-tools/trusty-memory".into(),
+                last_indexed: Some(Utc.with_ymd_and_hms(2026, 5, 18, 22, 29, 50).unwrap()),
+                ..Default::default()
+            },
+            IndexRow {
+                id: "claude-mpm".into(),
+                chunk_count: 6_163,
+                root_path: "/Users/masa/Projects/claude-mpm".into(),
+                last_indexed: Some(Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap()),
+                ..Default::default()
+            },
+            IndexRow {
+                id: "notes".into(),
+                chunk_count: 100,
+                root_path: String::new(),
+                last_indexed: None,
+                ..Default::default()
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn test_apply_sort_activity() {
+        // Activity: last_indexed desc, None last; chunk_count desc tiebreak.
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Activity;
+        let rows = filtered_sorted_indexes(&state);
+        assert_eq!(rows[0].id, "trusty-memory");
+        assert_eq!(rows[1].id, "claude-mpm");
+        assert_eq!(rows[2].id, "trusty-search");
+        // None sorts last.
+        assert_eq!(rows[3].id, "notes");
+    }
+
+    #[test]
+    fn test_apply_sort_name() {
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Name;
+        let rows = filtered_sorted_indexes(&state);
+        let ids: Vec<&str> = rows.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["claude-mpm", "notes", "trusty-memory", "trusty-search"]
+        );
+    }
+
+    #[test]
+    fn test_apply_sort_chunks() {
+        let mut state = diverse_state();
+        state.sort_key = IndexSortKey::Chunks;
+        let rows = filtered_sorted_indexes(&state);
+        assert_eq!(rows[0].id, "claude-mpm");
+        assert_eq!(rows[1].id, "trusty-memory");
+        assert_eq!(rows[2].id, "notes");
+        assert_eq!(rows[3].id, "trusty-search");
+    }
+
+    #[test]
+    fn test_apply_filter() {
+        let mut state = diverse_state();
+        // Case-insensitive substring match against id OR project.
+        state.filter = "TRUSTY".into();
+        let rows = filtered_sorted_indexes(&state);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|i| i.id.contains("trusty")));
+
+        // Match by project (root_path basename).
+        state.filter = "claude-mpm".into();
+        let rows = filtered_sorted_indexes(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "claude-mpm");
+
+        // No match → empty.
+        state.filter = "nothing-here".into();
+        assert!(filtered_sorted_indexes(&state).is_empty());
+
+        // Empty filter → everything.
+        state.filter.clear();
+        assert_eq!(filtered_sorted_indexes(&state).len(), 4);
+    }
+
+    #[test]
+    fn test_index_lines_grouped() {
+        let mut state = diverse_state();
+        state.group_by_project = true;
+        state.sort_key = IndexSortKey::Name;
+        let rows = index_lines(&state);
+
+        // "All" leads the list.
+        assert!(rows[0].is_all);
+
+        // Group headers appear and are non-selectable.
+        let headers: Vec<&IndexListRow> = rows.iter().filter(|r| r.is_header).collect();
+        assert!(
+            !headers.is_empty(),
+            "grouping must emit at least one header"
+        );
+        for h in &headers {
+            assert!(h.text.contains("──"));
+            assert!(!h.selected);
+        }
+        // Project names appear in the header text.
+        let header_text: String = headers
+            .iter()
+            .map(|h| h.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header_text.contains("trusty-memory") || header_text.contains("trusty-search"));
+        assert!(header_text.contains("claude-mpm"));
+
+        // Filter narrows grouping to matching projects only.
+        state.filter = "claude".into();
+        let rows = index_lines(&state);
+        let headers: Vec<&IndexListRow> = rows.iter().filter(|r| r.is_header).collect();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].text.contains("claude-mpm"));
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2_048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert!(format_bytes(2 * 1024 * 1024 * 1024).ends_with("GB"));
     }
 
     #[test]
@@ -1317,6 +1791,7 @@ mod tests {
                 id: format!("idx-{n}"),
                 chunk_count: 1,
                 root_path: String::new(),
+                ..Default::default()
             })
             .collect();
         let window = 5;
@@ -1378,6 +1853,7 @@ mod tests {
                 id: format!("idx-{n}"),
                 chunk_count: 100,
                 root_path: String::new(),
+                ..Default::default()
             })
             .collect();
         state.selected = state.last_row();

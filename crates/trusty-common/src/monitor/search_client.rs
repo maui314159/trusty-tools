@@ -78,12 +78,23 @@ struct IndexListWire {
 }
 
 /// Wire shape of `GET /indexes/:id/status` from the trusty-search daemon.
+///
+/// Why: the dashboard now surfaces last-indexed time and on-disk size in
+/// addition to the chunk count, so the wire struct captures those optional
+/// fields when the daemon reports them.
+/// What: the indexed root path, chunk count, optional disk size in bytes, and
+/// the optional last-indexed timestamp (parsed as `DateTime<Utc>`).
+/// Test: deserialisation is exercised live by the trusty-search daemon suite.
 #[derive(Debug, Deserialize)]
 struct IndexStatusWire {
     #[serde(default)]
     root_path: String,
     #[serde(default)]
     chunk_count: u64,
+    #[serde(default)]
+    disk_bytes: Option<u64>,
+    #[serde(default)]
+    last_indexed: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Typed HTTP client for the trusty-search daemon.
@@ -169,17 +180,18 @@ impl SearchClient {
         let mut indexes = Vec::with_capacity(list.indexes.len());
         for id in list.indexes {
             let row = match self.index_status(&id).await {
-                Ok((root_path, chunk_count)) => IndexRow {
+                Ok(status) => IndexRow {
                     id,
-                    chunk_count,
-                    root_path,
+                    chunk_count: status.chunk_count,
+                    root_path: status.root_path,
+                    disk_bytes: status.disk_bytes,
+                    last_indexed: status.last_indexed,
                 },
                 Err(e) => {
                     tracing::warn!("index status probe failed for {id}: {e}");
                     IndexRow {
                         id,
-                        chunk_count: 0,
-                        root_path: String::new(),
+                        ..Default::default()
                     }
                 }
             };
@@ -195,14 +207,15 @@ impl SearchClient {
         })
     }
 
-    /// Fetch one index's `(root_path, chunk_count)` from `/indexes/:id/status`.
+    /// Fetch one index's status payload from `/indexes/:id/status`.
     ///
-    /// Why: the index table shows each index's chunk count; this is the single
-    /// per-index probe used by [`Self::fetch_all`].
-    /// What: GETs `/indexes/:id/status` and returns the two fields the panel
-    /// renders.
+    /// Why: the index table shows each index's chunk count, last-indexed time,
+    /// and on-disk size; this is the single per-index probe used by
+    /// [`Self::fetch_all`].
+    /// What: GETs `/indexes/:id/status` and returns the parsed wire struct so
+    /// the caller can thread every optional field into the [`IndexRow`].
     /// Test: covered by the trusty-search daemon suite.
-    async fn index_status(&self, id: &str) -> anyhow::Result<(String, u64)> {
+    async fn index_status(&self, id: &str) -> anyhow::Result<IndexStatusWire> {
         let status: IndexStatusWire = self
             .http
             .get(format!("{}/indexes/{id}/status", self.base))
@@ -211,7 +224,7 @@ impl SearchClient {
             .error_for_status()?
             .json()
             .await?;
-        Ok((status.root_path, status.chunk_count))
+        Ok(status)
     }
 
     /// Trigger a reindex of `id` via `POST /indexes/:id/reindex`.
