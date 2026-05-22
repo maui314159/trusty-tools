@@ -7,12 +7,14 @@
 //! Test: See submodule tests.
 
 pub mod chat_sessions;
+pub mod concurrent_open;
 pub mod hnsw_store;
 pub mod kg;
 pub mod kg_redb;
 #[cfg(feature = "sqlite-kg")]
 pub mod kg_sqlite;
 pub mod kg_store;
+pub mod kg_writer;
 pub mod kuzu;
 pub mod l1_cache;
 pub mod palace_store;

@@ -13,6 +13,7 @@
 //! across reopen, drawer CRUD, count_active.
 
 use crate::memory_core::palace::Drawer;
+use crate::memory_core::store::concurrent_open::{OpenMode, SnapshotGuard, try_open_or_snapshot};
 use crate::memory_core::store::kg_store::{
     ACTIVE_SUBJECT_COUNTS, DRAWERS, DrawerRecord, TRIPLES, TRIPLES_BY_OBJECT, TRIPLES_BY_PREDICATE,
     TripleValue, decode_triple_key, decode_u64, decode_value, encode_object_index_key,
@@ -28,19 +29,55 @@ use uuid::Uuid;
 
 use super::kg::Triple;
 
+/// Sentinel returned by every write method when the store is in snapshot
+/// (read-only) mode.
+///
+/// Why: Issue #59 — a stdio MCP client that falls back to a snapshot must
+/// reject writes with a clear message so the caller sees "writes go
+/// through the HTTP daemon" instead of a silent divergence where the
+/// write succeeds locally but never reaches the live file.
+/// What: A `&'static str` so call sites can wrap it in `anyhow::anyhow!`
+/// without allocating.
+/// Test: `write_on_snapshot_returns_read_only_error`.
+pub(crate) const READ_ONLY_ERROR_MSG: &str = "palace is read-only: HTTP daemon holds the write lock — \
+     route writes through the daemon's HTTP API or stop the daemon \
+     before retrying via stdio";
+
+/// Shared per-path state: the open `Database` plus its open mode and
+/// optional snapshot guard. Bundled into one `Arc` so every cache hit
+/// inherits the same snapshot lifetime (the guard's `Drop` removes the
+/// snapshot file on disk).
+///
+/// Why: Issue #59 — when the live redb file is locked by another process
+/// (typically the HTTP daemon), `try_open_or_snapshot` copies it to a
+/// process-local snapshot. The snapshot's `SnapshotGuard` must live as
+/// long as any handle to the resulting `Database` to keep the temp file
+/// alive for reads. Bundling them in one `Arc` ties the two lifetimes
+/// together.
+/// What: Carries the open `Database`, the `OpenMode`, and the snapshot
+/// guard. `SnapshotGuard::noop()` is used for the read/write path so the
+/// shape is uniform.
+/// Test: Indirect via every `KgStoreRedb::open` call.
+#[derive(Debug)]
+struct KgDbState {
+    db: Arc<Database>,
+    mode: OpenMode,
+    _snapshot_guard: SnapshotGuard,
+}
+
 /// Why: redb forbids more than one in-process `Database` handle to the same
 /// file ("Database already open. Cannot acquire lock."). The trusty stack
 /// regularly opens the same palace from multiple registries within a single
 /// process (e.g. test setup + `AppState`, or background dreamer + foreground
 /// handle); SQLite previously allowed this so we must preserve it. The fix
-/// is a process-global cache of `Weak<Database>` keyed by canonical path —
+/// is a process-global cache of `Weak<KgDbState>` keyed by canonical path —
 /// when any handle is alive we hand it back; once all handles drop the entry
 /// expires and the next `open` creates a fresh `Database`.
 /// What: Lazily-initialised global mutex over a `HashMap<canonical_path,
-/// Weak<Database>>`.
+/// Weak<KgDbState>>`.
 /// Test: `multiple_handles_to_same_path_share_database`.
-fn db_cache() -> &'static Mutex<HashMap<PathBuf, Weak<Database>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+fn db_cache() -> &'static Mutex<HashMap<PathBuf, Weak<KgDbState>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<KgDbState>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -60,7 +97,7 @@ fn canonical_key(path: &Path) -> PathBuf {
 /// Test: Implicit — every test below constructs one.
 #[derive(Clone)]
 pub struct KgStoreRedb {
-    db: Arc<Database>,
+    state: Arc<KgDbState>,
     #[allow(dead_code)]
     path: PathBuf,
 }
@@ -108,16 +145,16 @@ impl KgStoreRedb {
                 .with_context(|| format!("create kg db parent dir {}", parent.display()))?;
         }
 
-        // Reuse an existing `Arc<Database>` if any handle to this path is
+        // Reuse an existing `Arc<KgDbState>` if any handle to this path is
         // still alive — see `db_cache` for the rationale.
         {
             let mut cache = db_cache().lock().expect("db_cache poisoned");
             let key = canonical_key(path);
             if let Some(weak) = cache.get(&key)
-                && let Some(db) = weak.upgrade()
+                && let Some(state) = weak.upgrade()
             {
                 return Ok(Self {
-                    db,
+                    state,
                     path: path.to_path_buf(),
                 });
             }
@@ -125,14 +162,19 @@ impl KgStoreRedb {
             cache.remove(&key);
         }
 
-        let db = Database::create(path)
+        // Try a normal exclusive open; on `DatabaseAlreadyOpen` fall back
+        // to a process-local snapshot copy so a stdio MCP client can read
+        // a palace while the HTTP daemon owns the live file (issue #59).
+        let (db, snapshot_guard, mode) = try_open_or_snapshot(path)
             .with_context(|| format!("open kg redb at {}", path.display()))?;
 
-        // Touch every table in a single write txn so they exist on disk even
-        // before the first write. redb only persists a table once it is opened
-        // in a write transaction; doing it here keeps later read transactions
-        // from failing on a brand-new file.
-        {
+        // Touch every table in a single write txn so they exist on disk
+        // even before the first write. Skip this step in snapshot mode
+        // because (a) the live file already initialised every table — we
+        // copied a fully-formed redb image — and (b) any write we make
+        // here would only land in the throw-away snapshot, masking the
+        // read-only intent of every later write rejection.
+        if matches!(mode, OpenMode::ReadWrite) {
             let wtx = db.begin_write().context("begin init txn")?;
             {
                 let _ = wtx.open_table(TRIPLES).context("init triples table")?;
@@ -150,18 +192,57 @@ impl KgStoreRedb {
             wtx.commit().context("commit init txn")?;
         }
 
-        let arc = Arc::new(db);
+        let state = Arc::new(KgDbState {
+            db,
+            mode,
+            _snapshot_guard: snapshot_guard,
+        });
         {
             let mut cache = db_cache().lock().expect("db_cache poisoned");
             // Use the post-create canonical path so symlinks resolve.
             let key = canonical_key(path);
-            cache.insert(key, Arc::downgrade(&arc));
+            cache.insert(key, Arc::downgrade(&state));
         }
 
         Ok(Self {
-            db: arc,
+            state,
             path: path.to_path_buf(),
         })
+    }
+
+    /// Whether this store is operating against a read-only snapshot.
+    ///
+    /// Why: Issue #59 — `KnowledgeGraph` exposes this through to
+    /// `PalaceHandle::is_read_only` so write paths can short-circuit
+    /// before touching the store. Cheap field read, no I/O.
+    /// What: Returns `true` when the underlying database was opened via
+    /// the snapshot fallback rather than directly.
+    /// Test: `write_on_snapshot_returns_read_only_error`.
+    pub fn is_read_only(&self) -> bool {
+        self.state.mode.is_read_only()
+    }
+
+    /// Internal accessor used by every method that previously read
+    /// `self.db`. Centralising it lets the cache and snapshot guard live
+    /// inside `KgDbState` without rewriting every call site.
+    fn db(&self) -> &Database {
+        &self.state.db
+    }
+
+    /// Reject the operation when the store is in snapshot mode.
+    ///
+    /// Why: Every write path (`assert`, `retract`, drawer upsert/delete)
+    /// must surface the same actionable error so users see the same
+    /// guidance regardless of which mutation they attempted.
+    /// What: Returns `Err(READ_ONLY_ERROR_MSG)` when `is_read_only()`,
+    /// otherwise `Ok(())`.
+    /// Test: `write_on_snapshot_returns_read_only_error`.
+    fn check_writable(&self) -> Result<()> {
+        if self.is_read_only() {
+            Err(anyhow::anyhow!(READ_ONLY_ERROR_MSG))
+        } else {
+            Ok(())
+        }
     }
 
     /// Assert a triple. If an active row exists for `(subject, predicate)` it
@@ -175,6 +256,7 @@ impl KgStoreRedb {
     /// (subject, predicate)" can never be observed broken.
     /// Test: `assert_then_query_returns_triple`, `assert_supersedes_prior`.
     pub fn assert(&self, triple: &Triple) -> Result<()> {
+        self.check_writable()?;
         let close_ms = triple.valid_from.timestamp_millis();
         let new_value = TripleValue {
             object: triple.object.clone(),
@@ -184,7 +266,7 @@ impl KgStoreRedb {
             provenance: triple.provenance.clone(),
         };
 
-        let wtx = self.db.begin_write().context("begin assert txn")?;
+        let wtx = self.db().begin_write().context("begin assert txn")?;
         {
             let mut triples = wtx.open_table(TRIPLES).context("open triples table")?;
             let mut by_object = wtx
@@ -316,9 +398,10 @@ impl KgStoreRedb {
     /// primary table, removes secondary indexes, and decrements the count.
     /// Test: `retract_closes_active_interval`.
     pub fn retract(&self, subject: &str, predicate: &str) -> Result<usize> {
+        self.check_writable()?;
         let key = encode_triple_key(subject, predicate);
         let close_ms = now_ms();
-        let wtx = self.db.begin_write().context("begin retract txn")?;
+        let wtx = self.db().begin_write().context("begin retract txn")?;
         let closed;
         {
             let mut triples = wtx.open_table(TRIPLES).context("open triples table")?;
@@ -409,7 +492,7 @@ impl KgStoreRedb {
     /// Test: `assert_then_query_returns_triple`.
     pub fn query_active(&self, subject: &str) -> Result<Vec<Triple>> {
         let prefix = subject_prefix(subject);
-        let rtx = self.db.begin_read().context("begin query_active txn")?;
+        let rtx = self.db().begin_read().context("begin query_active txn")?;
         let triples = rtx
             .open_table(TRIPLES)
             .context("open triples table for query_active")?;
@@ -453,7 +536,7 @@ impl KgStoreRedb {
     /// alphabetically), collect subjects whose count is > 0, take `limit`.
     /// Test: `list_subjects_returns_distinct_active_subjects`.
     pub fn list_subjects(&self, limit: usize) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read().context("begin list_subjects txn")?;
+        let rtx = self.db().begin_read().context("begin list_subjects txn")?;
         let counts = rtx
             .open_table(ACTIVE_SUBJECT_COUNTS)
             .context("open active_subject_counts")?;
@@ -484,7 +567,7 @@ impl KgStoreRedb {
     /// Test: `list_subjects_with_counts_returns_grouped_counts`.
     pub fn list_subjects_with_counts(&self, limit: usize) -> Result<Vec<(String, u64)>> {
         let rtx = self
-            .db
+            .db()
             .begin_read()
             .context("begin list_subjects_with_counts txn")?;
         let counts = rtx
@@ -518,7 +601,7 @@ impl KgStoreRedb {
     /// bounded by application sizing.
     /// Test: `list_active_returns_ordered_window`.
     pub fn list_active(&self, limit: usize, offset: usize) -> Result<Vec<Triple>> {
-        let rtx = self.db.begin_read().context("begin list_active txn")?;
+        let rtx = self.db().begin_read().context("begin list_active txn")?;
         let triples = rtx
             .open_table(TRIPLES)
             .context("open triples table for list_active")?;
@@ -554,7 +637,7 @@ impl KgStoreRedb {
     /// What: Iterate ACTIVE_SUBJECT_COUNTS, sum values.
     /// Test: `count_active_triples_returns_live_only`.
     pub fn count_active_triples(&self) -> u64 {
-        let rtx = match self.db.begin_read() {
+        let rtx = match self.db().begin_read() {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("count_active_triples: begin_read failed: {e:#}");
@@ -608,6 +691,7 @@ impl KgStoreRedb {
     /// bytes in DRAWERS.
     /// Test: `upsert_drawer_then_load_drawers_round_trips`.
     pub fn upsert_drawer(&self, drawer: &Drawer) -> Result<()> {
+        self.check_writable()?;
         let record = DrawerRecord {
             room_id: drawer.room_id.to_string(),
             content: drawer.content.clone(),
@@ -621,7 +705,7 @@ impl KgStoreRedb {
         };
         let bytes = encode_value(&record).context("encode drawer record")?;
         let id_bytes = *drawer.id.as_bytes();
-        let wtx = self.db.begin_write().context("begin upsert_drawer txn")?;
+        let wtx = self.db().begin_write().context("begin upsert_drawer txn")?;
         {
             let mut drawers = wtx.open_table(DRAWERS).context("open drawers table")?;
             drawers
@@ -639,8 +723,9 @@ impl KgStoreRedb {
     /// What: Remove the row keyed by UUID bytes from DRAWERS. No-op on unknown id.
     /// Test: `delete_drawer_removes_row`.
     pub fn delete_drawer(&self, id: Uuid) -> Result<()> {
+        self.check_writable()?;
         let id_bytes = *id.as_bytes();
-        let wtx = self.db.begin_write().context("begin delete_drawer txn")?;
+        let wtx = self.db().begin_write().context("begin delete_drawer txn")?;
         {
             let mut drawers = wtx.open_table(DRAWERS).context("open drawers table")?;
             drawers
@@ -659,7 +744,7 @@ impl KgStoreRedb {
     /// Rows with malformed UUID/timestamp are skipped with a warning.
     /// Test: `upsert_drawer_then_load_drawers_round_trips`.
     pub fn load_drawers(&self) -> Result<Vec<Drawer>> {
-        let rtx = self.db.begin_read().context("begin load_drawers txn")?;
+        let rtx = self.db().begin_read().context("begin load_drawers txn")?;
         let drawers = rtx.open_table(DRAWERS).context("open drawers table")?;
         let mut out = Vec::new();
         for entry in drawers.iter().context("iter drawers")? {
@@ -716,7 +801,10 @@ impl KgStoreRedb {
     /// collect into a `HashSet`.
     /// Test: `load_drawer_ids_matches_load_drawers`.
     pub fn load_drawer_ids(&self) -> Result<HashSet<Uuid>> {
-        let rtx = self.db.begin_read().context("begin load_drawer_ids txn")?;
+        let rtx = self
+            .db()
+            .begin_read()
+            .context("begin load_drawer_ids txn")?;
         let drawers = rtx.open_table(DRAWERS).context("open drawers table")?;
         let mut out = HashSet::new();
         for entry in drawers.iter().context("iter drawers")? {
@@ -750,7 +838,8 @@ impl KgStoreRedb {
     /// Test: Covered by the kg_migration integration test in
     /// `crates/trusty-common/tests/kg_migration_tests.rs`.
     pub fn import_all(&self, triples: Vec<Triple>, drawers: Vec<Drawer>) -> Result<()> {
-        let wtx = self.db.begin_write().context("begin import txn")?;
+        self.check_writable()?;
+        let wtx = self.db().begin_write().context("begin import txn")?;
         {
             let mut triples_t = wtx.open_table(TRIPLES).context("open triples table")?;
             let mut by_object = wtx
@@ -904,6 +993,86 @@ impl KgStoreRedb {
         Ok(())
     }
 
+    /// Apply a batch of write ops inside a single redb write transaction.
+    ///
+    /// Why: Issue #59 follow-up — bulk `assert` / `retract` / drawer
+    /// upsert workloads otherwise pay one `begin_write` + one fsync per op.
+    /// Coalescing N ops into a single transaction collapses N fsyncs into
+    /// one, which is the dominant cost on durable writes. The batch
+    /// preserves per-op semantics: each `Assert` still closes any prior
+    /// active interval, each `Retract` still moves rows to history, each
+    /// drawer op still mutates the DRAWERS table. The only behavioural
+    /// difference from calling each op individually is atomicity — if one
+    /// op fails, the whole batch is rolled back (caller decides via the
+    /// returned error whether to retry individually).
+    /// What: Opens one write transaction, applies each `BatchWriteOp` by
+    /// delegating to a free-function helper that takes already-opened
+    /// tables, and commits once. On any per-op error the transaction is
+    /// aborted and the error is returned together with the index of the
+    /// failing op so callers can log it.
+    /// Test: `apply_batch_groups_asserts_into_single_commit` and
+    /// `apply_batch_rolls_back_on_error` in this module.
+    pub fn apply_batch(&self, ops: &[BatchWriteOp]) -> Result<Vec<BatchOpResult>> {
+        self.check_writable()?;
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let wtx = self.db().begin_write().context("begin batch txn")?;
+        let mut results: Vec<BatchOpResult> = Vec::with_capacity(ops.len());
+        {
+            let mut triples = wtx.open_table(TRIPLES).context("open triples table")?;
+            let mut by_object = wtx
+                .open_table(TRIPLES_BY_OBJECT)
+                .context("open triples_by_object table")?;
+            let mut by_predicate = wtx
+                .open_table(TRIPLES_BY_PREDICATE)
+                .context("open triples_by_predicate table")?;
+            let mut counts = wtx
+                .open_table(ACTIVE_SUBJECT_COUNTS)
+                .context("open active_subject_counts table")?;
+            let mut drawers_t = wtx.open_table(DRAWERS).context("open drawers table")?;
+
+            for (idx, op) in ops.iter().enumerate() {
+                let res: Result<BatchOpResult> = match op {
+                    BatchWriteOp::Assert(triple) => batch_assert(
+                        &mut triples,
+                        &mut by_object,
+                        &mut by_predicate,
+                        &mut counts,
+                        triple,
+                    )
+                    .map(|_| BatchOpResult::Asserted),
+                    BatchWriteOp::Retract { subject, predicate } => batch_retract(
+                        &mut triples,
+                        &mut by_object,
+                        &mut by_predicate,
+                        &mut counts,
+                        subject,
+                        predicate,
+                    )
+                    .map(BatchOpResult::Retracted),
+                    BatchWriteOp::UpsertDrawer(drawer) => {
+                        batch_upsert_drawer(&mut drawers_t, drawer)
+                            .map(|_| BatchOpResult::DrawerUpserted)
+                    }
+                    BatchWriteOp::DeleteDrawer(id) => batch_delete_drawer(&mut drawers_t, *id)
+                        .map(|_| BatchOpResult::DrawerDeleted),
+                };
+                match res {
+                    Ok(r) => results.push(r),
+                    Err(e) => {
+                        return Err(
+                            e.context(format!("batch op #{idx} failed; transaction rolled back"))
+                        );
+                    }
+                }
+            }
+        }
+        wtx.commit().context("commit batch txn")?;
+        Ok(results)
+    }
+
     /// Dump every triple, including closed history rows.
     ///
     /// Why: The #45 migration path needs to walk the entire table to export
@@ -912,7 +1081,10 @@ impl KgStoreRedb {
     /// `hist:` rows decoded as `Triple` (so `valid_to.is_some()` for history).
     /// Test: `assert_supersedes_prior` checks history is preserved.
     pub fn dump_all_triples(&self) -> Result<Vec<Triple>> {
-        let rtx = self.db.begin_read().context("begin dump_all_triples txn")?;
+        let rtx = self
+            .db()
+            .begin_read()
+            .context("begin dump_all_triples txn")?;
         let triples = rtx
             .open_table(TRIPLES)
             .context("open triples table for dump_all_triples")?;
@@ -947,6 +1119,265 @@ impl KgStoreRedb {
         }
         Ok(out)
     }
+}
+
+/// A single write op that can be queued through `apply_batch`.
+///
+/// Why: The write coalescer in `kg_writer.rs` accepts ops from concurrent
+/// callers, then replays them inside a single redb transaction. Modelling
+/// the op shape explicitly keeps the writer task backend-agnostic and
+/// makes `apply_batch` directly unit-testable.
+/// What: Mirrors the four mutating entry points on `KgStoreRedb` —
+/// `assert`, `retract`, `upsert_drawer`, `delete_drawer`. All variants
+/// own their data so an op can cross an `mpsc` channel.
+/// Test: `apply_batch_groups_asserts_into_single_commit` exercises the
+/// `Assert` variant; the writer tests cover the others.
+#[derive(Debug, Clone)]
+pub enum BatchWriteOp {
+    /// Assert a triple; closes any prior active interval.
+    Assert(Triple),
+    /// Close the active triple for `(subject, predicate)` without
+    /// inserting a replacement.
+    Retract { subject: String, predicate: String },
+    /// Persist a drawer row.
+    UpsertDrawer(Drawer),
+    /// Remove a drawer row by UUID.
+    DeleteDrawer(Uuid),
+}
+
+/// Per-op outcome returned from `apply_batch`.
+///
+/// Why: Callers awaiting a queued op need typed results — in particular
+/// `Retract` returns 0/1 for "rows closed" which the writer task forwards
+/// back through a `oneshot::Sender<Result<usize>>`.
+/// What: Enum carrying the same return shape each single-op method
+/// already exposes (`assert` → unit, `retract` → usize, drawer ops →
+/// unit).
+/// Test: Indirect via `apply_batch_*` tests and the writer tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOpResult {
+    Asserted,
+    Retracted(usize),
+    DrawerUpserted,
+    DrawerDeleted,
+}
+
+// ----- in-transaction helpers shared by the single-op and batch paths -----
+//
+// Why: The single-op `assert` / `retract` / drawer methods already
+// implement the correct semantics inside their own `begin_write` block.
+// To share that logic with `apply_batch` without duplicating it, we lift
+// the per-op body into a free function that takes already-opened tables.
+// This keeps the txn boundary explicit (one `begin_write` per batch) and
+// avoids logic drift between the two paths. The single-op methods could
+// be migrated to call these helpers in a follow-up; for now we accept
+// the duplication to keep the diff minimal.
+
+type Tbl<'txn> = redb::Table<'txn, &'static [u8], &'static [u8]>;
+
+/// In-transaction assert helper; mirrors `KgStoreRedb::assert`.
+///
+/// Why: Lets `apply_batch` perform N asserts inside one write txn.
+/// What: Same close-prior + insert-new + index-maintenance logic that
+/// the single-op `assert` runs, but takes already-opened tables.
+/// Test: `apply_batch_groups_asserts_into_single_commit`.
+fn batch_assert(
+    triples: &mut Tbl<'_>,
+    by_object: &mut Tbl<'_>,
+    by_predicate: &mut Tbl<'_>,
+    counts: &mut Tbl<'_>,
+    triple: &Triple,
+) -> Result<()> {
+    let close_ms = triple.valid_from.timestamp_millis();
+    let new_value = TripleValue {
+        object: triple.object.clone(),
+        valid_from_ms: triple.valid_from.timestamp_millis(),
+        valid_to_ms: triple.valid_to.map(|dt| dt.timestamp_millis()),
+        confidence: triple.confidence,
+        provenance: triple.provenance.clone(),
+    };
+    let key = encode_triple_key(&triple.subject, &triple.predicate);
+
+    let mut closed_any = false;
+    let prior_opt: Option<TripleValue> = {
+        let existing = triples
+            .get(key.as_slice())
+            .context("read existing triple (batch)")?;
+        match existing {
+            Some(g) => Some(decode_value(g.value()).context("decode prior triple (batch)")?),
+            None => None,
+        }
+    };
+    if let Some(prior) = prior_opt
+        && prior.valid_to_ms.is_none()
+    {
+        let obj_key = encode_object_index_key(&prior.object, &triple.subject, &triple.predicate);
+        by_object
+            .remove(obj_key.as_slice())
+            .context("remove prior object index (batch)")?;
+        let pred_key = encode_predicate_index_key(&triple.predicate, &triple.subject);
+        by_predicate
+            .remove(pred_key.as_slice())
+            .context("remove prior predicate index (batch)")?;
+        closed_any = true;
+
+        let mut hist_key = Vec::with_capacity(5 + key.len() + 8);
+        hist_key.extend_from_slice(b"hist:");
+        hist_key.extend_from_slice(&key);
+        hist_key.extend_from_slice(&prior.valid_from_ms.to_be_bytes());
+        let closed = TripleValue {
+            valid_to_ms: Some(close_ms),
+            ..prior
+        };
+        let closed_bytes = encode_value(&closed).context("encode closed prior (batch)")?;
+        triples
+            .insert(hist_key.as_slice(), closed_bytes.as_slice())
+            .context("insert closed history row (batch)")?;
+    }
+
+    let new_bytes = encode_value(&new_value).context("encode new triple (batch)")?;
+    triples
+        .insert(key.as_slice(), new_bytes.as_slice())
+        .context("insert new triple (batch)")?;
+
+    if new_value.valid_to_ms.is_none() {
+        let obj_key =
+            encode_object_index_key(&new_value.object, &triple.subject, &triple.predicate);
+        by_object
+            .insert(obj_key.as_slice(), [].as_slice())
+            .context("insert new object index (batch)")?;
+        let pred_key = encode_predicate_index_key(&triple.predicate, &triple.subject);
+        by_predicate
+            .insert(pred_key.as_slice(), [].as_slice())
+            .context("insert new predicate index (batch)")?;
+        if !closed_any {
+            let subj_key = triple.subject.as_bytes();
+            let prev = counts
+                .get(subj_key)
+                .context("read prior count (batch)")?
+                .map(|v| decode_u64(v.value()))
+                .unwrap_or(0);
+            let next = prev.saturating_add(1);
+            counts
+                .insert(subj_key, encode_u64(next).as_slice())
+                .context("update active count (batch)")?;
+        }
+    } else if closed_any {
+        let subj_key = triple.subject.as_bytes();
+        let prev = counts
+            .get(subj_key)
+            .context("read prior count for closed-on-arrival (batch)")?
+            .map(|v| decode_u64(v.value()))
+            .unwrap_or(0);
+        let next = prev.saturating_sub(1);
+        if next == 0 {
+            counts
+                .remove(subj_key)
+                .context("remove zero count (batch)")?;
+        } else {
+            counts
+                .insert(subj_key, encode_u64(next).as_slice())
+                .context("update active count (batch)")?;
+        }
+    }
+    Ok(())
+}
+
+/// In-transaction retract helper; mirrors `KgStoreRedb::retract`.
+fn batch_retract(
+    triples: &mut Tbl<'_>,
+    by_object: &mut Tbl<'_>,
+    by_predicate: &mut Tbl<'_>,
+    counts: &mut Tbl<'_>,
+    subject: &str,
+    predicate: &str,
+) -> Result<usize> {
+    let key = encode_triple_key(subject, predicate);
+    let close_ms = now_ms();
+    let prior_opt: Option<TripleValue> = {
+        let existing = triples
+            .get(key.as_slice())
+            .context("lookup active triple for retract (batch)")?;
+        match existing {
+            Some(g) => Some(decode_value(g.value()).context("decode prior for retract (batch)")?),
+            None => None,
+        }
+    };
+    let Some(prior) = prior_opt else { return Ok(0) };
+    if prior.valid_to_ms.is_some() {
+        return Ok(0);
+    }
+
+    let mut hist_key = Vec::with_capacity(5 + key.len() + 8);
+    hist_key.extend_from_slice(b"hist:");
+    hist_key.extend_from_slice(&key);
+    hist_key.extend_from_slice(&prior.valid_from_ms.to_be_bytes());
+    let closed_v = TripleValue {
+        valid_to_ms: Some(close_ms),
+        ..prior.clone()
+    };
+    let bytes = encode_value(&closed_v).context("encode retract history (batch)")?;
+    triples
+        .insert(hist_key.as_slice(), bytes.as_slice())
+        .context("insert retract history row (batch)")?;
+    triples
+        .remove(key.as_slice())
+        .context("remove active row for retract (batch)")?;
+    let obj_key = encode_object_index_key(&prior.object, subject, predicate);
+    by_object
+        .remove(obj_key.as_slice())
+        .context("remove object index for retract (batch)")?;
+    let pred_key = encode_predicate_index_key(predicate, subject);
+    by_predicate
+        .remove(pred_key.as_slice())
+        .context("remove predicate index for retract (batch)")?;
+    let subj_key = subject.as_bytes();
+    let prev = counts
+        .get(subj_key)
+        .context("read prior count for retract (batch)")?
+        .map(|v| decode_u64(v.value()))
+        .unwrap_or(0);
+    let next = prev.saturating_sub(1);
+    if next == 0 {
+        counts
+            .remove(subj_key)
+            .context("remove zero count (batch)")?;
+    } else {
+        counts
+            .insert(subj_key, encode_u64(next).as_slice())
+            .context("update count after retract (batch)")?;
+    }
+    Ok(1)
+}
+
+/// In-transaction drawer upsert helper.
+fn batch_upsert_drawer(drawers: &mut Tbl<'_>, drawer: &Drawer) -> Result<()> {
+    let record = DrawerRecord {
+        room_id: drawer.room_id.to_string(),
+        content: drawer.content.clone(),
+        importance: drawer.importance,
+        tags: drawer.tags.clone(),
+        source_file: drawer
+            .source_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        created_at_ms: drawer.created_at.timestamp_millis(),
+    };
+    let bytes = encode_value(&record).context("encode drawer record (batch)")?;
+    let id_bytes = *drawer.id.as_bytes();
+    drawers
+        .insert(id_bytes.as_slice(), bytes.as_slice())
+        .context("insert drawer record (batch)")?;
+    Ok(())
+}
+
+/// In-transaction drawer delete helper.
+fn batch_delete_drawer(drawers: &mut Tbl<'_>, id: Uuid) -> Result<()> {
+    let id_bytes = *id.as_bytes();
+    drawers
+        .remove(id_bytes.as_slice())
+        .context("remove drawer record (batch)")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1188,5 +1619,248 @@ mod tests {
         let (_d, kg) = open_kg();
         kg.checkpoint().unwrap();
         kg.checkpoint().unwrap();
+    }
+
+    /// Why: `apply_batch` is the heart of the write-coalescing path —
+    /// asserting multiple triples in one transaction must produce the
+    /// same end state as calling `assert` N times.
+    /// What: Submits a 5-op batch (4 asserts + 1 retract) and verifies
+    /// the active set matches the expected result.
+    /// Test ID: apply_batch_groups_asserts_into_single_commit.
+    #[test]
+    fn apply_batch_groups_asserts_into_single_commit() {
+        let (_d, kg) = open_kg();
+        let ops = vec![
+            BatchWriteOp::Assert(t("a", "p1", "v1")),
+            BatchWriteOp::Assert(t("a", "p2", "v2")),
+            BatchWriteOp::Assert(t("b", "p1", "v3")),
+            BatchWriteOp::Assert(t("a", "p1", "v1b")), // supersedes a/p1
+            BatchWriteOp::Retract {
+                subject: "a".to_string(),
+                predicate: "p2".to_string(),
+            },
+        ];
+        let results = kg.apply_batch(&ops).unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(matches!(results[0], BatchOpResult::Asserted));
+        assert!(matches!(results[3], BatchOpResult::Asserted));
+        assert_eq!(results[4], BatchOpResult::Retracted(1));
+
+        // Active state: a/p1 = v1b (latest), a/p2 retracted, b/p1 = v3.
+        let a_active = kg.query_active("a").unwrap();
+        assert_eq!(a_active.len(), 1);
+        assert_eq!(a_active[0].predicate, "p1");
+        assert_eq!(a_active[0].object, "v1b");
+
+        let b_active = kg.query_active("b").unwrap();
+        assert_eq!(b_active.len(), 1);
+        assert_eq!(b_active[0].object, "v3");
+    }
+
+    /// Why: Empty batches must be safe — the writer may flush a coalesce
+    /// window with zero queued ops if the caller dropped its sender
+    /// between recv and drain.
+    /// What: `apply_batch(&[])` returns `Ok(vec![])` and does not open a
+    /// transaction (so write-locks are not contended for nothing).
+    /// Test ID: apply_batch_empty_is_noop.
+    #[test]
+    fn apply_batch_empty_is_noop() {
+        let (_d, kg) = open_kg();
+        let results = kg.apply_batch(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// Why: Drawer upserts must coexist with triple ops in the same
+    /// transaction so a `remember` + `kg_assert` burst can be coalesced.
+    /// What: Mixed batch with a drawer and a triple; both visible after.
+    /// Test ID: apply_batch_mixes_drawer_and_triple_ops.
+    #[test]
+    fn apply_batch_mixes_drawer_and_triple_ops() {
+        use crate::memory_core::palace::Drawer;
+        let (_d, kg) = open_kg();
+        let drawer = Drawer::new(Uuid::new_v4(), "hello world".to_string());
+        let drawer_id = drawer.id;
+        let ops = vec![
+            BatchWriteOp::UpsertDrawer(drawer),
+            BatchWriteOp::Assert(t("alice", "wrote", "drawer-1")),
+        ];
+        let results = kg.apply_batch(&ops).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], BatchOpResult::DrawerUpserted));
+        assert!(matches!(results[1], BatchOpResult::Asserted));
+
+        let drawer_ids = kg.load_drawer_ids().unwrap();
+        assert!(drawer_ids.contains(&drawer_id));
+        assert_eq!(kg.query_active("alice").unwrap().len(), 1);
+    }
+
+    // -- Issue #59: read-only snapshot fallback ----------------------------
+
+    /// Hold the live redb file with a direct `Database::create` (bypassing
+    /// the in-process `db_cache`) so the next `KgStoreRedb::open` triggers
+    /// the snapshot-mode fallback. The returned `Database` must be kept
+    /// alive for the duration of the test so the file lock is held.
+    ///
+    /// Why: Centralises the lock-from-another-handle pattern used by every
+    /// read-only test in this module.
+    /// What: Creates a redb file at `path` via the raw `redb` API; the
+    /// returned handle owns the exclusive flock.
+    /// Test: Indirect — every snapshot test below.
+    fn lock_redb_file(path: &Path) -> Database {
+        Database::create(path).expect("first lock-holder open")
+    }
+
+    /// Why: Confirms the central invariant of issue #59 — when the redb
+    /// file is locked by another handle, a fresh `KgStoreRedb::open` falls
+    /// back to a snapshot and `is_read_only` reports true.
+    /// What: Seeds a palace file, drops the seeding store so the cache
+    /// entry expires, locks the file via raw `Database::create`, then
+    /// opens `KgStoreRedb` and asserts the snapshot mode.
+    /// Test: this test.
+    #[test]
+    fn open_on_locked_file_returns_read_only_handle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kg.redb");
+        // Touch the file so it has the redb header.
+        drop(KgStoreRedb::open(&path).unwrap());
+        let _live = lock_redb_file(&path);
+
+        let snap = KgStoreRedb::open(&path).expect("snapshot fallback");
+        assert!(snap.is_read_only(), "snapshot must report read-only");
+    }
+
+    /// Why: Every write surface (`assert`, `retract`, drawer
+    /// upsert/delete, `import_all`) must reject the operation when the
+    /// store is in snapshot mode so the MCP / HTTP layer can surface a
+    /// single, actionable error string.
+    /// What: Seeds the file, drops the seeding store, locks the file,
+    /// opens a snapshot store, then exercises every write entrypoint and
+    /// asserts each returns an error whose message references the
+    /// daemon-guidance.
+    /// Test: this test.
+    #[test]
+    fn write_on_snapshot_returns_read_only_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kg.redb");
+        // Seed the live file with one row so retract has something to act on
+        // when the snapshot is taken.
+        {
+            let primary = KgStoreRedb::open(&path).unwrap();
+            primary.assert(&t("alice", "knows", "bob")).unwrap();
+        }
+        // Hold the live lock with a raw handle (bypasses the cache).
+        let _live = lock_redb_file(&path);
+
+        let snap = KgStoreRedb::open(&path).expect("snapshot fallback");
+        assert!(snap.is_read_only());
+
+        assert!(
+            snap.assert(&t("carol", "knows", "dave")).is_err(),
+            "assert must fail in snapshot mode"
+        );
+        assert!(
+            snap.retract("alice", "knows").is_err(),
+            "retract must fail in snapshot mode"
+        );
+        let drawer = Drawer::new(Uuid::new_v4(), "x");
+        assert!(
+            snap.upsert_drawer(&drawer).is_err(),
+            "upsert_drawer must fail in snapshot mode"
+        );
+        assert!(
+            snap.delete_drawer(drawer.id).is_err(),
+            "delete_drawer must fail in snapshot mode"
+        );
+        assert!(
+            snap.import_all(Vec::new(), Vec::new()).is_err(),
+            "import_all must fail in snapshot mode"
+        );
+
+        // Sentinel substring check — keeps the test resilient to wording
+        // tweaks while still pinning the operator-facing guidance.
+        let msg = format!("{:#}", snap.assert(&t("e", "f", "g")).unwrap_err());
+        assert!(
+            msg.contains("read-only"),
+            "expected read-only sentinel in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("daemon"),
+            "expected daemon-guidance in error, got: {msg}"
+        );
+    }
+
+    /// Why: Reads must continue to work against the snapshot copy so the
+    /// stdio MCP client can serve `query_active`, `list_subjects`,
+    /// `load_drawers`, and `count_active_triples` while the daemon owns
+    /// the live file.
+    /// What: Seeds the live file with one triple and one drawer, drops the
+    /// seeding store, locks the file, then opens a snapshot and asserts
+    /// every read surface returns the seeded data.
+    /// Test: this test.
+    #[test]
+    fn reads_on_snapshot_succeed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kg.redb");
+        let drawer_id = {
+            let primary = KgStoreRedb::open(&path).unwrap();
+            primary.assert(&t("alice", "works_at", "Acme")).unwrap();
+            let mut d = Drawer::new(Uuid::new_v4(), "snapshot drawer");
+            d.importance = 0.7;
+            primary.upsert_drawer(&d).unwrap();
+            d.id
+        };
+        let _live = lock_redb_file(&path);
+
+        let snap = KgStoreRedb::open(&path).expect("snapshot fallback");
+        let triples = snap.query_active("alice").unwrap();
+        assert_eq!(triples.len(), 1, "snapshot must surface seeded triple");
+        assert_eq!(triples[0].object, "Acme");
+
+        let subjects = snap.list_subjects(10).unwrap();
+        assert!(subjects.contains(&"alice".to_string()));
+
+        let drawers = snap.load_drawers().unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert_eq!(drawers[0].id, drawer_id);
+        assert_eq!(drawers[0].content, "snapshot drawer");
+
+        assert_eq!(snap.count_active_triples(), 1);
+    }
+
+    /// Why: Cached in-process handles to the same canonical path must be
+    /// usable concurrently — multiple tasks holding cloned `KgStoreRedb`
+    /// handles must each be able to issue reads simultaneously without
+    /// blocking each other. Validates the cache + `Arc<KgDbState>`
+    /// sharing.
+    /// What: Opens the same path three times in the same process (all
+    /// served from the cache), then issues `query_active` concurrently
+    /// on three threads. All three must succeed and observe the same row.
+    /// Test: this test.
+    #[test]
+    fn concurrent_readers_share_cached_state() {
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kg.redb");
+        let primary = KgStoreRedb::open(&path).unwrap();
+        primary.assert(&t("alice", "knows", "bob")).unwrap();
+
+        let a = KgStoreRedb::open(&path).unwrap();
+        let b = KgStoreRedb::open(&path).unwrap();
+        let c = KgStoreRedb::open(&path).unwrap();
+
+        let handles: Vec<_> = [a, b, c]
+            .into_iter()
+            .map(|store| {
+                thread::spawn(move || {
+                    let active = store.query_active("alice").unwrap();
+                    assert_eq!(active.len(), 1);
+                    assert_eq!(active[0].object, "bob");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
     }
 }
