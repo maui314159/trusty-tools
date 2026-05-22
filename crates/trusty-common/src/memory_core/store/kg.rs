@@ -881,6 +881,20 @@ impl KnowledgeGraph {
         crate::memory_core::community::find_communities(self)
     }
 
+    /// Whether this KG was opened against a read-only snapshot of a redb
+    /// file locked by another process.
+    ///
+    /// Why: Issue #59 — `PalaceHandle::is_read_only` aggregates this with
+    /// the vector store's flag so the MCP layer can produce a clear
+    /// "route writes through the HTTP daemon" error before any write is
+    /// attempted.
+    /// What: Delegates to `KgStoreRedb::is_read_only`.
+    /// Test: `palace_handle_read_only_when_kg_snapshotted` (in
+    /// `retrieval.rs`).
+    pub fn is_read_only(&self) -> bool {
+        self.store.is_read_only()
+    }
+
     /// Dump every triple including closed history rows.
     ///
     /// Why: Issue #45's SQLite → redb migration walks the entire SQLite table.

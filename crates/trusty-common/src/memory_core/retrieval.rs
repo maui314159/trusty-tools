@@ -165,6 +165,23 @@ impl PalaceHandle {
         self.is_compacting.load(Ordering::Relaxed)
     }
 
+    /// Whether this palace handle was opened against read-only snapshots of
+    /// its underlying redb files.
+    ///
+    /// Why: Issue #59 — when the HTTP daemon already holds the exclusive
+    /// `flock` on a palace's `kg.redb` and `index.usearch.redb`, a stdio
+    /// MCP client falls back to per-process snapshot copies so it can
+    /// still serve `recall`, `kg_query`, and `palace_info`. Write surfaces
+    /// (`remember`, `forget`, `kg_assert`, dream compaction) consult this
+    /// flag and return a clear "writes go through the HTTP daemon" error
+    /// instead of mutating the throw-away snapshot.
+    /// What: Returns `true` when either the KG store or the vector store
+    /// reports it is operating against a snapshot.
+    /// Test: `palace_handle_read_only_when_locked_by_another_process`.
+    pub fn is_read_only(&self) -> bool {
+        self.kg.is_read_only() || self.vector_store.is_read_only()
+    }
+
     /// Construct a new `PalaceHandle` with empty drawer table and L1 cache.
     ///
     /// Why: The registry creates handles eagerly when a palace is opened; the
@@ -383,6 +400,19 @@ impl PalaceHandle {
         tags: Vec<String>,
         importance: f32,
     ) -> Result<Uuid> {
+        // Issue #59: short-circuit before doing any embedding work when the
+        // palace is opened read-only. The store layer already rejects the
+        // eventual write, but returning here saves the cost of an embed
+        // and surfaces a single clear error rather than an inscrutable
+        // upsert failure stack.
+        if self.is_read_only() {
+            return Err(anyhow::anyhow!(
+                "palace '{}' is read-only: HTTP daemon holds the write lock — \
+                 route writes through the daemon's HTTP API or stop the daemon \
+                 before retrying via stdio",
+                self.id
+            ));
+        }
         // Encode RoomType into the room_id deterministically by hashing the
         // debug repr. Until we wire a real Room table, this keeps the room
         // signal recoverable for `list_drawers` filtering.
@@ -464,6 +494,17 @@ impl PalaceHandle {
     /// Test: `cli_forget_removes_drawer` asserts a recalled drawer disappears
     /// after forget.
     pub async fn forget(&self, id: Uuid) -> Result<()> {
+        // Issue #59: short-circuit read-only handles so callers get a
+        // clean error instead of two best-effort warnings followed by a
+        // misleading "ok".
+        if self.is_read_only() {
+            return Err(anyhow::anyhow!(
+                "palace '{}' is read-only: HTTP daemon holds the write lock — \
+                 route forget through the daemon's HTTP API or stop the daemon \
+                 before retrying via stdio",
+                self.id
+            ));
+        }
         // Best-effort vector removal — usearch may legitimately not have the
         // key (e.g. if remember failed mid-flight); we propagate other errors.
         if let Err(e) = self.vector_store.remove(id).await {

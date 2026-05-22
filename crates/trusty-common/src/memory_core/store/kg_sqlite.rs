@@ -53,6 +53,21 @@ impl KnowledgeGraphSqlite {
         conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
             .context("failed to enable WAL journal mode")?;
 
+        // Why: Issue #59 — multiple processes may open the same legacy
+        // `kg.db` concurrently (HTTP daemon + stdio MCP client). WAL mode
+        // already lets readers proceed alongside one writer, but a second
+        // writer must wait. Setting a 5s busy_timeout lets short-lived
+        // contention resolve transparently instead of erroring immediately.
+        // Setting synchronous=NORMAL pairs with WAL for the recommended
+        // durability/performance trade-off on multi-reader workloads.
+        // What: Issues both PRAGMAs on a fresh connection; failures bubble
+        // up so a misconfigured SQLite build is loud rather than silent.
+        // Test: Covered indirectly by every concurrent-access test.
+        conn.execute("PRAGMA busy_timeout = 5000", [])
+            .context("failed to set busy_timeout")?;
+        conn.execute("PRAGMA synchronous = NORMAL", [])
+            .context("failed to set synchronous=NORMAL")?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entities (
                 id          TEXT PRIMARY KEY,

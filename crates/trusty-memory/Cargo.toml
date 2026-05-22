@@ -54,3 +54,8 @@ colored = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tower = { workspace = true }
+# Used by `tests/mcp_stdio_tools.rs` to simulate a peer-process redb
+# lock (issue #59) by holding `Database::create` against a palace's
+# `kg.redb` / `index.usearch.redb` files while a fresh `AppState`
+# falls back to the snapshot path.
+redb = { workspace = true }

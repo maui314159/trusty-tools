@@ -86,6 +86,15 @@ pub enum HnswStoreError {
     InvalidUuid(#[from] uuid::Error),
     #[error("vector dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+    /// Returned by every write method when the store is in snapshot
+    /// (read-only) mode. Callers should surface this verbatim — the
+    /// message is the canonical guidance for issue #59.
+    #[error(
+        "palace is read-only: HTTP daemon holds the write lock — \
+         route writes through the daemon's HTTP API or stop the daemon \
+         before retrying via stdio"
+    )]
+    ReadOnly,
 }
 
 // Why: redb's `?` operator needs a `From<redb::StorageError>` (etc.) impl
@@ -145,6 +154,17 @@ pub struct HnswStore {
     index: Arc<RwLock<Hnsw<'static, f32, DistCosine>>>,
     dim: usize,
     next_id: AtomicU64,
+    /// When true, every write method short-circuits with a "read-only"
+    /// error before touching redb.
+    ///
+    /// Why: Issue #59 — a stdio MCP client may open the same palace as the
+    /// HTTP daemon by snapshotting the redb file. Snapshot writes would
+    /// silently diverge from the daemon's live file, so we reject them at
+    /// the store boundary instead.
+    /// What: Set by `HnswStore::open_read_only`; consulted by `upsert`,
+    /// `delete`, and `compact_orphans`.
+    /// Test: `vector_writes_rejected_on_snapshot` (in `vector.rs`).
+    read_only: bool,
 }
 
 impl HnswStore {
@@ -162,10 +182,27 @@ impl HnswStore {
     /// with an existing id.
     /// Test: `hydration_restores_index`.
     pub fn open(db: Arc<Database>, dim: usize) -> Result<Self> {
+        Self::open_with_mode(db, dim, false)
+    }
+
+    /// Open an HNSW store in either read-write or read-only mode.
+    ///
+    /// Why: Issue #59 — when redb was opened via the snapshot fallback,
+    /// the schema is already initialised in the copy we hold, and any
+    /// writes would only land in the snapshot. Skipping the init write
+    /// transaction in that case preserves the "no writes touch this
+    /// file" invariant, and stamping `read_only = true` makes every
+    /// mutating method return a clear error to the caller.
+    /// What: Identical to `open` except it skips the schema-touch write
+    /// txn when `read_only` is true and sets the `read_only` flag.
+    /// Test: `vector_writes_rejected_on_snapshot` (in `vector.rs`).
+    pub fn open_with_mode(db: Arc<Database>, dim: usize, read_only: bool) -> Result<Self> {
         // Touch the tables in a write txn so a brand-new redb file carries
         // them. redb only persists a table after it is opened for write at
-        // least once.
-        {
+        // least once. In read-only mode we skip this — the snapshot copy
+        // we hold was made from a fully-initialised live file, so the
+        // tables already exist.
+        if !read_only {
             let wtx = db.begin_write()?;
             {
                 let _ = wtx.open_table(VECTORS)?;
@@ -241,7 +278,20 @@ impl HnswStore {
             index: Arc::new(RwLock::new(index)),
             dim,
             next_id: AtomicU64::new(max_seen.saturating_add(1)),
+            read_only,
         })
+    }
+
+    /// Whether this store rejects writes (i.e. it was opened against a
+    /// snapshot of a file locked by another process).
+    ///
+    /// Why: Issue #59 — `UsearchStore` and ultimately `PalaceHandle`
+    /// surface this through to the MCP layer so write tools can produce a
+    /// meaningful error instead of a redb traceback.
+    /// What: Returns the value of the `read_only` flag.
+    /// Test: `vector_writes_rejected_on_snapshot` (in `vector.rs`).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Insert a (uuid, vector) row, returning the assigned vector_id.
@@ -263,6 +313,9 @@ impl HnswStore {
     /// in-memory graph.
     /// Test: `upsert_and_search_round_trips`.
     pub fn upsert(&self, uuid: &str, vector: &[f32]) -> Result<u64> {
+        if self.read_only {
+            return Err(HnswStoreError::ReadOnly);
+        }
         if vector.len() != self.dim {
             return Err(HnswStoreError::DimensionMismatch {
                 expected: self.dim,
@@ -378,6 +431,9 @@ impl HnswStore {
     /// known. The vector row itself stays in `VECTORS` until compaction.
     /// Test: `delete_filters_results`.
     pub fn delete(&self, uuid: &str) -> Result<bool> {
+        if self.read_only {
+            return Err(HnswStoreError::ReadOnly);
+        }
         let wtx = self.db.begin_write()?;
         let removed;
         {
@@ -462,6 +518,9 @@ impl HnswStore {
     /// Returns the number of `VECTORS` rows removed.
     /// Test: `compact_orphans_removes_dangling`.
     pub fn compact_orphans(&self) -> Result<usize> {
+        if self.read_only {
+            return Err(HnswStoreError::ReadOnly);
+        }
         // Snapshot live ids and tombstoned ids in a read txn first to
         // avoid holding the write txn over a large scan.
         let (live_ids, tombstoned_ids): (std::collections::HashSet<u64>, Vec<u64>) = {

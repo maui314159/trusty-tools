@@ -10920,6 +10920,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "mime_guess",
+ "redb",
  "reqwest 0.12.28",
  "rust-embed",
  "serde",
