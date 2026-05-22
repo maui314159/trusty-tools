@@ -75,6 +75,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/palaces/{id}/recall", get(recall_handler))
         .route("/api/v1/recall", get(recall_all_handler))
         .route("/api/v1/palaces/{id}/kg", get(kg_query).post(kg_assert))
+        .route("/api/v1/palaces/{id}/kg/subjects", get(kg_list_subjects))
+        .route("/api/v1/palaces/{id}/kg/all", get(kg_list_all))
+        .route("/api/v1/palaces/{id}/kg/count", get(kg_count))
         .route(
             "/api/v1/palaces/{id}/dream/status",
             get(palace_dream_status),
@@ -754,6 +757,112 @@ async fn kg_assert(
         .await
         .map_err(|e| ApiError::internal(format!("kg assert: {e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Default page size for KG explorer list endpoints when caller omits `limit`.
+///
+/// Why: 50 is large enough to feel responsive in the SPA without dumping a
+/// full graph in one request; matches the default the spec calls for.
+const DEFAULT_KG_LIST_LIMIT: usize = 50;
+
+/// Hard ceiling on `limit` for KG explorer list endpoints.
+///
+/// Why: prevent a misconfigured client from asking the daemon to materialize
+/// thousands of rows in one go; matches the spec's max=200.
+const MAX_KG_LIST_LIMIT: usize = 200;
+
+fn default_kg_list_limit() -> usize {
+    DEFAULT_KG_LIST_LIMIT
+}
+
+/// Query parameters for `GET /api/v1/palaces/{id}/kg/subjects`.
+///
+/// Why: The KG Explorer's left panel asks for a bounded subject list; `limit`
+/// is clamped server-side so the SPA cannot accidentally pull the whole graph.
+/// What: `limit` defaults to [`DEFAULT_KG_LIST_LIMIT`] and is clamped to
+/// `[1, MAX_KG_LIST_LIMIT]` in the handler.
+/// Test: indirectly by the KG explorer UI; `kg_list_subjects_returns_distinct`
+/// in the web tests below covers the happy path.
+#[derive(Deserialize)]
+struct KgListSubjectsParams {
+    #[serde(default = "default_kg_list_limit")]
+    limit: usize,
+}
+
+/// `GET /api/v1/palaces/{id}/kg/subjects?limit=N` — list distinct active
+/// subjects.
+///
+/// Why: The KG Explorer needs to browse subjects without a prior query (the
+/// existing `kg_query` endpoint requires one). Surfacing this read on the
+/// daemon avoids the SPA having to know how to issue SQL.
+/// What: clamps `limit` to `[1, MAX_KG_LIST_LIMIT]` and delegates to
+/// `KnowledgeGraph::list_subjects`. Returns a JSON array of strings.
+/// Test: `kg_list_subjects_returns_distinct` (web tests).
+async fn kg_list_subjects(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<KgListSubjectsParams>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let handle = open_handle(&state, &id)?;
+    let limit = q.limit.clamp(1, MAX_KG_LIST_LIMIT);
+    let subjects = handle
+        .kg
+        .list_subjects(limit)
+        .map_err(|e| ApiError::internal(format!("kg list_subjects: {e:#}")))?;
+    Ok(Json(subjects))
+}
+
+/// Query parameters for `GET /api/v1/palaces/{id}/kg/all`.
+///
+/// Why: The KG Explorer's "All" mode pages through every active triple;
+/// `limit`+`offset` give the SPA stable prev/next controls.
+/// What: defaults match `kg_list_subjects` for limit; `offset` defaults to 0.
+/// Test: `kg_list_all_returns_paginated_triples` (web tests).
+#[derive(Deserialize)]
+struct KgListAllParams {
+    #[serde(default = "default_kg_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+/// `GET /api/v1/palaces/{id}/kg/all?limit=N&offset=N` — list all active
+/// triples ordered by `valid_from` descending.
+///
+/// Why: The KG Explorer's "All" mode wants a paged view across every active
+/// triple regardless of subject. The existing `kg_query` requires a subject.
+/// What: clamps `limit` to `[1, MAX_KG_LIST_LIMIT]` and delegates to
+/// `KnowledgeGraph::list_active`. Returns a JSON array of `Triple` objects.
+/// Test: `kg_list_all_returns_paginated_triples` (web tests).
+async fn kg_list_all(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<KgListAllParams>,
+) -> Result<Json<Vec<Triple>>, ApiError> {
+    let handle = open_handle(&state, &id)?;
+    let limit = q.limit.clamp(1, MAX_KG_LIST_LIMIT);
+    let triples = handle
+        .kg
+        .list_active(limit, q.offset)
+        .await
+        .map_err(|e| ApiError::internal(format!("kg list_active: {e:#}")))?;
+    Ok(Json(triples))
+}
+
+/// `GET /api/v1/palaces/{id}/kg/count` — count of currently-active triples.
+///
+/// Why: The KG Explorer header shows a quick "N triples" badge; computing the
+/// count server-side avoids fetching every triple to count them.
+/// What: returns `{ "active": N }` where N is `count_active_triples()` on the
+/// palace's KG.
+/// Test: indirectly via the same palace counts surfaced on `/api/v1/status`.
+async fn kg_count(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let handle = open_handle(&state, &id)?;
+    let active = handle.kg.count_active_triples();
+    Ok(Json(json!({ "active": active })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2700,6 +2809,139 @@ mod tests {
             v["last_run_at"].is_string(),
             "last_run_at must be set by dream_run; got {v}"
         );
+    }
+
+    /// Why: The KG Explorer UI calls `/api/v1/palaces/{id}/kg/subjects` to
+    /// populate the left panel; the endpoint must return distinct active
+    /// subjects as a JSON string array.
+    /// What: Creates a palace, asserts two triples via the existing kg endpoint,
+    /// then GETs the subjects route and asserts the shape.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn kg_list_subjects_returns_distinct() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+
+        // Create palace.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "kg-list"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Assert two triples on distinct subjects.
+        for subj in ["alpha", "beta"] {
+            let body = json!({
+                "subject": subj,
+                "predicate": "is",
+                "object": "thing",
+            })
+            .to_string();
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/palaces/kg-list/kg")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/kg-list/kg/subjects?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("subjects must be array");
+        let subjects: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+        assert_eq!(subjects, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// Why: KG Explorer's "All" mode pages through every active triple via
+    /// `/api/v1/palaces/{id}/kg/all`; the endpoint must return a JSON array of
+    /// `Triple` rows ordered by `valid_from` DESC.
+    /// What: Creates a palace, asserts a triple, then GETs the all route and
+    /// asserts the response is an array with the expected shape.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn kg_list_all_returns_paginated_triples() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "kg-all"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = json!({
+            "subject": "alpha",
+            "predicate": "is",
+            "object": "thing",
+        })
+        .to_string();
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces/kg-all/kg")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/kg-all/kg/all?limit=10&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("triples must be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["subject"], "alpha");
+        assert_eq!(arr[0]["predicate"], "is");
+        assert_eq!(arr[0]["object"], "thing");
     }
 
     #[tokio::test]

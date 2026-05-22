@@ -13,6 +13,7 @@
   const links = [
     { path: '/', label: 'Health', icon: '♥' },
     { path: '/palaces', label: 'Palaces', icon: '▤' },
+    { path: '/kg', label: 'KG', icon: '⌬' },
     { path: '/logs', label: 'Logs', icon: '☰' },
     { path: '/dream', label: 'Dream', icon: '☾' }
   ];

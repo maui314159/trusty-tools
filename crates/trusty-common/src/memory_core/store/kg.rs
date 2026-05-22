@@ -250,6 +250,112 @@ impl KnowledgeGraph {
         Ok(triples)
     }
 
+    /// List up to `limit` distinct subjects that have at least one active triple.
+    ///
+    /// Why: The KG Explorer UI needs to browse subjects without knowing one
+    /// upfront — `query_active` requires a subject string, so absent a list
+    /// endpoint there is no way to discover what subjects exist. Returning
+    /// only subjects with at least one currently-active triple keeps the
+    /// explorer focused on "live" facts (matching the partial index).
+    /// What: synchronous `SELECT DISTINCT subject ... WHERE valid_to IS NULL`
+    /// against the `triples` table, capped by `limit`, ordered alphabetically
+    /// for stable presentation.
+    /// Test: `list_subjects_returns_distinct_active_subjects`.
+    pub fn list_subjects(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT subject FROM triples
+                   WHERE valid_to IS NULL
+                   ORDER BY subject
+                   LIMIT ?1",
+            )
+            .context("failed to prepare list_subjects statement")?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .context("failed to query subjects")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("failed to read subject row")?);
+        }
+        Ok(out)
+    }
+
+    /// List up to `limit` active triples ordered by `valid_from` descending,
+    /// skipping the first `offset` rows.
+    ///
+    /// Why: The KG Explorer UI shows an "All" mode that pages through every
+    /// currently-active triple, regardless of subject. Reusing `query_active`
+    /// would require iterating subjects client-side; this endpoint serves the
+    /// table directly with a single SQL scan.
+    /// What: `SELECT ... WHERE valid_to IS NULL ORDER BY valid_from DESC` with
+    /// LIMIT/OFFSET. Rows are mapped to `Triple` exactly as in `query_active`.
+    /// Test: `list_active_returns_ordered_window`.
+    pub async fn list_active(&self, limit: usize, offset: usize) -> Result<Vec<Triple>> {
+        let pool = self.pool.clone();
+        let triples = tokio::task::spawn_blocking(move || -> Result<Vec<Triple>> {
+            let conn = pool.get().context("failed to get sqlite connection")?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT subject, predicate, object, valid_from, valid_to,
+                            confidence, provenance
+                       FROM triples
+                       WHERE valid_to IS NULL
+                       ORDER BY valid_from DESC
+                       LIMIT ?1 OFFSET ?2",
+                )
+                .context("failed to prepare list_active statement")?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![limit as i64, offset as i64], |row| {
+                    let valid_from: String = row.get(3)?;
+                    let valid_to: Option<String> = row.get(4)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        valid_from,
+                        valid_to,
+                        row.get::<_, f64>(5)? as f32,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .context("failed to query active triples")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (subject, predicate, object, vf, vt, confidence, provenance) =
+                    row.context("failed to read triple row")?;
+                let valid_from = DateTime::parse_from_rfc3339(&vf)
+                    .context("invalid valid_from datetime")?
+                    .with_timezone(&Utc);
+                let valid_to = match vt {
+                    Some(s) => Some(
+                        DateTime::parse_from_rfc3339(&s)
+                            .context("invalid valid_to datetime")?
+                            .with_timezone(&Utc),
+                    ),
+                    None => None,
+                };
+                out.push(Triple {
+                    subject,
+                    predicate,
+                    object,
+                    valid_from,
+                    valid_to,
+                    confidence,
+                    provenance,
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .context("list_active spawn_blocking join error")??;
+        Ok(triples)
+    }
+
     /// Count currently active triples (where `valid_to IS NULL`).
     ///
     /// Why: The admin dashboard needs a per-palace tally of "live" facts in
@@ -658,6 +764,103 @@ mod tests {
             done >= 0,
             "checkpointed_pages must be non-negative, got {done}"
         );
+    }
+
+    /// Why: KG Explorer UI calls `list_subjects` to populate the left panel
+    /// without prior knowledge of subjects in the graph; only currently-active
+    /// (valid_to IS NULL) subjects should appear, each only once.
+    /// What: Assert two triples on different subjects plus one that supersedes
+    /// (closes) a prior subject's interval — list_subjects must return the
+    /// distinct set of subjects that still have at least one active row.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn list_subjects_returns_distinct_active_subjects() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        assert!(kg.list_subjects(50).unwrap().is_empty());
+
+        kg.assert(Triple {
+            subject: "bob".into(),
+            predicate: "knows".into(),
+            object: "alice".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+        kg.assert(Triple {
+            subject: "alice".into(),
+            predicate: "knows".into(),
+            object: "bob".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+        // Second assertion on same (subject, predicate) closes the first —
+        // still leaves one active row for "alice", so distinct count stays 2.
+        kg.assert(Triple {
+            subject: "alice".into(),
+            predicate: "knows".into(),
+            object: "carol".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+
+        let subjects = kg.list_subjects(50).unwrap();
+        assert_eq!(subjects, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    /// Why: KG Explorer's "All" mode pages through every active triple in
+    /// `valid_from DESC` order; the limit/offset window must cooperate with
+    /// the ORDER BY so prev/next paging is stable.
+    /// What: Assert three triples in order, then read them back with
+    /// `list_active` using a window of 2 starting at offset 1 — must return
+    /// the second-newest and the oldest, in that order.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn list_active_returns_ordered_window() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+
+        // Use distinct (subject, predicate) so none supersede each other and
+        // we keep three active rows. valid_from is "now" but the AUTOINCREMENT
+        // primary key (plus RFC3339 string ordering at 1s granularity) means
+        // we must space them out enough for ORDER BY valid_from DESC to be
+        // deterministic.
+        for i in 0..3 {
+            kg.assert(Triple {
+                subject: format!("subj-{i}"),
+                predicate: "rel".into(),
+                object: format!("obj-{i}"),
+                valid_from: Utc::now() + chrono::Duration::milliseconds(i * 10),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let all = kg.list_active(10, 0).await.unwrap();
+        assert_eq!(all.len(), 3);
+        // Newest first (i=2 was inserted with the latest valid_from).
+        assert_eq!(all[0].subject, "subj-2");
+        assert_eq!(all[2].subject, "subj-0");
+
+        // Window of size 2 starting at offset 1 → second-newest and oldest.
+        let window = kg.list_active(2, 1).await.unwrap();
+        assert_eq!(window.len(), 2);
+        assert_eq!(window[0].subject, "subj-1");
+        assert_eq!(window[1].subject, "subj-0");
     }
 
     #[tokio::test]

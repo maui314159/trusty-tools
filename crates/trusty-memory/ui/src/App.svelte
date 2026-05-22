@@ -11,10 +11,12 @@
    */
   import Sidebar from './lib/components/Sidebar.svelte';
   import Topbar from './lib/components/Topbar.svelte';
+  import ActivityFeed from './lib/components/ActivityFeed.svelte';
   import Health from './lib/views/Health.svelte';
   import Palaces from './lib/views/Palaces.svelte';
   import Logs from './lib/views/Logs.svelte';
   import Dream from './lib/views/Dream.svelte';
+  import KG from './lib/views/KG.svelte';
   import { getRoute } from './lib/router.svelte.js';
   import { refreshHealth, refreshStatus } from './lib/state.svelte.js';
   import { onMount } from 'svelte';
@@ -39,6 +41,7 @@
     const segs = route.segments;
     if (segs.length === 0) return { kind: 'health' };
     if (segs[0] === 'palaces' || segs[0] === 'palace') return { kind: 'palaces' };
+    if (segs[0] === 'kg') return { kind: 'kg' };
     if (segs[0] === 'logs') return { kind: 'logs' };
     if (segs[0] === 'dream') return { kind: 'dream' };
     if (segs[0] === 'health') return { kind: 'health' };
@@ -70,11 +73,14 @@
         <Palaces />
       {:else if view.kind === 'logs'}
         <Logs />
+      {:else if view.kind === 'kg'}
+        <KG />
       {:else if view.kind === 'dream'}
         <Dream />
       {/if}
     </div>
   </div>
+  <ActivityFeed />
 </div>
 
 <style>
@@ -87,6 +93,8 @@
     display: flex;
     flex-direction: column;
     margin-left: var(--trusty-sidebar-width);
+    /* Reserve space for the fixed-position ActivityFeed on the right. */
+    margin-right: 320px;
     min-width: 0;
   }
   .content {

@@ -70,5 +70,35 @@ export const api = {
   dreamRun: () => request('/api/v1/dream/run', { method: 'POST' }),
 
   /** Request a graceful daemon shutdown. */
-  stopDaemon: () => request('/api/v1/admin/stop', { method: 'POST' })
+  stopDaemon: () => request('/api/v1/admin/stop', { method: 'POST' }),
+
+  /**
+   * List distinct active subjects in a palace's knowledge graph.
+   * Why: KG Explorer left panel — caller doesn't know subjects up front.
+   */
+  kgListSubjects: (id, limit = 50) =>
+    request(
+      `/api/v1/palaces/${encodeURIComponent(id)}/kg/subjects?limit=${encodeURIComponent(limit)}`
+    ),
+
+  /**
+   * List active triples in a palace's KG, paginated by `valid_from DESC`.
+   * Why: KG Explorer "All" mode — table view without a subject filter.
+   */
+  kgListAll: (id, { limit = 50, offset = 0 } = {}) =>
+    request(
+      `/api/v1/palaces/${encodeURIComponent(id)}/kg/all?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`
+    ),
+
+  /**
+   * Query triples by subject within a single palace.
+   * Why: KG Explorer right panel when a subject is selected.
+   */
+  kgQuery: (id, subject) =>
+    request(
+      `/api/v1/palaces/${encodeURIComponent(id)}/kg?subject=${encodeURIComponent(subject)}`
+    ),
+
+  /** Count of currently-active triples for a palace. */
+  kgCount: (id) => request(`/api/v1/palaces/${encodeURIComponent(id)}/kg/count`)
 };
