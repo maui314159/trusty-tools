@@ -86,6 +86,11 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Storage / KG / embeddings (trusty-memory-core).
 usearch = "2.25"
+# Pure-Rust HNSW (issue #50). The `serde` feature does not exist on
+# hnsw_rs 0.3 — vectors are persisted in redb (postcard-encoded) and the
+# in-memory Hnsw index is rebuilt on palace open, so direct serde of the
+# Hnsw struct is unnecessary.
+hnsw_rs = "0.3"
 # Align with trusty-memory upstream (rusqlite 0.39, bundled libsqlite3).
 rusqlite = { version = "0.39", features = ["bundled"] }
 r2d2 = "0.8"
@@ -120,6 +125,15 @@ hmac = "0.12"
 hex = "0.4"
 ort = "2.0.0-rc.10"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# Candle: optional Metal/CPU BERT backend (issue #54). Versions match the
+# pre-existing pins in `trusty-search` so both consumers resolve to a single
+# version. The deps are listed here so the shared embedder in
+# `trusty-common` (behind `embedder-candle`) and the `trusty-search`
+# in-crate path can pull from the same workspace entry.
+candle-core = { version = "0.8", default-features = false }
+candle-nn = { version = "0.8", default-features = false }
+candle-transformers = { version = "0.8", default-features = false }
+hf-hub = { version = "0.3", default-features = false, features = ["online", "tokio"] }
 http-body-util = "0.1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"

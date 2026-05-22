@@ -26,6 +26,10 @@ cuda = ["trusty-common/embedder-cuda"]
 load-dynamic = ["trusty-common/embedder-load-dynamic"]
 coreml = ["trusty-common/embedder-coreml"]
 test-support = ["trusty-common/embedder-test-support"]
+# Issue #54: opt-in Candle BERT backend (all-MiniLM-L6-v2) on Metal/CPU.
+# Forwards to `trusty-common/embedder-candle`. Not default — operators must
+# enable it explicitly with `--features candle`.
+candle = ["trusty-common/embedder-candle"]
 
 [dependencies]
 trusty-common = { workspace = true, features = ["embedder"] }

@@ -40,6 +40,15 @@ uuid = { workspace = true, optional = true }
 fastembed = { workspace = true, features = ["hf-hub-native-tls"], optional = true }
 lru = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
+# Optional: enabled by the `embedder-candle` feature (issue #54). Candle is
+# an opt-in alternative BERT backend (all-MiniLM-L6-v2) running on Metal or
+# CPU, bypassing the ONNX/CoreML jetsam-kill risk on Apple Silicon. Default
+# builds keep the fastembed/ORT path unchanged.
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
 
 # Optional: enabled by the `monitor-tui` feature (formerly the
 # `trusty-monitor-tui` crate). ratatui + crossterm power the unified
@@ -80,6 +89,7 @@ genco = { version = "0.19", optional = true }
 # the feature so downstream crates that only want chat / mcp / symgraph
 # pay zero cost.
 usearch = { workspace = true, optional = true }
+hnsw_rs = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 r2d2 = { workspace = true, optional = true }
 r2d2_sqlite = { workspace = true, optional = true }
@@ -158,6 +168,21 @@ embedder-coreml = ["embedder"]
 # Exposes the `MockEmbedder` test double outside `cfg(test)` so downstream
 # integration tests can reuse it.
 embedder-test-support = ["embedder"]
+# Issue #54: opt-in Candle BERT backend (all-MiniLM-L6-v2 on Metal/CPU). Does
+# NOT replace the fastembed/ORT default — operators select it at runtime via
+# `TRUSTY_EMBEDDER=candle` on builds that compiled this feature in. The
+# CandleEmbedder lives in `embedder::candle_embedder` behind a `#[cfg]` gate.
+embedder-candle = [
+    "embedder",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:hf-hub",
+    "dep:tokenizers",
+    # `thiserror` is otherwise gated on the `symgraph` feature; the candle
+    # embedder uses it for `CandleEmbedderError`, so we pull it in here.
+    "dep:thiserror",
+]
 # Enables the `symgraph` module's contracts surface (formerly the
 # `trusty-symgraph` crate's default surface): pure data types
 # (`EntityType` / `RawEntity` / `EdgeKind` / `fact_hash_str` / tables).
@@ -210,6 +235,7 @@ symgraph-server = ["symgraph-parser", "axum-server"]
 # `sqlite-kg` feature still pulls them in for the legacy migration helpers.
 memory-core = [
     "dep:usearch",
+    "dep:hnsw_rs",
     "dep:git2",
     "dep:dashmap",
     "dep:futures",

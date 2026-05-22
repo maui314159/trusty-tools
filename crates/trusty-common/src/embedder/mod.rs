@@ -25,6 +25,14 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use lru::LruCache;
 use parking_lot::Mutex;
 
+// Issue #54: opt-in Candle BERT backend. Lives in its own submodule behind
+// the `embedder-candle` feature so the default fastembed/ORT build never
+// pays the candle compile cost.
+#[cfg(feature = "embedder-candle")]
+pub mod candle_embedder;
+#[cfg(feature = "embedder-candle")]
+pub use candle_embedder::{CandleEmbedder, CandleEmbedderError};
+
 /// Output dimension of the all-MiniLM-L6-v2 model.
 ///
 /// Note: we now load the INT8-quantised variant (`AllMiniLML6V2Q`) which
