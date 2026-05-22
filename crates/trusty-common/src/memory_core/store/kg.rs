@@ -67,8 +67,18 @@ impl KnowledgeGraph {
     /// path also succeeds (idempotent migrations).
     pub fn open(path: &Path) -> Result<Self> {
         let manager = SqliteConnectionManager::file(path);
+        // Why: r2d2's default `connection_timeout` is 30s. When a palace's
+        // `kg.db` is unopenable (corrupt, stale WAL sidecars, permissions),
+        // `Pool::builder().build()` blocks for the full 30s before returning
+        // an error — multiply that by N broken palaces at daemon startup and
+        // the HTTP server takes tens of minutes to bind (issue: trusty-memory
+        // stuck-startup on stale WAL). A 2-second timeout fails fast: healthy
+        // palaces open in milliseconds and never come near the ceiling, while
+        // broken palaces bail quickly so per-palace skipping in
+        // `load_palaces_from_disk` can move on to the next one.
         let pool = Pool::builder()
             .max_size(8)
+            .connection_timeout(std::time::Duration::from_secs(2))
             .build(manager)
             .context("failed to build sqlite connection pool")?;
 

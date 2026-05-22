@@ -234,7 +234,9 @@ impl AppState {
         // blocking pool so it never parks an async worker thread.
         let count = tokio::task::spawn_blocking(move || -> Result<usize> {
             let palaces = PalaceRegistry::list_palaces(&registry_dir)?;
+            let total = palaces.len();
             let mut loaded = 0usize;
+            let mut skipped = 0usize;
             for palace in palaces {
                 match trusty_common::memory_core::PalaceHandle::open(&palace) {
                     Ok(handle) => {
@@ -247,13 +249,23 @@ impl AppState {
                         loaded += 1;
                     }
                     Err(e) => {
+                        // Why: a single bad palace (corrupt kg.db, stale WAL,
+                        // permissions) must never abort startup or block the
+                        // HTTP server from binding. Log per-palace and keep
+                        // going; the summary below tells operators how many
+                        // were skipped without trawling the log.
                         tracing::warn!(
                             palace = %palace.id,
+                            data_dir = %palace.data_dir.display(),
                             "skipping palace during startup hydration: {e:#}"
                         );
+                        skipped += 1;
                     }
                 }
             }
+            tracing::info!(
+                "palace hydration summary: loaded {loaded}/{total} ({skipped} skipped due to errors)"
+            );
             Ok(loaded)
         })
         .await

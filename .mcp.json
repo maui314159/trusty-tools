@@ -14,6 +14,16 @@
         "daemon",
         "--mcp"
       ]
+    },
+    "trusty-memory": {
+      "type": "stdio",
+      "command": "trusty-memory",
+      "args": [
+        "serve",
+        "--mcp",
+        "--palace",
+        "trusty-tools"
+      ]
     }
   }
 }

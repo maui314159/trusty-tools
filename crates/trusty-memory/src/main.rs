@@ -223,12 +223,38 @@ async fn run_serve(
         let state = AppState::new(data_root)
             .with_default_palace(palace)
             .with_log_buffer(log_buffer);
-        // Re-hydrate every on-disk palace before serving so the dashboard and
-        // `palace_list` see the full set immediately after a restart. Without
-        // this the registry starts empty and palaces "disappear" until a tool
-        // call lazily re-opens them one at a time.
-        let count = state.load_palaces_from_disk().await?;
-        tracing::info!("Loaded {count} palaces from disk");
+        // Why: previously, `load_palaces_from_disk` was awaited synchronously
+        // before binding the HTTP listener. A single broken `kg.db` (stale
+        // WAL sidecar, corrupt file, permissions) could stall hydration for
+        // seconds per palace, deferring `/health` becoming reachable until
+        // every palace had been visited. The dashboard, MCP clients, and
+        // `launchctl` health-probes all interpret that as "the daemon is
+        // dead", so the launchd job thrashes and operators see no useful
+        // output. Spawning hydration as a background task lets the HTTP
+        // server bind immediately; palaces appear in `palace_list` and the
+        // dashboard as each one finishes opening. Per-palace failures are
+        // already logged and skipped inside `load_palaces_from_disk` so a
+        // single bad `kg.db` can never abort the daemon.
+        // What: `AppState` derives `Clone` (its internals are `Arc`-wrapped),
+        // so the background task gets a cheap clone that shares the same
+        // registry the serving state writes into. We log start, summary, and
+        // total elapsed time so operators can see the warmup completing in
+        // the daemon log.
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            tracing::info!("starting background palace hydration");
+            match bg_state.load_palaces_from_disk().await {
+                Ok(count) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "background palace hydration complete: {count} palaces loaded"
+                ),
+                Err(e) => tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "background palace hydration failed: {e:#}"
+                ),
+            }
+        });
         run_http(state, addr).await
     } else {
         let state = AppState::new(data_root).with_default_palace(palace);
