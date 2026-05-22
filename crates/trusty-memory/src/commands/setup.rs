@@ -59,6 +59,13 @@ pub fn handle_setup() -> Result<()> {
     // Phase 2: launchd (macOS only).
     install_service_phase()?;
 
+    // Phase 2b: pre-warm the embedder model cache. This downloads ~22 MB
+    // of ONNX into `$HOME/.cache/fastembed` before launchd ever starts the
+    // daemon, so the first `memory_recall` request does not have to wait
+    // for (and the read-only `TMPDIR` does not silently break) the model
+    // retrieval (GH #58).
+    prewarm_embedder_phase();
+
     // Phase 3: Claude settings patching.
     let patched = patch_claude_settings_phase()?;
 
@@ -139,6 +146,83 @@ fn install_service_phase() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Pre-warm the fastembed ONNX model cache before launchd ever starts the
+/// daemon.
+///
+/// Why: GH #58 — under launchd, `TMPDIR` is mounted read-only for the
+/// agent's UID, so fastembed's first `TextEmbedding::try_new` fails with
+/// `EROFS (os error 30)` and the HTTP daemon never becomes ready. Even
+/// with `FASTEMBED_CACHE_DIR` correctly set in the plist, downloading the
+/// ~22 MB model on the daemon's first request introduces latency and
+/// failure modes (network blips, slow ANE compile). Pre-warming during
+/// `setup` — which runs in the user's normal shell with full network and
+/// HOME access — moves both the download and the ONNX session warmup
+/// off the daemon's critical path and surfaces failures up-front where the
+/// user can act on them.
+/// What: explicitly sets `FASTEMBED_CACHE_DIR` to `$HOME/.cache/fastembed`
+/// (the same path the launchd plist will use), then spins up a single-
+/// threaded tokio runtime to drive `FastEmbedder::new()`. Failures are
+/// reported as warnings — they do not abort `setup` because the daemon
+/// will retry on its own startup, but a successful pre-warm is the
+/// difference between "instant first recall" and "users see EROFS errors".
+/// Test: side-effecting (network + filesystem); covered manually via
+/// `cargo run -p trusty-memory -- setup`.
+fn prewarm_embedder_phase() {
+    let cache_dir = trusty_common::embedder::resolve_fastembed_cache_dir();
+    // SAFETY: setup runs single-threaded before any worker spawns.
+    unsafe {
+        std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
+    }
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        eprintln!(
+            "  {} could not create {} ({e}) — daemon will retry on first request.",
+            "·".dimmed(),
+            cache_dir.display()
+        );
+        return;
+    }
+
+    println!(
+        "\n{} Pre-warming embedder model cache at {}…",
+        "·".dimmed(),
+        cache_dir.display()
+    );
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!(
+                "  {} could not build tokio runtime for pre-warm ({e}); skipping.",
+                "·".dimmed()
+            );
+            return;
+        }
+    };
+
+    match rt.block_on(trusty_common::embedder::FastEmbedder::new()) {
+        Ok(_e) => {
+            println!(
+                "{} Embedder model cached. First recall after daemon start will be instant.",
+                "✓".green()
+            );
+        }
+        Err(e) => {
+            // Non-fatal: daemon will retry on its own. Surface the error
+            // loudly so the operator can intervene (e.g. fix offline
+            // proxy, free disk space) before launchd hits the same wall.
+            eprintln!(
+                "  {} pre-warm failed ({e}). The daemon will retry on first request — \
+                 if this persists, inspect {} for partial downloads.",
+                "✗".red(),
+                cache_dir.display()
+            );
+        }
+    }
 }
 
 /// Patch every discovered Claude settings file (or fall back to

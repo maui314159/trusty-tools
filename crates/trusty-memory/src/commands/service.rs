@@ -104,8 +104,13 @@ pub(crate) fn launchd_log_dir() -> Result<std::path::PathBuf> {
 /// `launchctl` glue.
 /// What: assembles a [`trusty_common::launchd::LaunchdConfig`] pointing at
 /// the current binary with `serve` as the single argument; uses
-/// `KeepAlive::OnSuccess` so a clean shutdown does not crash-loop.
-/// Test: exercised via `service install` and `service start`.
+/// `KeepAlive::OnSuccess` so a clean shutdown does not crash-loop. Also
+/// injects `FASTEMBED_CACHE_DIR=$HOME/.cache/fastembed` so the embedder
+/// model download does not try to write into launchd's read-only sandbox
+/// `TMPDIR` (GH #58).
+/// Test: `build_launchd_config_sets_fastembed_cache_dir` asserts the env
+/// var is wired in. End-to-end exercised via `service install` /
+/// `service start`.
 #[cfg(target_os = "macos")]
 pub(crate) fn build_launchd_config(
     exe: std::path::PathBuf,
@@ -119,8 +124,35 @@ pub(crate) fn build_launchd_config(
         log_dir,
         keep_alive: KeepAlive::OnSuccess,
         throttle_interval: 10,
-        env_vars: vec![],
+        env_vars: fastembed_env_vars(),
     }
+}
+
+/// Build the env var list embedded into the LaunchAgent plist.
+///
+/// Why: launchd's per-agent `TMPDIR` is a sandboxed `/var/folders/.../T/`
+/// path that is **read-only** for the agent's UID. fastembed's default
+/// model retrieval path is derived from that `TMPDIR`, so the first
+/// `TextEmbedding::try_new` call fails with `EROFS (os error 30)` and the
+/// daemon never reaches a ready state (GH #58). Pinning
+/// `FASTEMBED_CACHE_DIR` to a writable user-owned directory in the plist
+/// solves the problem for every daemon start.
+/// What: returns `[("FASTEMBED_CACHE_DIR", "$HOME/.cache/fastembed")]`,
+/// expanding `$HOME` from the install-time user. If `HOME` is unset (very
+/// unusual), returns an empty list — `resolve_fastembed_cache_dir` will
+/// then fall back to its own logic at daemon startup.
+/// Test: `build_launchd_config_sets_fastembed_cache_dir` covers the happy
+/// path.
+#[cfg(target_os = "macos")]
+fn fastembed_env_vars() -> Vec<(String, String)> {
+    if let Some(home) = dirs::home_dir() {
+        let cache = home.join(".cache").join("fastembed");
+        return vec![(
+            "FASTEMBED_CACHE_DIR".to_string(),
+            cache.to_string_lossy().into_owned(),
+        )];
+    }
+    Vec::new()
 }
 
 #[cfg(target_os = "macos")]
@@ -300,6 +332,48 @@ mod tests {
         assert_eq!(cfg.args, vec!["serve".to_string()]);
         assert_eq!(cfg.keep_alive, KeepAlive::OnSuccess);
         assert_eq!(cfg.throttle_interval, 10);
-        assert!(cfg.env_vars.is_empty());
+        // env_vars is allowed to be empty only on hosts without a HOME
+        // (extremely rare); on developer/CI machines HOME is always set
+        // and FASTEMBED_CACHE_DIR must be wired in.
+        if dirs::home_dir().is_some() {
+            assert!(
+                cfg.env_vars.iter().any(|(k, _)| k == "FASTEMBED_CACHE_DIR"),
+                "FASTEMBED_CACHE_DIR must be present in the LaunchAgent plist (GH #58)"
+            );
+        }
+    }
+
+    /// Why: GH #58 — launchd's read-only `TMPDIR` breaks fastembed's first
+    /// model download. The plist installer is the single source of truth
+    /// for the daemon's runtime environment, so the env var must be set
+    /// there. Asserting on `build_launchd_config` (not just
+    /// `fastembed_env_vars`) catches regressions where someone strips the
+    /// env list when refactoring the config builder.
+    /// What: builds the config with dummy paths and asserts the env var is
+    /// present and points under `$HOME/.cache/fastembed`.
+    /// Test: pure construction, no fs side effects.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_launchd_config_sets_fastembed_cache_dir() {
+        use std::path::PathBuf;
+
+        let cfg = build_launchd_config(
+            PathBuf::from("/usr/local/bin/trusty-memory"),
+            PathBuf::from("/tmp/trusty-memory/logs"),
+        );
+        if let Some(home) = dirs::home_dir() {
+            let expected = home
+                .join(".cache")
+                .join("fastembed")
+                .to_string_lossy()
+                .into_owned();
+            let value = cfg
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == "FASTEMBED_CACHE_DIR")
+                .map(|(_, v)| v.clone())
+                .expect("FASTEMBED_CACHE_DIR must be present");
+            assert_eq!(value, expected);
+        }
     }
 }

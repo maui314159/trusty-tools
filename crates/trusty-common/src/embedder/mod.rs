@@ -45,6 +45,50 @@ pub const EMBED_DIM: usize = 384;
 /// cache itself fits well inside L2/L3 on a typical developer machine.
 pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 
+/// Resolve the on-disk cache directory used by fastembed for ONNX model
+/// downloads.
+///
+/// Why: fastembed's default cache path is the process-relative
+/// `./.fastembed_cache`, and when an explicit `FASTEMBED_CACHE_DIR` env var is
+/// not set the library falls back to a `TMPDIR`-derived path during model
+/// retrieval. Under macOS launchd the daemon's `TMPDIR` is a sandboxed
+/// `/var/folders/.../T/` mount that is **read-only** for the agent's UID,
+/// so the very first `TextEmbedding::try_new` call fails with
+/// `EROFS: Read-only file system (os error 30)` and the daemon never
+/// reaches a ready state (GH #58). Surfacing a single resolver lets every
+/// call site (and the launchd plist installer) agree on a writable path.
+/// What: returns the first match in this preference order:
+///   1. `FASTEMBED_CACHE_DIR` — fastembed's own override, honoured natively
+///      by `get_cache_dir()` inside the crate.
+///   2. `FASTEMBED_CACHE_PATH` — alternative name documented in our launchd
+///      install flow; accepted for forward-compat.
+///   3. `$HOME/.cache/fastembed` — XDG-style fallback that is always
+///      writable under launchd.
+///   4. As a last resort, the system temp dir with a `tracing::warn!`
+///      noting the daemon is likely misconfigured.
+/// Test: `resolve_fastembed_cache_dir_prefers_env_vars` covers (1)–(3).
+pub fn resolve_fastembed_cache_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("FASTEMBED_CACHE_DIR")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p);
+    }
+    if let Ok(p) = std::env::var("FASTEMBED_CACHE_PATH")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p);
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".cache").join("fastembed");
+    }
+    tracing::warn!(
+        "trusty-embedder: neither FASTEMBED_CACHE_DIR nor HOME is set; falling \
+         back to TMPDIR-derived cache. This is the likely cause of EROFS errors \
+         under launchd — set FASTEMBED_CACHE_DIR in the LaunchAgent plist."
+    );
+    std::env::temp_dir().join("fastembed")
+}
+
 /// Identifier for the execution provider an embedder is actually using.
 ///
 /// Why: callers want to log which backend is active (CPU vs CoreML/Metal vs
@@ -191,7 +235,31 @@ impl FastEmbedder {
     fn init_options(model: EmbeddingModel) -> (TextInitOptions, ExecutionProvider) {
         use ort::execution_providers::ExecutionProviderDispatch;
 
-        let opts = TextInitOptions::new(model);
+        // Pin the model cache to a writable, user-scoped directory before
+        // fastembed has a chance to fall back to the process-relative
+        // `./.fastembed_cache` or — worse — a `TMPDIR`-derived path that
+        // launchd has mounted read-only (GH #58).
+        let cache_dir = resolve_fastembed_cache_dir();
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            tracing::warn!(
+                "trusty-embedder: failed to create fastembed cache dir {}: {e}",
+                cache_dir.display()
+            );
+        } else {
+            tracing::info!(
+                "trusty-embedder: fastembed model cache dir = {}",
+                cache_dir.display()
+            );
+        }
+        // Also export FASTEMBED_CACHE_DIR so any internal fastembed call
+        // sites that read the env var directly (e.g. tokenizer/config
+        // fetches) pick up the same path. SAFETY: env mutation happens on
+        // the calling thread before any worker thread is spawned by
+        // fastembed itself.
+        unsafe {
+            std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
+        }
+        let opts = TextInitOptions::new(model).with_cache_dir(cache_dir);
 
         // Always register an explicit CPU EP with the memory arena DISABLED.
         //
@@ -563,6 +631,79 @@ impl Embedder for MockEmbedder {
 mod tests {
     use super::*;
 
+    /// Process-global lock guarding every test in this module that mutates
+    /// the process environment. Tests run in parallel by default, and
+    /// concurrent calls into `setenv`/`getenv` (even on disjoint keys) are
+    /// not safe across libc implementations — Rust 2024 reflects this by
+    /// marking `std::env::set_var` `unsafe`. One shared lock across all
+    /// env-touching tests in this binary is the simplest correct answer.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Why: GH #58 — launchd runs trusty-memory with a read-only `TMPDIR`,
+    /// and fastembed's default `./.fastembed_cache` is also unwritable from
+    /// the agent's working directory. Both env vars (`FASTEMBED_CACHE_DIR`,
+    /// `FASTEMBED_CACHE_PATH`) and the `$HOME/.cache/fastembed` fallback must
+    /// be honoured in that priority order. If the resolver regresses to
+    /// `TMPDIR`, the HTTP daemon will silently fail to initialise embeddings
+    /// for every install.
+    /// What: serialises env mutation, exercises all three layers of the
+    /// preference order, and asserts the resolver returns the expected path
+    /// for each.
+    /// Test: this test.
+    #[test]
+    fn resolve_fastembed_cache_dir_prefers_env_vars() {
+        let _g = ENV_LOCK.lock().unwrap();
+
+        let prev_dir = std::env::var("FASTEMBED_CACHE_DIR").ok();
+        let prev_path = std::env::var("FASTEMBED_CACHE_PATH").ok();
+
+        // SAFETY: serialised under ENV_LOCK; no other thread observes the
+        // mutation. Required because Rust 2024 marks env mutation `unsafe`.
+        unsafe {
+            std::env::set_var("FASTEMBED_CACHE_DIR", "/tmp/fast-dir-test");
+            std::env::remove_var("FASTEMBED_CACHE_PATH");
+        }
+        assert_eq!(
+            resolve_fastembed_cache_dir(),
+            std::path::PathBuf::from("/tmp/fast-dir-test"),
+            "FASTEMBED_CACHE_DIR must win when set"
+        );
+
+        unsafe {
+            std::env::remove_var("FASTEMBED_CACHE_DIR");
+            std::env::set_var("FASTEMBED_CACHE_PATH", "/tmp/fast-path-test");
+        }
+        assert_eq!(
+            resolve_fastembed_cache_dir(),
+            std::path::PathBuf::from("/tmp/fast-path-test"),
+            "FASTEMBED_CACHE_PATH must be honoured when FASTEMBED_CACHE_DIR is unset"
+        );
+
+        unsafe {
+            std::env::remove_var("FASTEMBED_CACHE_DIR");
+            std::env::remove_var("FASTEMBED_CACHE_PATH");
+        }
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                resolve_fastembed_cache_dir(),
+                home.join(".cache").join("fastembed"),
+                "must fall back to $HOME/.cache/fastembed when no env vars set"
+            );
+        }
+
+        // Restore for sibling tests.
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("FASTEMBED_CACHE_DIR", v),
+                None => std::env::remove_var("FASTEMBED_CACHE_DIR"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("FASTEMBED_CACHE_PATH", v),
+                None => std::env::remove_var("FASTEMBED_CACHE_PATH"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mock_embedder_round_trip() {
         let e = MockEmbedder::new(EMBED_DIM);
@@ -622,10 +763,8 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn trusty_device_cpu_disables_coreml_on_apple_silicon() {
-        use std::sync::Mutex;
-        // Serialise env mutation across all tests in this binary that touch
-        // process-global env.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        // Serialise env mutation via the module-level ENV_LOCK so this
+        // test does not race with the resolve_fastembed / CoreML variants.
         let _guard = ENV_LOCK.lock().unwrap();
 
         // SAFETY: test is single-threaded under ENV_LOCK; no other thread
@@ -663,8 +802,6 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn default_apple_silicon_uses_coreml_ane() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let prev_device = std::env::var("TRUSTY_DEVICE").ok();
@@ -702,8 +839,6 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn coreml_compute_units_all_opt_in() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let prev_device = std::env::var("TRUSTY_DEVICE").ok();
