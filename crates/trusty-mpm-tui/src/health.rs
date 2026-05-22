@@ -87,7 +87,8 @@ pub const LOG_BUFFER_CAP: usize = 200;
 /// tabs (`[1]HEALTH [2]LOGS [3]SEARCH`); a typed enum keeps tab-switch and
 /// render dispatch exhaustive.
 /// What: `Health` shows resource gauges + config, `Logs` shows a scrollable
-/// log tail, `Search` shows a query input + results.
+/// log tail, `Search` shows a query input + results, `Index` shows
+/// per-collection stats (graph + communities) for the selected row.
 /// Test: `tab_default_is_health`, `tab_switch_keys_route`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthTab {
@@ -98,6 +99,8 @@ pub enum HealthTab {
     Logs,
     /// The interactive search/recall view.
     Search,
+    /// The per-index stats view (graph + communities for the selected row).
+    Index,
 }
 
 /// One row in the left-panel collections list.
@@ -118,6 +121,48 @@ pub struct CollectionRow {
     pub note: String,
     /// Whether this row currently looks healthy (`true` shows `✓`, false `✗`).
     pub ok: bool,
+    /// RFC 3339 timestamp of the most recent index write, if any.
+    ///
+    /// Why: the left panel renders a `[Xh ago]` badge per row so operators can
+    /// spot stale indexes at a glance.
+    /// What: the `last_indexed` field from `GET /indexes/:id/status`; `None`
+    /// when the daemon has never indexed (or when the field is absent).
+    /// Test: `format_relative_time_handles_known_offsets`,
+    /// `collections_lines_show_relative_time`.
+    pub last_indexed: Option<String>,
+    /// Symbol graph node count for the index (zero for memory palaces).
+    ///
+    /// Why: the INDEX tab surfaces graph stats for the highlighted row.
+    /// What: the `node_count` field from `GET /indexes/:id/graph/stats`.
+    /// Test: `index_tab_lines_show_graph_stats`.
+    pub node_count: u64,
+    /// Symbol graph edge count for the index.
+    pub edge_count: u64,
+    /// Edge kinds sorted by count descending — `(kind, count)` pairs.
+    ///
+    /// Why: the INDEX tab draws a proportional bar per edge kind so the
+    /// operator can see the graph's shape at a glance.
+    /// What: the `edge_kinds` map from `GET /indexes/:id/graph/stats`
+    /// projected into a sorted vec.
+    /// Test: `index_tab_lines_show_edge_kind_bars`.
+    pub edge_kinds: Vec<(String, u64)>,
+    /// Community count from the index's KG community detection.
+    pub community_count: u64,
+    /// Modularity score (0..=1) from the community detection.
+    pub modularity: f64,
+    /// On-disk bytes for this collection (already in status payload).
+    pub disk_bytes: u64,
+    /// Whether the index carries a context embedding model.
+    pub has_context_embedding: bool,
+    /// KG triple count for memory palaces (zero for search collections).
+    ///
+    /// Why: the PALACES left panel surfaces both the vector count and the
+    /// knowledge-graph triple count so the operator can see at a glance which
+    /// palaces have graph data vs. only embeddings.
+    /// What: the `kg_triple_count` field from `GET /api/v1/palaces`.
+    /// Test: `project_palace_rows_reads_palaces`,
+    /// `collections_lines_show_graph_count_for_memory`.
+    pub kg_count: u64,
 }
 
 /// Ring buffer of recently-observed log lines for one service.
@@ -552,35 +597,93 @@ impl HealthClient {
             .unwrap_or_default();
         let mut rows = Vec::with_capacity(ids.len());
         for id in ids {
-            let count = self
+            // Status: chunk count + last_indexed + disk bytes + context embedding.
+            let status = self
                 .get_json(format!("{}/indexes/{id}/status", self.base))
                 .await
-                .ok()
+                .ok();
+            let count = status
+                .as_ref()
                 .and_then(|v| v.get("chunk_count").and_then(|c| c.as_u64()))
                 .unwrap_or(0);
+            let last_indexed = status
+                .as_ref()
+                .and_then(|v| v.get("last_indexed").and_then(|c| c.as_str()))
+                .map(str::to_string);
+            let disk_bytes = status
+                .as_ref()
+                .and_then(|v| v.get("disk_bytes").and_then(|c| c.as_u64()))
+                .unwrap_or(0);
+            let has_context_embedding = status
+                .as_ref()
+                .and_then(|v| v.get("has_context_embedding").and_then(|c| c.as_bool()))
+                .unwrap_or(false);
+
+            // Graph stats: nodes, edges, edge kind histogram. Errors → zeroes.
+            let graph = self
+                .get_json(format!("{}/indexes/{id}/graph/stats", self.base))
+                .await
+                .ok();
+            let node_count = graph
+                .as_ref()
+                .and_then(|v| v.get("node_count").and_then(|c| c.as_u64()))
+                .unwrap_or(0);
+            let edge_count = graph
+                .as_ref()
+                .and_then(|v| v.get("edge_count").and_then(|c| c.as_u64()))
+                .unwrap_or(0);
+            let edge_kinds = graph.as_ref().map(project_edge_kinds).unwrap_or_default();
+
+            // Communities: only the top-level summary fields are needed.
+            let communities = self
+                .get_json(format!("{}/indexes/{id}/communities", self.base))
+                .await
+                .ok();
+            let community_count = communities
+                .as_ref()
+                .and_then(|v| v.get("community_count").and_then(|c| c.as_u64()))
+                .unwrap_or(0);
+            let modularity = communities
+                .as_ref()
+                .and_then(|v| v.get("modularity").and_then(|c| c.as_f64()))
+                .unwrap_or(0.0);
+
+            let note = format_relative_time(last_indexed.as_deref());
             rows.push(CollectionRow {
                 id,
                 count,
-                note: "indexed".to_string(),
+                note,
                 ok: true,
+                last_indexed,
+                node_count,
+                edge_count,
+                edge_kinds,
+                community_count,
+                modularity,
+                disk_bytes,
+                has_context_embedding,
+                ..Default::default()
             });
         }
         rows
     }
 
-    /// Fetch the memory daemon's palace list with vector counts.
+    /// Fetch the memory daemon's palace list with vector and KG counts.
     ///
-    /// Why: the Collections list (left panel for the memory service) wants
-    /// a per-palace name + vector count so the operator can see at a glance
-    /// which palaces hold the most memory.
-    /// What: GETs `/api/v1/status` and projects each entry of `palaces` into
-    /// a [`CollectionRow`]. Any error yields an empty list.
+    /// Why: the Collections list (left panel for the memory service) needs the
+    /// per-palace name, vector count, and KG triple count so the operator can
+    /// see at a glance which palaces hold the most memory and which carry a
+    /// knowledge graph. `/api/v1/status` only exposes aggregate totals; the
+    /// per-palace breakdown lives at `/api/v1/palaces`.
+    /// What: GETs `/api/v1/palaces` (a JSON array of `PalaceInfo`) and
+    /// projects each entry into a [`CollectionRow`]. Any error yields an empty
+    /// list.
     /// Test: the projection is unit-tested via `project_palace_rows`.
     pub async fn memory_collections(&self) -> Vec<CollectionRow> {
-        let Ok(status) = self.get_json(format!("{}/api/v1/status", self.base)).await else {
+        let Ok(list) = self.get_json(format!("{}/api/v1/palaces", self.base)).await else {
             return Vec::new();
         };
-        project_palace_rows(&status)
+        project_palace_rows(&list)
     }
 
     /// Request a graceful shutdown of the daemon via its `admin/stop` endpoint.
@@ -643,20 +746,23 @@ fn project_log_tail(body: &serde_json::Value) -> (Vec<String>, u64) {
     let total = body
         .get("total")
         .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| lines.len() as u64);
+        .unwrap_or(lines.len() as u64);
     (lines, total)
 }
 
-/// Project a memory daemon `/api/v1/status` payload into palace rows.
+/// Project a memory daemon `/api/v1/palaces` payload into palace rows.
 ///
 /// Why: centralising the projection keeps the renderer terse and lets a unit
-/// test assert the shape without a live daemon.
-/// What: reads the `palaces` array, projecting each entry's `name` (falling
-/// back to `id`) and `vector_count` (falling back to `0`). A missing array
-/// yields an empty list.
-/// Test: `project_palace_rows`.
-fn project_palace_rows(status: &serde_json::Value) -> Vec<CollectionRow> {
-    let Some(arr) = status.get("palaces").and_then(|v| v.as_array()) else {
+/// test assert the shape without a live daemon. The wire format is a JSON
+/// array of `PalaceInfo` objects with per-palace `vector_count`,
+/// `drawer_count`, and `kg_triple_count`. `/api/v1/status` exposes only
+/// aggregate totals, so this is the only source of per-palace counts.
+/// What: reads the top-level array, projecting each entry's `name` (falling
+/// back to `id`), `vector_count`, and `kg_triple_count` (any absent field
+/// defaults to zero). A non-array payload yields an empty list.
+/// Test: `project_palace_rows_reads_palaces`.
+fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
+    let Some(arr) = list.as_array() else {
         return Vec::new();
     };
     arr.iter()
@@ -668,14 +774,81 @@ fn project_palace_rows(status: &serde_json::Value) -> Vec<CollectionRow> {
                 .unwrap_or("?")
                 .to_string();
             let count = p.get("vector_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let kg_count = p
+                .get("kg_triple_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             CollectionRow {
                 id,
                 count,
-                note: "ready".to_string(),
+                kg_count,
+                // Note left empty: the row shows vector + graph counts inline
+                // (e.g. `12v 34g`), so a trailing badge would be redundant.
+                note: String::new(),
                 ok: true,
+                ..Default::default()
             }
         })
         .collect()
+}
+
+/// Project a `/indexes/:id/graph/stats` payload's `edge_kinds` map into a
+/// vec sorted by count descending.
+///
+/// Why: the INDEX tab renders one row per edge kind, ordered so the heaviest
+/// relationship appears at the top; keeping the projection pure makes it
+/// testable without a live daemon.
+/// What: reads the `edge_kinds` object from `stats`, collects `(name, count)`
+/// pairs, and sorts by count descending (ties broken by name ascending).
+/// A missing object yields an empty vec.
+/// Test: `project_edge_kinds_sorts_desc`.
+fn project_edge_kinds(stats: &serde_json::Value) -> Vec<(String, u64)> {
+    let Some(map) = stats.get("edge_kinds").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(String, u64)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0)))
+        .collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
+}
+
+/// Format an RFC 3339 timestamp as a compact `[Xm/h/d ago]` badge.
+///
+/// Why: the collections list shows a freshness badge next to each row so the
+/// operator can spot stale indexes; raw RFC 3339 strings are too wide for the
+/// 28-column left panel.
+/// What: parses the timestamp with `chrono::DateTime::parse_from_rfc3339`,
+/// computes the signed delta against `Utc::now()`, and renders the largest
+/// unit that yields a non-zero figure (`Xm`, `Xh`, or `Xd`). `None` or an
+/// unparseable string yields `"never"`. A future timestamp (clock skew) is
+/// reported as `"just now"`.
+/// Test: `format_relative_time_handles_known_offsets`.
+pub fn format_relative_time(ts: Option<&str>) -> String {
+    let Some(s) = ts else {
+        return "never".to_string();
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(s) else {
+        return "never".to_string();
+    };
+    let now = chrono::Utc::now();
+    let delta = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    let secs = delta.num_seconds();
+    if secs < 60 {
+        // Includes negative (future) timestamps from clock skew.
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
 }
 
 /// Format a `uptime` in seconds as a compact `Xh Ym` string.
@@ -1062,7 +1235,7 @@ pub fn render(frame: &mut Frame, screen: &HealthScreen) {
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(28), // collections list
+            Constraint::Length(32), // collections list
             Constraint::Min(20),    // tabbed panel
         ])
         .split(outer[1]);
@@ -1155,15 +1328,23 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, screen: &Health
 
 /// Build the collections list lines (left panel).
 ///
-/// Why: a pure helper for testing the row formatting.
-/// What: one line per row — `> id  count ✓  [note]` or `  id  count ✗  [note]`
-/// for the highlighted vs other rows.
-/// Test: `collections_lines_format_each_row`.
+/// Why: a pure helper for testing the row formatting; the renderer feeds the
+/// returned strings into a paragraph widget so the format is exactly what the
+/// operator sees.
+/// What: one line per row. Search collections use
+/// `> id        count ✓ [note]`. Memory palaces use
+/// `> palace-name        12v 34g` — vector + KG triple counts, each with a
+/// `v` / `g` suffix and `--v` / `--g` when the count is zero so missing data
+/// is visible at a glance.
+/// Test: `collections_lines_format_each_row`,
+/// `collections_lines_show_graph_count_for_memory`,
+/// `collections_lines_show_dashes_for_zero_counts`.
 pub fn collections_lines(screen: &HealthScreen) -> Vec<String> {
     let rows = screen.focused_collections();
     if rows.is_empty() {
         return vec!["(none)".to_string()];
     }
+    let focus = screen.focus;
     rows.iter()
         .enumerate()
         .map(|(i, r)| {
@@ -1172,19 +1353,73 @@ pub fn collections_lines(screen: &HealthScreen) -> Vec<String> {
             } else {
                 " "
             };
-            let glyph = if r.ok { "✓" } else { "✗" };
-            let note = if r.note.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", r.note)
-            };
-            format!(
-                "{marker} {:<12} {:>6} {glyph}{note}",
-                r.id,
-                format_count(r.count)
-            )
+            match focus {
+                Daemon::Memory => format_palace_row(marker, r),
+                Daemon::Search => format_search_row(marker, r),
+            }
         })
         .collect()
+}
+
+/// Format one search-collection row (the existing layout).
+///
+/// Why: extracted so the memory branch can use a different layout without
+/// `collections_lines` growing a large match arm body.
+/// What: `{marker} {id:<12} {count:>6} {glyph}[badge]` where the badge prefers
+/// a parsed last-indexed time and falls back to the row's free-form note.
+/// Test: covered by `collections_lines_format_each_row`.
+fn format_search_row(marker: &str, r: &CollectionRow) -> String {
+    let glyph = if r.ok { "✓" } else { "✗" };
+    let badge_text = if r.last_indexed.is_some() {
+        format_relative_time(r.last_indexed.as_deref())
+    } else if !r.note.is_empty() {
+        r.note.clone()
+    } else {
+        String::new()
+    };
+    let badge = if badge_text.is_empty() {
+        String::new()
+    } else {
+        format!("  [{badge_text}]")
+    };
+    format!(
+        "{marker} {:<12} {:>6} {glyph}{badge}",
+        r.id,
+        format_count(r.count)
+    )
+}
+
+/// Format one memory-palace row.
+///
+/// Why: memory palaces have no `last_indexed` and benefit from showing both
+/// their vector count and their KG triple count; the previous shared layout
+/// wasted the trailing column on a hardcoded `ready` note.
+/// What: `{marker} {name:<16} {vec:>4} {kg:>4}` where each count is the
+/// abbreviated form (`format_count`) suffixed with `v` / `g`, falling back to
+/// `--v` / `--g` when the underlying count is zero so the operator can spot
+/// palaces missing vectors or a graph.
+/// Test: `collections_lines_show_graph_count_for_memory`,
+/// `collections_lines_show_dashes_for_zero_counts`.
+fn format_palace_row(marker: &str, r: &CollectionRow) -> String {
+    let vec_cell = format_count_suffix(r.count, 'v');
+    let kg_cell = format_count_suffix(r.kg_count, 'g');
+    format!("{marker} {:<16} {:>4} {:>4}", r.id, vec_cell, kg_cell)
+}
+
+/// Render a count plus a single-letter suffix, using `--` for zero.
+///
+/// Why: the palace row format wants `12v` / `34g` cells where a zero count
+/// stands out as `--v` / `--g`. Centralising the rule keeps both callers in
+/// sync.
+/// What: returns `"{abbrev}{suffix}"` for non-zero counts (where `abbrev` is
+/// `format_count`'s output) and `"--{suffix}"` for zero.
+/// Test: `format_count_suffix_handles_zero_and_value`.
+fn format_count_suffix(n: u64, suffix: char) -> String {
+    if n == 0 {
+        format!("--{suffix}")
+    } else {
+        format!("{}{suffix}", format_count(n))
+    }
 }
 
 /// Render the collections list (left panel).
@@ -1241,6 +1476,7 @@ pub fn tab_bar(active: HealthTab) -> Vec<(String, bool)> {
         ("[1]HEALTH", HealthTab::Health),
         ("[2]LOGS", HealthTab::Logs),
         ("[3]SEARCH", HealthTab::Search),
+        ("[4]INDEX", HealthTab::Index),
     ]
     .iter()
     .map(|(label, tab)| ((*label).to_string(), *tab == active))
@@ -1288,6 +1524,7 @@ fn render_tab_panel(frame: &mut Frame, area: ratatui::layout::Rect, screen: &Hea
         HealthTab::Health => render_health_tab(frame, split[1], screen),
         HealthTab::Logs => render_logs_tab(frame, split[1], screen),
         HealthTab::Search => render_search_tab(frame, split[1], screen),
+        HealthTab::Index => render_index_tab(frame, split[1], screen),
     }
 }
 
@@ -1428,6 +1665,116 @@ fn render_search_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &He
             Line::from("(press Enter in the search bar to run — execution not yet wired)"),
         ]
     };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the INDEX tab body lines for the currently-selected collection row.
+///
+/// Why: keeping the body builder pure lets a unit test assert the rendered
+/// content without a terminal backend; the per-row stats live on the
+/// [`CollectionRow`] so the renderer reads directly from the screen.
+/// What: returns a header (`Chunks` / `Disk` / `Last index` / `Context`),
+/// a Graph section (`Nodes` / `Edges` + one bar per edge kind, scaled to the
+/// largest kind with `MAX_BAR_WIDTH` blocks), and a Communities section
+/// (`Count` / `Modularity`). If no collection is selected (or the list is
+/// empty), returns a single placeholder line.
+/// Test: `index_tab_lines_show_graph_stats`,
+/// `index_tab_lines_show_edge_kind_bars`,
+/// `index_tab_lines_empty_when_no_selection`.
+pub fn index_tab_lines(screen: &HealthScreen) -> Vec<String> {
+    /// Maximum width (in `█` chars) of the edge-kind histogram bars.
+    ///
+    /// Why: the right panel is sized to fit the bars plus a count column on
+    /// 80-column terminals; 16 leaves room for both.
+    /// What: the cap passed to [`ascii_bar`].
+    const MAX_BAR_WIDTH: usize = 16;
+
+    let rows = screen.focused_collections();
+    if rows.is_empty() {
+        return vec!["(no collection selected)".to_string()];
+    }
+    let Some(row) = rows.get(screen.selected_collection) else {
+        return vec!["(no collection selected)".to_string()];
+    };
+
+    let mut lines = Vec::with_capacity(12);
+
+    // Header lines: chunks, disk, last_indexed, context embedding.
+    lines.push(format!(
+        "Chunks:     {:<10} Disk: {}",
+        format_count(row.count),
+        format_bytes(row.disk_bytes),
+    ));
+    let last_indexed_human = match row.last_indexed.as_deref() {
+        Some(s) => {
+            // Render the absolute timestamp in compact form alongside the
+            // relative badge. A parse failure falls back to the raw string.
+            let abs = chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|_| s.to_string());
+            format!("{abs} ({})", format_relative_time(Some(s)))
+        }
+        None => "never".to_string(),
+    };
+    lines.push(format!("Last index: {last_indexed_human}"));
+    let context = if row.has_context_embedding {
+        "embedded"
+    } else {
+        "none"
+    };
+    lines.push(format!("Context:    {context}"));
+    lines.push(String::new());
+
+    // Graph section.
+    lines.push("-- Graph ----------------------------------------------".to_string());
+    lines.push(format!(
+        "Nodes:      {:<10} Edges:  {}",
+        format_count(row.node_count),
+        format_count(row.edge_count),
+    ));
+    let max_kind = row.edge_kinds.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    for (name, count) in &row.edge_kinds {
+        let ratio = if max_kind == 0 {
+            0.0
+        } else {
+            *count as f64 / max_kind as f64
+        };
+        let bar = ascii_bar(ratio, MAX_BAR_WIDTH);
+        lines.push(format!("{:<16} {:>6}  {bar}", name, format_count(*count)));
+    }
+    lines.push(String::new());
+
+    // Communities section.
+    lines.push("-- Communities ----------------------------------------".to_string());
+    lines.push(format!(
+        "Count:      {:<10} Modularity: {:.3}",
+        row.community_count, row.modularity,
+    ));
+
+    lines
+}
+
+/// Render the INDEX tab body.
+///
+/// Why: kept separate so [`render_tab_panel`]'s match arm stays one line.
+/// What: draws the `index_tab_lines` as a `Paragraph`. Section headers (`-- … --`)
+/// render in cyan to match the existing HEALTH-tab section style.
+fn render_index_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let lines: Vec<Line> = index_tab_lines(screen)
+        .into_iter()
+        .map(|l| {
+            if l.starts_with("--") {
+                Line::from(Span::styled(
+                    l,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(l)
+            }
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1857,19 +2204,37 @@ mod tests {
 
     #[test]
     fn project_palace_rows_reads_palaces() {
-        let status = serde_json::json!({
-            "palaces": [
-                { "name": "default", "vector_count": 8400u64 },
-                { "name": "work",    "vector_count": 0u64 },
-            ]
-        });
-        let rows = project_palace_rows(&status);
+        // The wire format from `GET /api/v1/palaces` is a JSON array of
+        // `PalaceInfo`. Each entry carries the per-palace vector and KG
+        // triple counts.
+        let list = serde_json::json!([
+            { "name": "default", "vector_count": 8400u64, "kg_triple_count": 1200u64 },
+            { "name": "work",    "vector_count": 0u64,    "kg_triple_count": 0u64 },
+        ]);
+        let rows = project_palace_rows(&list);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "default");
         assert_eq!(rows[0].count, 8400);
+        assert_eq!(rows[0].kg_count, 1200);
         assert!(rows[0].ok);
-        // Absent `palaces` yields an empty list.
+        // Empty note: the new row format shows vectors + graph inline, so the
+        // trailing badge is intentionally suppressed.
+        assert!(rows[0].note.is_empty());
+        // A palace with no vectors or KG triples projects to zero counts.
+        assert_eq!(rows[1].count, 0);
+        assert_eq!(rows[1].kg_count, 0);
+        // A non-array payload yields an empty list (e.g. an unexpected object).
         assert!(project_palace_rows(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn format_count_suffix_handles_zero_and_value() {
+        // Zero renders as `--<suffix>` so the absence is visible at a glance.
+        assert_eq!(format_count_suffix(0, 'v'), "--v");
+        assert_eq!(format_count_suffix(0, 'g'), "--g");
+        // Non-zero re-uses `format_count`'s abbreviation.
+        assert_eq!(format_count_suffix(42, 'v'), "42v");
+        assert_eq!(format_count_suffix(12_345, 'g'), "12.3kg");
     }
 
     #[test]
@@ -1931,12 +2296,14 @@ mod tests {
                 count: 1_200,
                 note: "indexed".into(),
                 ok: true,
+                ..Default::default()
             },
             CollectionRow {
                 id: "trusty".into(),
                 count: 18_994,
                 note: "indexed".into(),
                 ok: true,
+                ..Default::default()
             },
         ];
         let lines = collections_lines(&screen);
@@ -1946,6 +2313,70 @@ mod tests {
         assert!(lines[1].starts_with(" "));
         assert!(lines[0].contains("cto"));
         assert!(lines[1].contains("trusty"));
+    }
+
+    #[test]
+    fn collections_lines_show_graph_count_for_memory() {
+        // Memory focus: each row renders the vector count + KG triple count
+        // inline, suffixed with `v` / `g`. No trailing `[note]` badge.
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.focus = Daemon::Memory;
+        screen.memory_collections = vec![CollectionRow {
+            id: "default".into(),
+            count: 12,
+            kg_count: 34,
+            ok: true,
+            ..Default::default()
+        }];
+        let lines = collections_lines(&screen);
+        assert_eq!(lines.len(), 1);
+        // Vector + graph counts appear with their suffixes.
+        assert!(
+            lines[0].contains("12v"),
+            "expected `12v` in {line:?}",
+            line = lines[0]
+        );
+        assert!(
+            lines[0].contains("34g"),
+            "expected `34g` in {line:?}",
+            line = lines[0]
+        );
+        // The palace name is rendered.
+        assert!(lines[0].contains("default"));
+        // No `ready` badge from the legacy format.
+        assert!(!lines[0].contains("ready"));
+        assert!(!lines[0].contains("["));
+    }
+
+    #[test]
+    fn collections_lines_show_dashes_for_zero_counts() {
+        // A palace with no vectors and no KG triples shows `--v` / `--g` so
+        // the operator can spot empty palaces at a glance.
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.focus = Daemon::Memory;
+        screen.memory_collections = vec![CollectionRow {
+            id: "empty".into(),
+            count: 0,
+            kg_count: 0,
+            ok: true,
+            ..Default::default()
+        }];
+        let lines = collections_lines(&screen);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("--v"),
+            "expected `--v` for zero vectors in {line:?}",
+            line = lines[0]
+        );
+        assert!(
+            lines[0].contains("--g"),
+            "expected `--g` for zero KG triples in {line:?}",
+            line = lines[0]
+        );
+        // `0v` / `0g` would be ambiguous with abbreviated counts; we render
+        // dashes instead.
+        assert!(!lines[0].contains("0v"));
+        assert!(!lines[0].contains("0g"));
     }
 
     #[test]
@@ -2032,6 +2463,129 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("Disk   ")));
         assert!(lines.iter().any(|l| l.contains("Embedder")));
         assert!(lines.iter().any(|l| l.contains("CoreML")));
+    }
+
+    #[test]
+    fn format_relative_time_handles_known_offsets() {
+        assert_eq!(format_relative_time(None), "never");
+        assert_eq!(format_relative_time(Some("not-a-time")), "never");
+        let now = chrono::Utc::now();
+        let mk = |d: chrono::Duration| (now - d).to_rfc3339();
+        assert_eq!(
+            format_relative_time(Some(&mk(chrono::Duration::minutes(5)))),
+            "5m ago"
+        );
+        assert_eq!(
+            format_relative_time(Some(&mk(chrono::Duration::hours(2)))),
+            "2h ago"
+        );
+        assert_eq!(
+            format_relative_time(Some(&mk(chrono::Duration::days(3)))),
+            "3d ago"
+        );
+        let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(format_relative_time(Some(&future)), "just now");
+    }
+
+    #[test]
+    fn project_edge_kinds_sorts_desc() {
+        let stats = serde_json::json!({
+            "edge_kinds": {
+                "CallsFunction": 8201u64,
+                "Implements":    1422u64,
+                "UsesType":      2411u64,
+            }
+        });
+        let kinds = project_edge_kinds(&stats);
+        assert_eq!(
+            kinds,
+            vec![
+                ("CallsFunction".to_string(), 8201),
+                ("UsesType".to_string(), 2411),
+                ("Implements".to_string(), 1422),
+            ]
+        );
+        assert!(project_edge_kinds(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn collections_lines_show_relative_time() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        screen.search_collections = vec![CollectionRow {
+            id: "trusty".into(),
+            count: 71_000,
+            note: String::new(),
+            ok: true,
+            last_indexed: Some(ts),
+            ..Default::default()
+        }];
+        let lines = collections_lines(&screen);
+        assert!(lines[0].contains("[5m ago]"));
+    }
+
+    #[test]
+    fn index_tab_lines_show_graph_stats() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![CollectionRow {
+            id: "trusty".into(),
+            count: 71_000,
+            ok: true,
+            disk_bytes: 2_469_606_195,
+            node_count: 4_821,
+            edge_count: 12_034,
+            community_count: 47,
+            modularity: 0.712,
+            has_context_embedding: true,
+            ..Default::default()
+        }];
+        let lines = index_tab_lines(&screen);
+        assert!(lines.iter().any(|l| l.starts_with("Chunks:")));
+        assert!(lines.iter().any(|l| l.contains("Disk: 2.3GB")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Context:") && l.contains("embedded"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Nodes:") && l.contains("Edges:"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Count:") && l.contains("Modularity") && l.contains("0.712"))
+        );
+    }
+
+    #[test]
+    fn index_tab_lines_show_edge_kind_bars() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![CollectionRow {
+            id: "trusty".into(),
+            edge_kinds: vec![
+                ("CallsFunction".to_string(), 8_201),
+                ("UsesType".to_string(), 2_411),
+                ("Implements".to_string(), 1_422),
+            ],
+            ..Default::default()
+        }];
+        let lines = index_tab_lines(&screen);
+        let calls = lines.iter().find(|l| l.contains("CallsFunction")).unwrap();
+        let impls = lines.iter().find(|l| l.contains("Implements")).unwrap();
+        let calls_blocks = calls.chars().filter(|c| *c == '█').count();
+        let impls_blocks = impls.chars().filter(|c| *c == '█').count();
+        assert!(calls_blocks >= impls_blocks);
+        assert!(calls_blocks > 0);
+    }
+
+    #[test]
+    fn index_tab_lines_empty_when_no_selection() {
+        let screen = HealthScreen::new("http://a", "http://b");
+        let lines = index_tab_lines(&screen);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no collection selected"));
     }
 
     #[test]

@@ -381,6 +381,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
                         KeyCode::Char('1') => health_screen.set_tab(health::HealthTab::Health),
                         KeyCode::Char('2') => health_screen.set_tab(health::HealthTab::Logs),
                         KeyCode::Char('3') => health_screen.set_tab(health::HealthTab::Search),
+                        KeyCode::Char('4') => health_screen.set_tab(health::HealthTab::Index),
                         _ => {}
                     }
                     continue;
@@ -391,6 +392,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('1') => health_screen.set_tab(health::HealthTab::Health),
                     KeyCode::Char('2') => health_screen.set_tab(health::HealthTab::Logs),
                     KeyCode::Char('3') => health_screen.set_tab(health::HealthTab::Search),
+                    KeyCode::Char('4') => health_screen.set_tab(health::HealthTab::Index),
                     KeyCode::Tab => {
                         health_screen.toggle_focus();
                         health_screen.clamp_collection_selection();

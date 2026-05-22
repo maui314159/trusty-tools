@@ -31,5 +31,9 @@ uuid.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The health screen renders "Xh ago" relative timestamps for each index's
+# last-indexed time; chrono parses the RFC 3339 strings returned by
+# `GET /indexes/:id/status` and computes deltas against `Utc::now()`.
+chrono.workspace = true
 # Service start/stop actions log their outcome to stderr via tracing.
 tracing.workspace = true
