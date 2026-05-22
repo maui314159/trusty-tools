@@ -226,6 +226,10 @@ memory-core = [
 # feature. Pulls in the `kuzu` crate. Off by default because kuzu adds a
 # large native dependency.
 memory-core-kuzu = ["memory-core", "dep:kuzu"]
+# Legacy SQLite KG read path (the pre-#44 backend). Kept compilable so the
+# #45 SQLite → redb migration tool can read old `kg.db` files. Issue #47
+# removes this feature and the dependency.
+sqlite-kg = ["memory-core"]
 # Enables the `monitor` module: the unified ratatui dashboard for the
 # trusty-search and trusty-memory daemons (formerly the `trusty-monitor-tui`
 # crate, and before that the standalone `trusty-monitor` binary). Pulls in

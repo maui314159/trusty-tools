@@ -8,6 +8,9 @@
 
 pub mod chat_sessions;
 pub mod kg;
+pub mod kg_redb;
+#[cfg(feature = "sqlite-kg")]
+pub mod kg_sqlite;
 pub mod kg_store;
 pub mod kuzu;
 pub mod l1_cache;
