@@ -90,6 +90,31 @@ impl KnowledgeGraphSqlite {
         Ok(Self { pool })
     }
 
+    /// Open an existing SQLite KG read-only.
+    ///
+    /// Why: Issue #45's migration must not mutate the legacy `kg.db` — we read
+    /// all rows then rename the file to `kg.db.migrated` so the migration is
+    /// idempotent. Opening read-only avoids any chance of accidental writes
+    /// (and lets the migration succeed even if the file is on read-only media).
+    /// What: Builds an r2d2 pool with the rusqlite `SQLITE_OPEN_READ_ONLY`
+    /// flag. Does **not** run schema migrations — readers must tolerate
+    /// whatever the legacy schema already contains.
+    /// Test: Integration test in `tests/kg_migration_tests.rs`.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let manager = SqliteConnectionManager::file(path)
+            .with_flags(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
+        let pool = Pool::builder()
+            .max_size(2)
+            .connection_timeout(std::time::Duration::from_secs(2))
+            .build(manager)
+            .context("failed to build read-only sqlite connection pool")?;
+        // Sanity-check that the connection works.
+        let _ = pool
+            .get()
+            .context("failed to get read-only sqlite connection")?;
+        Ok(Self { pool })
+    }
+
     /// Read every triple (active + historical) — used by the migration tool.
     ///
     /// Why: Issue #45 needs full history to faithfully reproduce the temporal

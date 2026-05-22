@@ -62,6 +62,89 @@ fn redb_path_for(input: &Path) -> std::path::PathBuf {
     }
 }
 
+/// One-shot SQLite → redb migration on palace open.
+///
+/// Why: Pre-#44 palaces persist all knowledge-graph state in
+/// `<data_dir>/kg.db` (SQLite). The redb migration (issue #44) silently
+/// creates a fresh `kg.redb` on first open — without this hook, every legacy
+/// triple and drawer would be invisible after upgrade. Running automatically
+/// on `KnowledgeGraph::open` means users do nothing; renaming `kg.db` to
+/// `kg.db.migrated` afterwards guarantees the migration runs exactly once
+/// per palace even across restarts.
+/// What: When `<data_dir>/kg.db` exists and `<data_dir>/kg.db.migrated` does
+/// not, open the legacy file read-only via `KgStoreSqlite`, dump every
+/// triple (active + historical) plus every drawer, write them into the redb
+/// store in a single transaction (`import_all`), then rename the legacy file
+/// to `kg.db.migrated`. Gated behind the `sqlite-kg` feature so non-migration
+/// builds drop the rusqlite dependency entirely; when the feature is off
+/// this function is a no-op.
+/// Test: `crates/trusty-common/tests/kg_migration_tests.rs` builds a real
+/// legacy `kg.db` with rusqlite, opens `KnowledgeGraph`, and asserts the
+/// active triples + drawers survive and the file is renamed.
+#[cfg(feature = "sqlite-kg")]
+fn migrate_from_sqlite_if_needed(data_dir: &Path, redb_store: &KgStoreRedb) -> Result<()> {
+    use crate::memory_core::store::kg_sqlite::KnowledgeGraphSqlite;
+
+    let legacy = data_dir.join("kg.db");
+    let migrated_marker = data_dir.join("kg.db.migrated");
+
+    if !legacy.exists() {
+        return Ok(());
+    }
+    if migrated_marker.exists() {
+        // Migration already done — defensive: if both somehow exist, prefer
+        // the marker and leave the legacy file alone.
+        return Ok(());
+    }
+
+    let sqlite = KnowledgeGraphSqlite::open_readonly(&legacy)
+        .with_context(|| format!("open legacy sqlite kg at {}", legacy.display()))?;
+    let triples = sqlite
+        .dump_all_triples()
+        .context("dump triples from legacy sqlite kg")?;
+    let drawers = sqlite
+        .load_drawers()
+        .context("load drawers from legacy sqlite kg")?;
+
+    let n_triples = triples.len();
+    let n_drawers = drawers.len();
+    redb_store
+        .import_all(triples, drawers)
+        .context("import legacy sqlite data into redb")?;
+
+    // Drop the SQLite handle before renaming so no open file handles linger.
+    drop(sqlite);
+
+    std::fs::rename(&legacy, &migrated_marker).with_context(|| {
+        format!(
+            "rename {} to {}",
+            legacy.display(),
+            migrated_marker.display()
+        )
+    })?;
+
+    tracing::info!(
+        "Migrated {} triples and {} drawers from SQLite to redb at {}",
+        n_triples,
+        n_drawers,
+        data_dir.display()
+    );
+    Ok(())
+}
+
+/// No-op stub used when the `sqlite-kg` feature is disabled.
+///
+/// Why: Issue #45's migration only compiles with rusqlite available. Keeping
+/// the call site in `open()` unconditional avoids `#[cfg]` noise there; this
+/// stub satisfies the type signature when the feature is off.
+/// What: Immediately returns `Ok(())`.
+/// Test: Compiles in default builds (no feature flag) — verified by
+/// `cargo test -p trusty-common --features memory-core`.
+#[cfg(not(feature = "sqlite-kg"))]
+fn migrate_from_sqlite_if_needed(_data_dir: &Path, _redb_store: &KgStoreRedb) -> Result<()> {
+    Ok(())
+}
+
 impl KnowledgeGraph {
     /// Open or create the redb-backed KG at the path derived from `path`.
     ///
@@ -72,6 +155,10 @@ impl KnowledgeGraph {
         let redb_path = redb_path_for(path);
         let store = KgStoreRedb::open(&redb_path)
             .with_context(|| format!("open KG redb at {}", redb_path.display()))?;
+        if let Some(data_dir) = redb_path.parent() {
+            migrate_from_sqlite_if_needed(data_dir, &store)
+                .with_context(|| format!("migrate legacy SQLite KG at {}", data_dir.display()))?;
+        }
         Ok(Self { store })
     }
 
