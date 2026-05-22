@@ -103,6 +103,9 @@ cargo clippy -p trusty-search -- -D warnings
 
 # Test a single crate with ignored tests
 cargo test -p trusty-embedder -- --include-ignored
+
+# Run trusty-search performance regression suite (requires daemon + indexed trusty-tools)
+cargo test -p trusty-search --test baseline_trusty_tools -- --include-ignored --nocapture
 ```
 
 ### Important: Crate Names vs. Directory Names
