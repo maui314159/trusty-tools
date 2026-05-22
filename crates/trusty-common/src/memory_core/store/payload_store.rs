@@ -50,6 +50,18 @@ use crate::memory_core::store::kg_store::{PAYLOADS, encode_payload_key, segment_
 /// JSON, migration) so each can be inspected without `downcast`. `NotFound`
 /// is a value not an error path — missing rows surface as `Ok(None)` instead.
 /// Test: Covered indirectly by the round-trip test and the missing-row test.
+//
+// Why (boxing): redb's error types (`DatabaseError`, `TransactionError`,
+// `TableError`, `StorageError`, `CommitError`) are large enums (the largest
+// variant pushes the parent enum past 180 bytes), which trips Clippy's
+// `result_large_err` lint at every `Result<_, PayloadStoreError>` return site.
+// We box each redb source so the enum stays small (≤ a couple of words per
+// variant) while preserving the typed error API. `serde_json::Error` is
+// similarly boxy and is boxed for the same reason.
+// What: Each variant whose source is a large foreign error owns a
+// `Box<Source>`; the `Display` impl deref-prints transparently.
+// Test: existing CRUD tests still exercise every variant's construction path
+// without behavioural change.
 #[derive(Debug, Error)]
 pub enum PayloadStoreError {
     #[error("payload store io error at {path}: {source}")]
@@ -62,31 +74,31 @@ pub enum PayloadStoreError {
     Database {
         path: PathBuf,
         #[source]
-        source: redb::DatabaseError,
+        source: Box<redb::DatabaseError>,
     },
     #[error("payload store redb transaction error at {path}: {source}")]
     Transaction {
         path: PathBuf,
         #[source]
-        source: redb::TransactionError,
+        source: Box<redb::TransactionError>,
     },
     #[error("payload store redb table error at {path}: {source}")]
     Table {
         path: PathBuf,
         #[source]
-        source: redb::TableError,
+        source: Box<redb::TableError>,
     },
     #[error("payload store redb storage error at {path}: {source}")]
     Storage {
         path: PathBuf,
         #[source]
-        source: redb::StorageError,
+        source: Box<redb::StorageError>,
     },
     #[error("payload store redb commit error at {path}: {source}")]
     Commit {
         path: PathBuf,
         #[source]
-        source: redb::CommitError,
+        source: Box<redb::CommitError>,
     },
     #[error("payload store postcard codec error: {source}")]
     Postcard {
@@ -96,7 +108,7 @@ pub enum PayloadStoreError {
     #[error("payload store json error: {source}")]
     Json {
         #[source]
-        source: serde_json::Error,
+        source: Box<serde_json::Error>,
     },
     #[error("payload store migration error at {path}: {message}")]
     Migration { path: PathBuf, message: String },
@@ -171,6 +183,7 @@ impl PayloadStore {
     ///    in a write transaction so range scans on a fresh file succeed.
     /// 4. Runs the one-shot SQLite → redb migration when the `sqlite-kg`
     ///    feature is enabled and a `payloads.db` is present.
+    ///
     /// Test: `roundtrip_persists_across_reopen` opens the same path twice;
     /// `migrates_legacy_sqlite_rows` (gated on `sqlite-kg`) exercises the
     /// one-shot copy.
@@ -194,7 +207,7 @@ impl PayloadStore {
 
         let db = Database::create(&redb_path).map_err(|e| PayloadStoreError::Database {
             path: redb_path.clone(),
-            source: e,
+            source: Box::new(e),
         })?;
 
         // Touch the PAYLOADS table so it exists on disk before the first read
@@ -206,19 +219,19 @@ impl PayloadStore {
                 .begin_write()
                 .map_err(|e| PayloadStoreError::Transaction {
                     path: redb_path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
             {
                 let _ = wtx
                     .open_table(PAYLOADS)
                     .map_err(|e| PayloadStoreError::Table {
                         path: redb_path.clone(),
-                        source: e,
+                        source: Box::new(e),
                     })?;
             }
             wtx.commit().map_err(|e| PayloadStoreError::Commit {
                 path: redb_path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         }
 
@@ -239,7 +252,7 @@ impl PayloadStore {
     /// Test: `roundtrip_persists_across_reopen`.
     pub fn upsert(&self, segment: &str, id: &str, uuid: Uuid, payload: &Value) -> Result<()> {
         let payload_json =
-            serde_json::to_string(payload).map_err(|e| PayloadStoreError::Json { source: e })?;
+            serde_json::to_string(payload).map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
         let record = PayloadRecord {
             uuid: *uuid.as_bytes(),
             payload: payload_json,
@@ -253,25 +266,25 @@ impl PayloadStore {
             .begin_write()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         {
             let mut table = wtx
                 .open_table(PAYLOADS)
                 .map_err(|e| PayloadStoreError::Table {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
             table
                 .insert(key.as_slice(), value_bytes.as_slice())
                 .map_err(|e| PayloadStoreError::Storage {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
         }
         wtx.commit().map_err(|e| PayloadStoreError::Commit {
             path: self.path.clone(),
-            source: e,
+            source: Box::new(e),
         })?;
         Ok(())
     }
@@ -290,19 +303,19 @@ impl PayloadStore {
             .begin_read()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let table = rtx
             .open_table(PAYLOADS)
             .map_err(|e| PayloadStoreError::Table {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let raw = table
             .get(key.as_slice())
             .map_err(|e| PayloadStoreError::Storage {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         match raw {
             Some(g) => {
@@ -310,7 +323,7 @@ impl PayloadStore {
                     .map_err(|e| PayloadStoreError::Postcard { source: e })?;
                 let uuid = Uuid::from_bytes(record.uuid);
                 let value: Value = serde_json::from_str(&record.payload)
-                    .map_err(|e| PayloadStoreError::Json { source: e })?;
+                    .map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
                 Ok(Some((uuid, value)))
             }
             None => Ok(None),
@@ -330,19 +343,19 @@ impl PayloadStore {
             .begin_read()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let table = rtx
             .open_table(PAYLOADS)
             .map_err(|e| PayloadStoreError::Table {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let got = table
             .get(key.as_slice())
             .map_err(|e| PayloadStoreError::Storage {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         Ok(got.is_some())
     }
@@ -385,25 +398,25 @@ impl PayloadStore {
             .begin_write()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         {
             let mut table = wtx
                 .open_table(PAYLOADS)
                 .map_err(|e| PayloadStoreError::Table {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
             table
                 .remove(key.as_slice())
                 .map_err(|e| PayloadStoreError::Storage {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
         }
         wtx.commit().map_err(|e| PayloadStoreError::Commit {
             path: self.path.clone(),
-            source: e,
+            source: Box::new(e),
         })?;
         Ok(())
     }
@@ -443,13 +456,13 @@ impl PayloadStore {
             .begin_read()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let table = rtx
             .open_table(PAYLOADS)
             .map_err(|e| PayloadStoreError::Table {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
 
         let mut out = Vec::new();
@@ -462,7 +475,7 @@ impl PayloadStore {
                     .range::<&[u8]>(prefix.as_slice()..end.as_slice())
                     .map_err(|e| PayloadStoreError::Storage {
                         path: self.path.clone(),
-                        source: e,
+                        source: Box::new(e),
                     })?,
             )
         } else {
@@ -478,7 +491,7 @@ impl PayloadStore {
                 for entry in range {
                     let (k, v) = entry.map_err(|e| PayloadStoreError::Storage {
                         path: self.path.clone(),
-                        source: e,
+                        source: Box::new(e),
                     })?;
                     if let Some(row) = decode_row(k.value(), v.value())? {
                         out.push(row);
@@ -488,11 +501,11 @@ impl PayloadStore {
             None => {
                 for entry in table.iter().map_err(|e| PayloadStoreError::Storage {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })? {
                     let (k, v) = entry.map_err(|e| PayloadStoreError::Storage {
                         path: self.path.clone(),
-                        source: e,
+                        source: Box::new(e),
                     })?;
                     if let Some(row) = decode_row(k.value(), v.value())? {
                         out.push(row);
@@ -511,13 +524,13 @@ impl PayloadStore {
             .begin_read()
             .map_err(|e| PayloadStoreError::Transaction {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let table = rtx
             .open_table(PAYLOADS)
             .map_err(|e| PayloadStoreError::Table {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         let prefix = segment_prefix(segment);
         let mut end = prefix.clone();
@@ -533,7 +546,7 @@ impl PayloadStore {
             .range::<&[u8]>(prefix.as_slice()..end.as_slice())
             .map_err(|e| PayloadStoreError::Storage {
                 path: self.path.clone(),
-                source: e,
+                source: Box::new(e),
             })?;
         for entry in range {
             match entry {
@@ -546,7 +559,7 @@ impl PayloadStore {
                 },
                 Err(e) => rows.push(Err(PayloadStoreError::Storage {
                     path: self.path.clone(),
-                    source: e,
+                    source: Box::new(e),
                 })),
             }
         }
@@ -570,7 +583,7 @@ fn decode_row(key: &[u8], value: &[u8]) -> Result<Option<PayloadRow>> {
         postcard::from_bytes(value).map_err(|e| PayloadStoreError::Postcard { source: e })?;
     let uuid = Uuid::from_bytes(record.uuid);
     let payload: Value =
-        serde_json::from_str(&record.payload).map_err(|e| PayloadStoreError::Json { source: e })?;
+        serde_json::from_str(&record.payload).map_err(|e| PayloadStoreError::Json { source: Box::new(e) })?;
     Ok(Some(PayloadRow {
         segment,
         id,
@@ -725,20 +738,20 @@ fn migrate_from_sqlite_if_present(orig_path: &Path, redb_path: &Path) -> Result<
     // the end of this scope.
     let db = Database::create(redb_path).map_err(|e| PayloadStoreError::Database {
         path: redb_path.to_path_buf(),
-        source: e,
+        source: Box::new(e),
     })?;
     let wtx = db
         .begin_write()
         .map_err(|e| PayloadStoreError::Transaction {
             path: redb_path.to_path_buf(),
-            source: e,
+            source: Box::new(e),
         })?;
     {
         let mut table = wtx
             .open_table(PAYLOADS)
             .map_err(|e| PayloadStoreError::Table {
                 path: redb_path.to_path_buf(),
-                source: e,
+                source: Box::new(e),
             })?;
         for (segment, id, uuid_bytes, payload_json) in staged {
             let record = PayloadRecord {
@@ -752,13 +765,13 @@ fn migrate_from_sqlite_if_present(orig_path: &Path, redb_path: &Path) -> Result<
                 .insert(key.as_slice(), value_bytes.as_slice())
                 .map_err(|e| PayloadStoreError::Storage {
                     path: redb_path.to_path_buf(),
-                    source: e,
+                    source: Box::new(e),
                 })?;
         }
     }
     wtx.commit().map_err(|e| PayloadStoreError::Commit {
         path: redb_path.to_path_buf(),
-        source: e,
+        source: Box::new(e),
     })?;
     drop(db);
 

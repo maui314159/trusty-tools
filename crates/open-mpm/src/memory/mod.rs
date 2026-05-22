@@ -240,8 +240,8 @@ mod tests {
             .await
             .expect("insert into trusty backend");
         assert!(
-            dir.path().join("trusty").join("payloads.db").exists(),
-            "trusty backend should create payloads.db under <data_dir>/trusty/"
+            dir.path().join("trusty").join("payloads.redb").exists(),
+            "trusty backend should create payloads.redb under <data_dir>/trusty/"
         );
     }
 }

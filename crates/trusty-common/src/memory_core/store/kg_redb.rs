@@ -801,6 +801,7 @@ impl KgStoreRedb {
                             None => None,
                         }
                     };
+                    #[allow(clippy::collapsible_if)]
                     if let Some(prior) = prior_opt {
                         if prior.valid_to_ms.is_none() {
                             // Demote existing active row to history (closed at
