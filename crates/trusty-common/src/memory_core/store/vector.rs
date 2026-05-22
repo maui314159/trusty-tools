@@ -240,10 +240,7 @@ impl UsearchStore {
         // mapped id and delete it via the HnswStore API, then run a
         // compaction. This is slower than recreating the file but doesn't
         // need to fight redb's locking semantics.
-        let ids: Vec<String> = self
-            .inner
-            .all_keys()
-            .context("snapshot keys for reset")?;
+        let ids: Vec<String> = self.inner.all_keys().context("snapshot keys for reset")?;
         for uuid_str in ids {
             // `delete` is idempotent — already-deleted ids return Ok(false).
             let _ = self
@@ -496,8 +493,8 @@ fn migrate_legacy_usearch_if_present(
         quantization: ScalarKind::F32,
         ..Default::default()
     };
-    let index = Index::new(&options)
-        .map_err(|e| anyhow::anyhow!("usearch-migrate: create index: {e}"))?;
+    let index =
+        Index::new(&options).map_err(|e| anyhow::anyhow!("usearch-migrate: create index: {e}"))?;
     let path_str = legacy_path
         .to_str()
         .with_context(|| format!("usearch path not UTF-8: {legacy_path:?}"))?;
@@ -696,8 +693,14 @@ mod tests {
     async fn reset_clears_index() {
         let dir = tempdir().unwrap();
         let store = UsearchStore::new(dir.path().join("test.usearch"), 384).unwrap();
-        store.upsert(Uuid::new_v4(), unit_vec(384, 1)).await.unwrap();
-        store.upsert(Uuid::new_v4(), unit_vec(384, 2)).await.unwrap();
+        store
+            .upsert(Uuid::new_v4(), unit_vec(384, 1))
+            .await
+            .unwrap();
+        store
+            .upsert(Uuid::new_v4(), unit_vec(384, 2))
+            .await
+            .unwrap();
         assert!(store.index_size() >= 2);
 
         store.reset().unwrap();

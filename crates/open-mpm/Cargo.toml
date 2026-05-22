@@ -1,6 +1,6 @@
 [package]
 name = "open-mpm"
-version = "0.38.3"
+version = "0.38.4"
 publish = false
 edition = "2024"
 description = "MPM orchestration platform: AI agent harness with multi-model routing, tool execution, and subprocess delegation."
@@ -37,8 +37,8 @@ include = [
 # The `memory-core` feature pulls in the Memory Palace storage engine
 # (absorbed from the former `trusty-memory-core` crate in #5 phase 2d).
 trusty-common = { workspace = true, features = ["mcp", "symgraph-parser", "memory-core"] }
-trusty-memory = { path = "../trusty-memory", version = "0.1.59" }
-trusty-search = { path = "../trusty-search", version = "0.3.45" }
+trusty-memory = { path = "../trusty-memory", version = "0.1.70" }
+trusty-search = { path = "../trusty-search", version = "0.4.1" }
 tokio = { version = "1", features = ["full"] }
 async-openai = "0.30"
 serde = { version = "1", features = ["derive"] }
@@ -121,7 +121,7 @@ lru = "0.12"
 #      `open-mpm-local` depend on both `open-mpm` and the agent crate, and
 #      wire them at startup via `open_mpm::install_plugins(...)` before
 #      calling `open_mpm::run()`.
-open-mpm-agent-api = { path = "../open-mpm-agent-api", version = "0.1.0" }
+open-mpm-agent-api = { path = "../open-mpm-agent-api", version = "0.1.1" }
 
 # [patch.crates-io] moved to workspace root Cargo.toml (Cargo requires
 # [patch] tables to live in the workspace root; see #460 for context).

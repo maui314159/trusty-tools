@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "cto-assistant"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6305,7 +6305,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6583,7 +6583,7 @@ dependencies = [
 
 [[package]]
 name = "open-mpm"
-version = "0.38.3"
+version = "0.38.4"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -6668,7 +6668,7 @@ dependencies = [
 
 [[package]]
 name = "open-mpm-agent-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -6677,7 +6677,7 @@ dependencies = [
 
 [[package]]
 name = "open-mpm-local"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cto-assistant",
@@ -7238,15 +7238,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e8366a6159044a37876a2b9817124296703c586a5c92e2c53751fa06d8d43e8"
 dependencies = [
  "toml_edit 0.20.7",
-]
-
-[[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit 0.25.11+spec-1.1.0",
 ]
 
 [[package]]
@@ -9665,7 +9656,7 @@ dependencies = [
 
 [[package]]
 name = "tc-services"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -9882,7 +9873,7 @@ dependencies = [
 
 [[package]]
 name = "tga"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -10336,18 +10327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_edit"
-version = "0.25.11+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
-dependencies = [
- "indexmap 2.14.0",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "winnow 1.0.3",
-]
-
-[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10750,7 +10729,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-analyze"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10811,7 +10790,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10879,7 +10858,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-cto-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -10893,7 +10872,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-embedder"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "sysinfo",
@@ -10903,7 +10882,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-gworkspace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -10922,14 +10901,14 @@ dependencies = [
 
 [[package]]
 name = "trusty-mcp-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "trusty-common",
 ]
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.69"
+version = "0.1.70"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10959,14 +10938,14 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "trusty-common",
 ]
 
 [[package]]
 name = "trusty-mpm-cli"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -10987,7 +10966,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-client"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -11004,7 +10983,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11027,7 +11006,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-daemon"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11063,7 +11042,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-gui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -11076,7 +11055,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-mcp"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11094,7 +11073,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-telegram"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -11114,7 +11093,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-tui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -11132,7 +11111,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-rpc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -11146,7 +11125,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.3.71"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11228,7 +11207,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-symgraph"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "http-body-util",
  "tempfile",
@@ -11239,7 +11218,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-tickets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12662,9 +12641,6 @@ name = "winnow"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"

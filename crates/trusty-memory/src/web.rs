@@ -1272,9 +1272,7 @@ async fn add_alias_handler(
         .palace
         .clone()
         .or_else(|| state.default_palace.clone())
-        .ok_or_else(|| {
-            ApiError::bad_request("missing 'palace' (no default palace configured)")
-        })?;
+        .ok_or_else(|| ApiError::bad_request("missing 'palace' (no default palace configured)"))?;
     let handle = open_handle(&state, &palace_name)?;
     let triple = Triple {
         subject: req.short.clone(),
