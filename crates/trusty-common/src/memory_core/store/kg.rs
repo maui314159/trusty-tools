@@ -22,9 +22,9 @@ use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::NodeIndex;
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
-use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -600,7 +600,10 @@ impl KnowledgeGraph {
                         frontier.push_back(e.target());
                     }
                 }
-                for e in adj.graph.edges_directed(node, petgraph::Direction::Incoming) {
+                for e in adj
+                    .graph
+                    .edges_directed(node, petgraph::Direction::Incoming)
+                {
                     if visited.insert(e.source()) {
                         frontier.push_back(e.source());
                     }
@@ -759,6 +762,70 @@ impl KnowledgeGraph {
     /// Test: `upsert_drawer_then_load_drawers_round_trips`.
     pub fn load_drawers(&self) -> Result<Vec<Drawer>> {
         self.store.load_drawers()
+    }
+
+    /// Snapshot the in-memory graph as `(node_names, undirected_edges)` for
+    /// algorithms that need to iterate the full adjacency outside this module.
+    ///
+    /// Why: Community detection (issue #52) runs Louvain over the full graph,
+    /// which needs every node and every edge in one pass. Exposing the
+    /// `Adjacency` type publicly would leak the storage representation; this
+    /// helper returns a flat snapshot keyed by stable node indices in the
+    /// returned `node_names` vector.
+    /// What: Acquires a read lock, walks every node and every outgoing edge,
+    /// emits each edge once as `(min_index, max_index)` so the result is an
+    /// undirected edge list (Louvain ignores edge direction). Self-loops are
+    /// dropped. Returns `(node_names, edges)` where `edges[i] = (u, v)` and
+    /// `u, v` index into `node_names`.
+    /// Test: `community_tests::partition_covers_all_nodes` exercises this
+    /// snapshot transitively through `community::find_communities`.
+    pub(crate) fn snapshot_undirected(&self) -> Result<(Vec<String>, Vec<(usize, usize)>)> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        // Build a dense index over the StableGraph's (possibly sparse)
+        // NodeIndex values so the caller can use plain `usize` keys.
+        let mut idx_to_dense: HashMap<NodeIndex<u32>, usize> = HashMap::new();
+        let mut node_names: Vec<String> = Vec::new();
+        for ni in adj.graph.node_indices() {
+            let name = adj.graph.node_weight(ni).cloned().unwrap_or_default();
+            idx_to_dense.insert(ni, node_names.len());
+            node_names.push(name);
+        }
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for ni in adj.graph.node_indices() {
+            let u = match idx_to_dense.get(&ni) {
+                Some(&u) => u,
+                None => continue,
+            };
+            for e in adj.graph.edges(ni) {
+                let Some(&v) = idx_to_dense.get(&e.target()) else {
+                    continue;
+                };
+                if u == v {
+                    // Drop self-loops — they have no community-detection
+                    // value and break the density denominator.
+                    continue;
+                }
+                let key = if u < v { (u, v) } else { (v, u) };
+                if seen.insert(key) {
+                    edges.push(key);
+                }
+            }
+        }
+        Ok((node_names, edges))
+    }
+
+    /// Identify community-shaped knowledge gaps in the active graph.
+    ///
+    /// Why: Convenience accessor so callers don't need to import the
+    /// `community` module just to get gap suggestions.
+    /// What: Delegates to `community::find_communities(self)`.
+    /// Test: `community_tests::knowledge_gaps_on_sparse_graph`.
+    pub fn knowledge_gaps(&self) -> Vec<crate::memory_core::community::KnowledgeGap> {
+        crate::memory_core::community::find_communities(self)
     }
 
     /// Dump every triple including closed history rows.
