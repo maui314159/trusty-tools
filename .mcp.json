@@ -20,7 +20,7 @@
       "command": "trusty-memory",
       "args": [
         "serve",
-        "--mcp",
+        "--stdio",
         "--palace",
         "trusty-tools"
       ]
