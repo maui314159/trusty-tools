@@ -270,11 +270,26 @@ impl MemoryTuiState {
     /// `visible` is treated as one row so the offset always tracks the cursor.
     /// Test: `test_scroll_offset`.
     pub fn sync_scroll(&mut self, visible: usize) {
+        let cursor = self.selected;
+        self.sync_scroll_to(cursor, visible);
+    }
+
+    /// Recompute the scroll offset for an arbitrary cursor row.
+    ///
+    /// Why: when filtering, sorting, or grouping reorders the rendered rows,
+    /// `Self::selected` (an index into the original `palaces` array) no
+    /// longer matches the row's on-screen position. The renderer must pass
+    /// in the *visible* row index so the viewport scrolls to the row the
+    /// user actually sees as selected.
+    /// What: identical scroll math to [`Self::sync_scroll`] but anchored on
+    /// the supplied `cursor_row` instead of `self.selected`.
+    /// Test: `test_sync_scroll_to_follows_sorted_order`.
+    pub fn sync_scroll_to(&mut self, cursor_row: usize, visible: usize) {
         let window = visible.max(1);
-        if self.selected >= self.scroll_offset + window {
-            self.scroll_offset = self.selected + 1 - window;
-        } else if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
+        if cursor_row >= self.scroll_offset + window {
+            self.scroll_offset = cursor_row + 1 - window;
+        } else if cursor_row < self.scroll_offset {
+            self.scroll_offset = cursor_row;
         }
     }
 
@@ -795,19 +810,40 @@ const ALL_SENTINEL: &str = "__all__";
 
 /// Ids of the rows the user can navigate between, in visible display order.
 ///
-/// Why: when a filter or sort is active the displayed row order no longer
-/// matches `state.palaces`; arrow keys must step through the visible order or
-/// they appear to skip rows. The leading sentinel keeps the "All palaces" row
-/// reachable.
-/// What: returns `[ALL_SENTINEL, …visible palace ids…]`, taking the visible
-/// subset from [`filtered_sorted_palaces`]. Group headers are not included
-/// (they are non-selectable).
+/// Why: when a filter, sort, or grouping is active the displayed row order no
+/// longer matches `state.palaces`; arrow keys must step through the visible
+/// order or they appear to skip rows. The leading sentinel keeps the "All
+/// palaces" row reachable.
+/// What: returns `[ALL_SENTINEL, …visible palace ids…]`. Order matches
+/// [`palace_lines`] exactly — flat filtered+sorted order, or grouped by
+/// project when [`MemoryTuiState::group_by_project`] is set (projects are
+/// visited in the order they first appear in the sorted list). Group headers
+/// are not included (they are non-selectable).
 /// Test: `test_visible_palace_ids`, `test_navigate_visible`.
 pub fn visible_palace_ids(state: &MemoryTuiState) -> Vec<String> {
-    let mut ids = Vec::with_capacity(state.palaces.len() + 1);
+    let visible = filtered_sorted_palaces(state);
+    let mut ids = Vec::with_capacity(visible.len() + 1);
     ids.push(ALL_SENTINEL.to_string());
-    for row in filtered_sorted_palaces(state) {
-        ids.push(row.id);
+    if state.group_by_project {
+        // Walk projects in first-seen order, then each project's palaces in
+        // sorted order — mirroring `palace_lines` exactly so arrow keys follow
+        // on-screen order.
+        let mut seen: Vec<String> = Vec::new();
+        for p in &visible {
+            let proj = p.project().to_string();
+            if !seen.iter().any(|s| s == &proj) {
+                seen.push(proj);
+            }
+        }
+        for project in &seen {
+            for palace in visible.iter().filter(|p| p.project() == project) {
+                ids.push(palace.id.clone());
+            }
+        }
+    } else {
+        for row in &visible {
+            ids.push(row.id.clone());
+        }
     }
     ids
 }
@@ -889,6 +925,33 @@ pub fn navigate_down_visible(state: &mut MemoryTuiState) {
         let new_id = ids[pos + 1].clone();
         select_visible_id(state, &new_id);
     }
+}
+
+/// Row index — within the rendered `palace_lines` output — that the cursor
+/// currently sits on.
+///
+/// Why: ratatui's `ListState::with_selected` and the viewport scroll math
+/// both index into the rendered list, but `state.selected` is an index into
+/// the *original* `state.palaces` Vec. After a filter, sort, or grouping
+/// reorders rows, the two indices diverge and the highlight + scroll latch
+/// onto the wrong on-screen line. This helper bridges them: given the same
+/// state the renderer sees, it returns the visible row at which the current
+/// selection is drawn so the highlight follows the sorted order.
+/// What: returns `0` when "All" is selected; otherwise walks
+/// [`palace_lines`] looking for the row whose `selected` flag is set and
+/// returns its index. Falls back to `0` (the "All" row) when no matching
+/// row is found, which mirrors how `clamp_to_visible` collapses a hidden
+/// selection back to "All".
+/// Test: `test_visible_selected_row_follows_sort`,
+/// `test_visible_selected_row_follows_group`.
+pub fn visible_selected_row(state: &MemoryTuiState) -> usize {
+    if state.selected == 0 {
+        return 0;
+    }
+    palace_lines(state)
+        .iter()
+        .position(|row| row.selected)
+        .unwrap_or(0)
 }
 
 /// Build the rows for the PALACES panel body.
@@ -1214,12 +1277,17 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
     }
 
     // Scroll the PALACES list so the selected row stays visible: the panel
-    // height minus its two border rows is the visible window.
+    // height minus its two border rows is the visible window. Both the scroll
+    // anchor and the ratatui ListState selection index must reference the
+    // *displayed* row (filter + sort + grouping reorder the rendered rows
+    // relative to `state.palaces`), so we look up the visible row index of
+    // the currently selected palace once and use it for both.
     let palace_visible = list_area.height.saturating_sub(2) as usize;
-    state.sync_scroll(palace_visible);
+    let visible_row = visible_selected_row(state);
+    state.sync_scroll_to(visible_row, palace_visible);
     let mut palace_state = ListState::default()
         .with_offset(state.scroll_offset)
-        .with_selected(Some(state.selected));
+        .with_selected(Some(visible_row));
     let palace_title = format!("PALACES [{}]", state.sort_key.label());
     frame.render_stateful_widget(
         List::new(palace_items).block(panel_block(&palace_title, list_focused)),
@@ -1963,6 +2031,90 @@ mod tests {
         navigate_down_visible(&mut state);
         // No more visible rows.
         assert_eq!(state.selected_id(), Some("trusty-search"));
+    }
+
+    #[test]
+    fn test_visible_selected_row_follows_sort() {
+        // The visible row index for the highlight must follow the rendered
+        // (filter + sort) order, not the original `state.palaces` order.
+        // Diverse palaces (in original order): trusty-search, trusty-memory,
+        // claude-mpm, notes. Selecting "claude-mpm" places it at cursor 3
+        // (index 2 + 1). With Name sort the displayed order is:
+        //   0 All, 1 claude-mpm, 2 notes, 3 trusty-memory, 4 trusty-search
+        // so the highlight must land on row 1, not row 3.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        let pos = state
+            .palaces
+            .iter()
+            .position(|p| p.id == "claude-mpm")
+            .expect("palace");
+        state.selected = pos + 1;
+        assert_eq!(state.selected, 3, "original index puts claude-mpm at 3");
+        assert_eq!(
+            visible_selected_row(&state),
+            1,
+            "claude-mpm is the first non-All row after Name sort",
+        );
+
+        // "All" always sits at row 0 regardless of sort.
+        state.selected = 0;
+        assert_eq!(visible_selected_row(&state), 0);
+
+        // With Vectors sort the displayed order is:
+        //   0 All, 1 claude-mpm (6163), 2 trusty-memory (3775),
+        //   3 notes (100), 4 trusty-search (12)
+        // so notes must land on row 3.
+        state.sort_key = PalaceSortKey::Vectors;
+        let pos = state
+            .palaces
+            .iter()
+            .position(|p| p.id == "notes")
+            .expect("palace");
+        state.selected = pos + 1;
+        assert_eq!(visible_selected_row(&state), 3);
+    }
+
+    #[test]
+    fn test_visible_selected_row_follows_group() {
+        // Grouping interleaves project headers (non-selectable) with palaces;
+        // the highlight row must skip over them and follow the grouped layout.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        state.group_by_project = true;
+        // Select "trusty-memory". The row layout starts with All, then the
+        // first project header, then its palace rows; the exact row index
+        // must match the position palace_lines marks as `selected`.
+        let pos = state
+            .palaces
+            .iter()
+            .position(|p| p.id == "trusty-memory")
+            .expect("palace");
+        state.selected = pos + 1;
+        let expected = palace_lines(&state)
+            .iter()
+            .position(|row| row.selected)
+            .expect("trusty-memory must appear in the grouped layout");
+        assert_eq!(visible_selected_row(&state), expected);
+        assert!(expected > 0, "highlight is not on the All row");
+    }
+
+    #[test]
+    fn test_sync_scroll_to_follows_sorted_order() {
+        // sync_scroll_to anchors the viewport on the *visible* row, so a
+        // selection deep in the sorted list scrolls the window down even
+        // when state.selected refers to a low index in the original Vec.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        // Visible order: All(0), claude-mpm(1), notes(2),
+        //                trusty-memory(3), trusty-search(4).
+        // Select trusty-search (original index 0 → state.selected = 1).
+        state.selected = 1;
+        let visible_row = visible_selected_row(&state);
+        assert_eq!(visible_row, 4, "trusty-search is the last visible row");
+        // A 3-row window must scroll so row 4 fits: offset = 4 + 1 - 3 = 2.
+        state.sync_scroll_to(visible_row, 3);
+        assert_eq!(state.scroll_offset, 2);
     }
 
     #[test]
