@@ -53,7 +53,7 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
 
         // Mutating
         "memory_remember" | "memory_forget" | "palace_create" | "palace_compact" | "kg_assert"
-        | "add_alias" | "remove_prompt_fact" => &[MEMORY_WRITE],
+        | "add_alias" | "remove_prompt_fact" | "discover_aliases" => &[MEMORY_WRITE],
 
         _ => &[],
     };

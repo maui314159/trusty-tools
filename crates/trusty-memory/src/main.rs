@@ -283,6 +283,15 @@ async fn run_serve(
                     "background palace hydration failed: {e:#}"
                 ),
             }
+            // Issue #42: once palaces are live, kick off auto-discovery
+            // against cwd targeting the default palace (if configured).
+            // Without a default palace there's no obvious destination, so
+            // skip — explicit MCP `discover_aliases` calls still work.
+            if let Some(palace) = bg_state.default_palace.clone() {
+                if let Ok(cwd) = std::env::current_dir() {
+                    bg_state.spawn_alias_discovery(palace, cwd);
+                }
+            }
         });
         run_http(state, addr).await
     } else {
@@ -306,6 +315,15 @@ async fn run_serve(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "background palace hydration failed: {e:#}"
                 ),
+            }
+            // Issue #42: once palaces are live, kick off auto-discovery
+            // against cwd targeting the default palace (if configured).
+            // Without a default palace there's no obvious destination, so
+            // skip — explicit MCP `discover_aliases` calls still work.
+            if let Some(palace) = bg_state.default_palace.clone() {
+                if let Ok(cwd) = std::env::current_dir() {
+                    bg_state.spawn_alias_discovery(palace, cwd);
+                }
             }
         });
         run_http_dynamic(state).await

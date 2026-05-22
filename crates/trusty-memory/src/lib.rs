@@ -22,6 +22,7 @@ use trusty_common::memory_core::PalaceRegistry;
 use trusty_common::ChatProvider;
 
 pub mod commands;
+pub mod discovery;
 pub mod openrpc;
 pub mod prompt_facts;
 pub mod service;
@@ -424,6 +425,43 @@ impl AppState {
             })
             .await
             .clone()
+    }
+
+    /// Spawn a fire-and-forget background task that auto-discovers project
+    /// aliases under `project_root` and asserts new ones into `palace`.
+    ///
+    /// Why (issue #42): Projects carry implicit shorthand — cargo package
+    /// names that differ from their directory, binary names that differ
+    /// from packages, first-letter abbreviations — that should be surfaced
+    /// without a user ever calling `add_alias`. Running discovery as a
+    /// detached task on palace-open keeps startup latency unchanged: the
+    /// daemon binds and starts serving immediately while the discovery scan
+    /// completes in the background, and any newly-asserted aliases land in
+    /// the prompt cache before the model's next `get_prompt_context` call.
+    /// What: clones `self` (cheap; `Arc`-backed), spawns a tokio task that
+    /// invokes the `discover_aliases` tool handler directly so the
+    /// dedup + cache-rebuild logic runs exactly the same path as the MCP
+    /// tool call. Errors are logged at `warn!`; one failed discovery never
+    /// destabilises the daemon.
+    /// Test: not unit-tested (timing-dependent fire-and-forget); the
+    /// underlying `discover_aliases` dispatch is covered by
+    /// `dispatch_discover_aliases_inserts_new_and_dedupes` in `tools::tests`.
+    pub fn spawn_alias_discovery(&self, palace: String, project_root: PathBuf) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let args = serde_json::json!({
+                "palace": palace,
+                "project_root": project_root.to_string_lossy(),
+            });
+            match tools::dispatch_tool(&state, "discover_aliases", args).await {
+                Ok(result) => tracing::info!(
+                    new = ?result.get("new"),
+                    already_known = ?result.get("already_known"),
+                    "alias discovery complete"
+                ),
+                Err(e) => tracing::warn!("alias discovery failed: {e:#}"),
+            }
+        });
     }
 
     pub async fn embedder(&self) -> Result<Arc<FastEmbedder>> {
@@ -902,7 +940,7 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[tokio::test]

@@ -280,6 +280,16 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                 }
             },
             {
+                "name": "discover_aliases",
+                "description": "Auto-discover project aliases by scanning Cargo workspace members, binary names, first-letter abbreviations, and the git remote. Asserts any newly-discovered (short, is_alias_for, full) triples into the resolved palace and rebuilds the prompt cache. Skips triples that already exist active in the KG.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_root": {"type": "string", "description": "Optional filesystem path to scan. Defaults to the process cwd."}
+                    }
+                }
+            },
+            {
                 "name": "memory_recall_all",
                 "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
                 "inputSchema": {
@@ -807,6 +817,84 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             // to strip.
             Ok(Value::String(body))
         }
+        "discover_aliases" => {
+            // Why (issue #42): Surface project shorthand automatically so the
+            // model never has to be told `tga == trusty-git-analytics`. The
+            // tool resolves a palace (default or argument), runs the
+            // pure-discovery scanner against the requested root (or cwd),
+            // checks each candidate against the palace's active KG, and
+            // asserts only the new ones. The prompt cache is rebuilt once
+            // at the end iff anything was actually asserted.
+            // What: returns `{ discovered: [...], already_known: N, new: M }`
+            // so callers can audit the delta.
+            // Test: `dispatch_discover_aliases_inserts_new_and_dedupes`.
+            let palace = resolve_palace(state, &args, "discover_aliases")?;
+            let project_root = args
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .ok_or_else(|| anyhow!("discover_aliases: no project_root and cwd unavailable"))?;
+
+            let discoveries = crate::discovery::discover_project_aliases(&project_root).await?;
+
+            let handle = open_palace_handle(state, &palace)?;
+
+            let mut already_known = 0usize;
+            let mut newly_asserted = 0usize;
+            let mut reported: Vec<Value> = Vec::with_capacity(discoveries.len());
+
+            for d in &discoveries {
+                // Check active triples for the subject; if any matches the
+                // same predicate + object, skip the assertion.
+                let active = handle
+                    .kg
+                    .query_active(&d.short)
+                    .await
+                    .context("kg.query_active")?;
+                let exists = active
+                    .iter()
+                    .any(|t| t.predicate == "is_alias_for" && t.object == d.full);
+                if exists {
+                    already_known += 1;
+                    continue;
+                }
+
+                let triple = Triple {
+                    subject: d.short.clone(),
+                    predicate: "is_alias_for".to_string(),
+                    object: d.full.clone(),
+                    valid_from: chrono::Utc::now(),
+                    valid_to: None,
+                    confidence: 1.0,
+                    provenance: Some(format!("discover_aliases:{}", d.source.as_str())),
+                };
+                handle
+                    .kg
+                    .assert(triple)
+                    .await
+                    .context("kg.assert (discover)")?;
+                newly_asserted += 1;
+                reported.push(json!({
+                    "short": d.short,
+                    "full": d.full,
+                    "source": d.source.as_str(),
+                }));
+            }
+
+            if newly_asserted > 0 {
+                if let Err(e) = crate::prompt_facts::rebuild_prompt_cache(state).await {
+                    tracing::warn!("rebuild_prompt_cache after discover_aliases failed: {e:#}");
+                }
+            }
+
+            Ok(json!({
+                "discovered": reported,
+                "already_known": already_known,
+                "new": newly_asserted,
+                "palace": palace,
+            }))
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -894,7 +982,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -916,6 +1004,7 @@ mod tests {
             "list_prompt_facts",
             "remove_prompt_fact",
             "get_prompt_context",
+            "discover_aliases",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -1200,6 +1289,76 @@ mod tests {
         let text = resp.as_str().expect("string body");
         assert!(text.contains("tga → trusty-git-analytics"));
         assert!(text.contains("tm → trusty-memory"));
+    }
+
+    /// Why (issue #42): `discover_aliases` must (a) auto-discover the
+    /// canonical workspace shorthand (`tga → trusty-git-analytics`),
+    /// (b) assert each discovery as an `is_alias_for` triple, (c) refresh
+    /// the prompt cache, and (d) dedupe on a second invocation — the second
+    /// call should report zero new and N already_known.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn dispatch_discover_aliases_inserts_new_and_dedupes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let state = AppState::new(root).with_default_palace(Some("disc".to_string()));
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "disc"}))
+            .await
+            .expect("palace_create");
+
+        // Use the live workspace root so the discovery actually finds
+        // something. CARGO_MANIFEST_DIR points at the crate dir; walk up
+        // twice to the workspace root.
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+
+        let first = dispatch_tool(
+            &state,
+            "discover_aliases",
+            json!({"project_root": workspace_root.to_string_lossy()}),
+        )
+        .await
+        .expect("discover_aliases first");
+
+        let new_count = first["new"].as_u64().expect("new is u64");
+        assert!(new_count > 0, "expected new discoveries on first call");
+        let discovered = first["discovered"].as_array().expect("discovered array");
+        assert!(
+            discovered
+                .iter()
+                .any(|d| d["short"] == "tga" && d["full"] == "trusty-git-analytics"),
+            "expected tga alias in discoveries; got {discovered:?}"
+        );
+
+        // The prompt cache must contain the new alias after discovery.
+        {
+            let guard = state.prompt_context_cache.read().expect("read lock");
+            assert!(
+                guard.formatted.contains("tga → trusty-git-analytics"),
+                "prompt cache missing tga alias after discover_aliases; got: {}",
+                guard.formatted
+            );
+        }
+
+        // Second invocation should report zero new and at least `new_count`
+        // already_known — the same discoveries are now in the KG.
+        let second = dispatch_tool(
+            &state,
+            "discover_aliases",
+            json!({"project_root": workspace_root.to_string_lossy()}),
+        )
+        .await
+        .expect("discover_aliases second");
+        assert_eq!(second["new"].as_u64(), Some(0), "expected 0 new on rerun");
+        let already_known = second["already_known"].as_u64().expect("already_known");
+        assert!(
+            already_known >= new_count,
+            "expected already_known >= {new_count}, got {already_known}"
+        );
     }
 
     #[tokio::test]
