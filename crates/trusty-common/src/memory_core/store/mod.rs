@@ -8,6 +8,7 @@
 
 pub mod chat_sessions;
 pub mod kg;
+pub mod kg_store;
 pub mod kuzu;
 pub mod l1_cache;
 pub mod palace_store;
