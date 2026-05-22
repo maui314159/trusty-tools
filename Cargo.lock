@@ -10945,7 +10945,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-cli"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -10966,7 +10966,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-client"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -10983,7 +10983,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-core"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11006,7 +11006,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-daemon"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11055,7 +11055,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-mcp"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11073,7 +11073,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-telegram"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -11093,7 +11093,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-tui"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",
