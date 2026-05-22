@@ -18,7 +18,7 @@
 //! line builders, and dream-event logging; `trusty-memory monitor tui`
 //! launches the live UI.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc;
 
@@ -87,6 +87,192 @@ pub fn sort_label(key: ThreeWaySortKey) -> &'static str {
 /// What: the display text of the palace list's first row.
 /// Test: `test_palace_lines` asserts this is the first row.
 pub const ALL_LABEL: &str = "All palaces";
+
+/// Braille spinner glyphs used for the "Indexing" state (rotating wave).
+///
+/// Why: a recognisable spinner prefix gives the operator a glance-cue that a
+/// palace is currently absorbing writes, without polling for an explicit state.
+/// What: ten-frame braille cycle, indexed by a wall-clock tick.
+/// Test: `test_palace_activity_state` (frames sampled deterministically).
+const INDEXING_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Braille spinner glyphs used for the "Dreaming" state (rotating block).
+///
+/// Why: a heavier, distinct cycle separates an in-progress dream/compaction
+/// from the lighter indexing spinner at a glance.
+/// What: eight-frame braille cycle.
+/// Test: `test_palace_activity_state`.
+const DREAMING_SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+
+/// A palace's current activity state, surfaced as a coloured spinner prefix.
+///
+/// Why: operators want to see at a glance whether each palace is idle, taking
+/// writes, recently active, dreaming, or unhealthy. A typed enum makes the
+/// renderer's colour + glyph mapping exhaustive.
+/// What: five mutually-exclusive states. The mapping from the underlying
+/// `PalaceRow` data lives in [`palace_activity_state`].
+/// Test: `test_palace_activity_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PalaceActivity {
+    /// Nothing recent — no spinner, default style.
+    Idle,
+    /// `last_write_at` within the last 10 seconds — rotating indexing spinner.
+    Indexing,
+    /// `last_write_at` within the last 60 seconds — static `⠿` in cyan.
+    Active,
+    /// A dream/compaction cycle is currently running — rotating block spinner.
+    Dreaming,
+    /// The palace reported an unhealthy / error state — red `✗`.
+    Error,
+}
+
+impl PalaceActivity {
+    /// Resolve the rendered prefix glyph for this state at wall-clock `tick`.
+    ///
+    /// Why: spinners must cycle without an explicit app tick; the wall-clock
+    /// driver lets every palace's frame advance independently of polls.
+    /// What: returns a single rendered character: `' '` for Idle, the indexed
+    /// frame from [`INDEXING_SPINNER`] / [`DREAMING_SPINNER`] for the rotating
+    /// states, `'⠿'` for Active, and `'✗'` for Error.
+    /// Test: `test_palace_activity_state`.
+    pub fn prefix(self, tick: usize) -> char {
+        match self {
+            PalaceActivity::Idle => ' ',
+            PalaceActivity::Indexing => INDEXING_SPINNER[tick % INDEXING_SPINNER.len()],
+            PalaceActivity::Active => '⠿',
+            PalaceActivity::Dreaming => DREAMING_SPINNER[tick % DREAMING_SPINNER.len()],
+            PalaceActivity::Error => '✗',
+        }
+    }
+
+    /// Resolve the foreground colour for this state.
+    ///
+    /// Why: colour reinforces the glyph — yellow for indexing, cyan for
+    /// active, magenta for dreaming, red for error, default for idle.
+    /// What: returns `None` for Idle (default terminal foreground) or
+    /// `Some(Color)` for the four signalling states.
+    /// Test: `test_palace_activity_state`.
+    pub fn color(self) -> Option<Color> {
+        match self {
+            PalaceActivity::Idle => None,
+            PalaceActivity::Indexing => Some(Color::Yellow),
+            PalaceActivity::Active => Some(Color::Cyan),
+            PalaceActivity::Dreaming => Some(Color::Magenta),
+            PalaceActivity::Error => Some(Color::Red),
+        }
+    }
+}
+
+/// Wall-clock spinner tick, driven by the system clock at 10 Hz.
+///
+/// Why: spinners must animate even when no app event fires; a wall-clock tick
+/// keeps every frame in motion without a separate timer.
+/// What: returns `now.duration_since(UNIX_EPOCH).as_millis() / 100`, cast to
+/// `usize` (saturating at zero on clock skew).
+/// Test: `test_spinner_tick_monotonic` only sanity-checks the call surface;
+/// downstream tests pass an explicit `tick` to keep them deterministic.
+pub fn spinner_tick() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 100) as usize)
+        .unwrap_or(0)
+}
+
+/// Derive a palace's current [`PalaceActivity`] from its wire fields.
+///
+/// Why: the row builder and the STATISTICS panel both need the same mapping.
+/// Centralising it keeps the rendering and the detail panel in sync, and the
+/// 10-second / 60-second cut-offs documented in one place.
+/// What: `is_compacting → Dreaming`; otherwise the elapsed time since
+/// `last_write_at` decides Indexing (< 10s), Active (< 60s), or Idle. Error
+/// is reserved for a future health field on the wire — never returned today.
+/// Test: `test_palace_activity_state`.
+pub fn palace_activity_state(
+    palace: &PalaceRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PalaceActivity {
+    if palace.is_compacting {
+        return PalaceActivity::Dreaming;
+    }
+    match palace.last_write_at {
+        Some(ts) => {
+            let delta = now.signed_duration_since(ts);
+            // Negative deltas (clock skew) are treated as fresh writes.
+            let secs = delta.num_seconds();
+            if secs < 10 {
+                PalaceActivity::Indexing
+            } else if secs < 60 {
+                PalaceActivity::Active
+            } else {
+                PalaceActivity::Idle
+            }
+        }
+        None => PalaceActivity::Idle,
+    }
+}
+
+/// Whether to keep a palace in the visible list.
+///
+/// Why: palaces with no vectors AND no KG triples carry no useful content for
+/// recall or graph queries, so they clutter the list. Filtering them out at the
+/// row-builder level keeps the filter / sort / group helpers downstream
+/// unchanged.
+/// What: returns `false` when both `vector_count == 0` and `kg_triple_count
+/// == 0`; otherwise `true`.
+/// Test: `test_filter_empty_palaces`.
+pub fn palace_has_content(palace: &PalaceRow) -> bool {
+    palace.vector_count > 0 || palace.kg_triple_count > 0
+}
+
+/// Render a `chrono::Duration` as a compact human-readable relative time.
+///
+/// Why: the detail panel's "Last write" line reads more naturally as "just
+/// now" / "2m ago" / "5h ago" than as a raw timestamp; the absolute timestamp
+/// is shown alongside for precision.
+/// What: returns `"just now"` for < 5s; `"<n>s ago"` for < 60s;
+/// `"<n>m ago"` for < 60min; `"<n>h ago"` for < 24h; `"<n>d ago"` otherwise.
+/// Negative deltas are clamped to "just now".
+/// Test: `test_format_relative_time`.
+pub fn format_relative_time(
+    now: chrono::DateTime<chrono::Utc>,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let secs = now.signed_duration_since(ts).num_seconds();
+    if secs < 5 {
+        return "just now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
+/// Human-readable label for a [`PalaceActivity`] state.
+///
+/// Why: the STATISTICS panel surfaces the current state in plain text next to
+/// the spinner; sharing the mapping keeps the row prefix and the detail panel
+/// label in lockstep.
+/// What: returns `"Idle"`, `"Indexing"`, `"Active"`, `"Dreaming"`, or
+/// `"Error"`.
+/// Test: covered indirectly by `test_stats_graph_section`.
+pub fn activity_label(activity: PalaceActivity) -> &'static str {
+    match activity {
+        PalaceActivity::Idle => "Idle",
+        PalaceActivity::Indexing => "Indexing",
+        PalaceActivity::Active => "Active",
+        PalaceActivity::Dreaming => "Dreaming",
+        PalaceActivity::Error => "Error",
+    }
+}
 
 /// Which zone of the memory UI currently holds keyboard focus.
 ///
@@ -643,19 +829,38 @@ pub fn help_text() -> String {
 /// Format one palace as a fixed-width table row.
 ///
 /// Why: the PALACES panel lists every palace with its vector count in aligned
-/// columns; isolating the formatter makes the alignment unit-testable.
-/// What: returns `> <name padded to 10>  <count>v`, where the leading marker
-/// is `>` for the selected row and a space otherwise.
+/// columns; isolating the formatter makes the alignment unit-testable. The
+/// selection marker is no longer baked into the row — the [`List`] widget
+/// handles the highlight via `highlight_symbol` + `highlight_style` so there
+/// is no unstyled gutter between the row text and the panel border.
+/// What: returns `<spinner> <name padded to 10>  <count>v`, where `spinner`
+/// is the [`PalaceActivity`] prefix character (a space for Idle).
 /// Test: `test_palace_row_display`.
-pub fn palace_row(palace: &PalaceRow, selected: bool) -> String {
-    let marker = if selected { ">" } else { " " };
+pub fn palace_row(palace: &PalaceRow, _selected: bool) -> String {
+    palace_row_with_activity(palace, PalaceActivity::Idle, 0)
+}
+
+/// Format one palace row with an explicit activity state and spinner tick.
+///
+/// Why: the live renderer needs to emit the activity-state spinner glyph
+/// (yellow / cyan / magenta / red); separating this from the pure
+/// `palace_row` keeps the existing legacy callers and tests compiling while
+/// the renderer uses the richer overload.
+/// What: returns `<spinner-glyph> <name padded to 10>  <count>v`.
+/// Test: `test_palace_row_with_activity`.
+pub fn palace_row_with_activity(
+    palace: &PalaceRow,
+    activity: PalaceActivity,
+    tick: usize,
+) -> String {
+    let prefix = activity.prefix(tick);
     let label = if palace.name.is_empty() {
         &palace.id
     } else {
         &palace.name
     };
     format!(
-        "{marker} {:<10} {:>7}v",
+        "{prefix} {:<10} {:>7}v",
         truncate(label, 10),
         format_count(palace.vector_count),
     )
@@ -681,25 +886,35 @@ pub struct PalaceListRow {
     pub is_all: bool,
     /// Whether this row is a non-selectable group header.
     pub is_header: bool,
+    /// The palace's activity state, when this row represents a real palace.
+    ///
+    /// Why: drives the spinner glyph's foreground colour at render time; the
+    /// "All" and header rows carry `None` because their colour is fixed.
+    /// What: `Some(state)` for a palace row, `None` for All / header / empty.
+    /// Test: `test_palace_lines_activity`.
+    pub activity: Option<PalaceActivity>,
 }
 
 /// Format an indented palace row for use under a group header.
 ///
-/// Why: when the list is grouped, palace rows are inset one extra space and
-/// the name column shrinks by one to keep the count column aligned with the
-/// flat layout.
-/// What: returns `"  <name padded to 9>  <count>v"`, with `>` replacing the
-/// leading space when `selected`.
-/// Test: `test_palace_lines_grouped`.
-fn palace_row_indented(palace: &PalaceRow, selected: bool) -> String {
-    let marker = if selected { ">" } else { " " };
+/// Why: companion to [`palace_row_with_activity`] for the grouped layout —
+/// matches the same spinner-glyph + label column structure but with the
+/// one-space group indent that keeps the count column aligned.
+/// What: returns `" <spinner> <name padded to 9>  <count>v"`.
+/// Test: `test_palace_row_with_activity`.
+fn palace_row_indented_with_activity(
+    palace: &PalaceRow,
+    activity: PalaceActivity,
+    tick: usize,
+) -> String {
+    let prefix = activity.prefix(tick);
     let label = if palace.name.is_empty() {
         &palace.id
     } else {
         &palace.name
     };
     format!(
-        "{marker}  {:<9} {:>7}v",
+        " {prefix} {:<9} {:>7}v",
         truncate(label, 9),
         format_count(palace.vector_count),
     )
@@ -709,12 +924,21 @@ fn palace_row_indented(palace: &PalaceRow, selected: bool) -> String {
 /// state's palaces, returning the visible subset in display order.
 ///
 /// Why: delegates to the shared [`tui_common::filtered_sorted`] so memory and
-/// search apply identical filter / sort rules. Kept as a memory-named wrapper
-/// for the existing tests and callers.
-/// What: thin wrapper over [`tui_common::filtered_sorted`].
-/// Test: `test_apply_filter`, `test_apply_sort_*`.
+/// search apply identical filter / sort rules. Empty palaces (zero vectors and
+/// zero KG triples) are dropped first — they carry no recallable or graph
+/// content and would only clutter the list. Kept as a memory-named wrapper for
+/// the existing tests and callers.
+/// What: filters out empty palaces via [`palace_has_content`], then delegates
+/// to [`tui_common::filtered_sorted`].
+/// Test: `test_apply_filter`, `test_apply_sort_*`, `test_filter_empty_palaces`.
 pub fn filtered_sorted_palaces(state: &MemoryTuiState) -> Vec<PalaceRow> {
-    tui_common::filtered_sorted(&state.palaces, &state.filter, state.sort_key)
+    let nonempty: Vec<PalaceRow> = state
+        .palaces
+        .iter()
+        .filter(|p| palace_has_content(p))
+        .cloned()
+        .collect();
+    tui_common::filtered_sorted(&nonempty, &state.filter, state.sort_key)
 }
 
 /// Ids of the rows the user can navigate between, in visible display order.
@@ -723,8 +947,14 @@ pub fn filtered_sorted_palaces(state: &MemoryTuiState) -> Vec<PalaceRow> {
 /// What: delegates to the shared helper with the memory state's fields.
 /// Test: `test_visible_palace_ids`, `test_navigate_visible`.
 pub fn visible_palace_ids(state: &MemoryTuiState) -> Vec<String> {
+    let nonempty: Vec<PalaceRow> = state
+        .palaces
+        .iter()
+        .filter(|p| palace_has_content(p))
+        .cloned()
+        .collect();
     tui_common::visible_ids(
-        &state.palaces,
+        &nonempty,
         &state.filter,
         state.sort_key,
         state.group_by_project,
@@ -737,13 +967,28 @@ pub fn visible_palace_ids(state: &MemoryTuiState) -> Vec<String> {
 /// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_up_visible(state: &mut MemoryTuiState) {
-    state.selected = tui_common::navigate_up(
-        &state.palaces,
-        state.selected,
+    // Filter empty palaces so arrows step over visible content only — but map
+    // the resulting cursor back into the original `state.palaces` array by id.
+    let nonempty: Vec<PalaceRow> = state
+        .palaces
+        .iter()
+        .filter(|p| palace_has_content(p))
+        .cloned()
+        .collect();
+    let current_id = state
+        .selected_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| tui_common::ALL_SENTINEL.to_string());
+    let local_cursor = tui_common::id_to_cursor(&nonempty, &current_id).unwrap_or(0);
+    let new_local = tui_common::navigate_up(
+        &nonempty,
+        local_cursor,
         &state.filter,
         state.sort_key,
         state.group_by_project,
     );
+    let new_id = tui_common::current_visible_id(&nonempty, new_local);
+    state.selected = tui_common::id_to_cursor(&state.palaces, &new_id).unwrap_or(0);
 }
 
 /// Move the cursor down one row in the visible (filtered + sorted) list.
@@ -752,13 +997,26 @@ pub fn navigate_up_visible(state: &mut MemoryTuiState) {
 /// What: delegates and writes back the new cursor.
 /// Test: `test_navigate_visible`.
 pub fn navigate_down_visible(state: &mut MemoryTuiState) {
-    state.selected = tui_common::navigate_down(
-        &state.palaces,
-        state.selected,
+    let nonempty: Vec<PalaceRow> = state
+        .palaces
+        .iter()
+        .filter(|p| palace_has_content(p))
+        .cloned()
+        .collect();
+    let current_id = state
+        .selected_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| tui_common::ALL_SENTINEL.to_string());
+    let local_cursor = tui_common::id_to_cursor(&nonempty, &current_id).unwrap_or(0);
+    let new_local = tui_common::navigate_down(
+        &nonempty,
+        local_cursor,
         &state.filter,
         state.sort_key,
         state.group_by_project,
     );
+    let new_id = tui_common::current_visible_id(&nonempty, new_local);
+    state.selected = tui_common::id_to_cursor(&state.palaces, &new_id).unwrap_or(0);
 }
 
 /// Row index — within the rendered `palace_lines` output — that the cursor
@@ -800,19 +1058,36 @@ pub fn visible_selected_row(state: &MemoryTuiState) -> usize {
 /// placeholder line.
 /// Test: `test_palace_lines`, `test_all_selector`, `test_palace_lines_grouped`.
 pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
+    palace_lines_at(state, chrono::Utc::now(), 0)
+}
+
+/// Variant of [`palace_lines`] that takes an explicit clock and spinner tick.
+///
+/// Why: the live renderer needs to drive the activity-state spinner from the
+/// wall-clock without polluting the broader test suite with clock dependencies.
+/// Splitting the time inputs out also makes the activity-state assertions
+/// deterministic.
+/// What: identical to [`palace_lines`] except that `now` drives the per-palace
+/// [`PalaceActivity`] derivation and `tick` selects the spinner frame.
+/// Test: `test_palace_lines_activity`.
+pub fn palace_lines_at(
+    state: &MemoryTuiState,
+    now: chrono::DateTime<chrono::Utc>,
+    tick: usize,
+) -> Vec<PalaceListRow> {
     let mut rows: Vec<PalaceListRow> = Vec::with_capacity(state.palaces.len() + 1);
 
     // The synthetic "All palaces" row always leads the list — including when
-    // filtering or grouping is active. The label may be wider than the per-
-    // palace name column — it is shown in full.
+    // filtering or grouping is active. The selection highlight is rendered by
+    // the List widget's highlight_symbol so the row text carries no marker.
     let total_vectors: u64 = state.palaces.iter().map(|p| p.vector_count).sum();
     let all_selected = state.selected == 0;
-    let all_marker = if all_selected { ">" } else { " " };
     rows.push(PalaceListRow {
-        text: format!("{all_marker} {ALL_LABEL}  {}v", format_count(total_vectors),),
+        text: format!("  {ALL_LABEL}  {}v", format_count(total_vectors)),
         selected: all_selected,
         is_all: true,
         is_header: false,
+        activity: None,
     });
 
     if state.palaces.is_empty() {
@@ -821,6 +1096,7 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
             selected: false,
             is_all: false,
             is_header: false,
+            activity: None,
         });
         return rows;
     }
@@ -832,6 +1108,7 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
             selected: false,
             is_all: false,
             is_header: false,
+            activity: None,
         });
         return rows;
     }
@@ -863,15 +1140,18 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
                 selected: false,
                 is_all: false,
                 is_header: true,
+                activity: None,
             });
             for palace in visible.iter().filter(|p| p.project() == project) {
                 let cursor = cursor_for(palace);
                 let selected = cursor == state.selected;
+                let activity = palace_activity_state(palace, now);
                 rows.push(PalaceListRow {
-                    text: palace_row_indented(palace, selected),
+                    text: palace_row_indented_with_activity(palace, activity, tick),
                     selected,
                     is_all: false,
                     is_header: false,
+                    activity: Some(activity),
                 });
             }
         }
@@ -879,11 +1159,13 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
         for palace in &visible {
             let cursor = cursor_for(palace);
             let selected = cursor == state.selected;
+            let activity = palace_activity_state(palace, now);
             rows.push(PalaceListRow {
-                text: palace_row(palace, selected),
+                text: palace_row_with_activity(palace, activity, tick),
                 selected,
                 is_all: false,
                 is_header: false,
+                activity: Some(activity),
             });
         }
     }
@@ -938,11 +1220,32 @@ pub fn stats_lines(state: &MemoryTuiState) -> Vec<String> {
             } else {
                 palace.name.as_str()
             };
-            vec![
+            let now = chrono::Utc::now();
+            let activity = palace_activity_state(palace, now);
+            let mut lines = vec![
                 format!("Palace:       {label}"),
                 format!("Vectors:      {}", format_count(palace.vector_count)),
                 format!("Id:           {}", palace.id),
-            ]
+                String::new(),
+                "Knowledge Graph".to_string(),
+                format!("  Nodes:        {}", format_count(palace.node_count)),
+                format!("  Edges:        {}", format_count(palace.edge_count)),
+                format!("  Communities:  {}", format_count(palace.community_count)),
+                format!("  Triples:      {}", format_count(palace.kg_triple_count)),
+                String::new(),
+            ];
+            match palace.last_write_at {
+                Some(ts) => {
+                    lines.push(format!(
+                        "Last write:   {} ({})",
+                        format_relative_time(now, ts),
+                        ts.format("%Y-%m-%d %H:%M:%S UTC"),
+                    ));
+                }
+                None => lines.push("Last write:   never".to_string()),
+            }
+            lines.push(format!("State:        {}", activity_label(activity)));
+            lines
         }
         None => vec!["(no palace selected)".to_string()],
     }
@@ -1011,28 +1314,29 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
         .split(rows[1]);
 
     let list_focused = state.focus == MemoryFocus::List;
-    let palace_items: Vec<ListItem> = palace_lines(state)
-        .into_iter()
+    // Drive the spinner animation from the wall clock so each frame advances
+    // without an explicit app tick.
+    let now = chrono::Utc::now();
+    let tick = spinner_tick();
+    let rendered_rows = palace_lines_at(state, now, tick);
+    let palace_items: Vec<ListItem> = rendered_rows
+        .iter()
         .map(|row| {
-            let style = if row.selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if row.is_header {
-                // Group headers — bold yellow, non-selectable.
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if row.is_all {
-                // The unselected "All" row stays distinct — bold yellow.
+            // Row styling — the List widget renders the *selection* highlight
+            // via `highlight_style` so the row content carries only its base
+            // colour. Activity-state rows colour the whole row to keep the
+            // spinner glyph and its label visually linked.
+            let style = if row.is_header || row.is_all {
+                // Group headers and the "All" row share the bold-yellow style.
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
+            } else if let Some(color) = row.activity.and_then(|a| a.color()) {
+                Style::default().fg(color)
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(row.text, style)))
+            ListItem::new(Line::from(Span::styled(row.text.clone(), style)))
         })
         .collect();
 
@@ -1093,14 +1397,32 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
     // relative to `state.palaces`), so we look up the visible row index of
     // the currently selected palace once and use it for both.
     let palace_visible = list_area.height.saturating_sub(2) as usize;
-    let visible_row = visible_selected_row(state);
+    // Resolve the highlight row from the rows we are about to render so the
+    // selection index matches one-for-one. Group headers (non-selectable) are
+    // skipped — if the cursor maps to a header we fall back to row 0 ("All").
+    let visible_row = rendered_rows
+        .iter()
+        .position(|row| row.selected && !row.is_header)
+        .unwrap_or(0);
     state.sync_scroll_to(visible_row, palace_visible);
+    let palace_title = format!("PALACES [{}]", sort_label(state.sort_key));
+    // The List widget handles the selection highlight via highlight_style +
+    // HighlightSpacing::Always so there is no unstyled gutter between the row
+    // text and the right border. The leading `> ` symbol replaces the old
+    // inline marker that used to be baked into the row text.
+    let highlight_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let mut palace_state = ListState::default()
         .with_offset(state.scroll_offset)
         .with_selected(Some(visible_row));
-    let palace_title = format!("PALACES [{}]", sort_label(state.sort_key));
     frame.render_stateful_widget(
-        List::new(palace_items).block(panel_block(&palace_title, list_focused)),
+        List::new(palace_items)
+            .block(panel_block(&palace_title, list_focused))
+            .highlight_style(highlight_style)
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always),
         list_area,
         &mut palace_state,
     );
@@ -1197,6 +1519,10 @@ mod tests {
                 id: "work".into(),
                 name: "work".into(),
                 vector_count: 0,
+                // Non-zero KG triple count keeps the palace visible — the
+                // empty-palace filter drops rows with zero vectors AND zero
+                // triples.
+                kg_triple_count: 42,
                 ..Default::default()
             },
         ];
@@ -1332,18 +1658,20 @@ mod tests {
 
     #[test]
     fn test_palace_row_display() {
-        // The selected row is marked `>`; columns are aligned and the count
-        // carries a trailing `v`.
+        // The selection highlight is now applied by the List widget via
+        // `highlight_symbol`, so the row text itself begins with a space-
+        // prefixed activity glyph (a space for the Idle state).
         let palace = PalaceRow {
             id: "default".into(),
             name: "default".into(),
             vector_count: 8_400,
             ..Default::default()
         };
-        let selected = palace_row(&palace, true);
-        assert!(selected.starts_with('>'), "selected marker: {selected}");
-        assert!(selected.contains("default"));
-        assert!(selected.contains("8,400v"));
+        let row = palace_row(&palace, true);
+        // Idle activity → leading space, then a space, then the label.
+        assert!(row.starts_with("  "), "leading spinner+space: {row}");
+        assert!(row.contains("default"));
+        assert!(row.contains("8,400v"));
 
         let unselected = palace_row(&palace, false);
         assert!(unselected.starts_with(' '), "unselected: {unselected}");
@@ -1379,7 +1707,6 @@ mod tests {
         assert!(rows[0].is_all);
         assert!(rows[0].selected);
         assert!(rows[0].text.contains(ALL_LABEL));
-        assert!(rows[0].text.starts_with('>'));
         // Rows 1..3 are the palaces, unselected.
         assert!(!rows[1].is_all && !rows[1].selected);
         assert!(rows[1].text.contains("default"));
@@ -1956,5 +2283,207 @@ mod tests {
         terminal
             .draw(|f| render(f, &mut state))
             .expect("help render must not panic");
+    }
+
+    #[test]
+    fn test_palace_activity_state() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap();
+
+        // is_compacting wins over recency.
+        let mut p = PalaceRow {
+            id: "a".into(),
+            name: "a".into(),
+            vector_count: 1,
+            is_compacting: true,
+            ..Default::default()
+        };
+        assert_eq!(palace_activity_state(&p, now), PalaceActivity::Dreaming);
+
+        // Fresh write (< 10s) → Indexing.
+        p.is_compacting = false;
+        p.last_write_at = Some(now - chrono::Duration::seconds(3));
+        assert_eq!(palace_activity_state(&p, now), PalaceActivity::Indexing);
+
+        // 10s ≤ delta < 60s → Active.
+        p.last_write_at = Some(now - chrono::Duration::seconds(30));
+        assert_eq!(palace_activity_state(&p, now), PalaceActivity::Active);
+
+        // ≥ 60s → Idle.
+        p.last_write_at = Some(now - chrono::Duration::seconds(120));
+        assert_eq!(palace_activity_state(&p, now), PalaceActivity::Idle);
+
+        // Never-written palace → Idle.
+        p.last_write_at = None;
+        assert_eq!(palace_activity_state(&p, now), PalaceActivity::Idle);
+
+        // Spinner prefix glyphs cycle deterministically.
+        assert_eq!(PalaceActivity::Idle.prefix(0), ' ');
+        assert_eq!(PalaceActivity::Active.prefix(0), '⠿');
+        assert_eq!(PalaceActivity::Error.prefix(0), '✗');
+        let i0 = PalaceActivity::Indexing.prefix(0);
+        let i1 = PalaceActivity::Indexing.prefix(1);
+        assert_ne!(i0, i1, "indexing spinner advances per tick");
+        let d0 = PalaceActivity::Dreaming.prefix(0);
+        let d1 = PalaceActivity::Dreaming.prefix(1);
+        assert_ne!(d0, d1, "dreaming spinner advances per tick");
+
+        // Colour mapping.
+        assert_eq!(PalaceActivity::Idle.color(), None);
+        assert_eq!(PalaceActivity::Indexing.color(), Some(Color::Yellow));
+        assert_eq!(PalaceActivity::Active.color(), Some(Color::Cyan));
+        assert_eq!(PalaceActivity::Dreaming.color(), Some(Color::Magenta));
+        assert_eq!(PalaceActivity::Error.color(), Some(Color::Red));
+    }
+
+    #[test]
+    fn test_filter_empty_palaces() {
+        // A palace with zero vectors AND zero KG triples is hidden; a palace
+        // with either non-zero count stays visible.
+        let mut state = MemoryTuiState::new("http://x");
+        state.palaces = vec![
+            PalaceRow {
+                id: "vec-only".into(),
+                name: "vec-only".into(),
+                vector_count: 10,
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "kg-only".into(),
+                name: "kg-only".into(),
+                kg_triple_count: 5,
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "empty".into(),
+                name: "empty".into(),
+                ..Default::default()
+            },
+        ];
+        let visible = filtered_sorted_palaces(&state);
+        assert_eq!(visible.len(), 2, "empty palace dropped");
+        assert!(visible.iter().any(|p| p.id == "vec-only"));
+        assert!(visible.iter().any(|p| p.id == "kg-only"));
+        assert!(!visible.iter().any(|p| p.id == "empty"));
+
+        // palace_lines reflects the same filter.
+        let rows = palace_lines(&state);
+        assert!(!rows.iter().any(|r| r.text.contains("empty")));
+    }
+
+    #[test]
+    fn test_palace_row_with_activity() {
+        let p = PalaceRow {
+            id: "default".into(),
+            name: "default".into(),
+            vector_count: 8_400,
+            ..Default::default()
+        };
+        // Indexing spinner glyph leads the row.
+        let row = palace_row_with_activity(&p, PalaceActivity::Indexing, 0);
+        assert_eq!(row.chars().next(), Some(INDEXING_SPINNER[0]));
+        assert!(row.contains("default"));
+        assert!(row.contains("8,400v"));
+
+        // Indented variant leads with a space, then the spinner.
+        let ind = palace_row_indented_with_activity(&p, PalaceActivity::Active, 0);
+        assert!(ind.starts_with(' '));
+        assert!(ind.contains('⠿'));
+        assert!(ind.contains("default"));
+    }
+
+    #[test]
+    fn test_palace_lines_activity() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap();
+        let mut state = MemoryTuiState::new("http://x");
+        state.palaces = vec![
+            PalaceRow {
+                id: "indexing".into(),
+                name: "indexing".into(),
+                vector_count: 1,
+                last_write_at: Some(now - chrono::Duration::seconds(2)),
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "dreaming".into(),
+                name: "dreaming".into(),
+                vector_count: 1,
+                is_compacting: true,
+                ..Default::default()
+            },
+        ];
+        let rows = palace_lines_at(&state, now, 0);
+        // Row 0 = All (no activity), then the two palaces with activity.
+        assert_eq!(rows[0].activity, None);
+        assert_eq!(rows[1].activity, Some(PalaceActivity::Indexing));
+        assert_eq!(rows[2].activity, Some(PalaceActivity::Dreaming));
+    }
+
+    #[test]
+    fn test_stats_graph_section() {
+        use chrono::{TimeZone, Utc};
+        let mut state = MemoryTuiState::new("http://x");
+        state.palaces = vec![PalaceRow {
+            id: "p1".into(),
+            name: "p1".into(),
+            vector_count: 1_234,
+            kg_triple_count: 567,
+            node_count: 4_321,
+            edge_count: 12_345,
+            community_count: 7,
+            last_write_at: Some(Utc.with_ymd_and_hms(2026, 5, 22, 11, 59, 50).unwrap()),
+            ..Default::default()
+        }];
+        state.selected = 1; // single palace
+        let lines = stats_lines(&state);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Knowledge Graph"));
+        assert!(joined.contains("Nodes:"));
+        assert!(joined.contains("4,321"));
+        assert!(joined.contains("Edges:"));
+        assert!(joined.contains("12.3k"));
+        assert!(joined.contains("Communities:"));
+        assert!(joined.contains("Triples:"));
+        assert!(joined.contains("567"));
+        assert!(joined.contains("Last write:"));
+        assert!(joined.contains("State:"));
+    }
+
+    #[test]
+    fn test_format_relative_time() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap();
+        assert_eq!(
+            format_relative_time(now, now - chrono::Duration::seconds(1)),
+            "just now"
+        );
+        assert_eq!(
+            format_relative_time(now, now - chrono::Duration::seconds(30)),
+            "30s ago"
+        );
+        assert_eq!(
+            format_relative_time(now, now - chrono::Duration::minutes(2)),
+            "2m ago"
+        );
+        assert_eq!(
+            format_relative_time(now, now - chrono::Duration::hours(5)),
+            "5h ago"
+        );
+        assert_eq!(
+            format_relative_time(now, now - chrono::Duration::days(3)),
+            "3d ago"
+        );
+        // Future timestamps (clock skew) clamp to "just now".
+        assert_eq!(
+            format_relative_time(now, now + chrono::Duration::seconds(10)),
+            "just now"
+        );
+    }
+
+    #[test]
+    fn test_spinner_tick_returns_value() {
+        // Sanity check the call surface; the value itself is non-deterministic.
+        let _t = spinner_tick();
     }
 }

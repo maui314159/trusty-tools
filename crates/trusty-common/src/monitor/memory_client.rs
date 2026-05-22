@@ -91,6 +91,22 @@ struct PalaceWire {
     last_write_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     description: Option<String>,
+    /// Number of active KG triples; `#[serde(default)]` for forward-compat.
+    #[serde(default)]
+    kg_triple_count: u64,
+    /// KG node count; `#[serde(default)]` for forward-compat.
+    #[serde(default)]
+    node_count: u64,
+    /// KG edge count; `#[serde(default)]` for forward-compat.
+    #[serde(default)]
+    edge_count: u64,
+    /// Detected community count; `#[serde(default)]` for forward-compat.
+    #[serde(default)]
+    community_count: u64,
+    /// Whether a dream cycle is currently running; `#[serde(default)]` for
+    /// forward-compat against pre-spinner daemon builds.
+    #[serde(default)]
+    is_compacting: bool,
 }
 
 /// Typed HTTP client for the trusty-memory daemon.
@@ -516,6 +532,11 @@ pub fn parse_palaces(raw: &serde_json::Value) -> Vec<PalaceRow> {
             drawer_count: p.drawer_count,
             last_write_at: p.last_write_at,
             description: p.description,
+            kg_triple_count: p.kg_triple_count,
+            node_count: p.node_count,
+            edge_count: p.edge_count,
+            community_count: p.community_count,
+            is_compacting: p.is_compacting,
         })
         .collect()
 }

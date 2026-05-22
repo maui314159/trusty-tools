@@ -206,6 +206,37 @@ pub struct PalaceRow {
     pub last_write_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The palace description; used to infer the originating project.
     pub description: Option<String>,
+    /// Number of active KG triples in the palace (0 when no handle).
+    ///
+    /// Why: surfaces graph activity in the STATISTICS panel and lets the empty-
+    /// palace filter keep palaces that have only KG data and no vectors.
+    /// What: `kg_triple_count` from `/api/v1/palaces`.
+    /// Test: `test_stats_graph_section`, `test_filter_empty_palaces`.
+    pub kg_triple_count: u64,
+    /// Distinct-entity (node) count in the KG (0 when no handle).
+    ///
+    /// Why: shown in the STATISTICS Knowledge Graph section.
+    /// What: `node_count` from `/api/v1/palaces`.
+    /// Test: `test_stats_graph_section`.
+    pub node_count: u64,
+    /// Directed-edge count in the KG (0 when no handle).
+    ///
+    /// Why: shown in the STATISTICS Knowledge Graph section.
+    /// What: `edge_count` from `/api/v1/palaces`.
+    /// Test: `test_stats_graph_section`.
+    pub edge_count: u64,
+    /// Number of Louvain communities detected in the KG (0 when no handle).
+    ///
+    /// Why: shown in the STATISTICS Knowledge Graph section.
+    /// What: `community_count` from `/api/v1/palaces`.
+    /// Test: `test_stats_graph_section`.
+    pub community_count: u64,
+    /// Whether a dream/compaction cycle is currently running against the palace.
+    ///
+    /// Why: drives the "Dreaming" state in the active-palace indicators.
+    /// What: `is_compacting` from `/api/v1/palaces`.
+    /// Test: `test_palace_activity_state`.
+    pub is_compacting: bool,
 }
 
 #[cfg(feature = "monitor-tui")]
