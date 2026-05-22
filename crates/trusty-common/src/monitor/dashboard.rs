@@ -92,9 +92,12 @@ impl SearchData {
 
 /// One trusty-memory palace row rendered in the memory panel's table.
 ///
-/// Why: the memory panel lists every palace with its vector count.
-/// What: the palace id, friendly name, and vector count.
-/// Test: `test_memory_panel_renders`.
+/// Why: the memory panel lists every palace with its vector count plus the
+/// metadata the TUI needs to filter, sort, and group by project.
+/// What: the palace id, friendly name, vector and drawer counts, the last
+/// write timestamp (when reported), and the auto-registration description
+/// string used to infer the originating project.
+/// Test: `test_memory_panel_renders`, `test_palace_row_project`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PalaceRow {
     /// The palace identifier.
@@ -103,6 +106,31 @@ pub struct PalaceRow {
     pub name: String,
     /// Number of stored vectors in the palace.
     pub vector_count: u64,
+    /// Number of drawers in the palace (from `PalaceInfo`).
+    pub drawer_count: u64,
+    /// The last write timestamp, when reported by the daemon.
+    pub last_write_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The palace description; used to infer the originating project.
+    pub description: Option<String>,
+}
+
+impl PalaceRow {
+    /// Infer the project this palace belongs to.
+    ///
+    /// Why: project name is encoded in the auto-registered description path,
+    /// so the TUI can group palaces by their originating repo.
+    /// What: extracts the basename of the path in
+    /// `"Auto-registered from <path>"`, falling back to the palace name when
+    /// the description does not match the expected prefix.
+    /// Test: `test_palace_row_project`.
+    pub fn project(&self) -> &str {
+        self.description
+            .as_deref()
+            .and_then(|d| d.strip_prefix("Auto-registered from "))
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.name)
+    }
 }
 
 /// The polled trusty-memory panel payload.
@@ -655,11 +683,13 @@ mod tests {
                     id: "default".into(),
                     name: "default".into(),
                     vector_count: 8_400,
+                    ..Default::default()
                 },
                 PalaceRow {
                     id: "work".into(),
                     name: "work".into(),
                     vector_count: 0,
+                    ..Default::default()
                 },
             ],
         }
@@ -884,6 +914,44 @@ mod tests {
         assert_eq!(truncate("short", 16), "short");
         assert_eq!(truncate("0123456789abcdefghij", 8), "0123456…");
         assert_eq!(truncate("exactlyeight", 12), "exactlyeight");
+    }
+
+    #[test]
+    fn test_palace_row_project() {
+        // Auto-registered description → basename of the path.
+        let row = PalaceRow {
+            id: "trusty-search".into(),
+            name: "trusty-search".into(),
+            description: Some("Auto-registered from /Users/masa/Projects/trusty-search".into()),
+            ..Default::default()
+        };
+        assert_eq!(row.project(), "trusty-search");
+
+        // No description → falls back to the palace name.
+        let bare = PalaceRow {
+            id: "p1".into(),
+            name: "notes".into(),
+            ..Default::default()
+        };
+        assert_eq!(bare.project(), "notes");
+
+        // Unexpected description shape → fall back to the name.
+        let weird = PalaceRow {
+            id: "p2".into(),
+            name: "weird".into(),
+            description: Some("hand-made palace".into()),
+            ..Default::default()
+        };
+        assert_eq!(weird.project(), "weird");
+
+        // Trailing slash should not yield an empty basename.
+        let trailing = PalaceRow {
+            id: "p3".into(),
+            name: "fallback".into(),
+            description: Some("Auto-registered from /tmp/".into()),
+            ..Default::default()
+        };
+        assert_eq!(trailing.project(), "fallback");
     }
 
     #[test]

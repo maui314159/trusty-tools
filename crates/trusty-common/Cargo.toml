@@ -1,6 +1,6 @@
 [package]
 name = "trusty-common"
-version = "0.4.11"
+version = "0.4.12"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -228,4 +228,4 @@ memory-core-kuzu = ["memory-core", "dep:kuzu"]
 # ratatui + crossterm; the daemon HTTP clients reuse the `reqwest` already
 # required. Consumed via `trusty_common::monitor::run()` by the
 # `monitor tui` subcommand of `trusty-search` and `trusty-memory`.
-monitor-tui = ["dep:ratatui", "dep:crossterm"]
+monitor-tui = ["dep:ratatui", "dep:crossterm", "dep:chrono"]

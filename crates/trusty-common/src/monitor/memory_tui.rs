@@ -55,8 +55,54 @@ const LEFT_PANEL_MAX: u16 = 28;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line key hint shown along the bottom of the UI.
-pub const KEY_HINT: &str =
-    "[Tab] focus  [d] dream  [↑↓] select  [Enter] recall  [q] quit  [?] help";
+pub const KEY_HINT: &str = "[Tab] focus  [d] dream  [↑↓] select  [Enter] recall  [/] filter  [s] sort  [g] group  [q] quit  [?] help";
+
+/// Sort order applied to the palace list.
+///
+/// Why: operators want to flip between most-recently-active, alphabetical, and
+/// vector-count-heavy views without leaving the TUI; a small enum keeps the
+/// renderer and the key handler agreed on the available options.
+/// What: `Activity` (default — last write desc, vectors as tiebreak), `Name`
+/// (alphabetical asc), `Vectors` (vector_count desc).
+/// Test: `test_palace_sort_key_cycle`, `test_apply_sort_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PalaceSortKey {
+    /// Sort by last write timestamp desc; vector_count desc as tiebreak.
+    #[default]
+    Activity,
+    /// Sort alphabetically by palace name (ascending).
+    Name,
+    /// Sort by vector_count desc.
+    Vectors,
+}
+
+impl PalaceSortKey {
+    /// Advance to the next sort key in the cycle.
+    ///
+    /// Why: `[s]` cycles through the three sort orders.
+    /// What: `Activity → Name → Vectors → Activity`.
+    /// Test: `test_palace_sort_key_cycle`.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Activity => Self::Name,
+            Self::Name => Self::Vectors,
+            Self::Vectors => Self::Activity,
+        }
+    }
+
+    /// One-word label for the status bar / panel title.
+    ///
+    /// Why: the panel header shows the current sort key.
+    /// What: returns `"Activity"`, `"Name"`, or `"Vectors"`.
+    /// Test: `test_palace_sort_key_cycle`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Name => "Name",
+            Self::Vectors => "Vectors",
+        }
+    }
+}
 
 /// Label for the synthetic "All palaces" entry at the top of the list.
 ///
@@ -118,6 +164,14 @@ pub struct MemoryTuiState {
     pub focus: MemoryFocus,
     /// Whether the help overlay is visible (toggled with `?`).
     pub show_help: bool,
+    /// Case-insensitive filter applied to palace name / project; empty disables.
+    pub filter: String,
+    /// Whether the inline filter bar is focused (captures typed chars).
+    pub filter_active: bool,
+    /// Current palace-list sort order.
+    pub sort_key: PalaceSortKey,
+    /// Whether the palace list is grouped by inferred project.
+    pub group_by_project: bool,
 }
 
 impl MemoryTuiState {
@@ -139,6 +193,10 @@ impl MemoryTuiState {
             input: String::new(),
             focus: MemoryFocus::List,
             show_help: false,
+            filter: String::new(),
+            filter_active: false,
+            sort_key: PalaceSortKey::default(),
+            group_by_project: false,
         }
     }
 
@@ -497,6 +555,21 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 continue;
             }
             match (state.focus, key.code) {
+                // Filter-active bindings come first — they capture characters,
+                // backspace, Esc, and Enter before the general List handlers.
+                (MemoryFocus::List, KeyCode::Esc) if state.filter_active => {
+                    // Keep the filter text so the user can re-activate.
+                    state.filter_active = false;
+                }
+                (MemoryFocus::List, KeyCode::Enter) if state.filter_active => {
+                    state.filter_active = false;
+                }
+                (MemoryFocus::List, KeyCode::Backspace) if state.filter_active => {
+                    state.filter.pop();
+                }
+                (MemoryFocus::List, KeyCode::Char(c)) if state.filter_active => {
+                    state.filter.push(c);
+                }
                 (_, KeyCode::Char('?')) => state.show_help = true,
                 (_, KeyCode::Tab) => state.toggle_focus(),
                 (_, KeyCode::Esc) => return Ok(()),
@@ -504,6 +577,16 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 (MemoryFocus::List, KeyCode::Char('q')) => return Ok(()),
                 (MemoryFocus::List, KeyCode::Up) => state.select_up(),
                 (MemoryFocus::List, KeyCode::Down) => state.select_down(),
+                (MemoryFocus::List, KeyCode::Char('/')) => {
+                    state.filter_active = true;
+                    state.filter.clear();
+                }
+                (MemoryFocus::List, KeyCode::Char('s')) => {
+                    state.sort_key = state.sort_key.next();
+                }
+                (MemoryFocus::List, KeyCode::Char('g')) => {
+                    state.group_by_project = !state.group_by_project;
+                }
                 (MemoryFocus::List, KeyCode::Char('d')) => {
                     state.log.push("dream cycle triggered");
                     match client.dream_run().await {
@@ -545,6 +628,9 @@ pub fn help_text() -> String {
         "  Tab     switch focus between the palace list and the recall bar",
         "  ↑ / ↓   move the palace selection (when the list has focus)",
         "  All     the top list row fans recalls / stats across every palace",
+        "  /       activate the inline palace filter (Esc / Enter close)",
+        "  s       cycle palace sort: Activity → Name → Vectors",
+        "  g       toggle grouping by inferred project",
         "  d       run a dream cycle across every palace",
         "  Enter   run a recall query — all palaces, or the selected one",
         "  ?       toggle this help overlay",
@@ -586,12 +672,14 @@ pub fn palace_row(palace: &PalaceRow, selected: bool) -> String {
 
 /// One rendered row of the PALACES panel.
 ///
-/// Why: the renderer styles three row kinds differently — the "All" row is
-/// bold, the selected row is highlighted, ordinary rows are plain — so the line
-/// builder must surface which kind each row is rather than just a bool.
-/// What: the row `text`, whether it is `selected`, and whether it is the
-/// synthetic `is_all` ("All palaces") row.
-/// Test: `test_palace_lines`, `test_all_selector`.
+/// Why: the renderer styles four row kinds differently — the "All" row is
+/// bold, group headers are bold yellow and non-selectable, the selected row is
+/// highlighted, ordinary rows are plain — so the line builder must surface
+/// which kind each row is rather than just a bool.
+/// What: the row `text`, whether it is `selected`, whether it is the synthetic
+/// `is_all` ("All palaces") row, and whether it is a group header (non-
+/// selectable when grouping by project).
+/// Test: `test_palace_lines`, `test_all_selector`, `test_palace_lines_grouped`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PalaceListRow {
     /// The fully-formatted row text.
@@ -600,6 +688,71 @@ pub struct PalaceListRow {
     pub selected: bool,
     /// Whether this row is the synthetic "All palaces" entry.
     pub is_all: bool,
+    /// Whether this row is a non-selectable group header.
+    pub is_header: bool,
+}
+
+/// Format an indented palace row for use under a group header.
+///
+/// Why: when the list is grouped, palace rows are inset one extra space and
+/// the name column shrinks by one to keep the count column aligned with the
+/// flat layout.
+/// What: returns `"  <name padded to 9>  <count>v"`, with `>` replacing the
+/// leading space when `selected`.
+/// Test: `test_palace_lines_grouped`.
+fn palace_row_indented(palace: &PalaceRow, selected: bool) -> String {
+    let marker = if selected { ">" } else { " " };
+    let label = if palace.name.is_empty() {
+        &palace.id
+    } else {
+        &palace.name
+    };
+    format!(
+        "{marker}  {:<9} {:>7}v",
+        truncate(label, 9),
+        format_count(palace.vector_count),
+    )
+}
+
+/// Apply [`MemoryTuiState::filter`] and [`MemoryTuiState::sort_key`] to a slice
+/// of palaces, returning the visible subset in display order.
+///
+/// Why: filtering and sorting are pure functions of the state — extracting
+/// them keeps [`palace_lines`] terse and makes both behaviours unit-testable
+/// without a terminal.
+/// What: case-insensitive substring match against `name` and `project()`; then
+/// sort per `sort_key`. The original palace ordering is preserved when the
+/// sort comparator returns `Equal`.
+/// Test: `test_apply_filter`, `test_apply_sort_activity`,
+/// `test_apply_sort_name`, `test_apply_sort_vectors`.
+pub fn filtered_sorted_palaces(state: &MemoryTuiState) -> Vec<PalaceRow> {
+    let filter_lower = state.filter.to_lowercase();
+    let mut rows: Vec<PalaceRow> = state
+        .palaces
+        .iter()
+        .filter(|p| {
+            if filter_lower.is_empty() {
+                return true;
+            }
+            p.name.to_lowercase().contains(&filter_lower)
+                || p.project().to_lowercase().contains(&filter_lower)
+        })
+        .cloned()
+        .collect();
+    match state.sort_key {
+        PalaceSortKey::Activity => {
+            // last_write_at desc, None last; vector_count desc as tiebreak.
+            rows.sort_by(|a, b| match (a.last_write_at, b.last_write_at) {
+                (Some(x), Some(y)) => y.cmp(&x).then_with(|| b.vector_count.cmp(&a.vector_count)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.vector_count.cmp(&a.vector_count),
+            });
+        }
+        PalaceSortKey::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+        PalaceSortKey::Vectors => rows.sort_by(|a, b| b.vector_count.cmp(&a.vector_count)),
+    }
+    rows
 }
 
 /// Build the rows for the PALACES panel body.
@@ -607,14 +760,18 @@ pub struct PalaceListRow {
 /// Why: separating row construction from the ratatui widgets lets a test
 /// assert the rendered content without a terminal backend.
 /// What: returns the synthetic "All palaces" row first (carrying the summed
-/// vector count across every palace), then one row per palace. With no palaces
-/// the "All" row is still shown followed by a placeholder line.
-/// Test: `test_palace_lines`, `test_all_selector`.
+/// vector count across every palace), then either a flat list of filtered +
+/// sorted palace rows, or — when [`MemoryTuiState::group_by_project`] is set —
+/// non-selectable `── <project> ──` group headers interleaved with their
+/// member palaces. With no palaces the "All" row is still shown followed by a
+/// placeholder line.
+/// Test: `test_palace_lines`, `test_all_selector`, `test_palace_lines_grouped`.
 pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
     let mut rows: Vec<PalaceListRow> = Vec::with_capacity(state.palaces.len() + 1);
 
-    // The synthetic "All palaces" row always leads the list. The label may be
-    // wider than the per-palace name column — it is shown in full.
+    // The synthetic "All palaces" row always leads the list — including when
+    // filtering or grouping is active. The label may be wider than the per-
+    // palace name column — it is shown in full.
     let total_vectors: u64 = state.palaces.iter().map(|p| p.vector_count).sum();
     let all_selected = state.selected == 0;
     let all_marker = if all_selected { ">" } else { " " };
@@ -622,6 +779,7 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
         text: format!("{all_marker} {ALL_LABEL}  {}v", format_count(total_vectors),),
         selected: all_selected,
         is_all: true,
+        is_header: false,
     });
 
     if state.palaces.is_empty() {
@@ -629,19 +787,72 @@ pub fn palace_lines(state: &MemoryTuiState) -> Vec<PalaceListRow> {
             text: "  (no palaces)".to_string(),
             selected: false,
             is_all: false,
+            is_header: false,
         });
         return rows;
     }
 
-    for (i, palace) in state.palaces.iter().enumerate() {
-        // Row 0 is "All", so palace `i` lives at cursor row `i + 1`.
-        let row = i + 1;
-        let selected = row == state.selected;
+    let visible = filtered_sorted_palaces(state);
+    if visible.is_empty() {
         rows.push(PalaceListRow {
-            text: palace_row(palace, selected),
-            selected,
+            text: "  (no matches)".to_string(),
+            selected: false,
             is_all: false,
+            is_header: false,
         });
+        return rows;
+    }
+
+    // We need to compute the cursor row each visible palace lives at. The cursor
+    // addresses the *original* `state.palaces` indices (cursor n → palaces[n-1])
+    // so we look up each visible palace's original index by id.
+    let cursor_for = |p: &PalaceRow| -> usize {
+        state
+            .palaces
+            .iter()
+            .position(|orig| orig.id == p.id)
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    };
+
+    if state.group_by_project {
+        // Collect distinct projects in the order they first appear in `visible`.
+        let mut seen: Vec<String> = Vec::new();
+        for p in &visible {
+            let proj = p.project().to_string();
+            if !seen.iter().any(|s| s == &proj) {
+                seen.push(proj);
+            }
+        }
+        for project in &seen {
+            rows.push(PalaceListRow {
+                text: format!("── {project} ─────"),
+                selected: false,
+                is_all: false,
+                is_header: true,
+            });
+            for palace in visible.iter().filter(|p| p.project() == project) {
+                let cursor = cursor_for(palace);
+                let selected = cursor == state.selected;
+                rows.push(PalaceListRow {
+                    text: palace_row_indented(palace, selected),
+                    selected,
+                    is_all: false,
+                    is_header: false,
+                });
+            }
+        }
+    } else {
+        for palace in &visible {
+            let cursor = cursor_for(palace);
+            let selected = cursor == state.selected;
+            rows.push(PalaceListRow {
+                text: palace_row(palace, selected),
+                selected,
+                is_all: false,
+                is_header: false,
+            });
+        }
     }
     rows
 }
@@ -799,6 +1010,11 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if row.is_header {
+                // Group headers — bold yellow, non-selectable.
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else if row.is_all {
                 // The unselected "All" row stays distinct — bold yellow.
                 Style::default()
@@ -810,16 +1026,68 @@ pub fn render(frame: &mut Frame, state: &mut MemoryTuiState) {
             ListItem::new(Line::from(Span::styled(row.text, style)))
         })
         .collect();
+
+    // When the inline filter is active or carries text, split the left column
+    // vertically so the filter input renders above the palace list.
+    let show_filter_bar = state.filter_active || !state.filter.is_empty();
+    let (filter_area, list_area) = if show_filter_bar {
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(split[0]);
+        (Some(inner[0]), inner[1])
+    } else {
+        (None, split[0])
+    };
+
+    if let Some(area) = filter_area {
+        let border_color = if state.filter_active {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    state.filter.as_str().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    if state.filter_active { "_" } else { "" },
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(
+                        Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .title(Span::styled(
+                        " FILTER ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            ),
+            area,
+        );
+    }
+
     // Scroll the PALACES list so the selected row stays visible: the panel
     // height minus its two border rows is the visible window.
-    let palace_visible = split[0].height.saturating_sub(2) as usize;
+    let palace_visible = list_area.height.saturating_sub(2) as usize;
     state.sync_scroll(palace_visible);
     let mut palace_state = ListState::default()
         .with_offset(state.scroll_offset)
         .with_selected(Some(state.selected));
+    let palace_title = format!("PALACES [{}]", state.sort_key.label());
     frame.render_stateful_widget(
-        List::new(palace_items).block(panel_block("PALACES", list_focused)),
-        split[0],
+        List::new(palace_items).block(panel_block(&palace_title, list_focused)),
+        list_area,
         &mut palace_state,
     );
 
@@ -960,11 +1228,13 @@ mod tests {
                 id: "default".into(),
                 name: "default".into(),
                 vector_count: 8_400,
+                ..Default::default()
             },
             PalaceRow {
                 id: "work".into(),
                 name: "work".into(),
                 vector_count: 0,
+                ..Default::default()
             },
         ];
         state.status = Some(MemoryData {
@@ -1105,6 +1375,7 @@ mod tests {
             id: "default".into(),
             name: "default".into(),
             vector_count: 8_400,
+            ..Default::default()
         };
         let selected = palace_row(&palace, true);
         assert!(selected.starts_with('>'), "selected marker: {selected}");
@@ -1119,6 +1390,7 @@ mod tests {
             id: "p-xyz".into(),
             name: String::new(),
             vector_count: 0,
+            ..Default::default()
         };
         let row = palace_row(&nameless, false);
         assert!(row.contains("p-xyz"));
@@ -1129,6 +1401,7 @@ mod tests {
             id: "x".into(),
             name: "a-very-long-palace-name".into(),
             vector_count: 1,
+            ..Default::default()
         };
         assert!(palace_row(&long, false).contains('…'));
     }
@@ -1277,9 +1550,164 @@ mod tests {
     }
 
     #[test]
+    fn test_palace_sort_key_cycle() {
+        assert_eq!(PalaceSortKey::default(), PalaceSortKey::Activity);
+        assert_eq!(PalaceSortKey::Activity.next(), PalaceSortKey::Name);
+        assert_eq!(PalaceSortKey::Name.next(), PalaceSortKey::Vectors);
+        assert_eq!(PalaceSortKey::Vectors.next(), PalaceSortKey::Activity);
+        assert_eq!(PalaceSortKey::Activity.label(), "Activity");
+        assert_eq!(PalaceSortKey::Name.label(), "Name");
+        assert_eq!(PalaceSortKey::Vectors.label(), "Vectors");
+    }
+
+    /// State with four palaces spanning two projects, varied vector counts,
+    /// and varied last_write_at timestamps. Used by the sort / filter / group
+    /// tests.
+    fn diverse_state() -> MemoryTuiState {
+        use chrono::{TimeZone, Utc};
+        let mut state = MemoryTuiState::new("http://127.0.0.1:7070");
+        state.palaces = vec![
+            PalaceRow {
+                id: "trusty-search".into(),
+                name: "trusty-search".into(),
+                vector_count: 12,
+                last_write_at: Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()),
+                description: Some(
+                    "Auto-registered from /Users/masa/Projects/trusty-tools/trusty-search".into(),
+                ),
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "trusty-memory".into(),
+                name: "trusty-memory".into(),
+                vector_count: 3_775,
+                last_write_at: Some(Utc.with_ymd_and_hms(2026, 5, 18, 22, 29, 50).unwrap()),
+                description: Some(
+                    "Auto-registered from /Users/masa/Projects/trusty-tools/trusty-memory".into(),
+                ),
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "claude-mpm".into(),
+                name: "claude-mpm".into(),
+                vector_count: 6_163,
+                last_write_at: Some(Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap()),
+                description: Some("Auto-registered from /Users/masa/Projects/claude-mpm".into()),
+                ..Default::default()
+            },
+            PalaceRow {
+                id: "notes".into(),
+                name: "notes".into(),
+                vector_count: 100,
+                last_write_at: None,
+                description: None,
+                ..Default::default()
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn test_apply_sort_activity() {
+        // Activity: last_write_at desc, None last; vector_count desc tiebreak.
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Activity;
+        let rows = filtered_sorted_palaces(&state);
+        assert_eq!(rows[0].id, "trusty-memory");
+        assert_eq!(rows[1].id, "claude-mpm");
+        assert_eq!(rows[2].id, "trusty-search");
+        // None sorts last.
+        assert_eq!(rows[3].id, "notes");
+    }
+
+    #[test]
+    fn test_apply_sort_name() {
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Name;
+        let rows = filtered_sorted_palaces(&state);
+        let names: Vec<&str> = rows.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["claude-mpm", "notes", "trusty-memory", "trusty-search"]
+        );
+    }
+
+    #[test]
+    fn test_apply_sort_vectors() {
+        let mut state = diverse_state();
+        state.sort_key = PalaceSortKey::Vectors;
+        let rows = filtered_sorted_palaces(&state);
+        assert_eq!(rows[0].id, "claude-mpm");
+        assert_eq!(rows[1].id, "trusty-memory");
+        assert_eq!(rows[2].id, "notes");
+        assert_eq!(rows[3].id, "trusty-search");
+    }
+
+    #[test]
+    fn test_apply_filter() {
+        let mut state = diverse_state();
+        // Case-insensitive substring match against name OR project.
+        state.filter = "TRUSTY".into();
+        let rows = filtered_sorted_palaces(&state);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|p| p.name.contains("trusty")));
+
+        // Match by project (description path basename).
+        state.filter = "claude-mpm".into();
+        let rows = filtered_sorted_palaces(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "claude-mpm");
+
+        // No match → empty.
+        state.filter = "nothing-here".into();
+        assert!(filtered_sorted_palaces(&state).is_empty());
+
+        // Empty filter → everything.
+        state.filter.clear();
+        assert_eq!(filtered_sorted_palaces(&state).len(), 4);
+    }
+
+    #[test]
+    fn test_palace_lines_grouped() {
+        let mut state = diverse_state();
+        state.group_by_project = true;
+        state.sort_key = PalaceSortKey::Name;
+        let rows = palace_lines(&state);
+
+        // "All" leads the list.
+        assert!(rows[0].is_all);
+
+        // Group headers appear and are non-selectable.
+        let headers: Vec<&PalaceListRow> = rows.iter().filter(|r| r.is_header).collect();
+        assert!(
+            !headers.is_empty(),
+            "grouping must emit at least one header"
+        );
+        for h in &headers {
+            assert!(h.text.contains("──"));
+            assert!(!h.selected);
+        }
+        // Project names appear in the header text.
+        let header_text: String = headers
+            .iter()
+            .map(|h| h.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header_text.contains("trusty-memory") || header_text.contains("trusty-search"));
+        assert!(header_text.contains("claude-mpm"));
+
+        // Filter narrows grouping to matching projects only.
+        state.filter = "claude".into();
+        let rows = palace_lines(&state);
+        let headers: Vec<&PalaceListRow> = rows.iter().filter(|r| r.is_header).collect();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].text.contains("claude-mpm"));
+    }
+
+    #[test]
     fn test_help_text_lists_bindings() {
         let text = help_text();
-        for token in ["Tab", "d ", "Enter", "?", "q "] {
+        for token in ["Tab", "d ", "Enter", "?", "q ", "/", "s ", "g "] {
             assert!(text.contains(token), "help text missing {token}");
         }
     }
@@ -1302,6 +1730,7 @@ mod tests {
                 id: format!("p-{n}"),
                 name: format!("palace-{n}"),
                 vector_count: 1,
+                ..Default::default()
             })
             .collect();
         let window = 5;
@@ -1362,6 +1791,7 @@ mod tests {
                 id: format!("p-{n}"),
                 name: format!("palace-{n}"),
                 vector_count: 100,
+                ..Default::default()
             })
             .collect();
         state.selected = state.last_row();

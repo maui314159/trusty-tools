@@ -85,6 +85,12 @@ struct PalaceWire {
     name: String,
     #[serde(default, alias = "vectors", alias = "total_vectors")]
     vector_count: u64,
+    #[serde(default)]
+    drawer_count: u64,
+    #[serde(default)]
+    last_write_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// Typed HTTP client for the trusty-memory daemon.
@@ -507,6 +513,9 @@ pub fn parse_palaces(raw: &serde_json::Value) -> Vec<PalaceRow> {
             id: p.id,
             name: p.name,
             vector_count: p.vector_count,
+            drawer_count: p.drawer_count,
+            last_write_at: p.last_write_at,
+            description: p.description,
         })
         .collect()
 }
