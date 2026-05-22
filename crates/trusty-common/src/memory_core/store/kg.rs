@@ -18,12 +18,14 @@ use crate::memory_core::palace::Drawer;
 use crate::memory_core::store::kg_redb::KgStoreRedb;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use petgraph::algo::dijkstra;
+use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::NodeIndex;
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
+use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -481,6 +483,169 @@ impl KnowledgeGraph {
         }
         path_rev.reverse();
         let path: Vec<String> = path_rev
+            .into_iter()
+            .filter_map(|i| adj.graph.node_weight(i).cloned())
+            .collect();
+        Ok(Some(path))
+    }
+
+    /// Return all entities reachable from `entity` within `max_hops` steps.
+    ///
+    /// Why: Multi-hop traversal for graph RAG context expansion (#7, #10) —
+    /// callers seed a small set of entities and want to enrich it with every
+    /// directly-or-indirectly-connected entity up to a bounded radius, without
+    /// paying for repeated redb scans per hop.
+    /// What: Breadth-first search over the in-memory adjacency starting at
+    /// `entity` (excluded from the result). Follows outgoing edges
+    /// (subject → object) only, since that mirrors the directional semantics
+    /// of `shortest_path`. `max_hops = 0` always returns an empty vec.
+    /// Returned entities are deduplicated and ordered by discovery (BFS
+    /// order). Returns an empty vec when the entity is unknown.
+    /// Test: `kg_graph_tests::bfs_reachable_within_hops`.
+    pub fn reachable(&self, entity: &str, max_hops: usize) -> Result<Vec<String>> {
+        if max_hops == 0 {
+            return Ok(Vec::new());
+        }
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let Some(&start) = adj.node_index.get(entity) else {
+            return Ok(Vec::new());
+        };
+        let mut visited: HashSet<NodeIndex<u32>> = HashSet::new();
+        visited.insert(start);
+        let mut frontier: VecDeque<(NodeIndex<u32>, usize)> = VecDeque::new();
+        frontier.push_back((start, 0));
+        let mut out: Vec<String> = Vec::new();
+        while let Some((node, depth)) = frontier.pop_front() {
+            if depth == max_hops {
+                continue;
+            }
+            for e in adj.graph.edges(node) {
+                let tgt = e.target();
+                if visited.insert(tgt) {
+                    if let Some(name) = adj.graph.node_weight(tgt) {
+                        out.push(name.clone());
+                    }
+                    frontier.push_back((tgt, depth + 1));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return every `(subject, edge)` pair whose edge targets `entity`.
+    ///
+    /// Why: Reverse-direction lookup ("what points TO this entity?") was
+    /// previously a full table scan in redb; the petgraph adjacency already
+    /// indexes incoming edges via `Direction::Incoming`, making the operation
+    /// O(in-degree) instead of O(rows).
+    /// What: Acquires a read lock on the adjacency, walks `edges_directed(
+    /// node, Incoming)`, and returns `(source_entity_name, KgEdge)` pairs.
+    /// Returns an empty vec when the entity is unknown.
+    /// Test: `kg_graph_tests::reverse_lookup_returns_incoming`.
+    pub fn incoming(&self, entity: &str) -> Result<Vec<(String, KgEdge)>> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let Some(&idx) = adj.node_index.get(entity) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for e in adj.graph.edges_directed(idx, petgraph::Direction::Incoming) {
+            let src = adj
+                .graph
+                .node_weight(e.source())
+                .cloned()
+                .unwrap_or_default();
+            out.push((src, e.weight().clone()));
+        }
+        Ok(out)
+    }
+
+    /// Return the number of weakly-connected components in the active graph.
+    ///
+    /// Why: Structural analysis — answers "how many disjoint subgraphs exist
+    /// in this palace?" which informs both diagnostics (an unexpectedly high
+    /// component count suggests missing edges) and retrieval ranking (small
+    /// components are likely tightly-themed clusters).
+    /// What: `petgraph::algo::connected_components` requires
+    /// `NodeCompactIndexable`, which `StableGraph` does not implement (its
+    /// indices remain stable across edge/node removals and so are not
+    /// guaranteed compact). Instead, performs BFS in `(outgoing ∪ incoming)`
+    /// direction starting from each unvisited node and counts the number of
+    /// independent traversals — equivalent to weakly-connected components on
+    /// the directed graph. Returns 0 for an empty graph.
+    /// Test: `kg_graph_tests::connected_components_count`.
+    pub fn connected_components(&self) -> Result<usize> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let mut visited: HashSet<NodeIndex<u32>> = HashSet::new();
+        let mut count = 0usize;
+        for start in adj.graph.node_indices() {
+            if visited.contains(&start) {
+                continue;
+            }
+            count += 1;
+            let mut frontier: VecDeque<NodeIndex<u32>> = VecDeque::new();
+            frontier.push_back(start);
+            visited.insert(start);
+            while let Some(node) = frontier.pop_front() {
+                for e in adj.graph.edges(node) {
+                    if visited.insert(e.target()) {
+                        frontier.push_back(e.target());
+                    }
+                }
+                for e in adj.graph.edges_directed(node, petgraph::Direction::Incoming) {
+                    if visited.insert(e.source()) {
+                        frontier.push_back(e.source());
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Return the A* shortest path from `from` to `to`, if any.
+    ///
+    /// Why: Multi-hop reasoning needs optimal path finding; A* with an
+    /// admissible heuristic is the textbook choice. With unit edge weights
+    /// and a zero heuristic, A* reduces to BFS — but routing through
+    /// `petgraph::algo::astar` documents the API surface we want to expose
+    /// to future callers who may supply a non-trivial heuristic (e.g.
+    /// learned embedding distance).
+    /// What: Resolves both endpoints to node indices, then calls
+    /// `petgraph::algo::astar` on the directed `StableGraph` with unit edge
+    /// cost and a zero heuristic. Returns `Some(entity_sequence)` from `from`
+    /// to `to` inclusive, or `None` when either endpoint is unknown or no
+    /// path exists.
+    /// Test: `kg_graph_tests::astar_path_finds_route`.
+    pub fn astar_path(&self, from: &str, to: &str) -> Result<Option<Vec<String>>> {
+        let adj = self
+            .adj
+            .read()
+            .map_err(|_| anyhow::anyhow!("kg adjacency lock poisoned"))?;
+        let Some(&from_idx) = adj.node_index.get(from) else {
+            return Ok(None);
+        };
+        let Some(&to_idx) = adj.node_index.get(to) else {
+            return Ok(None);
+        };
+        let result = astar(
+            &adj.graph,
+            from_idx,
+            |n| n == to_idx,
+            |_| 1usize,
+            |_| 0usize,
+        );
+        let Some((_, indices)) = result else {
+            return Ok(None);
+        };
+        let path: Vec<String> = indices
             .into_iter()
             .filter_map(|i| adj.graph.node_weight(i).cloned())
             .collect();

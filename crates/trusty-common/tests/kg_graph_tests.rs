@@ -187,3 +187,175 @@ async fn shortest_path_finds_route() {
     kg.assert(t("X", "knows", "Y")).await.unwrap();
     assert_eq!(kg.shortest_path("A", "X").unwrap(), None);
 }
+
+/// Why: `reachable` underpins graph RAG context expansion — callers seed an
+/// entity and want every entity within N hops, with the radius strictly
+/// enforced so deeper nodes do not leak into the result.
+/// What: Builds an A→B→C→D chain, asserts `reachable("A", 2)` returns
+/// exactly `{B, C}` (D is at depth 3 and must be excluded). Also covers
+/// `max_hops = 0` and unknown entities.
+#[tokio::test]
+async fn bfs_reachable_within_hops() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+    kg.assert(t("A", "to", "B")).await.unwrap();
+    kg.assert(t("B", "to", "C")).await.unwrap();
+    kg.assert(t("C", "to", "D")).await.unwrap();
+
+    let mut hits = kg.reachable("A", 2).unwrap();
+    hits.sort();
+    assert_eq!(
+        hits,
+        vec!["B".to_string(), "C".to_string()],
+        "BFS within 2 hops must include B and C but not D"
+    );
+
+    // max_hops = 0 returns nothing (entity itself is not its own neighbour).
+    assert!(kg.reachable("A", 0).unwrap().is_empty());
+
+    // Larger radius eventually picks up D.
+    let mut all = kg.reachable("A", 3).unwrap();
+    all.sort();
+    assert_eq!(all, vec!["B".to_string(), "C".to_string(), "D".to_string()]);
+
+    // Unknown entity is empty, not an error.
+    assert!(kg.reachable("missing", 5).unwrap().is_empty());
+}
+
+/// Why: `incoming` replaces the previous full table scan for reverse lookup
+/// ("what points TO X?") with an O(in-degree) petgraph traversal — but only
+/// if it returns the same answer. This test pins the directional contract.
+/// What: Builds A→B→C and asserts `incoming("C")` returns exactly one
+/// `(B, edge)` pair. Verifies the edge payload's predicate matches.
+#[tokio::test]
+async fn reverse_lookup_returns_incoming() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+    kg.assert(t("A", "to", "B")).await.unwrap();
+    kg.assert(t("B", "to", "C")).await.unwrap();
+
+    let into_c = kg.incoming("C").unwrap();
+    assert_eq!(into_c.len(), 1, "C has exactly one incoming edge");
+    assert_eq!(into_c[0].0, "B");
+    assert_eq!(into_c[0].1.predicate, "to");
+
+    // A has nothing pointing at it.
+    assert!(kg.incoming("A").unwrap().is_empty());
+
+    // Unknown entity is empty.
+    assert!(kg.incoming("nope").unwrap().is_empty());
+}
+
+/// Why: The weakly-connected-component count is a structural health metric;
+/// two disjoint pairs of nodes must report exactly 2 components.
+/// What: Seeds two unrelated edges (A→B and X→Y) and asserts the component
+/// count is 2. Adds a bridging edge and asserts the count collapses to 1.
+#[tokio::test]
+async fn connected_components_count() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+    kg.assert(t("A", "to", "B")).await.unwrap();
+    kg.assert(t("X", "to", "Y")).await.unwrap();
+    assert_eq!(kg.connected_components().unwrap(), 2);
+
+    // Bridge the two components.
+    kg.assert(t("B", "to", "X")).await.unwrap();
+    assert_eq!(kg.connected_components().unwrap(), 1);
+}
+
+/// Why: `astar_path` is the optimal-path primitive for multi-hop reasoning;
+/// with unit weights it must return the same path that `shortest_path` finds
+/// while exercising the `petgraph::algo::astar` API surface.
+/// What: Builds A→B→C and asserts the A* path is `[A, B, C]`. Covers the
+/// unreachable case (returns `None`) and the unknown-endpoint case.
+#[tokio::test]
+async fn astar_path_finds_route() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+    kg.assert(t("A", "to", "B")).await.unwrap();
+    kg.assert(t("B", "to", "C")).await.unwrap();
+
+    assert_eq!(
+        kg.astar_path("A", "C").unwrap(),
+        Some(vec!["A".to_string(), "B".to_string(), "C".to_string()])
+    );
+
+    // Same node → trivial single-node path.
+    assert_eq!(
+        kg.astar_path("A", "A").unwrap(),
+        Some(vec!["A".to_string()])
+    );
+
+    // Unknown endpoint → None.
+    assert_eq!(kg.astar_path("A", "missing").unwrap(), None);
+    assert_eq!(kg.astar_path("missing", "C").unwrap(), None);
+
+    // Disconnected → None.
+    kg.assert(t("X", "to", "Y")).await.unwrap();
+    assert_eq!(kg.astar_path("A", "X").unwrap(), None);
+}
+
+/// Why: `list_subjects` (which goes through redb's `ACTIVE_SUBJECT_COUNTS`
+/// table) is authoritative for "which subjects have active triples?". As we
+/// route more graph queries through petgraph, this cross-check guards
+/// against the in-memory cache and redb store diverging.
+/// What: Seeds three subjects (alice has 2 active rows, bob has 1, carol
+/// retracted — 0 active rows), then asserts `list_subjects` returns only
+/// the subjects with at least one active triple, in deterministic order.
+#[tokio::test]
+async fn list_subjects_matches_redb() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+
+    kg.assert(t("alice", "knows", "bob")).await.unwrap();
+    kg.assert(t("alice", "likes", "rust")).await.unwrap();
+    kg.assert(t("bob", "knows", "alice")).await.unwrap();
+    kg.assert(t("carol", "knows", "dave")).await.unwrap();
+    let closed = kg.retract("carol", "knows").await.unwrap();
+    assert_eq!(closed, 1);
+
+    let subjects = kg.list_subjects(50).unwrap();
+    assert_eq!(
+        subjects,
+        vec!["alice".to_string(), "bob".to_string()],
+        "carol has no active triples and must not appear"
+    );
+}
+
+/// Why: `list_active` (per-subject query through redb) is the authoritative
+/// source for "which triples are active for X?". The petgraph adjacency is
+/// hydrated from this method on open and updated by `assert`/`retract`, so
+/// the two views must agree after every mutation.
+/// What: Seeds two active triples for alice and one for bob, then asserts
+/// `query_active("alice")` reports exactly the expected (predicate, object)
+/// pairs and `query_active("bob")` reports its single row.
+#[tokio::test]
+async fn list_active_matches_redb() {
+    let dir = tempdir().unwrap();
+    let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+
+    kg.assert(t("alice", "knows", "bob")).await.unwrap();
+    kg.assert(t("alice", "likes", "rust")).await.unwrap();
+    kg.assert(t("bob", "knows", "alice")).await.unwrap();
+
+    let mut alice_rows: Vec<(String, String)> = kg
+        .query_active("alice")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.predicate, t.object))
+        .collect();
+    alice_rows.sort();
+    assert_eq!(
+        alice_rows,
+        vec![
+            ("knows".to_string(), "bob".to_string()),
+            ("likes".to_string(), "rust".to_string()),
+        ]
+    );
+
+    let bob_rows = kg.query_active("bob").await.unwrap();
+    assert_eq!(bob_rows.len(), 1);
+    assert_eq!(bob_rows[0].predicate, "knows");
+    assert_eq!(bob_rows[0].object, "alice");
+}
