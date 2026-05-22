@@ -6,6 +6,14 @@
       "args": [
         "serve"
       ]
+    },
+    "trusty-mpm": {
+      "type": "stdio",
+      "command": "trusty-mpm",
+      "args": [
+        "daemon",
+        "--mcp"
+      ]
     }
   }
 }
