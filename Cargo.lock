@@ -10895,6 +10895,9 @@ dependencies = [
 name = "trusty-embedder"
 version = "0.1.5"
 dependencies = [
+ "anyhow",
+ "sysinfo",
+ "tokio",
  "trusty-common",
 ]
 

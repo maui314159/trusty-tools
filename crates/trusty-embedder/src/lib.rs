@@ -7,3 +7,9 @@
 //! trusty_common::embedder::*` instead.
 
 pub use trusty_common::embedder::*;
+
+// Issue #55: portable RSS measurement helper used by the candle Metal
+// validation benchmark (`bin/candle_metal_bench.rs`). Always compiled —
+// the helper is a thin sysinfo wrapper and the unit tests do not require
+// the `candle` feature.
+pub mod rss;
