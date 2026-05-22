@@ -195,6 +195,20 @@ pub fn encode_payload_key(segment: &str, id: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Why: Range scans by segment use `range(prefix..end)` where `prefix` is
+///      `[segment_len][segment]`; this helper computes that prefix so callers
+///      can enumerate every payload row in a given segment.
+/// What: Segment prefix = `[segment_len: u16 BE][segment bytes]`.
+/// Test: `payload_keys_group_by_segment` verifies key ordering matches the
+///       prefix derived from this helper.
+pub fn segment_prefix(segment: &str) -> Vec<u8> {
+    let seg = segment.as_bytes();
+    let mut out = Vec::with_capacity(2 + seg.len());
+    out.extend_from_slice(&(seg.len() as u16).to_be_bytes());
+    out.extend_from_slice(seg);
+    out
+}
+
 // ── Value encode/decode ──────────────────────────────────────────────────
 
 /// Why: All value types share a single postcard codec — central helper keeps
