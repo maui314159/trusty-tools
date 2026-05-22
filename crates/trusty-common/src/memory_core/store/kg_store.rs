@@ -79,6 +79,41 @@ pub const PAYLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("payloa
 /// Test: Coverage lives in `analytics::tests` (round-trip + reopen).
 pub const RECALL_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("recall_log");
 
+/// Vector store: monotonic `u64` id → postcard-encoded `Vec<f32>`.
+///
+/// Why: Issue #50 — `HnswStore` (the pure-Rust `hnsw_rs` backend) persists
+///      its raw vectors in redb so the in-memory HNSW index can be rebuilt
+///      from scratch on palace open. Keyed by a monotonic vector_id (not the
+///      drawer UUID) so `hnsw_rs`'s native `usize` external id space maps
+///      directly onto redb keys without re-hashing UUIDs.
+/// What: Key = `u64` vector_id, value = postcard-encoded `Vec<f32>` (the
+///       embedding).
+/// Test: Coverage lives in `crate::memory_core::store::hnsw_store::tests`.
+pub const VECTORS: TableDefinition<u64, &[u8]> = TableDefinition::new("vectors");
+
+/// Vector key mapping: drawer UUID string → vector_id.
+///
+/// Why: Callers address vectors by drawer UUID (string); the HNSW index
+///      addresses them by `u64`. Storing the mapping in redb eliminates the
+///      JSON `key_map` sidecar used by `UsearchStore` and makes orphan
+///      compaction a redb scan rather than a session-only diff.
+/// What: Key = UUID string (drawer id), value = `u64` vector_id (the row
+///       index into the `VECTORS` table).
+/// Test: Coverage lives in `crate::memory_core::store::hnsw_store::tests`.
+pub const VECTOR_KEYS: TableDefinition<&str, u64> = TableDefinition::new("vector_keys");
+
+/// Tombstone table for soft-deleted vector_ids.
+///
+/// Why: `hnsw_rs` does not support removal from the in-memory HNSW graph
+///      once a point is inserted. Instead of rebuilding the entire index on
+///      every delete, we mark the vector_id as tombstoned in redb and filter
+///      it out at search time. The tombstones are cleared on a full rebuild
+///      (e.g. dream compaction).
+/// What: Key = `u64` vector_id (tombstoned), value = empty `&[u8]`.
+/// Test: Coverage lives in `crate::memory_core::store::hnsw_store::tests`
+///       (`delete_filters_results`).
+pub const DELETED_VECTORS: TableDefinition<u64, &[u8]> = TableDefinition::new("deleted_vectors");
+
 /// Chat-session store (for the trusty-memory web UI's chat panel).
 ///
 /// Why: Each chat session is keyed by a UUID string and carries a small
@@ -440,6 +475,9 @@ mod tests {
             PAYLOADS.name(),
             SESSIONS.name(),
             RECALL_LOG.name(),
+            VECTORS.name(),
+            VECTOR_KEYS.name(),
+            DELETED_VECTORS.name(),
         ];
         for i in 0..names.len() {
             for j in (i + 1)..names.len() {

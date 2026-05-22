@@ -7,6 +7,7 @@
 //! Test: See submodule tests.
 
 pub mod chat_sessions;
+pub mod hnsw_store;
 pub mod kg;
 pub mod kg_redb;
 #[cfg(feature = "sqlite-kg")]
