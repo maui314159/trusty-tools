@@ -14,6 +14,7 @@ use super::reindex_engine::{
     register_index_with_daemon, register_index_with_daemon_filtered, run_reindex,
     run_reindex_force, RegisterFilters,
 };
+use crate::config::{CollectionConfig, GlobalConfig};
 use crate::core::project_config::{ProjectConfig, PROJECT_CONFIG_FILENAME};
 use crate::core::repo_config::{language_to_exts, IndexConfig, RepoConfig, CONFIG_FILENAME};
 use anyhow::Result;
@@ -295,12 +296,60 @@ async fn index_one_with_filters(
         );
     }
 
+    // Mirror the registration into `~/.config/trusty-search/config.yaml` so
+    // (a) `index remove` has a canonical entry to drop, and (b) the daemon's
+    // auto-discovery on the next restart sees the collection as a first-class
+    // user-declared entry rather than guessing it from filesystem markers.
+    // Best-effort: a failed YAML write must not undo the successful daemon
+    // registration, so we only warn and continue.
+    persist_collection_to_global_config(index_name, project_path, filters);
+
     if force {
         run_reindex_force(index_name, project_path, timeout_secs).await?;
     } else {
         run_reindex(index_name, project_path, timeout_secs).await?;
     }
     Ok(())
+}
+
+/// Write (or update) an entry in `~/.config/trusty-search/config.yaml`.
+///
+/// Why: issue #40 — the YAML config is the user-facing source of truth for
+/// indexed projects. Every successful `trusty-search index` invocation must
+/// add/update its matching `collections:` entry so a daemon restart preserves
+/// the registration and `index remove` has a row to drop. Failures here are
+/// non-fatal because the daemon-side registration already succeeded.
+/// What: loads the existing config (creating an empty one if missing), upserts
+/// a `CollectionConfig` matching `name`/`path` plus the filter-derived
+/// `exclude`/`extensions`/`domain_terms`, and saves atomically. Warnings are
+/// emitted via `tracing::warn!` so daemon logs surface them without polluting
+/// stdout.
+/// Test: covered indirectly by `config::tests::roundtrip_preserves_fields`
+/// (round-trip) and `config::tests::upsert_replaces_by_name` (idempotency);
+/// CLI smoke tested by running `trusty-search index` twice and inspecting the
+/// resulting YAML.
+fn persist_collection_to_global_config(
+    index_name: &str,
+    project_path: &std::path::Path,
+    filters: &RegisterFilters,
+) {
+    let mut cfg = match GlobalConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("could not load global config to record index '{index_name}': {e:#}");
+            return;
+        }
+    };
+    cfg.upsert_collection(CollectionConfig {
+        name: index_name.to_string(),
+        path: project_path.to_path_buf(),
+        extensions: filters.extensions.clone(),
+        exclude: filters.exclude_globs.clone(),
+        domain_terms: filters.domain_terms.clone(),
+    });
+    if let Err(e) = cfg.save() {
+        tracing::warn!("could not save global config after registering '{index_name}': {e:#}");
+    }
 }
 
 #[cfg(test)]
