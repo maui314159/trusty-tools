@@ -82,6 +82,16 @@ export const api = {
     ),
 
   /**
+   * List distinct active subjects paired with their active-triple count.
+   * Why: KG Explorer renders a count badge next to each subject and
+   * supports sort-by-count without N round-trips.
+   */
+  kgListSubjectsWithCounts: (id, limit = 200) =>
+    request(
+      `/api/v1/palaces/${encodeURIComponent(id)}/kg/subjects_with_counts?limit=${encodeURIComponent(limit)}`
+    ),
+
+  /**
    * List active triples in a palace's KG, paginated by `valid_from DESC`.
    * Why: KG Explorer "All" mode — table view without a subject filter.
    */

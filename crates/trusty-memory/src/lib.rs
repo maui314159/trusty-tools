@@ -74,7 +74,17 @@ pub enum DaemonEvent {
     },
     DrawerAdded {
         palace_id: String,
+        /// Friendly palace name (Palace.name) at write time. Why: lets SSE
+        /// consumers (the dashboard activity feed) render the human-readable
+        /// label without a separate id→name lookup. Empty string if the
+        /// emitter could not resolve the name.
+        #[serde(default)]
+        palace_name: String,
         drawer_count: usize,
+        /// Wall-clock timestamp when the drawer was added. Why: SSE
+        /// receivers want to render "just now / 2m ago" relative to the
+        /// daemon's clock, not the time the SSE frame happens to arrive.
+        timestamp: chrono::DateTime<chrono::Utc>,
     },
     DrawerDeleted {
         palace_id: String,

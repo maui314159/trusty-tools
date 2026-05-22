@@ -20,12 +20,18 @@
   let palaceId = $state('');
   let mode = $state('all'); // 'all' | 'subject'
   let selectedSubject = $state('');
+  // subjects is now [{subject, count}] so the panel can show a count badge
+  // and sort by count without extra round-trips.
   let subjects = $state([]);
   let triples = $state([]);
   let count = $state(null);
   let offset = $state(0);
   let loading = $state(false);
   let error = $state(null);
+
+  // Subject panel filter + sort state.
+  let subjectFilter = $state('');
+  let subjectSort = $state('name'); // 'name' | 'count'
 
   async function refreshPalaces() {
     try {
@@ -45,12 +51,45 @@
       return;
     }
     try {
-      subjects = await api.kgListSubjects(palaceId, 200);
+      const rows = await api.kgListSubjectsWithCounts(palaceId, 200);
+      // Server returns [{subject, count}]; tolerate legacy [subject] shape so
+      // a stale daemon still populates the panel (with count=0).
+      subjects = (rows || []).map((r) =>
+        typeof r === 'string'
+          ? { subject: r, count: 0 }
+          : { subject: r.subject ?? '', count: Number(r.count ?? 0) }
+      );
     } catch (e) {
       error = e.message || String(e);
       subjects = [];
     }
   }
+
+  /**
+   * Why: 200 subjects is a lot; operators want a substring filter to find
+   * the one they care about, plus a sort toggle (alphabetical vs by triple
+   * count descending).
+   * What: applies substring + sort to the loaded subjects list.
+   * Test: visibleSubjects with filter 'al' on [{subject:'alice'},{subject:'bob'}]
+   * yields just 'alice'.
+   */
+  let visibleSubjects = $derived.by(() => {
+    const f = subjectFilter.trim().toLowerCase();
+    let out = subjects.slice();
+    if (f) {
+      out = out.filter((s) => (s.subject || '').toLowerCase().includes(f));
+    }
+    if (subjectSort === 'count') {
+      out.sort(
+        (a, b) =>
+          (b.count ?? 0) - (a.count ?? 0) ||
+          (a.subject || '').localeCompare(b.subject || '')
+      );
+    } else {
+      out.sort((a, b) => (a.subject || '').localeCompare(b.subject || ''));
+    }
+    return out;
+  });
 
   async function loadAll() {
     if (!palaceId) {
@@ -184,21 +223,41 @@
 
 <div class="explorer mt-4">
   <aside class="left">
-    <div class="panel-head">Subjects ({subjects.length})</div>
+    <div class="panel-head">
+      <span>Subjects ({visibleSubjects.length}/{subjects.length})</span>
+    </div>
+    <div class="subj-controls">
+      <input
+        type="search"
+        class="subj-filter"
+        placeholder="🔍 Filter subjects…"
+        bind:value={subjectFilter}
+      />
+      <label class="subj-sort">
+        <span>Sort</span>
+        <select bind:value={subjectSort}>
+          <option value="name">A→Z</option>
+          <option value="count">Count</option>
+        </select>
+      </label>
+    </div>
     <div class="panel-body">
-      {#if subjects.length === 0}
-        <div class="empty">No subjects.</div>
+      {#if visibleSubjects.length === 0}
+        <div class="empty">
+          {subjects.length === 0 ? 'No subjects.' : 'No matches.'}
+        </div>
       {:else}
         <ul class="subj-list">
-          {#each subjects as s}
+          {#each visibleSubjects as s (s.subject)}
             <li>
               <button
                 type="button"
                 class="subj-btn"
-                class:active={selectedSubject === s}
-                onclick={() => loadSubject(s)}
+                class:active={selectedSubject === s.subject}
+                onclick={() => loadSubject(s.subject)}
               >
-                {s}
+                <span class="subj-name">{s.subject}</span>
+                <span class="subj-count">{s.count}</span>
               </button>
             </li>
           {/each}
@@ -380,7 +439,10 @@
     padding: 0;
   }
   .subj-btn {
-    display: block;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     width: 100%;
     text-align: left;
     padding: 6px 14px;
@@ -398,6 +460,52 @@
     background: var(--trusty-accent-soft, #e0e7ff);
     color: var(--trusty-accent, #4f46e5);
     font-weight: 600;
+  }
+  .subj-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .subj-count {
+    flex: 0 0 auto;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: var(--trusty-bg-subtle, #f3f4f6);
+    color: var(--trusty-text-secondary, #6b7280);
+    font-family: var(--trusty-font, sans-serif);
+  }
+  .subj-btn.active .subj-count {
+    background: var(--trusty-accent, #4f46e5);
+    color: white;
+  }
+  .subj-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--trusty-border, #e5e7eb);
+    background: var(--trusty-bg-subtle, #fafafa);
+  }
+  .subj-filter {
+    width: 100%;
+    padding: 4px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--trusty-border, #e5e7eb);
+    font-size: 12px;
+  }
+  .subj-sort {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--trusty-text-secondary, #6b7280);
+  }
+  .subj-sort select {
+    flex: 1;
+    padding: 2px 6px;
+    font-size: 11px;
   }
 
   .table {

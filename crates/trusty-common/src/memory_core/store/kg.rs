@@ -283,6 +283,39 @@ impl KnowledgeGraph {
         Ok(out)
     }
 
+    /// List up to `limit` distinct active subjects paired with their active
+    /// triple count.
+    ///
+    /// Why: The KG Explorer UI shows a count badge next to each subject so
+    /// operators can spot heavy subjects at a glance. Computing it server-side
+    /// in a single SQL pass avoids issuing one `query_active` per subject.
+    /// What: `SELECT subject, COUNT(*) FROM triples WHERE valid_to IS NULL
+    /// GROUP BY subject ORDER BY subject LIMIT ?1`. Returns `Vec<(subject,
+    /// count)>` ordered alphabetically.
+    /// Test: `list_subjects_with_counts_returns_grouped_counts`.
+    pub fn list_subjects_with_counts(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT subject, COUNT(*) FROM triples
+                   WHERE valid_to IS NULL
+                   GROUP BY subject
+                   ORDER BY subject
+                   LIMIT ?1",
+            )
+            .context("failed to prepare list_subjects_with_counts statement")?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .context("failed to query subjects with counts")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("failed to read subject count row")?);
+        }
+        Ok(out)
+    }
+
     /// List up to `limit` active triples ordered by `valid_from` descending,
     /// skipping the first `offset` rows.
     ///
@@ -817,6 +850,41 @@ mod tests {
 
         let subjects = kg.list_subjects(50).unwrap();
         assert_eq!(subjects, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    /// Why: KG Explorer UI shows a triple-count badge next to each subject;
+    /// the count must reflect only currently-active triples (valid_to IS NULL)
+    /// and group correctly when a subject appears in many predicates.
+    /// What: Assert four triples — three under "alice" (different predicates,
+    /// all active) and one under "bob" — then verify the grouped counts.
+    /// Test: this test itself.
+    #[tokio::test]
+    async fn list_subjects_with_counts_returns_grouped_counts() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        assert!(kg.list_subjects_with_counts(50).unwrap().is_empty());
+
+        for (subj, pred) in [
+            ("alice", "knows"),
+            ("alice", "likes"),
+            ("alice", "owns"),
+            ("bob", "knows"),
+        ] {
+            kg.assert(Triple {
+                subject: subj.into(),
+                predicate: pred.into(),
+                object: "thing".into(),
+                valid_from: Utc::now(),
+                valid_to: None,
+                confidence: 1.0,
+                provenance: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let rows = kg.list_subjects_with_counts(50).unwrap();
+        assert_eq!(rows, vec![("alice".to_string(), 3), ("bob".to_string(), 1)]);
     }
 
     /// Why: KG Explorer's "All" mode pages through every active triple in

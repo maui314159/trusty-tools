@@ -76,6 +76,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/recall", get(recall_all_handler))
         .route("/api/v1/palaces/{id}/kg", get(kg_query).post(kg_assert))
         .route("/api/v1/palaces/{id}/kg/subjects", get(kg_list_subjects))
+        .route(
+            "/api/v1/palaces/{id}/kg/subjects_with_counts",
+            get(kg_list_subjects_with_counts),
+        )
         .route("/api/v1/palaces/{id}/kg/all", get(kg_list_all))
         .route("/api/v1/palaces/{id}/kg/count", get(kg_count))
         .route(
@@ -432,6 +436,16 @@ struct PalaceInfo {
     kg_triple_count: usize,
     wing_count: usize,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Max `created_at` across this palace's drawers, or `None` if empty.
+    ///
+    /// Why: The UI "sort by activity" mode needs a single timestamp per
+    /// palace so operators can spot recently-written palaces. Computing it
+    /// from the loaded drawer set avoids adding a per-write update path or a
+    /// new on-disk index.
+    /// What: `handle.drawers.read().iter().map(|d| d.created_at).max()`.
+    /// Null when the handle is unavailable or the palace has zero drawers.
+    /// Test: `palace_list_includes_last_write_at` (web tests, added below).
+    last_write_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Build a `PalaceInfo` from a `Palace` row plus an optional opened handle.
@@ -444,18 +458,21 @@ struct PalaceInfo {
 /// is the closest proxy).
 /// Test: `palace_list_includes_richer_counts`.
 fn palace_info_from(palace: &Palace, handle: Option<&Arc<PalaceHandle>>) -> PalaceInfo {
-    let (drawer_count, vector_count, kg_triple_count, wing_count) = if let Some(h) = handle {
-        let drawers = h.drawers.read();
-        let distinct_rooms: HashSet<Uuid> = drawers.iter().map(|d| d.room_id).collect();
-        (
-            drawers.len(),
-            h.vector_store.index_size(),
-            h.kg.count_active_triples(),
-            distinct_rooms.len(),
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
+    let (drawer_count, vector_count, kg_triple_count, wing_count, last_write_at) =
+        if let Some(h) = handle {
+            let drawers = h.drawers.read();
+            let distinct_rooms: HashSet<Uuid> = drawers.iter().map(|d| d.room_id).collect();
+            let last_write = drawers.iter().map(|d| d.created_at).max();
+            (
+                drawers.len(),
+                h.vector_store.index_size(),
+                h.kg.count_active_triples(),
+                distinct_rooms.len(),
+                last_write,
+            )
+        } else {
+            (0, 0, 0, 0, None)
+        };
     PalaceInfo {
         id: palace.id.0.clone(),
         name: palace.name.clone(),
@@ -465,6 +482,7 @@ fn palace_info_from(palace: &Palace, handle: Option<&Arc<PalaceHandle>>) -> Pala
         kg_triple_count,
         wing_count,
         created_at: palace.created_at,
+        last_write_at,
     }
 }
 
@@ -583,9 +601,15 @@ async fn create_drawer(
         .await
         .map_err(|e| ApiError::internal(format!("remember: {e:#}")))?;
     let drawer_count = handle.drawers.read().len();
+    let palace_name = PalaceRegistry::list_palaces(&state.data_root)
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.id.0 == id).map(|p| p.name))
+        .unwrap_or_else(|| id.clone());
     state.emit(DaemonEvent::DrawerAdded {
         palace_id: id.clone(),
+        palace_name,
         drawer_count,
+        timestamp: chrono::Utc::now(),
     });
     state.emit(aggregate_status_event(&state));
     Ok(Json(json!({ "id": drawer_id })))
@@ -810,6 +834,35 @@ async fn kg_list_subjects(
         .list_subjects(limit)
         .map_err(|e| ApiError::internal(format!("kg list_subjects: {e:#}")))?;
     Ok(Json(subjects))
+}
+
+/// `GET /api/v1/palaces/{id}/kg/subjects_with_counts?limit=N` — list distinct
+/// active subjects with their active-triple counts.
+///
+/// Why: The KG Explorer's subject list shows a count badge per subject and
+/// supports sort-by-count. Returning the grouped counts in a single SQL pass
+/// is cheaper than issuing one query per subject from the SPA.
+/// What: clamps `limit` to `[1, MAX_KG_LIST_LIMIT]` and delegates to
+/// `KnowledgeGraph::list_subjects_with_counts`. Returns a JSON array of
+/// `{subject, count}` objects ordered alphabetically.
+/// Test: indirectly via the KG Explorer UI; the core `list_subjects_with_counts`
+/// test in `kg.rs` covers the SQL grouping.
+async fn kg_list_subjects_with_counts(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<KgListSubjectsParams>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let handle = open_handle(&state, &id)?;
+    let limit = q.limit.clamp(1, MAX_KG_LIST_LIMIT);
+    let rows = handle
+        .kg
+        .list_subjects_with_counts(limit)
+        .map_err(|e| ApiError::internal(format!("kg list_subjects_with_counts: {e:#}")))?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(subject, count)| json!({ "subject": subject, "count": count }))
+        .collect();
+    Ok(Json(out))
 }
 
 /// Query parameters for `GET /api/v1/palaces/{id}/kg/all`.
