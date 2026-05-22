@@ -2128,12 +2128,18 @@ async fn graph_handler(
 /// (issue #41 phase 2).
 ///
 /// Why: lets agents and dashboards verify KG health (total nodes/edges plus a
-/// per-`EdgeKind` breakdown) without parsing the much larger `/graph` export
-/// or scraping Prometheus. The Phase B/C edge counts here are the load-bearing
-/// signal that the entity-derived edges are actually wired.
-/// What: snapshots the symbol graph (lock-free after the `Arc` clone) and
-/// returns `{ node_count, edge_count, edge_kinds: { CallsFunction: …, … } }`.
-/// Returns 404 when the index id is unknown.
+/// per-`EdgeKind` breakdown and community-detection summary) without parsing
+/// the much larger `/graph` export or scraping Prometheus. The Phase B/C edge
+/// counts here are the load-bearing signal that the entity-derived edges are
+/// actually wired; `community_count` / `modularity` let the monitor TUI render
+/// the STATISTICS panel with one request instead of also probing
+/// `/communities`.
+/// What: snapshots the symbol graph (lock-free after the `Arc` clone), reads
+/// any persisted Louvain partition from the corpus store, and returns
+/// `{ node_count, edge_count, edge_kinds: { CallsFunction: …, … },
+///    community_count, modularity }`. `community_count` is 0 and `modularity`
+/// is 0.0 when no partition has been persisted yet. Returns 404 when the
+/// index id is unknown.
 /// Test: covered by `graph_stats_handler_returns_breakdown` in this module.
 async fn graph_stats_handler(
     State(state): State<Arc<SearchAppState>>,
@@ -2141,19 +2147,48 @@ async fn graph_stats_handler(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    let graph = {
+    let (graph, corpus) = {
         let indexer = handle.indexer.read().await;
-        indexer.snapshot_symbol_graph().await
+        (
+            indexer.snapshot_symbol_graph().await,
+            indexer.corpus_store(),
+        )
     };
     let breakdown = graph.edge_kind_breakdown();
     let mut edge_kinds = serde_json::Map::with_capacity(breakdown.len());
     for (tag, count) in breakdown {
         edge_kinds.insert(tag, serde_json::Value::from(count));
     }
+
+    // Surface community-detection summary alongside the graph stats so the
+    // monitor TUI / dashboards only need to hit one endpoint to render the
+    // STATISTICS panel (issue: TUI community_count/modularity missing).
+    // Reading communities is best-effort: when the index has not yet run
+    // Louvain detection (or the corpus store is absent), `community_count`
+    // is 0 and `modularity` is 0.0 — the fields are always present so clients
+    // can deserialise without `Option`s.
+    let (community_count, modularity) = match corpus {
+        Some(corpus) => {
+            tokio::task::spawn_blocking(move || crate::core::SymbolGraph::load_communities(&corpus))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|records| {
+                    let count = records.len() as u64;
+                    let m: f64 = records.iter().map(|r| r.modularity_contribution).sum();
+                    (count, m)
+                })
+                .unwrap_or((0, 0.0))
+        }
+        None => (0, 0.0),
+    };
+
     Ok(Json(serde_json::json!({
         "node_count": graph.node_count(),
         "edge_count": graph.edge_count(),
         "edge_kinds": serde_json::Value::Object(edge_kinds),
+        "community_count": community_count,
+        "modularity": modularity,
     })))
 }
 

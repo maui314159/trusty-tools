@@ -361,6 +361,7 @@ pub fn init_tracing(verbose_count: u8) {
 /// daemon `/logs/tail` integration tests cover the wired path end-to-end.
 #[must_use]
 pub fn init_tracing_with_buffer(verbose_count: u8, capacity: usize) -> log_buffer::LogBuffer {
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -370,19 +371,33 @@ pub fn init_tracing_with_buffer(verbose_count: u8, capacity: usize) -> log_buffe
         2 => "debug",
         _ => "trace",
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    // Stderr filter follows the same verbosity ladder + `RUST_LOG` override as
+    // `init_tracing` so terminal output stays compact at the operator's chosen
+    // level.
+    let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+
+    // The log-buffer layer must capture activity even when the stderr filter
+    // is set to `warn` (the default for `trusty-search start` without `-v`).
+    // Operators reading `/logs/tail` expect to see info-level lifecycle events
+    // (file-watcher reindexes, startup scans). Without a separate filter the
+    // global stderr filter would suppress them before they reach the buffer.
+    // `RUST_LOG_BUFFER` lets ops widen or narrow the buffer independently of
+    // stderr; the default of `info` matches the activity feed's intent.
+    let buffer_filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG_BUFFER")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     let buffer = log_buffer::LogBuffer::new(capacity);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_target(false);
+        .with_target(false)
+        .with_filter(stderr_filter);
+    let buf_layer = log_buffer::LogBufferLayer::new(buffer.clone()).with_filter(buffer_filter);
     // try_init so callers that pre-install a subscriber don't panic — the
     // returned buffer simply stays empty in that (rare) case.
     let _ = tracing_subscriber::registry()
-        .with(filter)
         .with(fmt_layer)
-        .with(log_buffer::LogBufferLayer::new(buffer.clone()))
+        .with(buf_layer)
         .try_init();
     buffer
 }
