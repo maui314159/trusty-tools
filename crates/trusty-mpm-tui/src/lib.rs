@@ -61,7 +61,8 @@ pub enum Screen {
 /// manage services; a shared constant keeps the hint in one place.
 /// What: the one-line key reference drawn at the bottom of the health screen.
 /// Test: `health_status_bar_lists_keys`.
-pub const HEALTH_KEY_HINT: &str = "[1]chat [2]health [Tab]focus [S]start [X]stop [q]quit";
+pub const HEALTH_KEY_HINT: &str =
+    "[1]health [2]logs [3]search [Tab]svc [↑↓]nav [r]refresh [S]start [X]stop [c]chat [q]quit";
 
 /// Run the ratatui coordinator dashboard against `url`.
 ///
@@ -330,6 +331,10 @@ async fn run_loop<B: ratatui::backend::Backend>(
     );
 
     poll_daemon(&mut state, client).await;
+    // Prime the health screen with one refresh so collections + logs are
+    // present the first time the operator opens [Screen::Health].
+    refresh_health_data(&mut health_screen).await;
+    let mut last_health_refresh = Instant::now();
     state.sidebar_visible = !state.sessions.is_empty();
     // Apply a `tm connect` focus once the priming poll has filled the list.
     if let Some(id) = focus_id.as_deref()
@@ -352,18 +357,66 @@ async fn run_loop<B: ratatui::backend::Backend>(
             && let Event::Key(key) = event::read()?
         {
             // The health screen has its own key handling, kept separate so the
-            // chat-screen branch below stays unchanged.
+            // chat-screen branch below stays unchanged. Within the health
+            // screen the digit keys switch the right-panel tab; `c` returns
+            // to the coordinator chat. When the Search tab is active and the
+            // input bar holds focus, alphanumeric keys edit the search query.
             if screen == Screen::Health {
+                // Handle the always-visible search bar's input when the
+                // Search tab has captured it.
+                if health_screen.tab == health::HealthTab::Search
+                    && health_screen.search_input_focused
+                {
+                    match key.code {
+                        KeyCode::Esc => {
+                            health_screen.search_query.clear();
+                            health_screen.search_input_focused = false;
+                        }
+                        KeyCode::Backspace => {
+                            health_screen.search_query.pop();
+                        }
+                        KeyCode::Char(c) if !c.is_ascii_digit() => {
+                            health_screen.search_query.push(c);
+                        }
+                        KeyCode::Char('1') => health_screen.set_tab(health::HealthTab::Health),
+                        KeyCode::Char('2') => health_screen.set_tab(health::HealthTab::Logs),
+                        KeyCode::Char('3') => health_screen.set_tab(health::HealthTab::Search),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('1') => screen = Screen::Chat,
-                    KeyCode::Char('2') => {} // already here
-                    KeyCode::Tab => health_screen.toggle_focus(),
-                    KeyCode::Char('S') | KeyCode::Char('s') => {
+                    KeyCode::Char('c') => screen = Screen::Chat,
+                    KeyCode::Char('1') => health_screen.set_tab(health::HealthTab::Health),
+                    KeyCode::Char('2') => health_screen.set_tab(health::HealthTab::Logs),
+                    KeyCode::Char('3') => health_screen.set_tab(health::HealthTab::Search),
+                    KeyCode::Tab => {
+                        health_screen.toggle_focus();
+                        health_screen.clamp_collection_selection();
+                    }
+                    KeyCode::Up => match health_screen.tab {
+                        health::HealthTab::Logs => health_screen.focused_logs_mut().scroll_up(),
+                        _ => health_screen.select_collection_up(),
+                    },
+                    KeyCode::Down => match health_screen.tab {
+                        health::HealthTab::Logs => health_screen.focused_logs_mut().scroll_down(),
+                        _ => health_screen.select_collection_down(),
+                    },
+                    KeyCode::Char('r') => {
+                        // Trigger an immediate refresh of collections + logs.
+                        refresh_health_data(&mut health_screen).await;
+                    }
+                    KeyCode::Char('S') => {
                         health_start(&mut state, &health_screen);
                     }
-                    KeyCode::Char('X') | KeyCode::Char('x') => {
+                    KeyCode::Char('X') => {
                         health_stop(&mut state, &health_screen).await;
+                    }
+                    // Any other alphanumeric autoswitches to the Search tab.
+                    KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                        health_screen.set_tab(health::HealthTab::Search);
+                        health_screen.search_query.push(c);
                     }
                     _ => {}
                 }
@@ -460,7 +513,59 @@ async fn run_loop<B: ratatui::backend::Backend>(
             poll_daemon(&mut state, client).await;
             last_poll = Instant::now();
         }
+
+        // Refresh the health screen's collections + logs every 5 s while it
+        // is the active surface (kept off the hot path when the operator is
+        // in the chat screen).
+        if screen == Screen::Health && last_health_refresh.elapsed() >= Duration::from_secs(5) {
+            refresh_health_data(&mut health_screen).await;
+            last_health_refresh = Instant::now();
+        }
     }
+}
+
+/// Refresh the focused service's collections list and log tail in-place.
+///
+/// Why: the operator's `r` key (and the periodic refresh) wants the left
+/// panel and Logs tab to be reflected from the latest daemon snapshot
+/// without restarting the polling tasks.
+/// What: for the focused service, fetches `collections` (via the search /
+/// memory list endpoints) and `logs_tail(LOG_BUFFER_CAP)`; folds the result
+/// into the screen and clamps the selection.
+/// Test: live behaviour is covered by the daemon suites; this is the thin
+/// orchestration glue.
+async fn refresh_health_data(screen: &mut health::HealthScreen) {
+    // Refresh both services so a `Tab` toggle does not show stale data.
+    for daemon in [health::Daemon::Search, health::Daemon::Memory] {
+        let url = match daemon {
+            health::Daemon::Search => screen.search_url.clone(),
+            health::Daemon::Memory => screen.memory_url.clone(),
+        };
+        let client = health::client_for(daemon, &url);
+        let rows = match daemon {
+            health::Daemon::Search => client.search_collections().await,
+            health::Daemon::Memory => client.memory_collections().await,
+        };
+        match daemon {
+            health::Daemon::Search => screen.search_collections = rows,
+            health::Daemon::Memory => screen.memory_collections = rows,
+        }
+        if let Ok((lines, total)) = client.logs_tail(health::LOG_BUFFER_CAP as u32).await {
+            let buf = match daemon {
+                health::Daemon::Search => &mut screen.search_logs,
+                health::Daemon::Memory => &mut screen.memory_logs,
+            };
+            // Preserve scroll position when auto-scroll is off so an operator
+            // reading older lines is not yanked back to the tail.
+            let preserve_scroll = !buf.auto_scroll;
+            let prior_offset = buf.scroll_offset;
+            buf.replace(lines, Some(total));
+            if preserve_scroll {
+                buf.scroll_offset = prior_offset.min(buf.lines.len().saturating_sub(1));
+            }
+        }
+    }
+    screen.clamp_collection_selection();
 }
 
 /// Spawn the focused daemon's start command as a detached child process.
@@ -573,23 +678,27 @@ mod tests {
     /// What: returns the [`Screen`] reached after pressing `key` from `from`.
     /// Test: used by `screen_switch_preserves_chat_state`.
     fn switch(from: Screen, key: char) -> Screen {
-        match key {
-            '1' => Screen::Chat,
-            '2' => Screen::Health,
+        // Mirror the event-loop branches:
+        //   - From Chat, `2` opens the Health screen.
+        //   - From Health, `c` returns to Chat (digits route to tabs there).
+        match (from, key) {
+            (Screen::Chat, '2') => Screen::Health,
+            (Screen::Health, 'c') => Screen::Chat,
             _ => from,
         }
     }
 
     #[test]
     fn screen_switch_preserves_chat_state() {
-        // Switching [1] → [2] → [1] must not reset the coordinator chat: the
-        // chat state is owned by the loop, independent of the active Screen.
+        // Switching Chat → Health → Chat must not reset the coordinator
+        // chat: the chat state is owned by the loop, independent of the
+        // active Screen.
         let mut state = DashboardState::default();
         state.push_chat(ChatMessage::user("remember me"));
         // Simulate the screen-switch keypresses the loop handles.
         let screen = switch(Screen::Chat, '2');
         assert_eq!(screen, Screen::Health);
-        let screen = switch(screen, '1');
+        let screen = switch(screen, 'c');
         assert_eq!(screen, Screen::Chat);
         // The transcript built before switching is still intact.
         assert_eq!(state.chat_history.len(), 1);
@@ -598,13 +707,18 @@ mod tests {
 
     #[test]
     fn health_status_bar_lists_keys() {
-        // The footer must document every screen-switch and service key.
+        // The footer must document every tab-switch, navigation, and
+        // service-management key of the redesigned screen (issue #36).
         for token in [
-            "[1]chat",
-            "[2]health",
+            "[1]health",
+            "[2]logs",
+            "[3]search",
             "[Tab]",
+            "[↑↓]",
+            "[r]",
             "[S]start",
             "[X]stop",
+            "[c]chat",
             "[q]quit",
         ] {
             assert!(

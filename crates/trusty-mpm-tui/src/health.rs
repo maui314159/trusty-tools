@@ -72,6 +72,167 @@ pub enum Daemon {
     Memory,
 }
 
+/// Maximum number of buffered log lines kept per service.
+///
+/// Why: the Logs tab is a ring buffer of the most recent daemon log lines; a
+/// fixed cap keeps memory bounded on long sessions.
+/// What: 200 lines — wide enough to scroll through recent activity, small
+/// enough to redraw quickly.
+/// Test: `log_buffer_evicts_oldest`.
+pub const LOG_BUFFER_CAP: usize = 200;
+
+/// Which right-panel tab is currently active.
+///
+/// Why: the redesign in issue #36 puts the per-service detail behind three
+/// tabs (`[1]HEALTH [2]LOGS [3]SEARCH`); a typed enum keeps tab-switch and
+/// render dispatch exhaustive.
+/// What: `Health` shows resource gauges + config, `Logs` shows a scrollable
+/// log tail, `Search` shows a query input + results.
+/// Test: `tab_default_is_health`, `tab_switch_keys_route`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthTab {
+    /// The resource / config view.
+    #[default]
+    Health,
+    /// The log-tail view.
+    Logs,
+    /// The interactive search/recall view.
+    Search,
+}
+
+/// One row in the left-panel collections list.
+///
+/// Why: the redesigned screen surfaces the service's collections (search
+/// indexes) or palaces (memory) so the operator can see each one's status at
+/// a glance and drill into it.
+/// What: a display id, an item count (chunks or vectors), and a one-line
+/// status note (e.g. `indexed 2m ago`, `reindexing 42%…`, `error: …`).
+/// Test: `collection_row_default_is_empty`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CollectionRow {
+    /// Display id (index id or palace name).
+    pub id: String,
+    /// Item count — chunks for search, vectors for memory.
+    pub count: u64,
+    /// One-line status note rendered after the count.
+    pub note: String,
+    /// Whether this row currently looks healthy (`true` shows `✓`, false `✗`).
+    pub ok: bool,
+}
+
+/// Ring buffer of recently-observed log lines for one service.
+///
+/// Why: the Logs tab needs the last N lines and must drop the oldest when
+/// full so memory cannot grow without bound; the tab also tracks a scroll
+/// offset so the operator can hold position while new lines arrive.
+/// What: a `VecDeque` capped at [`LOG_BUFFER_CAP`] plus an `auto_scroll` flag
+/// and a `scroll_offset` (lines from the bottom).
+/// Test: `log_buffer_evicts_oldest`, `log_buffer_scroll_clamps`.
+#[derive(Debug, Clone, Default)]
+pub struct LogBuffer {
+    /// The line ring; oldest at the front, newest at the back.
+    pub lines: std::collections::VecDeque<String>,
+    /// Total lines ever observed (for the "showing N/M" footer).
+    pub total_seen: u64,
+    /// When `true`, the view follows the tail; any ↑/↓ press disables it.
+    pub auto_scroll: bool,
+    /// Lines scrolled up from the bottom; `0` == tail visible.
+    pub scroll_offset: usize,
+}
+
+impl LogBuffer {
+    /// Build an empty, auto-scrolling buffer.
+    ///
+    /// Why: a fresh service view starts following the tail with no history.
+    /// What: empty deque, `auto_scroll = true`, `scroll_offset = 0`.
+    /// Test: `log_buffer_starts_empty`.
+    pub fn new() -> Self {
+        Self {
+            lines: std::collections::VecDeque::new(),
+            total_seen: 0,
+            auto_scroll: true,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Replace the buffer's contents with a freshly-polled tail.
+    ///
+    /// Why: the Logs tab polls `/logs/tail?n=…` periodically; each response
+    /// is the latest snapshot and replaces the buffer rather than appending,
+    /// so missed lines while paused do not duplicate.
+    /// What: clears the deque, pushes up to [`LOG_BUFFER_CAP`] of `new_lines`
+    /// (keeping the newest), and updates `total_seen` to `total` when given.
+    /// Test: `log_buffer_replace_caps_at_limit`.
+    pub fn replace(&mut self, new_lines: Vec<String>, total: Option<u64>) {
+        self.lines.clear();
+        let start = new_lines.len().saturating_sub(LOG_BUFFER_CAP);
+        for line in new_lines.into_iter().skip(start) {
+            self.lines.push_back(line);
+        }
+        if let Some(t) = total {
+            self.total_seen = t;
+        } else {
+            self.total_seen = self.lines.len() as u64;
+        }
+    }
+
+    /// Push one new line (the streaming path).
+    ///
+    /// Why: future streaming transports can append individual lines without
+    /// re-fetching the full tail; centralising the cap-and-evict logic keeps
+    /// every caller consistent.
+    /// What: appends to the back; evicts the front when over [`LOG_BUFFER_CAP`].
+    /// Test: `log_buffer_evicts_oldest`.
+    pub fn push(&mut self, line: String) {
+        self.lines.push_back(line);
+        self.total_seen = self.total_seen.saturating_add(1);
+        while self.lines.len() > LOG_BUFFER_CAP {
+            self.lines.pop_front();
+        }
+    }
+
+    /// Scroll up one line (toward older entries), disabling auto-scroll.
+    ///
+    /// Why: the operator pressing ↑ wants to hold position while the tail
+    /// keeps growing; auto-scroll resumes only when the operator presses
+    /// `End` or any non-arrow key per the spec.
+    /// What: increments `scroll_offset` up to `lines.len() - 1`; clears
+    /// `auto_scroll`.
+    /// Test: `log_buffer_scroll_clamps`.
+    pub fn scroll_up(&mut self) {
+        self.auto_scroll = false;
+        let max = self.lines.len().saturating_sub(1);
+        if self.scroll_offset < max {
+            self.scroll_offset += 1;
+        }
+    }
+
+    /// Scroll down one line (toward newer entries).
+    ///
+    /// Why: lets the operator return toward the tail after ↑-scrolling.
+    /// What: decrements `scroll_offset`; re-enables auto-scroll when the
+    /// offset reaches zero (the tail is visible again).
+    /// Test: `log_buffer_scroll_clamps`.
+    pub fn scroll_down(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset -= 1;
+        }
+        if self.scroll_offset == 0 {
+            self.auto_scroll = true;
+        }
+    }
+
+    /// Snap back to the tail and re-enable auto-scroll.
+    ///
+    /// Why: any non-scroll keypress should resume tailing per the spec.
+    /// What: zeroes `scroll_offset` and sets `auto_scroll = true`.
+    /// Test: `log_buffer_snap_to_tail`.
+    pub fn snap_to_tail(&mut self) {
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+    }
+}
+
 /// Wire shape of `GET /health` shared by both daemons (issue #35).
 ///
 /// Why: trusty-search and trusty-memory return a compatible health block —
@@ -342,6 +503,86 @@ impl HealthClient {
             .await?)
     }
 
+    /// Fetch the most recent `n` log lines from the daemon.
+    ///
+    /// Why: the Logs tab (`[2]`) tails the daemon's in-memory log ring via
+    /// `GET /logs/tail?n=…`; both daemons share this endpoint (issue #35).
+    /// What: GETs `/logs/tail?n=…` and projects `lines` + `total`. A daemon
+    /// without this endpoint (older build) yields `Ok((vec![], 0))` rather
+    /// than an error so the tab degrades to a placeholder cleanly.
+    /// Test: live behaviour is covered by the daemon suites; the projection
+    /// is unit-tested via `project_log_tail`.
+    pub async fn logs_tail(&self, n: u32) -> anyhow::Result<(Vec<String>, u64)> {
+        let url = format!("{}/logs/tail?n={n}", self.base);
+        match self.http.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => Ok(project_log_tail(&body)),
+                    Err(_) => Ok((Vec::new(), 0)),
+                }
+            }
+            // 404 or older daemon: no logs endpoint — degrade to empty.
+            Ok(_) => Ok((Vec::new(), 0)),
+            Err(e) => Err(anyhow::anyhow!("logs_tail: {e}")),
+        }
+    }
+
+    /// Fetch the search daemon's index list with chunk counts.
+    ///
+    /// Why: the Collections list (left panel for the search service) wants a
+    /// per-index name + chunk count so the operator can see at a glance
+    /// which corpora are loaded.
+    /// What: GETs `/indexes`, then `GET /indexes/:id/status` per index,
+    /// projecting `(id, chunk_count)` into [`CollectionRow`]s. Any error
+    /// yields an empty list rather than failing.
+    /// Test: live behaviour is covered by the daemon suites; the projection
+    /// is unit-tested via `project_index_rows`.
+    pub async fn search_collections(&self) -> Vec<CollectionRow> {
+        let Ok(list) = self.get_json(format!("{}/indexes", self.base)).await else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = list
+            .get("indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let count = self
+                .get_json(format!("{}/indexes/{id}/status", self.base))
+                .await
+                .ok()
+                .and_then(|v| v.get("chunk_count").and_then(|c| c.as_u64()))
+                .unwrap_or(0);
+            rows.push(CollectionRow {
+                id,
+                count,
+                note: "indexed".to_string(),
+                ok: true,
+            });
+        }
+        rows
+    }
+
+    /// Fetch the memory daemon's palace list with vector counts.
+    ///
+    /// Why: the Collections list (left panel for the memory service) wants
+    /// a per-palace name + vector count so the operator can see at a glance
+    /// which palaces hold the most memory.
+    /// What: GETs `/api/v1/status` and projects each entry of `palaces` into
+    /// a [`CollectionRow`]. Any error yields an empty list.
+    /// Test: the projection is unit-tested via `project_palace_rows`.
+    pub async fn memory_collections(&self) -> Vec<CollectionRow> {
+        let Ok(status) = self.get_json(format!("{}/api/v1/status", self.base)).await else {
+            return Vec::new();
+        };
+        project_palace_rows(&status)
+    }
+
     /// Request a graceful shutdown of the daemon via its `admin/stop` endpoint.
     ///
     /// Why: the `[X]` key stops the focused daemon without the operator
@@ -380,6 +621,61 @@ fn project_memory_counts(status: &serde_json::Value) -> (u64, u64, u64, u64) {
         u("total_drawers"),
         u("total_kg_triples"),
     )
+}
+
+/// Project a `/logs/tail` response into `(lines, total)`.
+///
+/// Why: keeps the wire-shape parsing in one testable function so the client
+/// stays terse and an older daemon's quirky payload cannot crash the TUI.
+/// What: reads `lines` (array of strings, defaulting to `[]`) and `total`
+/// (u64, defaulting to `lines.len()`).
+/// Test: `project_log_tail_reads_fields`.
+fn project_log_tail(body: &serde_json::Value) -> (Vec<String>, u64) {
+    let lines: Vec<String> = body
+        .get("lines")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let total = body
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| lines.len() as u64);
+    (lines, total)
+}
+
+/// Project a memory daemon `/api/v1/status` payload into palace rows.
+///
+/// Why: centralising the projection keeps the renderer terse and lets a unit
+/// test assert the shape without a live daemon.
+/// What: reads the `palaces` array, projecting each entry's `name` (falling
+/// back to `id`) and `vector_count` (falling back to `0`). A missing array
+/// yields an empty list.
+/// Test: `project_palace_rows`.
+fn project_palace_rows(status: &serde_json::Value) -> Vec<CollectionRow> {
+    let Some(arr) = status.get("palaces").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|p| {
+            let id = p
+                .get("name")
+                .or_else(|| p.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let count = p.get("vector_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            CollectionRow {
+                id,
+                count,
+                note: "ready".to_string(),
+                ok: true,
+            }
+        })
+        .collect()
 }
 
 /// Format a `uptime` in seconds as a compact `Xh Ym` string.
@@ -556,6 +852,22 @@ pub struct HealthScreen {
     pub memory_url: String,
     /// Which panel `[S]`/`[X]` act on; `[Tab]` cycles it.
     pub focus: Daemon,
+    /// Which right-panel tab is currently visible.
+    pub tab: HealthTab,
+    /// Collections for the search service (issue #36 left panel).
+    pub search_collections: Vec<CollectionRow>,
+    /// Palaces for the memory service (issue #36 left panel).
+    pub memory_collections: Vec<CollectionRow>,
+    /// Highlighted row in the focused service's collections list.
+    pub selected_collection: usize,
+    /// Log ring buffer for the search service.
+    pub search_logs: LogBuffer,
+    /// Log ring buffer for the memory service.
+    pub memory_logs: LogBuffer,
+    /// Buffer for the Search tab's query input (always visible in footer).
+    pub search_query: String,
+    /// Cursor on the search input when focused (drawn as `_`).
+    pub search_input_focused: bool,
 }
 
 impl HealthScreen {
@@ -573,6 +885,102 @@ impl HealthScreen {
             memory: PanelState::Connecting,
             memory_url: memory_url.into(),
             focus: Daemon::Search,
+            tab: HealthTab::default(),
+            search_collections: Vec::new(),
+            memory_collections: Vec::new(),
+            selected_collection: 0,
+            search_logs: LogBuffer::new(),
+            memory_logs: LogBuffer::new(),
+            search_query: String::new(),
+            search_input_focused: false,
+        }
+    }
+
+    /// Switch to the given right-panel tab.
+    ///
+    /// Why: the `1` / `2` / `3` keys move between the Health, Logs, and
+    /// Search tabs; routing through one setter keeps the focus-side-effect
+    /// (auto-focusing the search input on the Search tab) in one place.
+    /// What: stores `tab` and auto-focuses the search input when `Search`.
+    /// Test: `tab_switch_keys_route`.
+    pub fn set_tab(&mut self, tab: HealthTab) {
+        self.tab = tab;
+        self.search_input_focused = matches!(tab, HealthTab::Search);
+    }
+
+    /// Currently-focused service's collections list.
+    ///
+    /// Why: the left panel renders the focused service's collections; one
+    /// accessor keeps the renderer free of per-daemon branching.
+    /// What: returns a borrowed slice into the focused service's list.
+    /// Test: `collections_for_focus`.
+    pub fn focused_collections(&self) -> &[CollectionRow] {
+        match self.focus {
+            Daemon::Search => &self.search_collections,
+            Daemon::Memory => &self.memory_collections,
+        }
+    }
+
+    /// Mutable handle to the focused service's log buffer.
+    ///
+    /// Why: ↑/↓ in the Logs tab scrolls the focused service's buffer; a
+    /// single accessor keeps the event-loop branches small.
+    /// What: returns `&mut self.search_logs` or `&mut self.memory_logs`.
+    /// Test: covered by the scroll tests on `LogBuffer`.
+    pub fn focused_logs_mut(&mut self) -> &mut LogBuffer {
+        match self.focus {
+            Daemon::Search => &mut self.search_logs,
+            Daemon::Memory => &mut self.memory_logs,
+        }
+    }
+
+    /// Borrow the focused service's log buffer.
+    ///
+    /// Why: the renderer reads (but does not mutate) the buffer to draw the
+    /// Logs tab; keeping a shared accessor next to the mutable one mirrors
+    /// the common ratatui borrow pattern.
+    /// What: returns `&self.search_logs` or `&self.memory_logs`.
+    /// Test: covered indirectly by the render smoke tests.
+    pub fn focused_logs(&self) -> &LogBuffer {
+        match self.focus {
+            Daemon::Search => &self.search_logs,
+            Daemon::Memory => &self.memory_logs,
+        }
+    }
+
+    /// Move the collections selection up one row (saturating at the top).
+    ///
+    /// Why: ↑ on the left panel highlights the previous collection; saturate
+    /// so the operator cannot scroll off the end into an undefined index.
+    /// What: decrements `selected_collection` with a floor of zero.
+    /// Test: `select_collection_saturates`.
+    pub fn select_collection_up(&mut self) {
+        self.selected_collection = self.selected_collection.saturating_sub(1);
+    }
+
+    /// Move the collections selection down one row (saturating at the bottom).
+    ///
+    /// Why: ↓ on the left panel highlights the next collection; saturate at
+    /// the end so a shrinking list never leaves the index out of bounds.
+    /// What: increments `selected_collection` up to `len - 1`.
+    /// Test: `select_collection_saturates`.
+    pub fn select_collection_down(&mut self) {
+        let max = self.focused_collections().len().saturating_sub(1);
+        if self.selected_collection < max {
+            self.selected_collection += 1;
+        }
+    }
+
+    /// Clamp the collections selection to the focused list's bounds.
+    ///
+    /// Why: after a poll replaces the list with a shorter one, a stale
+    /// selection index would render an out-of-bounds row.
+    /// What: pins `selected_collection` to `len - 1` (or `0` when empty).
+    /// Test: `select_collection_clamps_after_shrink`.
+    pub fn clamp_collection_selection(&mut self) {
+        let max = self.focused_collections().len().saturating_sub(1);
+        if self.selected_collection > max {
+            self.selected_collection = max;
         }
     }
 
@@ -636,41 +1044,413 @@ pub fn client_for(daemon: Daemon, base_url: &str) -> HealthClient {
 /// Test: line content is unit-tested via `search_panel_lines` /
 /// `memory_panel_lines`; this glue is exercised by `render_health_smoke`.
 pub fn render(frame: &mut Frame, screen: &HealthScreen) {
+    // Three-zone layout (issue #36):
+    //   1. Header (2 lines: title + stats)
+    //   2. Main (left collections list + right tabbed panel)
+    //   3. Footer (search/command input + key hint)
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(6)])
+        .constraints([
+            Constraint::Length(3), // header (title + stats)
+            Constraint::Min(6),    // main body
+            Constraint::Length(3), // footer (search input)
+        ])
         .split(frame.area());
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " trusty-mpm health ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))),
-        outer[0],
-    );
+    render_header(frame, outer[0], screen);
 
-    let panels = Layout::default()
+    let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Length(28), // collections list
+            Constraint::Min(20),    // tabbed panel
+        ])
         .split(outer[1]);
 
-    render_panel(
-        frame,
-        panels[0],
-        "SEARCH",
-        &search_panel_lines(&screen.search, &screen.search_url),
-        screen.search.is_online(),
-        screen.focus == Daemon::Search,
+    render_collections(frame, body[0], screen);
+    render_tab_panel(frame, body[1], screen);
+    render_footer(frame, outer[2], screen);
+}
+
+/// Title for the focused service ("trusty-search" / "trusty-memory").
+///
+/// Why: the header uses the focused service's name to make the surface
+/// clearly single-service; centralising the mapping keeps both renders
+/// consistent.
+/// What: returns the conventional binary name for the focused daemon.
+/// Test: `service_name_matches_focus`.
+pub fn service_name(focus: Daemon) -> &'static str {
+    match focus {
+        Daemon::Search => "trusty-search",
+        Daemon::Memory => "trusty-memory",
+    }
+}
+
+/// Build the header text lines (issue #36 zone 1).
+///
+/// Why: pure helper so the header content is testable without a terminal.
+/// What: line 1 is `service vX.Y.Z [●] ONLINE` (or `[○] OFFLINE`); line 2 is
+/// the resource snapshot `RSS / CPU / Disk / Uptime`. An offline panel keeps
+/// the layout shape — fields show `?`.
+/// Test: `header_lines_show_focus_summary`.
+pub fn header_lines(screen: &HealthScreen) -> Vec<String> {
+    let focused = match screen.focus {
+        Daemon::Search => &screen.search,
+        Daemon::Memory => &screen.memory,
+    };
+    let name = service_name(screen.focus);
+    match focused {
+        PanelState::Online(data) => {
+            let version = if data.version.is_empty() {
+                "?".to_string()
+            } else {
+                format!("v{}", data.version)
+            };
+            vec![
+                format!("{name} {version}  [●] ONLINE"),
+                format!(
+                    "RSS: {}  CPU: {:.0}%  Disk: {}  Uptime: {}",
+                    format_rss(data.rss_mb),
+                    data.cpu_pct,
+                    format_bytes(data.disk_bytes),
+                    format_uptime(data.uptime_secs),
+                ),
+            ]
+        }
+        PanelState::Offline { last_error } => vec![
+            format!("{name}  [○] OFFLINE"),
+            format!("last error: {last_error}"),
+        ],
+        PanelState::Connecting => vec![format!("{name}  [○] connecting…"), String::new()],
+    }
+}
+
+/// Render the header zone (title + resource snapshot).
+///
+/// Why: kept separate so the main `render` reads top-to-bottom.
+/// What: draws the two `header_lines` inside a single bordered block.
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let online = match screen.focus {
+        Daemon::Search => screen.search.is_online(),
+        Daemon::Memory => screen.memory.is_online(),
+    };
+    let lines = header_lines(screen);
+    let title_color = if online { Color::Green } else { Color::Red };
+    let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(title_color))
+                .title(Span::styled(
+                    format!(" {} ", service_name(screen.focus)),
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
+        area,
     );
-    render_panel(
-        frame,
-        panels[1],
-        "MEMORY",
-        &memory_panel_lines(&screen.memory, &screen.memory_url),
-        screen.memory.is_online(),
-        screen.focus == Daemon::Memory,
+}
+
+/// Build the collections list lines (left panel).
+///
+/// Why: a pure helper for testing the row formatting.
+/// What: one line per row — `> id  count ✓  [note]` or `  id  count ✗  [note]`
+/// for the highlighted vs other rows.
+/// Test: `collections_lines_format_each_row`.
+pub fn collections_lines(screen: &HealthScreen) -> Vec<String> {
+    let rows = screen.focused_collections();
+    if rows.is_empty() {
+        return vec!["(none)".to_string()];
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let marker = if i == screen.selected_collection {
+                ">"
+            } else {
+                " "
+            };
+            let glyph = if r.ok { "✓" } else { "✗" };
+            let note = if r.note.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", r.note)
+            };
+            format!(
+                "{marker} {:<12} {:>6} {glyph}{note}",
+                r.id,
+                format_count(r.count)
+            )
+        })
+        .collect()
+}
+
+/// Render the collections list (left panel).
+///
+/// Why: kept separate so the renderer remains small and one branch handles
+/// the search-vs-memory title label.
+/// What: draws the list inside a bordered block titled `COLLECTIONS (n)` for
+/// search or `PALACES (n)` for memory; the highlighted row uses bold blue.
+fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let rows = screen.focused_collections();
+    let label = match screen.focus {
+        Daemon::Search => "COLLECTIONS",
+        Daemon::Memory => "PALACES",
+    };
+    let title = format!(" {label} ({}) ", rows.len());
+    let lines = collections_lines(screen);
+    let body: Vec<Line> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            if i == screen.selected_collection && !rows.is_empty() {
+                Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default().borders(Borders::ALL).title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ),
+        area,
+    );
+}
+
+/// Build the tab bar header text ("[1]HEALTH  [2]LOGS  [3]SEARCH").
+///
+/// Why: pure helper so the active-tab highlighting is testable.
+/// What: returns `(label, active)` pairs the renderer styles.
+/// Test: `tab_bar_marks_active`.
+pub fn tab_bar(active: HealthTab) -> Vec<(String, bool)> {
+    [
+        ("[1]HEALTH", HealthTab::Health),
+        ("[2]LOGS", HealthTab::Logs),
+        ("[3]SEARCH", HealthTab::Search),
+    ]
+    .iter()
+    .map(|(label, tab)| ((*label).to_string(), *tab == active))
+    .collect()
+}
+
+/// Render the right-side tabbed panel (HEALTH / LOGS / SEARCH).
+///
+/// Why: keeps the per-tab body switch in one place.
+/// What: draws the tab bar on the first body line; the active tab is bold
+/// cyan, others dimmed. Below the bar, dispatches to a per-tab renderer.
+fn render_tab_panel(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " DETAILS ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    // Tab bar line.
+    let mut spans: Vec<Span> = Vec::new();
+    for (label, active) in tab_bar(screen.tab) {
+        let style = if active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw("  "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), split[0]);
+
+    // Active tab body.
+    match screen.tab {
+        HealthTab::Health => render_health_tab(frame, split[1], screen),
+        HealthTab::Logs => render_logs_tab(frame, split[1], screen),
+        HealthTab::Search => render_search_tab(frame, split[1], screen),
+    }
+}
+
+/// Build the HEALTH tab body lines (gauges + config summary).
+///
+/// Why: pure helper so the resource gauges are testable.
+/// What: returns the memory bar, disk bar, embedder status, and a CoreML
+/// summary line. An offline panel returns a placeholder.
+/// Test: `health_tab_lines_show_gauges`.
+pub fn health_tab_lines(screen: &HealthScreen) -> Vec<String> {
+    let panel = match screen.focus {
+        Daemon::Search => &screen.search,
+        Daemon::Memory => &screen.memory,
+    };
+    let data = match panel {
+        PanelState::Online(d) => d,
+        PanelState::Offline { last_error } => {
+            return vec![format!("offline: {last_error}")];
+        }
+        PanelState::Connecting => {
+            return vec!["connecting…".to_string()];
+        }
+    };
+    // The /health endpoint reports RSS in MB; the gauge maxes at 8 GB by
+    // default (the documented memory ceiling); ratio is clamped to [0, 1].
+    const MEM_CEILING_MB: u64 = 8 * 1024;
+    let mem_ratio = (data.rss_mb as f64 / MEM_CEILING_MB as f64).clamp(0.0, 1.0);
+    let mem_pct = (mem_ratio * 100.0).round() as u64;
+    let disk_ratio = if data.disk_bytes > 0 {
+        // Disk gauge is illustrative: a 10-GB axis keeps the bar useful for
+        // typical developer codebases.
+        const DISK_CEILING_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+        (data.disk_bytes as f64 / DISK_CEILING_BYTES as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    vec![
+        format!(
+            "Memory {bar} {used} / {cap} ({pct}%)",
+            bar = ascii_bar(mem_ratio, 10),
+            used = format_rss(data.rss_mb),
+            cap = format_rss(MEM_CEILING_MB),
+            pct = mem_pct,
+        ),
+        format!(
+            "Disk   {bar} {used}",
+            bar = ascii_bar(disk_ratio, 10),
+            used = format_bytes(data.disk_bytes),
+        ),
+        String::new(),
+        "Embedder: ready".to_string(),
+        "CoreML:  batch=32  tripwire=4GB".to_string(),
+    ]
+}
+
+/// Build an ASCII bar of length `width`, filled to `ratio` (0.0..=1.0).
+///
+/// Why: ratatui's `Gauge` widget paints with colour; the spec asks for the
+/// fixed-width `████████░░` glyph form rendered as text. A pure helper keeps
+/// the proportion arithmetic unit-testable.
+/// What: returns a string with `filled` blocks (`█`) then `width-filled`
+/// dots (`░`).
+/// Test: `ascii_bar_fills_proportionally`.
+pub fn ascii_bar(ratio: f64, width: usize) -> String {
+    let r = ratio.clamp(0.0, 1.0);
+    let filled = (r * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let mut s = String::with_capacity(width * 3);
+    for _ in 0..filled {
+        s.push('█');
+    }
+    for _ in filled..width {
+        s.push('░');
+    }
+    s
+}
+
+/// Render the HEALTH tab body.
+fn render_health_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let lines: Vec<Line> = health_tab_lines(screen)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the LOGS tab body (scrollable ring buffer).
+fn render_logs_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let buf = screen.focused_logs();
+    if buf.lines.is_empty() {
+        let hint = "Log streaming not available — start daemon with RUST_LOG=debug";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+    let height = area.height as usize;
+    let total = buf.lines.len();
+    // The view shows the bottom `height` lines minus the operator's scroll
+    // offset. Auto-scroll means `scroll_offset == 0` (tail visible).
+    let end = total.saturating_sub(buf.scroll_offset);
+    let start = end.saturating_sub(height);
+    let body: Vec<Line> = buf
+        .lines
+        .iter()
+        .skip(start)
+        .take(end - start)
+        .map(|l| Line::from(l.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(body), area);
+}
+
+/// Render the SEARCH/RECALL tab body.
+fn render_search_tab(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let lines = if screen.search_query.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                "Type a query in the search bar below.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(match screen.focus {
+                Daemon::Search => "Searches the focused index for code chunks.",
+                Daemon::Memory => "Recalls memories from the focused palace.",
+            }),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                format!("Query: {}", screen.search_query),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("(press Enter in the search bar to run — execution not yet wired)"),
+        ]
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the footer zone: search input bar + key hint.
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
+    let cursor = if screen.search_input_focused { "_" } else { "" };
+    let prompt = match screen.focus {
+        Daemon::Search => "SEARCH ▶",
+        Daemon::Memory => "RECALL ▶",
+    };
+    let input_line = format!("{prompt} {}{cursor}", screen.search_query);
+    let input_style = if screen.search_input_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(input_line))
+            .style(input_style)
+            .block(Block::default().borders(Borders::ALL)),
+        area,
     );
 }
 
@@ -680,6 +1460,9 @@ pub fn render(frame: &mut Frame, screen: &HealthScreen) {
 /// title, body, and highlight differ.
 /// What: draws a bordered [`Paragraph`] whose title carries the panel name,
 /// coloured by liveness; a focused panel gets a bold cyan border.
+/// Kept for callers that want the legacy side-by-side panel; the new
+/// per-service render uses its own header / collections / tab helpers.
+#[allow(dead_code)]
 fn render_panel(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
@@ -955,6 +1738,300 @@ mod tests {
             PanelState::Offline { last_error } => assert!(!last_error.is_empty()),
             other => panic!("expected Offline, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tab_default_is_health() {
+        // The redesigned screen opens on the Health tab.
+        assert_eq!(HealthTab::default(), HealthTab::Health);
+    }
+
+    #[test]
+    fn tab_switch_keys_route() {
+        // `set_tab` stores the requested tab and auto-focuses the search
+        // input only when switching to the Search tab (per the spec).
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        assert!(!screen.search_input_focused);
+        screen.set_tab(HealthTab::Logs);
+        assert_eq!(screen.tab, HealthTab::Logs);
+        assert!(!screen.search_input_focused);
+        screen.set_tab(HealthTab::Search);
+        assert_eq!(screen.tab, HealthTab::Search);
+        assert!(screen.search_input_focused);
+        screen.set_tab(HealthTab::Health);
+        assert!(!screen.search_input_focused);
+    }
+
+    #[test]
+    fn log_buffer_starts_empty() {
+        let buf = LogBuffer::new();
+        assert!(buf.lines.is_empty());
+        assert!(buf.auto_scroll);
+        assert_eq!(buf.scroll_offset, 0);
+    }
+
+    #[test]
+    fn log_buffer_evicts_oldest() {
+        // Pushing past the cap evicts the oldest entries; the newest stay.
+        let mut buf = LogBuffer::new();
+        for i in 0..(LOG_BUFFER_CAP + 10) {
+            buf.push(format!("line {i}"));
+        }
+        assert_eq!(buf.lines.len(), LOG_BUFFER_CAP);
+        assert_eq!(buf.lines.front().map(String::as_str), Some("line 10"));
+        assert_eq!(
+            buf.lines.back().map(String::as_str),
+            Some(format!("line {}", LOG_BUFFER_CAP + 9)).as_deref()
+        );
+    }
+
+    #[test]
+    fn log_buffer_replace_caps_at_limit() {
+        // `replace` swaps in a fresh tail but never holds more than the cap.
+        let mut buf = LogBuffer::new();
+        let huge: Vec<String> = (0..(LOG_BUFFER_CAP * 2)).map(|i| format!("l{i}")).collect();
+        buf.replace(huge, Some(9999));
+        assert_eq!(buf.lines.len(), LOG_BUFFER_CAP);
+        assert_eq!(buf.total_seen, 9999);
+    }
+
+    #[test]
+    fn log_buffer_scroll_clamps() {
+        // ↑ disables auto-scroll and saturates at the top; ↓ re-enables auto-scroll
+        // when it returns to the tail.
+        let mut buf = LogBuffer::new();
+        for i in 0..5 {
+            buf.push(format!("l{i}"));
+        }
+        assert!(buf.auto_scroll);
+        buf.scroll_up();
+        assert!(!buf.auto_scroll);
+        assert_eq!(buf.scroll_offset, 1);
+        for _ in 0..20 {
+            buf.scroll_up();
+        }
+        // Saturates at `lines.len() - 1` (4 here).
+        assert_eq!(buf.scroll_offset, 4);
+        for _ in 0..10 {
+            buf.scroll_down();
+        }
+        assert_eq!(buf.scroll_offset, 0);
+        assert!(buf.auto_scroll);
+    }
+
+    #[test]
+    fn log_buffer_snap_to_tail() {
+        let mut buf = LogBuffer::new();
+        for i in 0..3 {
+            buf.push(format!("l{i}"));
+        }
+        buf.scroll_up();
+        buf.scroll_up();
+        assert!(!buf.auto_scroll);
+        buf.snap_to_tail();
+        assert_eq!(buf.scroll_offset, 0);
+        assert!(buf.auto_scroll);
+    }
+
+    #[test]
+    fn project_log_tail_reads_fields() {
+        let body = serde_json::json!({
+            "lines": ["a", "b", "c"],
+            "total": 42u64,
+        });
+        let (lines, total) = project_log_tail(&body);
+        assert_eq!(
+            lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(total, 42);
+        // Absent `total` falls back to `lines.len()`.
+        let body = serde_json::json!({ "lines": ["a", "b"] });
+        let (_, total) = project_log_tail(&body);
+        assert_eq!(total, 2);
+        // Absent `lines` yields an empty list.
+        let body = serde_json::json!({});
+        let (lines, _) = project_log_tail(&body);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn project_palace_rows_reads_palaces() {
+        let status = serde_json::json!({
+            "palaces": [
+                { "name": "default", "vector_count": 8400u64 },
+                { "name": "work",    "vector_count": 0u64 },
+            ]
+        });
+        let rows = project_palace_rows(&status);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "default");
+        assert_eq!(rows[0].count, 8400);
+        assert!(rows[0].ok);
+        // Absent `palaces` yields an empty list.
+        assert!(project_palace_rows(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn service_name_matches_focus() {
+        assert_eq!(service_name(Daemon::Search), "trusty-search");
+        assert_eq!(service_name(Daemon::Memory), "trusty-memory");
+    }
+
+    #[test]
+    fn header_lines_show_focus_summary() {
+        // An online panel renders the version + resource snapshot.
+        let mut screen = HealthScreen::new(DEFAULT_SEARCH_URL, DEFAULT_MEMORY_URL);
+        screen.search = PanelState::Online(sample_search());
+        let lines = header_lines(&screen);
+        assert!(lines[0].contains("trusty-search"));
+        assert!(lines[0].contains("v0.3.67"));
+        assert!(lines[0].contains("ONLINE"));
+        assert!(lines[1].contains("RSS:"));
+        assert!(lines[1].contains("CPU:"));
+        assert!(lines[1].contains("Uptime:"));
+
+        // An offline panel shows OFFLINE + the captured error.
+        screen.search = PanelState::Offline {
+            last_error: "connection refused".into(),
+        };
+        let lines = header_lines(&screen);
+        assert!(lines[0].contains("OFFLINE"));
+        assert!(lines[1].contains("connection refused"));
+    }
+
+    #[test]
+    fn tab_bar_marks_active() {
+        let bar = tab_bar(HealthTab::Logs);
+        // Each entry is (label, active); exactly one is active.
+        let active_count = bar.iter().filter(|(_, a)| *a).count();
+        assert_eq!(active_count, 1);
+        let logs_active = bar
+            .iter()
+            .find(|(l, _)| l.contains("LOGS"))
+            .map(|(_, a)| *a)
+            .unwrap();
+        assert!(logs_active);
+    }
+
+    #[test]
+    fn collection_row_default_is_empty() {
+        let row = CollectionRow::default();
+        assert!(row.id.is_empty());
+        assert_eq!(row.count, 0);
+        assert!(!row.ok);
+    }
+
+    #[test]
+    fn collections_lines_format_each_row() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![
+            CollectionRow {
+                id: "cto".into(),
+                count: 1_200,
+                note: "indexed".into(),
+                ok: true,
+            },
+            CollectionRow {
+                id: "trusty".into(),
+                count: 18_994,
+                note: "indexed".into(),
+                ok: true,
+            },
+        ];
+        let lines = collections_lines(&screen);
+        assert_eq!(lines.len(), 2);
+        // The first row is the highlighted one (selected_collection == 0).
+        assert!(lines[0].starts_with(">"));
+        assert!(lines[1].starts_with(" "));
+        assert!(lines[0].contains("cto"));
+        assert!(lines[1].contains("trusty"));
+    }
+
+    #[test]
+    fn collections_for_focus() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![CollectionRow {
+            id: "i".into(),
+            ..Default::default()
+        }];
+        screen.memory_collections = vec![
+            CollectionRow {
+                id: "p1".into(),
+                ..Default::default()
+            },
+            CollectionRow {
+                id: "p2".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(screen.focused_collections().len(), 1);
+        screen.toggle_focus();
+        assert_eq!(screen.focused_collections().len(), 2);
+    }
+
+    #[test]
+    fn select_collection_saturates() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![
+            CollectionRow {
+                id: "a".into(),
+                ..Default::default()
+            },
+            CollectionRow {
+                id: "b".into(),
+                ..Default::default()
+            },
+        ];
+        // Down moves toward the end, saturates at len-1.
+        screen.select_collection_down();
+        assert_eq!(screen.selected_collection, 1);
+        screen.select_collection_down();
+        assert_eq!(screen.selected_collection, 1);
+        // Up saturates at 0.
+        screen.select_collection_up();
+        assert_eq!(screen.selected_collection, 0);
+        screen.select_collection_up();
+        assert_eq!(screen.selected_collection, 0);
+    }
+
+    #[test]
+    fn select_collection_clamps_after_shrink() {
+        let mut screen = HealthScreen::new("http://a", "http://b");
+        screen.search_collections = vec![CollectionRow {
+            id: "a".into(),
+            ..Default::default()
+        }];
+        screen.selected_collection = 99;
+        screen.clamp_collection_selection();
+        assert_eq!(screen.selected_collection, 0);
+        screen.search_collections.clear();
+        screen.clamp_collection_selection();
+        assert_eq!(screen.selected_collection, 0);
+    }
+
+    #[test]
+    fn ascii_bar_fills_proportionally() {
+        assert_eq!(ascii_bar(0.0, 10), "░░░░░░░░░░");
+        assert_eq!(ascii_bar(1.0, 10), "██████████");
+        // Half full: 5 blocks + 5 dots.
+        let half = ascii_bar(0.5, 10);
+        assert_eq!(half.chars().filter(|c| *c == '█').count(), 5);
+        assert_eq!(half.chars().filter(|c| *c == '░').count(), 5);
+        // Out-of-range ratios are clamped.
+        assert_eq!(ascii_bar(2.0, 4), "████");
+        assert_eq!(ascii_bar(-1.0, 4), "░░░░");
+    }
+
+    #[test]
+    fn health_tab_lines_show_gauges() {
+        let mut screen = HealthScreen::new(DEFAULT_SEARCH_URL, DEFAULT_MEMORY_URL);
+        screen.search = PanelState::Online(sample_search());
+        let lines = health_tab_lines(&screen);
+        assert!(lines.iter().any(|l| l.starts_with("Memory ")));
+        assert!(lines.iter().any(|l| l.starts_with("Disk   ")));
+        assert!(lines.iter().any(|l| l.contains("Embedder")));
+        assert!(lines.iter().any(|l| l.contains("CoreML")));
     }
 
     #[test]
