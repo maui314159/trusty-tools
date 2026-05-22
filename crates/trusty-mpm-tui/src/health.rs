@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph},
 };
 use serde::Deserialize;
 
@@ -756,17 +756,22 @@ fn project_log_tail(body: &serde_json::Value) -> (Vec<String>, u64) {
 /// test assert the shape without a live daemon. The wire format is a JSON
 /// array of `PalaceInfo` objects with per-palace `vector_count`,
 /// `drawer_count`, and `kg_triple_count`. `/api/v1/status` exposes only
-/// aggregate totals, so this is the only source of per-palace counts.
+/// aggregate totals, so this is the only source of per-palace counts. Empty
+/// palaces (no vectors AND no KG triples) are filtered out so the left pane
+/// only lists palaces that actually hold memory — an empty palace is
+/// indistinguishable from a placeholder and just adds visual noise.
 /// What: reads the top-level array, projecting each entry's `name` (falling
 /// back to `id`), `vector_count`, and `kg_triple_count` (any absent field
-/// defaults to zero). A non-array payload yields an empty list.
-/// Test: `project_palace_rows_reads_palaces`.
+/// defaults to zero). Rows where both counts are zero are dropped. A
+/// non-array payload yields an empty list.
+/// Test: `project_palace_rows_reads_palaces`,
+/// `project_palace_rows_filters_empty`.
 fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
     let Some(arr) = list.as_array() else {
         return Vec::new();
     };
     arr.iter()
-        .map(|p| {
+        .filter_map(|p| {
             let id = p
                 .get("name")
                 .or_else(|| p.get("id"))
@@ -778,7 +783,12 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 .get("kg_triple_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            CollectionRow {
+            // Skip palaces with no vectors and no graph triples: they hold
+            // nothing the operator can act on and clutter the left pane.
+            if count == 0 && kg_count == 0 {
+                return None;
+            }
+            Some(CollectionRow {
                 id,
                 count,
                 kg_count,
@@ -787,7 +797,7 @@ fn project_palace_rows(list: &serde_json::Value) -> Vec<CollectionRow> {
                 note: String::new(),
                 ok: true,
                 ..Default::default()
-            }
+            })
         })
         .collect()
 }
@@ -1426,14 +1436,14 @@ fn format_count_suffix(n: u64, suffix: char) -> String {
 ///
 /// Why: kept separate so the renderer remains small and one branch handles
 /// the search-vs-memory title label.
-/// What: draws the list inside a bordered block titled `COLLECTIONS (n)` for
-/// search or `PALACES (n)` for memory; the highlighted row uses bold blue.
-/// Each row is right-padded to the block's inner width so the selection
-/// highlight (and any future per-row styling) covers the full row instead of
-/// leaving an unstyled "gutter" on the right where the row text ends short of
-/// the border.
-/// Test: `render_health_smoke` exercises the layout; row formatting is covered
-/// by `collections_lines_format_each_row` and friends.
+/// What: draws a stateful `List` inside a bordered block titled
+/// `COLLECTIONS (n)` for search or `PALACES (n)` for memory. The selected row
+/// uses bold white-on-blue via `highlight_style`, which (unlike a manually
+/// padded `Paragraph` row) is applied by ratatui across every inner cell of
+/// the row regardless of the underlying text length — that is what eliminates
+/// the unstyled "right gutter" the manual-padding fix struggled with.
+/// Test: `render_health_smoke` exercises the layout end-to-end; row formatting
+/// is covered by `collections_lines_format_each_row` and friends.
 fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &HealthScreen) {
     let rows = screen.focused_collections();
     let label = match screen.focus {
@@ -1442,48 +1452,44 @@ fn render_collections(frame: &mut Frame, area: ratatui::layout::Rect, screen: &H
     };
     let title = format!(" {label} ({}) ", rows.len());
     let lines = collections_lines(screen);
-    // Inner content width = area width minus the two border columns. Saturating
-    // sub so a degenerate 0/1-wide area cannot underflow.
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let body: Vec<Line> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, text)| {
-            // Right-pad with spaces so the line spans the full inner width.
-            // Truncate using char count to avoid splitting at byte boundaries
-            // in the middle of a multi-byte glyph (e.g. ✓ / ✗).
-            let char_count = text.chars().count();
-            let padded = if char_count >= inner_width {
-                text.chars().take(inner_width).collect::<String>()
-            } else {
-                let mut s = text;
-                s.extend(std::iter::repeat(' ').take(inner_width - char_count));
-                s
-            };
-            if i == screen.selected_collection && !rows.is_empty() {
-                Line::from(Span::styled(
-                    padded,
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(padded)
-            }
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(body).block(
-            Block::default().borders(Borders::ALL).title(Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ),
-        area,
-    );
+    // Switched from `Paragraph` + manual right-pad to the canonical `List` +
+    // `ListState` pattern. The previous approach right-padded each row to
+    // `area.width - 2` so the selected row's `Span::styled` background covered
+    // the full inner width, but the residual "right gutter" the user reported
+    // was actually an artefact of how ratatui's `Paragraph` clips trailing
+    // styled spans on some terminals — the styled cells reached the inner
+    // border but the final cell of the highlight could be reset by the
+    // terminal's own SGR handling. A `List` widget styles entire rows via
+    // `highlight_style`, applies the style to every cell from the inner-left
+    // border to the inner-right border (independent of the item's text
+    // length), and renders `HighlightSpacing::Always` so unselected rows align
+    // with the selected one. This eliminates the gutter at the rendering layer
+    // instead of relying on the input text being exactly inner-width chars
+    // wide.
+    let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+        // `HighlightSpacing::Always` keeps every row aligned regardless of
+        // whether a `highlight_symbol` is set; without it, unselected rows
+        // would shift one column left when the selection changes.
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(screen.selected_collection.min(rows.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// Build the tab bar header text ("[1]HEALTH  [2]LOGS  [3]SEARCH").
@@ -2226,10 +2232,12 @@ mod tests {
     fn project_palace_rows_reads_palaces() {
         // The wire format from `GET /api/v1/palaces` is a JSON array of
         // `PalaceInfo`. Each entry carries the per-palace vector and KG
-        // triple counts.
+        // triple counts. Palaces with non-zero vector OR KG counts pass
+        // through; the empty-filter behaviour is covered separately by
+        // `project_palace_rows_filters_empty`.
         let list = serde_json::json!([
             { "name": "default", "vector_count": 8400u64, "kg_triple_count": 1200u64 },
-            { "name": "work",    "vector_count": 0u64,    "kg_triple_count": 0u64 },
+            { "name": "work",    "vector_count": 0u64,    "kg_triple_count": 42u64 },
         ]);
         let rows = project_palace_rows(&list);
         assert_eq!(rows.len(), 2);
@@ -2240,11 +2248,31 @@ mod tests {
         // Empty note: the new row format shows vectors + graph inline, so the
         // trailing badge is intentionally suppressed.
         assert!(rows[0].note.is_empty());
-        // A palace with no vectors or KG triples projects to zero counts.
+        // A KG-only palace still passes through (only fully-empty palaces are
+        // dropped).
+        assert_eq!(rows[1].id, "work");
         assert_eq!(rows[1].count, 0);
-        assert_eq!(rows[1].kg_count, 0);
+        assert_eq!(rows[1].kg_count, 42);
         // A non-array payload yields an empty list (e.g. an unexpected object).
         assert!(project_palace_rows(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn project_palace_rows_filters_empty() {
+        // Why: a palace with zero vectors AND zero KG triples is just a
+        // placeholder — listing it in the left pane adds noise without
+        // surfacing any actionable state. The filter drops those rows.
+        let list = serde_json::json!([
+            { "name": "live",    "vector_count": 10u64, "kg_triple_count": 0u64 },
+            { "name": "empty",   "vector_count": 0u64,  "kg_triple_count": 0u64 },
+            { "name": "kg-only", "vector_count": 0u64,  "kg_triple_count": 5u64 },
+            { "name": "both",    "vector_count": 3u64,  "kg_triple_count": 7u64 },
+            // Missing fields default to zero and are treated as empty.
+            { "name": "stub" },
+        ]);
+        let rows = project_palace_rows(&list);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["live", "kg-only", "both"]);
     }
 
     #[test]
