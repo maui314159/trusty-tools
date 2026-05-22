@@ -22,7 +22,8 @@ use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::core::chunker::ChunkType;
-use crate::core::entity::EdgeKind;
+use crate::core::corpus::{CorpusStore, PersistedKgNode};
+use crate::core::entity::{EdgeKind, EntityType, RawEntity};
 
 /// Default cap on symbol graph nodes (issue: 180GB RSS fix).
 ///
@@ -109,6 +110,35 @@ impl SymbolGraph {
     ///   in the same file. Coarse but cheap; nesting-depth refinement can come
     ///   later.
     pub fn build_from_chunks(chunks: &[ChunkTuple]) -> Self {
+        Self::build_from_chunks_with_entities(chunks, &[])
+    }
+
+    /// Build a graph from the chunk corpus, additionally wiring Phase B/C
+    /// entity-derived edges from the supplied per-file entity lists
+    /// (issue #41 phase 2).
+    ///
+    /// Why: `build_from_chunks` only emits the structural Phase A edges
+    /// (`CallsFunction`, `Implements`, `ModuleContains`). Phase B/C edges
+    /// (`TestedBy`, `CoOccursInTest`, `Documents`, `ReferencesConcept`) need
+    /// the per-file `RawEntity` lists — they live alongside chunks in the
+    /// `CorpusStore` but aren't part of the structural `ChunkTuple`. This
+    /// entry point keeps the old signature intact while letting warm-boot and
+    /// per-file ingest populate the richer edge set.
+    /// What: same three structural passes as `build_from_chunks`, followed by
+    /// a fourth pass that walks `entities_by_file` to emit:
+    ///   * `EdgeKind::TestedBy`: for every callee of a `ChunkType::Test`
+    ///     chunk, draw `callee → test_symbol`.
+    ///   * `EdgeKind::CoOccursInTest`: for two distinct test chunks that both
+    ///     call the same function, draw the symmetric pair of edges.
+    ///   * `EdgeKind::Documents` / `EdgeKind::ReferencesConcept`: for every
+    ///     `DocConcept` / `NaturalLanguagePhrase` entity whose `text`
+    ///     resolves to a defined symbol, draw an edge from each symbol in the
+    ///     entity's source file to that target.
+    /// Test: covered by `test_phase_bc_edges_wired_from_entities`.
+    pub fn build_from_chunks_with_entities(
+        chunks: &[ChunkTuple],
+        entities_by_file: &[(String, Vec<RawEntity>)],
+    ) -> Self {
         let mut g = Self::new();
 
         // Pass 1: register all defining symbols.
@@ -127,9 +157,294 @@ impl SymbolGraph {
         // Pass 3: ModuleContains edges from container chunks.
         g.add_module_contains_edges(chunks);
 
+        // Pass 4 (issue #41 phase 2): Phase B test-relation edges +
+        // Phase C documentation/concept edges from the entity lists.
+        g.add_test_relation_edges(chunks, &by_suffix);
+        g.add_doc_concept_edges(chunks, entities_by_file, &by_suffix);
+
         g
     }
 
+    /// Pass 4a (issue #41 phase 2): wire Phase B `TestedBy` and
+    /// `CoOccursInTest` edges from test chunks.
+    ///
+    /// Why: a hit on a `#[test] fn` is a strong signal that the function(s)
+    /// it exercises are relevant — and that *other* tests calling the same
+    /// function form a natural co-occurrence cluster. Without these edges the
+    /// `EdgeKind::TestedBy` multiplier (0.80) and the `CoOccursInTest` lane
+    /// defined in `contracts.rs` never fire.
+    /// What: walks every chunk; for each `ChunkType::Test` with a registered
+    /// symbol, resolves every entry in `calls` to a defining symbol and adds
+    /// `callee → test` `TestedBy` edges. Also groups tests by their resolved
+    /// callees and emits symmetric `CoOccursInTest` edges between distinct
+    /// test symbols that share a callee.
+    /// Test: `test_phase_bc_edges_wired_from_entities`.
+    fn add_test_relation_edges(
+        &mut self,
+        chunks: &[ChunkTuple],
+        by_suffix: &HashMap<String, NodeIndex>,
+    ) {
+        // callee_node → set of test NodeIndexes that exercise it.
+        let mut callee_to_tests: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
+        for (_chunk_id, _file, name, calls, _inh, ct) in chunks {
+            if !matches!(ct, ChunkType::Test) {
+                continue;
+            }
+            let Some(name) = name else { continue };
+            let Some(&test_idx) = self.by_symbol.get(name) else {
+                continue;
+            };
+            for callee in calls {
+                let Some(callee_idx) = self.resolve_callee_fast(callee, by_suffix) else {
+                    continue;
+                };
+                if callee_idx == test_idx {
+                    continue;
+                }
+                self.graph
+                    .add_edge(callee_idx, test_idx, EdgeKind::TestedBy);
+                callee_to_tests
+                    .entry(callee_idx)
+                    .or_default()
+                    .push(test_idx);
+            }
+        }
+
+        // CoOccursInTest: for each callee with ≥2 tests, draw symmetric edges
+        // between every distinct pair of tests sharing that callee. Skip
+        // self-pairs and dedupe (one edge per unordered pair per callee).
+        for tests in callee_to_tests.values() {
+            for i in 0..tests.len() {
+                for j in (i + 1)..tests.len() {
+                    let a = tests[i];
+                    let b = tests[j];
+                    if a == b {
+                        continue;
+                    }
+                    self.graph.add_edge(a, b, EdgeKind::CoOccursInTest);
+                    self.graph.add_edge(b, a, EdgeKind::CoOccursInTest);
+                }
+            }
+        }
+    }
+
+    /// Pass 4b (issue #41 phase 2): wire Phase C `Documents` and
+    /// `ReferencesConcept` edges from per-file entity lists.
+    ///
+    /// Why: doc-comment derived concepts (NER `NaturalLanguagePhrase`,
+    /// `DocConcept`) tie natural-language queries to the symbols defined in
+    /// the same file. Without these edges the corresponding multipliers
+    /// (0.65 for `Documents`, 0.60 for `ReferencesConcept`) never fire on
+    /// conceptual queries.
+    /// What: for each entity of type `DocConcept` /
+    /// `NaturalLanguagePhrase`, resolves its `text` against the symbol table.
+    /// If it resolves to a defined symbol `T`, every other symbol defined in
+    /// the entity's source file receives a `Documents` (DocConcept) or
+    /// `ReferencesConcept` (NaturalLanguagePhrase) edge to `T`. Self-edges
+    /// are filtered.
+    /// Test: `test_phase_bc_edges_wired_from_entities`.
+    fn add_doc_concept_edges(
+        &mut self,
+        chunks: &[ChunkTuple],
+        entities_by_file: &[(String, Vec<RawEntity>)],
+        by_suffix: &HashMap<String, NodeIndex>,
+    ) {
+        if entities_by_file.is_empty() {
+            return;
+        }
+        let by_file = self.group_symbols_by_file(chunks);
+        for (file, ents) in entities_by_file {
+            let Some(siblings) = by_file.get(file.as_str()) else {
+                continue;
+            };
+            for ent in ents {
+                let kind = match ent.entity_type {
+                    EntityType::DocConcept => EdgeKind::Documents,
+                    EntityType::NaturalLanguagePhrase => EdgeKind::ReferencesConcept,
+                    _ => continue,
+                };
+                let Some(target_idx) = self.resolve_callee_fast(&ent.text, by_suffix) else {
+                    continue;
+                };
+                for (_sym, src_idx) in siblings.iter() {
+                    if *src_idx == target_idx {
+                        continue;
+                    }
+                    self.graph.add_edge(*src_idx, target_idx, kind.clone());
+                }
+            }
+        }
+    }
+
+    /// Persist the current graph into the supplied [`CorpusStore`]
+    /// (issue #41 phase 2).
+    ///
+    /// Why: cold-start graph rebuild from chunks is O(N) and loses Phase B/C
+    /// edges that were derived from per-file entity lists at ingest time.
+    /// Persisting the graph alongside the chunk corpus lets warm-boot rehydrate
+    /// it in O(nodes + edges) with the full multi-phase edge set intact.
+    /// What: walks every node and every edge, builds the
+    /// `(nodes, adj_fwd, adj_rev)` payload, and hands it to
+    /// `CorpusStore::save_kg_graph` (one atomic redb txn).
+    /// Test: `test_save_load_round_trip_preserves_graph`.
+    pub fn save_to_corpus(&self, corpus: &CorpusStore) -> anyhow::Result<()> {
+        let mut nodes: Vec<(String, PersistedKgNode)> = Vec::with_capacity(self.graph.node_count());
+        for node in self.graph.node_weights() {
+            nodes.push((
+                node.symbol.clone(),
+                PersistedKgNode {
+                    chunk_id: node.chunk_id.clone(),
+                    file: node.file.clone(),
+                },
+            ));
+        }
+
+        let mut fwd: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut rev: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for edge in self.graph.edge_references() {
+            let src = match self.graph.node_weight(edge.source()) {
+                Some(n) => n.symbol.clone(),
+                None => continue,
+            };
+            let tgt = match self.graph.node_weight(edge.target()) {
+                Some(n) => n.symbol.clone(),
+                None => continue,
+            };
+            let kind = edge_kind_tag(edge.weight()).to_string();
+            fwd.entry(src.clone())
+                .or_default()
+                .push((kind.clone(), tgt.clone()));
+            rev.entry(tgt).or_default().push((kind, src));
+        }
+        let adj_fwd: Vec<(String, Vec<(String, String)>)> = fwd.into_iter().collect();
+        let adj_rev: Vec<(String, Vec<(String, String)>)> = rev.into_iter().collect();
+        corpus.save_kg_graph(&nodes, &adj_fwd, &adj_rev)
+    }
+
+    /// Load the persisted graph from the supplied [`CorpusStore`]
+    /// (issue #41 phase 2).
+    ///
+    /// Why: warm-boot wants to skip the full `build_from_chunks` rebuild when
+    /// a previously-saved graph is available. Restoring the persisted graph
+    /// directly preserves Phase B/C edges that were computed at ingest time.
+    /// What: reads the three KG tables, reconstructs the `petgraph::DiGraph`,
+    /// and returns `Ok(Some(graph))`. Returns `Ok(None)` when the persisted
+    /// node table is empty (fresh database / not yet saved). Forward edges are
+    /// canonical; the reverse table is consulted to recover edges whose
+    /// source node was filtered out of the forward index (should not normally
+    /// happen but guards against an inconsistent persisted state).
+    /// Test: `test_save_load_round_trip_preserves_graph`.
+    pub fn load_from_corpus(corpus: &CorpusStore) -> anyhow::Result<Option<Self>> {
+        let (nodes, adj_fwd, _adj_rev) = corpus.load_kg_graph()?;
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        let mut g = Self::new();
+        for (symbol, persisted) in nodes {
+            let idx = g.graph.add_node(SymbolNode {
+                symbol: symbol.clone(),
+                chunk_id: persisted.chunk_id.clone(),
+                file: persisted.file.clone(),
+            });
+            g.by_symbol.insert(symbol, idx);
+            g.chunk_to_symbol
+                .insert(persisted.chunk_id, g.graph[idx].symbol.clone());
+        }
+        for (src, targets) in adj_fwd {
+            let Some(&src_idx) = g.by_symbol.get(&src) else {
+                continue;
+            };
+            for (kind_tag, tgt) in targets {
+                let Some(&tgt_idx) = g.by_symbol.get(&tgt) else {
+                    continue;
+                };
+                let Some(kind) = edge_kind_from_tag(&kind_tag) else {
+                    tracing::warn!("kg: skipping persisted edge with unknown kind '{kind_tag}'");
+                    continue;
+                };
+                g.graph.add_edge(src_idx, tgt_idx, kind);
+            }
+        }
+        Ok(Some(g))
+    }
+
+    /// Edge-kind counts per `EdgeKind` variant present in the graph
+    /// (issue #41 phase 2).
+    ///
+    /// Why: the `GET /indexes/{id}/graph/stats` endpoint surfaces these
+    /// counts so operators (and agents) can verify graph health without
+    /// scraping Prometheus.
+    /// What: returns a `Vec<(edge_kind_tag, count)>` sorted by tag for stable
+    /// JSON output.
+    /// Test: `test_edge_kind_breakdown_counts_by_variant`.
+    pub fn edge_kind_breakdown(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for edge in self.graph.edge_references() {
+            *counts
+                .entry(edge_kind_tag(edge.weight()).to_string())
+                .or_insert(0) += 1;
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+/// Stable string tag for an `EdgeKind`, used as the persisted edge label and
+/// the JSON key in `/graph/stats` (issue #41 phase 2).
+///
+/// Why: persisting an enum directly couples the on-disk format to a particular
+/// `serde` representation. Funnelling every persistence + API hop through this
+/// helper keeps the tag stable across rust-version / serde-format changes and
+/// makes the round-trip easy to reason about.
+/// What: returns the matching variant name (`Debug`-style spelling).
+/// Test: covered transitively by `test_save_load_round_trip_preserves_graph`.
+fn edge_kind_tag(kind: &EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::CallsFunction => "CallsFunction",
+        EdgeKind::CalledByFunction => "CalledByFunction",
+        EdgeKind::Implements => "Implements",
+        EdgeKind::UsesType => "UsesType",
+        EdgeKind::Derives => "Derives",
+        EdgeKind::ModuleContains => "ModuleContains",
+        EdgeKind::ReExports => "ReExports",
+        EdgeKind::RaisesError => "RaisesError",
+        EdgeKind::Configures => "Configures",
+        EdgeKind::TestedBy => "TestedBy",
+        EdgeKind::TestUsesFixture => "TestUsesFixture",
+        EdgeKind::CoOccursInTest => "CoOccursInTest",
+        EdgeKind::Documents => "Documents",
+        EdgeKind::ReferencesConcept => "ReferencesConcept",
+        EdgeKind::Aliases => "Aliases",
+        EdgeKind::ErrorDescribes => "ErrorDescribes",
+    }
+}
+
+/// Inverse of [`edge_kind_tag`]: parse a persisted edge tag back into the
+/// `EdgeKind` variant (issue #41 phase 2).
+fn edge_kind_from_tag(tag: &str) -> Option<EdgeKind> {
+    Some(match tag {
+        "CallsFunction" => EdgeKind::CallsFunction,
+        "CalledByFunction" => EdgeKind::CalledByFunction,
+        "Implements" => EdgeKind::Implements,
+        "UsesType" => EdgeKind::UsesType,
+        "Derives" => EdgeKind::Derives,
+        "ModuleContains" => EdgeKind::ModuleContains,
+        "ReExports" => EdgeKind::ReExports,
+        "RaisesError" => EdgeKind::RaisesError,
+        "Configures" => EdgeKind::Configures,
+        "TestedBy" => EdgeKind::TestedBy,
+        "TestUsesFixture" => EdgeKind::TestUsesFixture,
+        "CoOccursInTest" => EdgeKind::CoOccursInTest,
+        "Documents" => EdgeKind::Documents,
+        "ReferencesConcept" => EdgeKind::ReferencesConcept,
+        "Aliases" => EdgeKind::Aliases,
+        "ErrorDescribes" => EdgeKind::ErrorDescribes,
+        _ => return None,
+    })
+}
+
+impl SymbolGraph {
     /// Pass 1: register one `SymbolNode` per unique `function_name` in the corpus.
     ///
     /// Why: every later pass keys on `by_symbol`, so symbols must exist before
@@ -677,6 +992,83 @@ impl SymbolGraph {
             queue.push_back((nb, depth + 1));
         }
     }
+
+    /// Replace one file's portion of the graph with a freshly-rebuilt subset
+    /// from `new_chunks` (issue #41 phase 2).
+    ///
+    /// Why: a per-file index update (`POST /indexes/:id/index-file`) shouldn't
+    /// trigger a full `build_from_chunks` over the entire corpus. By taking
+    /// the existing corpus snapshot, replacing this file's chunks with the
+    /// new ones, and rebuilding only the resulting tuples, we keep
+    /// incremental edits O(corpus) instead of O(corpus²) over many
+    /// successive saves and avoid losing Phase B/C edges on the file just
+    /// touched. Because `petgraph::DiGraph` does not stably remove nodes
+    /// (`remove_node` is a swap-remove that invalidates trailing indices),
+    /// an in-place patch is impractical — we instead rebuild the whole graph
+    /// from a corpus snapshot the caller supplies. The caller already holds
+    /// the corpus map (`CodeIndexer::chunks`), so the snapshot is cheap.
+    /// What: keeps every chunk tuple whose `file` differs from `file_path`,
+    /// appends the rebuilt tuples for the new chunks, and runs
+    /// `build_from_chunks_with_entities` on the result. The caller is
+    /// responsible for persisting via [`Self::save_to_corpus`] afterwards.
+    /// Test: covered by `test_update_file_drops_old_edges_and_wires_new`.
+    pub fn update_file(
+        &mut self,
+        existing: &[ChunkTuple],
+        existing_entities: &[(String, Vec<RawEntity>)],
+        file_path: &str,
+        new_chunks: &[ChunkTuple],
+        new_entities: &[RawEntity],
+    ) {
+        let mut merged: Vec<ChunkTuple> = existing
+            .iter()
+            .filter(|t| t.1 != file_path)
+            .cloned()
+            .collect();
+        merged.extend(new_chunks.iter().cloned());
+
+        let mut merged_ents: Vec<(String, Vec<RawEntity>)> = existing_entities
+            .iter()
+            .filter(|(f, _)| f != file_path)
+            .cloned()
+            .collect();
+        if !new_entities.is_empty() {
+            merged_ents.push((file_path.to_string(), new_entities.to_vec()));
+        }
+
+        *self = Self::build_from_chunks_with_entities(&merged, &merged_ents);
+    }
+
+    /// Remove every node / edge attributed to `file_path` (issue #41 phase 2).
+    ///
+    /// Why: a file deletion (`POST /indexes/:id/remove-file` or a
+    /// `FileWatcher` rename event) must purge that file's symbols from the
+    /// graph so subsequent KG expansions don't surface stale chunks. Like
+    /// `update_file`, the lack of stable petgraph node removal makes a
+    /// rebuild-from-snapshot the simplest correct implementation.
+    /// What: filters the supplied corpus snapshot to exclude tuples whose
+    /// `file` matches `file_path`, then runs
+    /// `build_from_chunks_with_entities` on the survivors. Caller is
+    /// responsible for persisting via [`Self::save_to_corpus`] afterwards.
+    /// Test: covered by `test_remove_file_drops_file_symbols`.
+    pub fn remove_file(
+        &mut self,
+        existing: &[ChunkTuple],
+        existing_entities: &[(String, Vec<RawEntity>)],
+        file_path: &str,
+    ) {
+        let kept: Vec<ChunkTuple> = existing
+            .iter()
+            .filter(|t| t.1 != file_path)
+            .cloned()
+            .collect();
+        let kept_ents: Vec<(String, Vec<RawEntity>)> = existing_entities
+            .iter()
+            .filter(|(f, _)| f != file_path)
+            .cloned()
+            .collect();
+        *self = Self::build_from_chunks_with_entities(&kept, &kept_ents);
+    }
 }
 
 #[cfg(test)]
@@ -1049,5 +1441,206 @@ mod tests {
         let chunks = vec![chunk("f:1", "f.rs", Some("f"), &["f"])];
         let g = SymbolGraph::build_from_chunks(&chunks);
         assert_eq!(g.edge_count(), 0);
+    }
+
+    /// Issue #41 phase 2: Phase B (`TestedBy`, `CoOccursInTest`) and Phase C
+    /// (`Documents`, `ReferencesConcept`) edges fire when `build_from_chunks_
+    /// with_entities` is fed the matching chunk + entity inputs.
+    #[test]
+    fn test_phase_bc_edges_wired_from_entities() {
+        // Two test functions both exercise `target`; a non-test function in the
+        // same file documents `target` via a `DocConcept` entity.
+        let chunks = vec![
+            chunk_full(
+                "t1",
+                "tests.rs",
+                Some("test_one"),
+                &["target"],
+                &[],
+                ChunkType::Test,
+            ),
+            chunk_full(
+                "t2",
+                "tests.rs",
+                Some("test_two"),
+                &["target"],
+                &[],
+                ChunkType::Test,
+            ),
+            chunk_full(
+                "p:1",
+                "tests.rs",
+                Some("prose_owner"),
+                &[],
+                &[],
+                ChunkType::Function,
+            ),
+            chunk_full(
+                "tgt",
+                "lib.rs",
+                Some("target"),
+                &[],
+                &[],
+                ChunkType::Function,
+            ),
+        ];
+        let entities = vec![(
+            "tests.rs".to_string(),
+            vec![RawEntity::new(
+                EntityType::DocConcept,
+                "target".into(),
+                (0, 6),
+                "tests.rs",
+                1,
+            )],
+        )];
+        let g = SymbolGraph::build_from_chunks_with_entities(&chunks, &entities);
+
+        // TestedBy: `target` should be tested by both tests.
+        let tested_by = g.neighbors_by_edge("target", &[EdgeKind::TestedBy], 1);
+        let names: HashSet<&str> = tested_by.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(names.contains("test_one"), "got {names:?}");
+        assert!(names.contains("test_two"), "got {names:?}");
+
+        // CoOccursInTest: tests sharing a callee should link to one another.
+        let coocc = g.neighbors_by_edge("test_one", &[EdgeKind::CoOccursInTest], 1);
+        assert!(
+            coocc.iter().any(|(n, _, _)| n == "test_two"),
+            "got {coocc:?}"
+        );
+
+        // Documents: `prose_owner` (same file as DocConcept) → `target`.
+        let docs = g.neighbors_by_edge("prose_owner", &[EdgeKind::Documents], 1);
+        assert!(docs.iter().any(|(n, _, _)| n == "target"), "got {docs:?}");
+    }
+
+    /// Issue #41 phase 2: a graph saved via `save_to_corpus` and reloaded
+    /// via `load_from_corpus` is structurally equivalent to the original.
+    #[test]
+    fn test_save_load_round_trip_preserves_graph() {
+        use crate::core::corpus::CorpusStore;
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("alpha"), &["beta"]),
+            chunk("b:1", "b.rs", Some("beta"), &[]),
+            chunk_full(
+                "t:1",
+                "a.rs",
+                Some("test_alpha"),
+                &["alpha"],
+                &[],
+                ChunkType::Test,
+            ),
+        ];
+        let original = SymbolGraph::build_from_chunks(&chunks);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.redb");
+        {
+            let store = CorpusStore::open(&path).unwrap();
+            original.save_to_corpus(&store).expect("save kg");
+        }
+
+        let store = CorpusStore::open(&path).unwrap();
+        let restored = SymbolGraph::load_from_corpus(&store)
+            .expect("load kg")
+            .expect("graph present");
+
+        assert_eq!(restored.node_count(), original.node_count());
+        assert_eq!(restored.edge_count(), original.edge_count());
+
+        // BFS results should match for every original symbol.
+        for sym in ["alpha", "beta", "test_alpha"] {
+            let mut a = original.callees_of(sym, 2);
+            let mut b = restored.callees_of(sym, 2);
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "callees_of({sym}) diverged");
+        }
+    }
+
+    /// Issue #41 phase 2: `load_from_corpus` on an empty database returns
+    /// `Ok(None)` so the warm-boot path can fall back to `build_from_chunks`.
+    #[test]
+    fn test_load_from_empty_corpus_returns_none() {
+        use crate::core::corpus::CorpusStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = CorpusStore::open(&dir.path().join("index.redb")).unwrap();
+        assert!(SymbolGraph::load_from_corpus(&store).unwrap().is_none());
+    }
+
+    /// Issue #41 phase 2: `update_file` drops stale edges from the previous
+    /// version of a file and wires new edges from the replacement chunks.
+    #[test]
+    fn test_update_file_drops_old_edges_and_wires_new() {
+        // Initial corpus: a.rs defines `alpha` which calls `beta`.
+        let initial: Vec<ChunkTuple> = vec![
+            chunk("a:old", "a.rs", Some("alpha"), &["beta"]),
+            chunk("b:1", "b.rs", Some("beta"), &[]),
+            chunk("c:1", "c.rs", Some("gamma"), &[]),
+        ];
+        let mut g = SymbolGraph::build_from_chunks(&initial);
+        let pre_alpha_callees = g.callees_of("alpha", 1);
+        assert!(pre_alpha_callees.iter().any(|(s, _)| s == "beta"));
+
+        // Replace a.rs so `alpha` now calls `gamma` instead.
+        let new_chunks: Vec<ChunkTuple> = vec![chunk("a:new", "a.rs", Some("alpha"), &["gamma"])];
+        g.update_file(&initial, &[], "a.rs", &new_chunks, &[]);
+
+        let alpha_callees = g.callees_of("alpha", 1);
+        let names: HashSet<&str> = alpha_callees.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(!names.contains("beta"), "stale edge survived: {names:?}");
+        assert!(names.contains("gamma"), "new edge missing: {names:?}");
+    }
+
+    /// Issue #41 phase 2: `remove_file` purges every symbol owned by the
+    /// given file from the graph.
+    #[test]
+    fn test_remove_file_drops_file_symbols() {
+        let chunks: Vec<ChunkTuple> = vec![
+            chunk("a:1", "a.rs", Some("alpha"), &["beta"]),
+            chunk("b:1", "b.rs", Some("beta"), &[]),
+        ];
+        let mut g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.node_count(), 2);
+
+        g.remove_file(&chunks, &[], "a.rs");
+
+        assert_eq!(g.node_count(), 1, "alpha (defined in a.rs) must be gone");
+        assert!(g.callees_of("alpha", 1).is_empty());
+        assert!(g.callers_of("beta", 1).is_empty(), "stale caller edge");
+    }
+
+    /// Issue #41 phase 2: `edge_kind_breakdown` returns one entry per
+    /// `EdgeKind` variant present in the graph, sorted by tag.
+    #[test]
+    fn test_edge_kind_breakdown_counts_by_variant() {
+        let chunks = vec![
+            chunk_full(
+                "c:1",
+                "c.rs",
+                Some("Child"),
+                &["sibling"],
+                &["Parent"],
+                ChunkType::Class,
+            ),
+            chunk_full("p:1", "p.rs", Some("Parent"), &[], &[], ChunkType::Class),
+            chunk_full(
+                "s:1",
+                "c.rs",
+                Some("sibling"),
+                &[],
+                &[],
+                ChunkType::Function,
+            ),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let counts: HashMap<String, usize> = g.edge_kind_breakdown().into_iter().collect();
+        assert!(counts.get("CallsFunction").copied().unwrap_or(0) >= 1);
+        assert!(counts.get("Implements").copied().unwrap_or(0) >= 1);
+        // Sorted output: keys must be in ascending order.
+        let breakdown = g.edge_kind_breakdown();
+        let mut sorted = breakdown.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(breakdown, sorted, "breakdown must be sorted by tag");
     }
 }

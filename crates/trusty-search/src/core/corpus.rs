@@ -61,6 +61,35 @@ const CHUNKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chunks"
 /// `Vec<RawEntity>`.
 const ENTITIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entities");
 
+/// redb table holding the persisted `SymbolGraph` nodes (issue #41 phase 2).
+///
+/// Why: cold-start graph rebuild from the chunk corpus is O(N chunks) and
+/// loses Phase B/C edges. Persisting the graph adjacency lists alongside the
+/// chunk corpus lets warm-boot rehydrate the KG in O(nodes + edges) without
+/// re-running `build_from_chunks`.
+/// What: `symbol → &[u8]` where the value is `serde_json`-encoded
+/// [`PersistedKgNode`] (carries `chunk_id` + `file` for round-trip equality).
+pub(crate) const KG_NODES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_nodes");
+
+/// redb table holding the forward (source → targets) KG adjacency list.
+///
+/// Why: BFS expansion walks outgoing edges by symbol; storing the full edge
+/// list under the source key gives O(1) load of all outgoing edges per node.
+/// What: `source_symbol → &[u8]` where the value is `serde_json`-encoded
+/// `Vec<(EdgeKind, target_symbol)>`. One row per source symbol; empty
+/// adjacency lists are omitted.
+pub(crate) const KG_EDGES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kg_edges");
+
+/// redb table holding the reverse (target → sources) KG adjacency list.
+///
+/// Why: `callers_of` expansions walk *incoming* edges by symbol; a separate
+/// reverse adjacency keeps that lookup O(1) instead of forcing a full
+/// forward-edge scan.
+/// What: `target_symbol → &[u8]` where the value is `serde_json`-encoded
+/// `Vec<(EdgeKind, source_symbol)>`.
+pub(crate) const KG_EDGES_REV_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("kg_edges_rev");
+
 /// Durable, redb-backed store for an index's chunk corpus + entity lists.
 ///
 /// Why: see module docs — replaces the full-rewrite `chunks.json` snapshot
@@ -110,6 +139,15 @@ impl CorpusStore {
                 txn.open_table(CHUNKS_TABLE).context("init chunks table")?;
                 txn.open_table(ENTITIES_TABLE)
                     .context("init entities table")?;
+                // Issue #41 phase 2: materialize the KG persistence tables
+                // alongside the chunk/entity tables so warm-boot reads never
+                // race a missing-table error on a fresh database.
+                txn.open_table(KG_NODES_TABLE)
+                    .context("init kg_nodes table")?;
+                txn.open_table(KG_EDGES_TABLE)
+                    .context("init kg_edges table")?;
+                txn.open_table(KG_EDGES_REV_TABLE)
+                    .context("init kg_edges_rev table")?;
             }
             txn.commit().context("commit corpus init txn")?;
         }
@@ -417,6 +455,179 @@ impl CorpusStore {
         let table = txn.open_table(CHUNKS_TABLE)?;
         Ok(table.len().context("count chunks")? as usize)
     }
+
+    /// Borrow the underlying `redb::Database` (issue #41 phase 2).
+    ///
+    /// Why: the `SymbolGraph` persistence helpers (`save_to_corpus`,
+    /// `load_from_corpus`, …) need direct access to the KG tables that live
+    /// alongside the chunk corpus in the same redb file. Exposing the
+    /// `Database` here means we don't duplicate the file-open dance on every
+    /// graph save and avoids opening a second .redb file per index.
+    /// What: returns a borrow of `self.db`. Callers can begin read/write
+    /// transactions against the KG tables exported as
+    /// `pub(crate) const KG_*_TABLE` in this module.
+    /// Test: covered indirectly by every `SymbolGraph::*_corpus` test.
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
+    }
+
+    /// Replace the persisted KG node set + forward/reverse adjacency lists in
+    /// one atomic transaction (issue #41 phase 2).
+    ///
+    /// Why: persisting the symbol graph alongside the chunk corpus lets
+    /// warm-boot skip the full `build_from_chunks` rebuild. Doing the whole
+    /// write under one transaction guarantees readers never observe a
+    /// half-rewritten graph.
+    /// What: clears the three KG tables then re-inserts the supplied nodes and
+    /// forward/reverse adjacencies. Each value is `serde_json`-encoded. An
+    /// `(adj_fwd, adj_rev)` row whose vector is empty is skipped to keep the
+    /// stored graph minimal.
+    /// Test: `save_load_kg_roundtrip` round-trips a synthetic graph through
+    /// `save_kg_graph` + `load_kg_graph` and asserts equality.
+    pub fn save_kg_graph(
+        &self,
+        nodes: &[(String, PersistedKgNode)],
+        adj_fwd: &[(String, Vec<(String, String)>)],
+        adj_rev: &[(String, Vec<(String, String)>)],
+    ) -> Result<()> {
+        let txn = self.db.begin_write().context("begin kg graph upsert txn")?;
+        {
+            let mut nodes_tbl = txn.open_table(KG_NODES_TABLE)?;
+            // Drain stale rows first so a shrinking graph doesn't leave orphans.
+            nodes_tbl.retain(|_, _| false).context("clear kg_nodes")?;
+            for (symbol, node) in nodes {
+                let bytes = serde_json::to_vec(node)
+                    .with_context(|| format!("serialize kg node {symbol}"))?;
+                nodes_tbl
+                    .insert(symbol.as_str(), bytes.as_slice())
+                    .with_context(|| format!("insert kg node {symbol}"))?;
+            }
+
+            let mut fwd_tbl = txn.open_table(KG_EDGES_TABLE)?;
+            fwd_tbl.retain(|_, _| false).context("clear kg_edges")?;
+            for (src, targets) in adj_fwd {
+                if targets.is_empty() {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(targets)
+                    .with_context(|| format!("serialize kg fwd adjacency for {src}"))?;
+                fwd_tbl
+                    .insert(src.as_str(), bytes.as_slice())
+                    .with_context(|| format!("insert kg fwd adjacency for {src}"))?;
+            }
+
+            let mut rev_tbl = txn.open_table(KG_EDGES_REV_TABLE)?;
+            rev_tbl.retain(|_, _| false).context("clear kg_edges_rev")?;
+            for (tgt, sources) in adj_rev {
+                if sources.is_empty() {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(sources)
+                    .with_context(|| format!("serialize kg rev adjacency for {tgt}"))?;
+                rev_tbl
+                    .insert(tgt.as_str(), bytes.as_slice())
+                    .with_context(|| format!("insert kg rev adjacency for {tgt}"))?;
+            }
+        }
+        txn.commit().context("commit kg graph upsert txn")?;
+        Ok(())
+    }
+
+    /// Load the persisted symbol graph (issue #41 phase 2).
+    ///
+    /// Why: warm-boot wants to bring the KG back online without paying the
+    /// `build_from_chunks` cost. Returning the raw node + adjacency lists lets
+    /// the caller (`SymbolGraph::load_from_corpus`) rebuild the in-memory
+    /// `petgraph` without re-touching the chunk corpus.
+    /// What: returns `(nodes, adj_fwd, adj_rev)` where each list is the
+    /// deserialized contents of the three KG tables. An empty (or fresh)
+    /// database yields three empty vectors. Corrupt rows are skipped with a
+    /// `warn` rather than failing the whole load.
+    /// Test: `save_load_kg_roundtrip`.
+    #[allow(clippy::type_complexity)]
+    pub fn load_kg_graph(
+        &self,
+    ) -> Result<(
+        Vec<(String, PersistedKgNode)>,
+        Vec<(String, Vec<(String, String)>)>,
+        Vec<(String, Vec<(String, String)>)>,
+    )> {
+        let txn = self.db.begin_read().context("begin kg graph read txn")?;
+
+        let mut nodes: Vec<(String, PersistedKgNode)> = Vec::new();
+        {
+            let nodes_tbl = txn.open_table(KG_NODES_TABLE)?;
+            for entry in nodes_tbl.iter().context("iterate kg_nodes table")? {
+                let (key, value) = entry.context("read kg_nodes row")?;
+                let symbol = key.value().to_string();
+                match serde_json::from_slice::<PersistedKgNode>(value.value()) {
+                    Ok(node) => nodes.push((symbol, node)),
+                    Err(e) => tracing::warn!("kg: skipping corrupt kg_nodes row '{symbol}' ({e})"),
+                }
+            }
+        }
+
+        let adj_fwd = load_adjacency(&txn, KG_EDGES_TABLE, "kg_edges")?;
+        let adj_rev = load_adjacency(&txn, KG_EDGES_REV_TABLE, "kg_edges_rev")?;
+        Ok((nodes, adj_fwd, adj_rev))
+    }
+
+    /// Number of persisted KG nodes currently stored.
+    ///
+    /// Why: warm-boot uses this as a cheap "is the persisted graph populated?"
+    /// probe before deciding whether to fall back to `build_from_chunks`.
+    /// What: returns the row count of `KG_NODES_TABLE`.
+    /// Test: covered by `save_load_kg_roundtrip` (asserts count after save).
+    pub fn kg_node_count(&self) -> Result<usize> {
+        let txn = self.db.begin_read().context("begin kg count txn")?;
+        let table = txn.open_table(KG_NODES_TABLE)?;
+        Ok(table.len().context("count kg_nodes")? as usize)
+    }
+}
+
+/// Iterate one of the KG adjacency tables and deserialize each row.
+///
+/// Why: `KG_EDGES_TABLE` and `KG_EDGES_REV_TABLE` have identical shapes
+/// (`symbol → Vec<(edge_kind, peer_symbol)>`); centralising the read avoids
+/// duplicating the corrupt-row tolerance and `serde_json` decode boilerplate.
+/// What: walks the table on the supplied read transaction and returns a
+/// `Vec<(key, adjacency)>`. Corrupt rows are logged at `warn` and skipped.
+/// Test: covered transitively by `save_load_kg_roundtrip`.
+fn load_adjacency(
+    txn: &redb::ReadTransaction,
+    table_def: TableDefinition<'_, &str, &[u8]>,
+    label: &str,
+) -> Result<Vec<(String, Vec<(String, String)>)>> {
+    let table = txn.open_table(table_def)?;
+    let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for entry in table
+        .iter()
+        .with_context(|| format!("iterate {label} table"))?
+    {
+        let (key, value) = entry.with_context(|| format!("read {label} row"))?;
+        let sym = key.value().to_string();
+        match serde_json::from_slice::<Vec<(String, String)>>(value.value()) {
+            Ok(adj) => out.push((sym, adj)),
+            Err(e) => tracing::warn!("kg: skipping corrupt {label} row '{sym}' ({e})"),
+        }
+    }
+    Ok(out)
+}
+
+/// Compact on-disk representation of a [`crate::core::symbol_graph::SymbolNode`]
+/// (issue #41 phase 2).
+///
+/// Why: the runtime `SymbolNode` carries the symbol name three times (as the
+/// `petgraph` node weight, the `by_symbol` map key, and inside the node
+/// itself). Storing only `chunk_id + file` (with the symbol implied by the
+/// row key) keeps the on-disk size lean and avoids a String redundancy.
+/// What: serde-derived JSON payload stored under `KG_NODES_TABLE[symbol]`.
+/// Test: covered by `save_load_kg_roundtrip` in this module and by the
+/// `SymbolGraph` round-trip test in `core::symbol_graph::tests`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersistedKgNode {
+    pub chunk_id: String,
+    pub file: String,
 }
 
 #[cfg(test)]
@@ -640,5 +851,60 @@ mod tests {
         // And `open_fresh` on a path that does not exist is also fine.
         let fresh2 = CorpusStore::open_fresh(&dir.path().join("never.redb.tmp")).unwrap();
         assert_eq!(fresh2.chunk_count().unwrap(), 0);
+    }
+
+    /// Issue #41 phase 2: round-trip a tiny KG through `save_kg_graph` and
+    /// `load_kg_graph`. Closes (and reopens) the store between save and load
+    /// to prove the data is durable, not just held in process memory.
+    #[test]
+    fn save_load_kg_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.redb");
+
+        let nodes = vec![
+            (
+                "alpha".to_string(),
+                PersistedKgNode {
+                    chunk_id: "a:1:1".into(),
+                    file: "a.rs".into(),
+                },
+            ),
+            (
+                "beta".to_string(),
+                PersistedKgNode {
+                    chunk_id: "b:1:1".into(),
+                    file: "b.rs".into(),
+                },
+            ),
+        ];
+        let adj_fwd = vec![(
+            "alpha".to_string(),
+            vec![("CallsFunction".to_string(), "beta".to_string())],
+        )];
+        let adj_rev = vec![(
+            "beta".to_string(),
+            vec![("CallsFunction".to_string(), "alpha".to_string())],
+        )];
+
+        {
+            let store = CorpusStore::open(&path).unwrap();
+            store
+                .save_kg_graph(&nodes, &adj_fwd, &adj_rev)
+                .expect("save kg");
+            assert_eq!(store.kg_node_count().unwrap(), 2);
+        }
+
+        // Reopen and assert every row survived.
+        let store = CorpusStore::open(&path).unwrap();
+        let (loaded_nodes, loaded_fwd, loaded_rev) = store.load_kg_graph().unwrap();
+        assert_eq!(loaded_nodes.len(), 2);
+        assert_eq!(loaded_fwd, adj_fwd);
+        assert_eq!(loaded_rev, adj_rev);
+
+        // Saving an empty graph clears every table.
+        store.save_kg_graph(&[], &[], &[]).unwrap();
+        assert_eq!(store.kg_node_count().unwrap(), 0);
+        let (n, f, r) = store.load_kg_graph().unwrap();
+        assert!(n.is_empty() && f.is_empty() && r.is_empty());
     }
 }

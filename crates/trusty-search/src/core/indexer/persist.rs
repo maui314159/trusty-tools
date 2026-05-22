@@ -188,14 +188,77 @@ impl CodeIndexer {
                 emap.insert(file, ents);
             }
         }
-        // Phase 4: rebuild the symbol graph from the restored corpus.
-        self.rebuild_symbol_graph().await;
+        // Phase 4: bring the symbol graph back online. Issue #41 phase 2:
+        // prefer the persisted graph (O(nodes + edges) load) over a full
+        // `build_from_chunks` rebuild (O(N chunks)). A `None`/empty persisted
+        // graph (fresh redb, never-saved) falls through to the rebuild path
+        // so first-boot still produces a working KG.
+        self.load_or_rebuild_symbol_graph().await;
         tracing::info!(
             "restored {} chunks for index '{}' from redb corpus",
             total,
             self.index_id
         );
         Ok(total)
+    }
+
+    /// Warm-boot helper: load the persisted KG when present, otherwise fall
+    /// back to a full `rebuild_symbol_graph` (issue #41 phase 2).
+    ///
+    /// Why: cold-start cost of `build_from_chunks` on a 100k-chunk corpus is
+    /// the dominant non-embedding cost of a warm-boot. Loading the persisted
+    /// graph collapses that to a redb read; the rebuild is only paid on the
+    /// genuine first-boot (when nothing has been saved yet) or after a schema
+    /// migration that clears `KG_NODES_TABLE`.
+    /// What: if a `CorpusStore` is wired, calls
+    /// `SymbolGraph::load_from_corpus` on a blocking worker. On `Ok(Some)`
+    /// installs that graph directly; on `Ok(None)` or `Err` (logged at
+    /// `warn`) falls back to `rebuild_symbol_graph`.
+    /// Test: covered by the `corpus_kg_warm_boot_roundtrip` integration
+    /// test path; the symbol-graph round-trip itself is unit-tested in
+    /// `core::symbol_graph::tests`.
+    pub(super) async fn load_or_rebuild_symbol_graph(&self) {
+        let Some(corpus) = self.corpus.clone() else {
+            self.rebuild_symbol_graph().await;
+            return;
+        };
+        let index_id = self.index_id.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            crate::core::symbol_graph::SymbolGraph::load_from_corpus(&corpus)
+        })
+        .await;
+        match join {
+            Ok(Ok(Some(graph))) => {
+                tracing::info!(
+                    "warm-boot: loaded persisted symbol graph for '{index_id}' \
+                     ({} nodes / {} edges)",
+                    graph.node_count(),
+                    graph.edge_count()
+                );
+                *self.symbol_graph.write().await = std::sync::Arc::new(graph);
+            }
+            Ok(Ok(None)) => {
+                tracing::info!(
+                    "warm-boot: no persisted KG for '{index_id}' — \
+                     rebuilding from chunk corpus"
+                );
+                self.rebuild_symbol_graph().await;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "warm-boot: KG load for '{index_id}' failed ({e}) — \
+                     falling back to rebuild_symbol_graph"
+                );
+                self.rebuild_symbol_graph().await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "warm-boot: KG load task panicked for '{index_id}' ({e}) — \
+                     falling back to rebuild_symbol_graph"
+                );
+                self.rebuild_symbol_graph().await;
+            }
+        }
     }
 
     /// One-time migration: copy a legacy `chunks.json` snapshot into the redb

@@ -688,6 +688,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/api/chat/providers", get(list_chat_providers))
         .route("/indexes/{id}/status", get(index_status_handler))
         .route("/indexes/{id}/graph", get(graph_handler))
+        .route("/indexes/{id}/graph/stats", get(graph_stats_handler))
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
         .route(
@@ -1985,6 +1986,39 @@ async fn graph_handler(
         axum::http::HeaderValue::from_static("max-age=3600"),
     );
     Ok(response)
+}
+
+/// `GET /indexes/{id}/graph/stats` — symbol-graph summary statistics
+/// (issue #41 phase 2).
+///
+/// Why: lets agents and dashboards verify KG health (total nodes/edges plus a
+/// per-`EdgeKind` breakdown) without parsing the much larger `/graph` export
+/// or scraping Prometheus. The Phase B/C edge counts here are the load-bearing
+/// signal that the entity-derived edges are actually wired.
+/// What: snapshots the symbol graph (lock-free after the `Arc` clone) and
+/// returns `{ node_count, edge_count, edge_kinds: { CallsFunction: …, … } }`.
+/// Returns 404 when the index id is unknown.
+/// Test: covered by `graph_stats_handler_returns_breakdown` in this module.
+async fn graph_stats_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let graph = {
+        let indexer = handle.indexer.read().await;
+        indexer.snapshot_symbol_graph().await
+    };
+    let breakdown = graph.edge_kind_breakdown();
+    let mut edge_kinds = serde_json::Map::with_capacity(breakdown.len());
+    for (tag, count) in breakdown {
+        edge_kinds.insert(tag, serde_json::Value::from(count));
+    }
+    Ok(Json(serde_json::json!({
+        "node_count": graph.node_count(),
+        "edge_count": graph.edge_count(),
+        "edge_kinds": serde_json::Value::Object(edge_kinds),
+    })))
 }
 
 async fn index_file_handler(
