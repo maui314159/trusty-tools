@@ -77,6 +77,36 @@ struct IndexListWire {
     indexes: Vec<String>,
 }
 
+/// Wire shape of `GET /indexes/:id/graph/stats` from the trusty-search daemon.
+///
+/// Why: the STATISTICS panel surfaces graph node/edge counts and a per-kind
+/// breakdown; this captures only the fields the panel needs.
+/// What: total node and edge counts plus a map of edge kind → count.
+/// Test: deserialisation is exercised live by the trusty-search daemon suite.
+#[derive(Debug, Deserialize)]
+struct GraphStatsWire {
+    #[serde(default)]
+    node_count: u64,
+    #[serde(default)]
+    edge_count: u64,
+    #[serde(default)]
+    edge_kinds: std::collections::HashMap<String, u64>,
+}
+
+/// Wire shape of `GET /indexes/:id/communities` from the trusty-search daemon.
+///
+/// Why: the STATISTICS panel surfaces the community count and modularity
+/// score; the full `communities` array is intentionally ignored.
+/// What: top-level community count and modularity score.
+/// Test: deserialisation is exercised live by the trusty-search daemon suite.
+#[derive(Debug, Deserialize)]
+struct CommunitiesWire {
+    #[serde(default)]
+    community_count: u64,
+    #[serde(default)]
+    modularity: f64,
+}
+
 /// Wire shape of `GET /indexes/:id/status` from the trusty-search daemon.
 ///
 /// Why: the dashboard now surfaces last-indexed time and on-disk size in
@@ -179,22 +209,46 @@ impl SearchClient {
 
         let mut indexes = Vec::with_capacity(list.indexes.len());
         for id in list.indexes {
-            let row = match self.index_status(&id).await {
+            let mut row = match self.index_status(&id).await {
                 Ok(status) => IndexRow {
-                    id,
+                    id: id.clone(),
                     chunk_count: status.chunk_count,
                     root_path: status.root_path,
                     disk_bytes: status.disk_bytes,
                     last_indexed: status.last_indexed,
+                    ..Default::default()
                 },
                 Err(e) => {
                     tracing::warn!("index status probe failed for {id}: {e}");
                     IndexRow {
-                        id,
+                        id: id.clone(),
                         ..Default::default()
                     }
                 }
             };
+            // Graph stats and community info are best-effort: a failure leaves
+            // the corresponding counters at zero so the panel can still render.
+            match self.index_graph_stats(&id).await {
+                Ok(stats) => {
+                    row.node_count = stats.node_count;
+                    row.edge_count = stats.edge_count;
+                    let mut kinds: Vec<(String, u64)> = stats.edge_kinds.into_iter().collect();
+                    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    row.edge_kinds = kinds;
+                }
+                Err(e) => {
+                    tracing::debug!("graph stats probe failed for {id}: {e}");
+                }
+            }
+            match self.index_communities(&id).await {
+                Ok(c) => {
+                    row.community_count = c.community_count;
+                    row.modularity = c.modularity;
+                }
+                Err(e) => {
+                    tracing::debug!("communities probe failed for {id}: {e}");
+                }
+            }
             indexes.push(row);
         }
         // Stable ordering so the panel does not flicker between polls.
@@ -225,6 +279,47 @@ impl SearchClient {
             .json()
             .await?;
         Ok(status)
+    }
+
+    /// Fetch the knowledge-graph stats for an index from `/graph/stats`.
+    ///
+    /// Why: the STATISTICS panel surfaces graph size and per-edge-kind
+    /// breakdown alongside chunk count; this probe is intentionally
+    /// non-fatal — a 404 or missing graph leaves `IndexRow` graph counters
+    /// at zero so the rest of the panel still renders.
+    /// What: GETs `/indexes/:id/graph/stats` and returns the parsed wire
+    /// struct.
+    /// Test: covered by the trusty-search daemon suite.
+    async fn index_graph_stats(&self, id: &str) -> anyhow::Result<GraphStatsWire> {
+        let stats: GraphStatsWire = self
+            .http
+            .get(format!("{}/indexes/{id}/graph/stats", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(stats)
+    }
+
+    /// Fetch the community-detection summary for an index from `/communities`.
+    ///
+    /// Why: the STATISTICS panel reports the top-level community count and
+    /// modularity score; the full `communities` array is ignored to keep
+    /// the wire payload small.
+    /// What: GETs `/indexes/:id/communities` and returns the parsed wire
+    /// struct.
+    /// Test: covered by the trusty-search daemon suite.
+    async fn index_communities(&self, id: &str) -> anyhow::Result<CommunitiesWire> {
+        let c: CommunitiesWire = self
+            .http
+            .get(format!("{}/indexes/{id}/communities", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(c)
     }
 
     /// Trigger a reindex of `id` via `POST /indexes/:id/reindex`.

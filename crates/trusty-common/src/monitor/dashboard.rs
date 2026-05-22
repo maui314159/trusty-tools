@@ -52,11 +52,16 @@ pub enum Focus {
 /// Why: the search panel lists every registered index with its chunk count so
 /// the operator can see corpus sizes at a glance; the TUI also uses
 /// `disk_bytes` and `last_indexed` to drive its sort / stats panels and the
-/// inferred project name (from `root_path`) to group rows.
+/// inferred project name (from `root_path`) to group rows. Graph stats and
+/// community info give the operator visibility into the symbol graph and
+/// detected community structure built by the daemon.
 /// What: the index id, its chunk count, indexed root path, optional on-disk
-/// size, and optional last-indexed timestamp.
-/// Test: `test_search_panel_renders`, `test_index_row_project`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// size, optional last-indexed timestamp, plus knowledge-graph node/edge
+/// counts, per-edge-kind breakdown (sorted desc by count), and community
+/// count + modularity score from community detection.
+/// Test: `test_search_panel_renders`, `test_index_row_project`,
+/// `test_stats_lines_graph_section`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IndexRow {
     /// The index identifier.
     pub id: String,
@@ -68,6 +73,36 @@ pub struct IndexRow {
     pub disk_bytes: Option<u64>,
     /// The last time the index was (re)built, when reported.
     pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
+    /// Knowledge-graph node count for the index (0 when no graph was built).
+    ///
+    /// Why: surfaces graph size in the STATISTICS panel.
+    /// What: nodes from `/indexes/:id/graph/stats`.
+    /// Test: `test_stats_lines_graph_section`.
+    pub node_count: u64,
+    /// Knowledge-graph edge count for the index.
+    ///
+    /// Why: paired with `node_count` to show graph density.
+    /// What: edges from `/indexes/:id/graph/stats`.
+    /// Test: `test_stats_lines_graph_section`.
+    pub edge_count: u64,
+    /// Per-edge-kind counts, sorted by count descending.
+    ///
+    /// Why: lets the operator see which relationship types dominate.
+    /// What: vector of `(kind_name, count)` from `edge_kinds`.
+    /// Test: `test_stats_lines_edge_kind_bars`.
+    pub edge_kinds: Vec<(String, u64)>,
+    /// Number of communities detected by community detection.
+    ///
+    /// Why: surfaces high-level cluster count in the STATISTICS panel.
+    /// What: `community_count` from `/indexes/:id/communities` (0 when none).
+    /// Test: `test_stats_lines_graph_section`.
+    pub community_count: u64,
+    /// Modularity score of the community partition (0.0 when unknown).
+    ///
+    /// Why: a quality signal for the detected community structure.
+    /// What: `modularity` from `/indexes/:id/communities`.
+    /// Test: `test_stats_lines_graph_section`.
+    pub modularity: f64,
 }
 
 #[cfg(feature = "monitor-tui")]

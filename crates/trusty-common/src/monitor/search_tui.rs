@@ -983,11 +983,15 @@ pub fn index_lines(state: &SearchTuiState) -> Vec<IndexListRow> {
 pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
     if state.is_all_selected() {
         let total: u64 = state.indexes.iter().map(|i| i.chunk_count).sum();
+        let total_nodes: u64 = state.indexes.iter().map(|i| i.node_count).sum();
         let mut lines = vec![
             format!("Scope:        {ALL_LABEL}"),
             format!("Indexes:      {}", state.indexes.len()),
             format!("Total chunks: {}", format_count(total)),
         ];
+        if total_nodes > 0 {
+            lines.push(format!("Graph nodes:  {}", format_count(total_nodes)));
+        }
         if state.indexes.is_empty() {
             lines.push("(no indexes registered)".to_string());
         } else {
@@ -1025,6 +1029,42 @@ pub fn stats_lines(state: &SearchTuiState) -> Vec<String> {
                     "Last indexed: {}",
                     when.format("%Y-%m-%d %H:%M UTC")
                 ));
+            }
+            // Graph stats section — only shown when the daemon has actually
+            // built a graph for the index (node_count > 0).
+            if idx.node_count > 0 {
+                lines.push(String::new());
+                lines.push("Graph:".to_string());
+                lines.push(format!(
+                    "  Nodes:    {:>8}  Edges: {:>8}",
+                    format_count(idx.node_count),
+                    format_count(idx.edge_count),
+                ));
+                if let Some(max) = idx.edge_kinds.iter().map(|(_, n)| *n).max()
+                    && max > 0
+                {
+                    const BAR_WIDTH: usize = 14;
+                    for (kind, count) in &idx.edge_kinds {
+                        let bar_len =
+                            ((*count as f64 / max as f64) * BAR_WIDTH as f64).round() as usize;
+                        let bar_len = bar_len.min(BAR_WIDTH);
+                        let bar: String = "█".repeat(bar_len);
+                        lines.push(format!(
+                            "  {:<18} {:>7}  {}",
+                            truncate(kind, 18),
+                            format_count(*count),
+                            bar,
+                        ));
+                    }
+                }
+                if idx.community_count > 0 {
+                    lines.push(String::new());
+                    lines.push("Communities:".to_string());
+                    lines.push(format!(
+                        "  Count: {}  Modularity: {:.3}",
+                        idx.community_count, idx.modularity,
+                    ));
+                }
             }
             lines
         }
@@ -1438,6 +1478,83 @@ mod tests {
                 .any(|l| l.contains("Chunks:") && l.contains("1,200"))
         );
         assert!(one.iter().any(|l| l.contains("/tmp/cto")));
+    }
+
+    #[test]
+    fn test_stats_lines_graph_section() {
+        // An index with non-zero node_count should produce a Graph section
+        // including the nodes/edges line and a Communities section when
+        // community_count is positive.
+        let mut state = sample_state();
+        state.indexes[0].node_count = 4_821;
+        state.indexes[0].edge_count = 12_034;
+        state.indexes[0].edge_kinds = vec![
+            ("CallsFunction".into(), 8_201),
+            ("UsesType".into(), 2_411),
+            ("Implements".into(), 1_422),
+        ];
+        state.indexes[0].community_count = 47;
+        state.indexes[0].modularity = 0.712;
+        state.select_down(); // cursor 1 → cto (the modified row)
+        let lines = stats_lines(&state);
+        assert!(lines.iter().any(|l| l == "Graph:"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Nodes:") && l.contains("4,821") && l.contains("Edges:"))
+        );
+        assert!(lines.iter().any(|l| l.contains("CallsFunction")));
+        assert!(lines.iter().any(|l| l == "Communities:"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Count: 47") && l.contains("Modularity: 0.712"))
+        );
+    }
+
+    #[test]
+    fn test_stats_lines_no_graph_section() {
+        // An index with node_count == 0 should not produce a Graph section
+        // at all, even if other graph counters are spuriously populated.
+        let mut state = sample_state();
+        state.indexes[0].node_count = 0;
+        state.indexes[0].edge_count = 100; // ignored without nodes
+        state.indexes[0].community_count = 5; // ignored without nodes
+        state.select_down();
+        let lines = stats_lines(&state);
+        assert!(!lines.iter().any(|l| l == "Graph:"));
+        assert!(!lines.iter().any(|l| l == "Communities:"));
+        assert!(!lines.iter().any(|l| l.contains("Nodes:")));
+    }
+
+    #[test]
+    fn test_stats_lines_edge_kind_bars() {
+        // The largest edge kind gets the full 14-char bar; smaller kinds get
+        // proportionally fewer bars.
+        let mut state = sample_state();
+        state.indexes[0].node_count = 100;
+        state.indexes[0].edge_count = 200;
+        state.indexes[0].edge_kinds = vec![
+            ("Big".into(), 100), // max → 14 bars
+            ("Half".into(), 50), // 50% → 7 bars
+            ("Tiny".into(), 10), // 10% → ~1 bar
+        ];
+        state.select_down();
+        let lines = stats_lines(&state);
+        let bar_lines: Vec<&String> = lines.iter().filter(|l| l.contains('█')).collect();
+        assert_eq!(bar_lines.len(), 3, "expected one bar line per edge kind");
+        let big_bars = bar_lines[0].matches('█').count();
+        let half_bars = bar_lines[1].matches('█').count();
+        let tiny_bars = bar_lines[2].matches('█').count();
+        assert_eq!(big_bars, 14, "largest kind gets 14 bars");
+        assert!(
+            half_bars < big_bars && half_bars > tiny_bars,
+            "half-sized kind ({half_bars}) sits between big ({big_bars}) and tiny ({tiny_bars})"
+        );
+        assert!(
+            tiny_bars >= 1,
+            "tiny kind should still get at least one bar"
+        );
     }
 
     #[test]
