@@ -158,7 +158,7 @@ async fn remember_then_recall_returns_drawer() {
     let drawer_id = remember(
         fx.state(),
         "round-trip",
-        "Quokkas are tiny marsupials native to Australia",
+        "Quokkas are small marsupials native to a few small islands off the coast of Western Australia",
         &["wildlife"],
     )
     .await;
@@ -199,14 +199,14 @@ async fn recall_ranks_best_match_first() {
     remember(
         fx.state(),
         "rank",
-        "Python uses reference counting for garbage collection",
+        "Python uses reference counting combined with a cyclic collector for garbage collection of objects",
         &["python"],
     )
     .await;
     remember(
         fx.state(),
         "rank",
-        "JavaScript engines use generational garbage collection",
+        "JavaScript engines use generational garbage collection with separate young and old object generations",
         &["js"],
     )
     .await;
@@ -248,7 +248,7 @@ async fn recall_deep_returns_at_least_as_many_as_shallow() {
         remember(
             fx.state(),
             "deep",
-            &format!("Memory drawer number {i} about programming languages"),
+            &format!("Memory drawer number {i} contains useful notes about programming languages and their runtime characteristics"),
             &[],
         )
         .await;
@@ -546,7 +546,7 @@ async fn read_only_memory_recall_succeeds() {
         remember(
             &state,
             &palace,
-            "Kookaburras are kingfishers native to Australia",
+            "Kookaburras are large terrestrial kingfishers native to the woodlands of eastern Australia and southern New Guinea",
             &[],
         )
         .await;
@@ -698,7 +698,13 @@ async fn read_only_kg_assert_returns_clear_error() {
 async fn two_states_can_read_same_palace_simultaneously() {
     let fx = Fixture::new();
     create_palace(fx.state(), "shared").await;
-    remember(fx.state(), "shared", "Echidnas are egg-laying mammals", &[]).await;
+    remember(
+        fx.state(),
+        "shared",
+        "Echidnas are egg-laying mammals known as monotremes, found across Australia and New Guinea",
+        &[],
+    )
+    .await;
 
     let state_b = fresh_state(fx.data_root());
 
@@ -728,7 +734,7 @@ async fn read_only_open_while_writer_holds_lock_succeeds() {
         remember(
             &state,
             &palace,
-            "Wombats produce cube-shaped droppings",
+            "Wombats produce distinctive cube-shaped droppings due to the unusual elasticity of their intestinal walls",
             &[],
         )
         .await;
