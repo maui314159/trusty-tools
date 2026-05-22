@@ -22,6 +22,10 @@
 !.claude/agents/
 !.claude/agents/**
 
+# Exclude agent runtime-state dot-files (not source-controlled)
+.claude/agents/.dependency_cache
+.claude/agents/.mpm_deployment_state
+
 # Re-include tracked files from .claude-mpm/
 !.claude-mpm/INSTRUCTIONS.md
 !.claude-mpm/AGENT_DELEGATION.md
@@ -43,3 +47,7 @@
 # trusty-search runtime artifacts
 crates/trusty-search/.claude-mpm/
 crates/trusty-search/ui/node_modules/
+
+# Temp directories and analytics databases
+claude-mpm-patch/
+tga.db
