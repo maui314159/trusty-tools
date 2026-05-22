@@ -1,0 +1,124 @@
+# trusty-memory Makefile
+#
+# Why: Provides ergonomic single-command workflows for version bumping,
+# deploying, and health-checking the trusty-memory daemon on macOS,
+# mirroring the trusty-search Makefile pattern.
+# What: `patch` bumps version + commits + tags; `deploy` installs the binary
+# and restarts both launchd daemons; `smoke` probes the health endpoints.
+# Test: `make help` lists all targets; `make smoke` exits 0 when daemon is live.
+
+.PHONY: patch deploy smoke clean check clippy test help
+
+# ── Launchd plist paths ──────────────────────────────────────────────────────
+PLIST_CANONICAL := $(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist
+PLIST_LEGACY    := $(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist
+
+# ── Health-check endpoints ───────────────────────────────────────────────────
+# Primary: read the bound address from the runtime lock file.
+# Fallback: well-known default port used during first-run before lock exists.
+SUPPORT_DIR  := $(HOME)/Library/Application Support/trusty-memory
+HTTP_ADDR_FILE := $(SUPPORT_DIR)/http_addr
+FALLBACK_ADDR  := 127.0.0.1:7070
+
+## Bump the patch version, commit, tag, and push.
+## Why: Every patch release produces the canonical `trusty-memory-v<VERSION>`
+## tag that triggers the crates.io publish workflow.  Version is read in the
+## SAME shell as the bump to avoid Make's parse-time expansion.
+patch:
+	cargo set-version --bump patch
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 \
+	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])") && \
+	git add Cargo.toml Cargo.lock && \
+	git commit -m "chore(release): bump trusty-memory to v$$VERSION" && \
+	git tag "trusty-memory-v$$VERSION" && \
+	git push origin main && \
+	git push origin "trusty-memory-v$$VERSION" && \
+	echo ">> pushed trusty-memory-v$$VERSION — CI will publish to crates.io automatically" && \
+	echo ">> run 'make deploy' once CI finishes to install the new binary locally"
+
+## Install the locally-built binary and restart both launchd daemons.
+## Why: Replacing the binary while the daemon is running causes macOS to
+## SIGKILL the process with "Code Signature Invalid"; unloading first ensures
+## a clean handoff.  Both the canonical and legacy plist labels are unloaded
+## so stale daemons from either label cannot survive across deploys.
+##
+## Stop strategy (surgical):
+##   1. `launchctl unload` — stops the launchd-managed instance by label.
+##   2. `trusty-memory service stop` — SIGTERMs the process that wrote the
+##      PID lockfile; never matches by command-line string.
+##   3. `pkill -TERM -x trusty-memory` — matches argv[0] exactly; cannot
+##      accidentally match tmux, claude, or other processes.
+deploy:
+	-launchctl unload $(PLIST_CANONICAL) 2>/dev/null
+	-launchctl unload $(PLIST_LEGACY) 2>/dev/null
+	-rm -f $(PLIST_LEGACY)
+	-trusty-memory service stop 2>/dev/null
+	-pkill -TERM -x trusty-memory 2>/dev/null
+	sleep 2
+	CARGO_BUILD_JOBS=2 cargo install --path . --locked
+	launchctl load $(PLIST_CANONICAL) 2>/dev/null || trusty-memory service start
+
+## Health-check: verify the daemon is reachable and version matches.
+## Why: Confirms the deployed binary is the expected version and the HTTP
+## server is accepting connections before declaring a deploy successful.
+## Probes the address from the runtime lock file first; falls back to the
+## well-known default port (7070) if the lock file is absent.
+smoke:
+	@echo ">> trusty-memory smoke test"
+	@ADDR="$(FALLBACK_ADDR)"; \
+	if [ -f "$(HTTP_ADDR_FILE)" ]; then \
+	  ADDR=$$(cat "$(HTTP_ADDR_FILE)"); \
+	  echo ">> using address from http_addr: $$ADDR"; \
+	else \
+	  echo ">> http_addr file not found; using fallback $$ADDR"; \
+	fi; \
+	echo ">> probing http://$$ADDR/health"; \
+	curl -sf "http://$$ADDR/health" | python3 -m json.tool || \
+	  (echo "ERROR: health check failed on $$ADDR" && exit 1)
+	@echo ">> also probing fallback http://$(FALLBACK_ADDR)/health (no-op if same)"; \
+	curl -sf "http://$(FALLBACK_ADDR)/health" >/dev/null 2>&1 && \
+	  echo ">> $(FALLBACK_ADDR) reachable" || \
+	  echo "   ($(FALLBACK_ADDR) not reachable — OK if daemon bound elsewhere)"
+	@BIN_VERSION=$$(trusty-memory --version 2>&1 | awk '{print $$2}'); \
+	CARGO_VERSION=$$(cargo metadata --no-deps --format-version 1 \
+	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
+	echo ">> binary version:  $$BIN_VERSION"; \
+	echo ">> Cargo.toml version: $$CARGO_VERSION"; \
+	if [ "$$BIN_VERSION" = "$$CARGO_VERSION" ]; then \
+	  echo ">> versions match — smoke PASSED"; \
+	else \
+	  echo "WARNING: version mismatch (run 'make deploy' to update binary)"; \
+	fi
+
+## Remove local build artifacts.
+clean:
+	cargo clean
+
+## Quick local quality gate — type-check without full compilation.
+check:
+	cargo check --workspace
+
+## Run clippy across all targets with warnings as errors.
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+## Run the full test suite.
+test:
+	cargo test --workspace
+
+help:
+	@printf '\ntrustY-memory Makefile targets\n'
+	@printf '%-10s %s\n' \
+	  patch   "Bump patch version, commit, tag, and push" \
+	  deploy  "Build + install binary, restart both launchd daemons" \
+	  smoke   "Health-check both ports, verify version matches" \
+	  clean   "Remove build artifacts (cargo clean)" \
+	  check   "cargo check --workspace" \
+	  clippy  "cargo clippy --workspace --all-targets" \
+	  test    "cargo test --workspace" \
+	  help    "Show this help"
+	@printf '\nLaunchd plists managed:\n'
+	@printf '  %s\n' \
+	  "$(PLIST_CANONICAL)" \
+	  "$(PLIST_LEGACY)"
+	@printf '\n'
