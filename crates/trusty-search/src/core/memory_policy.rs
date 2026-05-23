@@ -401,7 +401,12 @@ impl MemoryTier {
     /// they're driven more by index size than absolute RAM.
     fn defaults(self, memory_limit_mb: usize, index_memory_limit_mb: usize) -> TierDefaults {
         let (embedding_cache, bm25_corpus_cap, max_kg_nodes) = match self {
-            MemoryTier::Medium => (5_000, 100_000, 150_000),
+            // 1 000 entries × 1.5 KB = 1.5 MB per index; was 5 000 (7.5 MB)
+            // before idle-memory audit. With ~243 indexes on a typical host the
+            // old default parked ~1.8 GB of mostly-cold embedding caches; 1 000
+            // entries cover the working set of any active session. Operators
+            // who need a larger cache can raise it via TRUSTY_EMBEDDING_CACHE.
+            MemoryTier::Medium => (1_000, 100_000, 150_000),
             MemoryTier::Large => (10_000, 200_000, 300_000),
             MemoryTier::XLarge => (20_000, 400_000, 500_000),
         };
@@ -788,7 +793,8 @@ mod tests {
         assert_eq!(medium.max_chunks, 204_800);
         // max_batch_size tracks INDEX limit: floor(12288 * 0.75 / 32) = 288
         assert_eq!(medium.max_batch_size, 288);
-        assert_eq!(medium.embedding_cache, 5_000);
+        // Lowered from 5 000 → 1 000 by the idle-memory audit (1.5 MB/index).
+        assert_eq!(medium.embedding_cache, 1_000);
 
         // 32 GB host → Large → daemon limit = 8 GB, index limit = 24 GB.
         let large = d(32 * 1024, MemoryTier::Large);
