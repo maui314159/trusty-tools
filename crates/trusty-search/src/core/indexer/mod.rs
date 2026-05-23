@@ -34,6 +34,7 @@ use crate::core::entity::RawEntity;
 use crate::core::store::VectorStore;
 use crate::core::symbol_graph::SymbolGraph;
 
+pub(crate) mod archive;
 mod files;
 pub mod graph_score;
 mod ingest;
@@ -217,6 +218,14 @@ pub struct CodeChunk {
     /// run. Lets callers group results by architectural cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub community_id: Option<u64>,
+
+    /// Issue #75: short label explaining why this chunk was archive-downranked,
+    /// when a score multiplier penalty was applied. Examples:
+    /// `"path:deprecated"`, `"annotation:#[deprecated]"`, `"marker:.archived"`,
+    /// `"stale:git_mtime"`. `None` when the chunk did not match any archive
+    /// signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
 }
 
 /// Query parameters for hybrid search.
@@ -339,6 +348,7 @@ pub(crate) fn raw_to_code_chunk(
         index_id: None,
         on_branch: false,
         community_id: None,
+        archive_reason: None,
     }
 }
 
@@ -392,14 +402,17 @@ pub(crate) fn file_type_score_multiplier(path: &str) -> f32 {
 /// Why: lifted out of `search` to keep the materialization loop short and
 /// to make the precedence rules unit-testable in isolation.
 /// What: direct hits (HNSW and/or BM25) take precedence over KG-only paths.
-/// Test: covered indirectly by `test_kg_expansion_marks_neighbours_with_hybrid_kg`.
+/// Issue #75: the `(false,false,false)` arm is reserved for the grep
+/// fallback lane and now returns the canonical `"fallback:ripgrep"` label.
+/// Test: covered indirectly by `test_kg_expansion_marks_neighbours_with_hybrid_kg`
+/// and `test_compute_match_reason_fallback_label`.
 pub(crate) fn compute_match_reason(in_v: bool, in_b: bool, in_kg: bool) -> &'static str {
     match (in_v, in_b, in_kg) {
         (true, true, _) => "hybrid",
         (true, false, _) => "vector",
         (false, true, _) => "bm25",
         (false, false, true) => "hybrid+kg",
-        (false, false, false) => "fallback",
+        (false, false, false) => "fallback:ripgrep",
     }
 }
 

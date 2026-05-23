@@ -20,10 +20,51 @@ use crate::core::entity::EdgeKind;
 use crate::core::git::{normalize_path, resolve_branch_files};
 use crate::core::search::rrf::{rrf_fuse, RRF_K};
 
+use super::archive::{self, MarkerCache};
 use super::{
     build_compact_snippet, compute_match_reason, file_type_score_multiplier, hash_query,
     raw_to_code_chunk, CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS,
 };
+
+/// Score assigned to grep-fallback hits (issue #75). Intentionally tiny so
+/// fallback rows never out-rank a real BM25/vector hit — they only surface
+/// when the primary lanes returned nothing.
+const GREP_FALLBACK_SCORE: f32 = 0.001;
+
+/// Merge a grep lane into an already-RRF-fused list (issue #75).
+///
+/// Why: `rrf_fuse` is hard-coded to two lanes (HNSW + BM25). Rather than
+/// reshape its signature, we fold the grep lane in via the same reciprocal
+/// rank formula and re-truncate to `top_k`. Grep hits that already appeared
+/// in the fused list get their score bumped; brand-new ids show up at the
+/// bottom of the ranking.
+/// What: walks `grep_lane` (ordered best-first), adds `weight * 1/(k+rank)`
+/// to each id's score, re-sorts by score desc with id as tie-break, then
+/// truncates.
+/// Test: `test_merge_grep_lane_appends_new_ids` in `indexer::tests`.
+pub(crate) fn merge_grep_lane(
+    fused: Vec<(String, f32)>,
+    grep_lane: &[(String, f32)],
+    weight: f32,
+    top_k: usize,
+) -> Vec<(String, f32)> {
+    if grep_lane.is_empty() {
+        return fused;
+    }
+    let mut accum: HashMap<String, f32> = fused.into_iter().collect();
+    for (rank0, (id, _)) in grep_lane.iter().enumerate() {
+        let rank = (rank0 + 1) as f32;
+        *accum.entry(id.clone()).or_insert(0.0) += weight * (1.0 / (RRF_K + rank));
+    }
+    let mut out: Vec<(String, f32)> = accum.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out.truncate(top_k);
+    out
+}
 
 /// Lower bound for the branch-modified file score multiplier (issue #122).
 /// `1.0` disables boosting and is the floor.
@@ -216,6 +257,45 @@ impl CodeIndexer {
         Ok(bm25.score_query_all(query, want))
     }
 
+    /// Grep-fallback lane: scan in-memory chunk contents for a literal match
+    /// of `query` (issue #75).
+    ///
+    /// Why: when the primary BM25 + vector lanes both return no rows (rare
+    /// but real on small / unusual indexes, or when the query tokenises to
+    /// nothing useful) we want at least an exact-substring fallback before
+    /// telling the caller "no results". This is the same role ripgrep would
+    /// play if shelled out to, but it runs against the already-loaded chunk
+    /// corpus so it costs nothing extra to maintain.
+    /// What: builds a regex from `regex::escape(query)` (so user input is
+    /// treated as a literal, never as a pattern), then walks
+    /// `self.chunks.read()` and collects up to `want` hits scored at
+    /// [`GREP_FALLBACK_SCORE`]. Empty / regex-build failure short-circuits
+    /// to `Vec::new()`.
+    /// Test: `test_grep_fallback_returns_substring_hits` in `indexer::tests`.
+    pub(super) async fn grep_fallback_search(
+        &self,
+        query: &str,
+        want: usize,
+    ) -> Vec<(String, f32)> {
+        if query.is_empty() || want == 0 {
+            return Vec::new();
+        }
+        let Ok(re) = regex::Regex::new(&regex::escape(query)) else {
+            return Vec::new();
+        };
+        let chunks = self.chunks.read().await;
+        let mut out: Vec<(String, f32)> = Vec::new();
+        for raw in chunks.values() {
+            if re.is_match(&raw.content) {
+                out.push((raw.id.clone(), GREP_FALLBACK_SCORE));
+                if out.len() >= want {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Run the HNSW lane. Returns `(chunk_id, distance)` style — we treat the
     /// `VectorStore`'s `score` as opaque since RRF only consumes rank.
     pub(super) async fn vector_search(
@@ -350,6 +430,19 @@ impl CodeIndexer {
         self.inject_entity_exact_match(&intent, &query.text, beta, &mut bm25_results)
             .await;
 
+        // 2a) Issue #75: for Definition intent, run grep in parallel as a
+        //     third RRF lane. Exact identifier matches give a strong signal
+        //     for "where is this symbol declared" queries that the regex
+        //     tokeniser may otherwise miss (underscore-heavy names, embedded
+        //     in larger words, etc.). We re-use the BM25 weight `beta` for
+        //     the grep lane because the signal it carries is lexical, not
+        //     semantic.
+        let grep_lane: Vec<(String, f32)> = if matches!(intent, QueryIntent::Definition) {
+            self.grep_fallback_search(&query.text, want).await
+        } else {
+            Vec::new()
+        };
+
         // 3) RRF fuse, then MMR diversity.
         let fused_raw = rrf_fuse(
             &hnsw_results,
@@ -359,6 +452,22 @@ impl CodeIndexer {
             RRF_K,
             query.top_k,
         );
+        let fused_raw = merge_grep_lane(fused_raw, &grep_lane, beta, query.top_k);
+
+        // 3a) Issue #75: empty-result fallback. When both primary lanes (and
+        //     the optional Definition grep lane) produced nothing, scan the
+        //     in-memory chunk corpus for a literal substring match and use
+        //     those as the result set. They are scored at
+        //     [`GREP_FALLBACK_SCORE`] (≈ 0.001) so they are clearly weaker
+        //     than any real BM25/vector hit, and they materialise with
+        //     `match_reason = "fallback:ripgrep"` because they appear in
+        //     none of the (in_hnsw, in_bm25, in_kg) sets the materializer
+        //     consults.
+        let fused_raw = if fused_raw.is_empty() {
+            self.grep_fallback_search(&query.text, query.top_k).await
+        } else {
+            fused_raw
+        };
         let fused = self.apply_mmr_rerank(fused_raw, query.top_k).await;
 
         // 4) KG expand (conditional). Track which IDs came **only** from KG
@@ -386,7 +495,7 @@ impl CodeIndexer {
             .await;
 
         // 5) Materialise the top-k IDs into `CodeChunk`s.
-        let result = self
+        let mut result = self
             .materialize_search_results(
                 all,
                 &hnsw_results,
@@ -396,7 +505,49 @@ impl CodeIndexer {
                 query,
             )
             .await;
+
+        // 6) Issue #75: archive downranking. Apply a multiplicative score
+        //    penalty to chunks that look like archive / deprecated / legacy
+        //    code. Done after MMR + materialization so the per-result
+        //    `archive_reason` label can be stamped onto the same `CodeChunk`
+        //    we return. Sort once more after stamping so demoted rows sink.
+        self.apply_archive_downrank(&mut result);
         Ok(result)
+    }
+
+    /// Stamp `archive_reason` + apply score penalty to each result chunk
+    /// (issue #75).
+    ///
+    /// Why: archived code shouldn't dominate the top-k for queries that ought
+    /// to surface live code. We demote (rather than drop) so the operator can
+    /// still see the archived row when nothing better matched, with a clear
+    /// label explaining why it sank.
+    /// What: walks `results`, runs [`archive::classify`] against each chunk's
+    /// (path, content), multiplies `score` by the returned multiplier, sets
+    /// `archive_reason`, then re-sorts by score desc. The marker-file cache
+    /// is shared across the whole pass so K chunks under the same directory
+    /// pay at most one filesystem hit.
+    /// Test: `test_archive_downrank_demotes_deprecated_chunks` and the unit
+    /// tests in [`archive::tests`].
+    fn apply_archive_downrank(&self, results: &mut Vec<CodeChunk>) {
+        if results.is_empty() {
+            return;
+        }
+        let mut markers = MarkerCache::new();
+        for chunk in results.iter_mut() {
+            let (mult, reason) =
+                archive::classify(&self.root_path, &chunk.file, &chunk.content, &mut markers);
+            if reason.is_some() {
+                chunk.score *= mult;
+                chunk.archive_reason = reason;
+            }
+        }
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
     }
 
     /// Re-rank merged direct+KG candidates and apply file-type weighting.

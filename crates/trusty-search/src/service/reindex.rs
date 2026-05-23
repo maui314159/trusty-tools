@@ -1458,6 +1458,13 @@ pub fn spawn_reindex_with_cleanup(
             }
         } else {
             progress.status.store(ReindexStatus::Complete);
+            // Issue #75: refresh the captured HEAD SHA so subsequent searches
+            // compare against the commit we just indexed against. Best-effort:
+            // a `None` (non-git workdir / missing git binary) silently clears
+            // any previously cached value, which keeps the stale flag honest
+            // rather than reporting freshness we can no longer verify.
+            let new_sha = crate::core::git::head_sha(&handle.root_path);
+            *handle.indexed_head_sha.write().await = new_sha;
         }
 
         // Final synchronous RSS poll so the peak reflects post-KG memory
@@ -1546,6 +1553,7 @@ mod tests {
             path_filter: vec![],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+            indexed_head_sha: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -1617,6 +1625,7 @@ mod tests {
             path_filter: vec!["common-*".to_string()],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+            indexed_head_sha: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);

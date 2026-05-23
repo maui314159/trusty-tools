@@ -1403,3 +1403,176 @@ async fn test_corpus_store_swap_and_take() {
         "live corpus was mutated while a staging corpus was swapped in"
     );
 }
+
+// ----- Issue #75 — line numbers, grep fallback, archive downranking ---------
+
+#[test]
+fn test_compute_match_reason_fallback_label() {
+    // Why: the `(false,false,false)` arm used to return the bare "fallback"
+    // string. Issue #75 renamed it to `"fallback:ripgrep"` so grep-fallback
+    // hits are clearly labelled in MCP / HTTP output.
+    assert_eq!(
+        compute_match_reason(false, false, false),
+        "fallback:ripgrep"
+    );
+    assert_eq!(compute_match_reason(true, false, false), "vector");
+    assert_eq!(compute_match_reason(false, true, false), "bm25");
+    assert_eq!(compute_match_reason(true, true, false), "hybrid");
+    assert_eq!(compute_match_reason(false, false, true), "hybrid+kg");
+}
+
+#[tokio::test]
+async fn test_grep_fallback_returns_substring_hits() {
+    // Why: when both primary lanes return nothing, an exact-substring scan
+    // over the in-memory corpus should still surface relevant chunks. The
+    // hits must carry a score equal to GREP_FALLBACK_SCORE so they sink
+    // below any real hit.
+    let idx = make_indexer();
+    idx.add_chunk(raw("a", "src/a.rs", "fn alpha_qwerty_unique() {}"))
+        .await
+        .unwrap();
+    idx.add_chunk(raw("b", "src/b.rs", "fn beta() {}"))
+        .await
+        .unwrap();
+    let hits = idx.grep_fallback_search("alpha_qwerty_unique", 5).await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "a");
+    // The score must be tiny — well below any real BM25 / vector hit.
+    assert!(hits[0].1 < 0.01, "fallback score should be sub-0.01");
+}
+
+#[tokio::test]
+async fn test_grep_fallback_treats_query_as_literal() {
+    // Why: user input must never be treated as a regex. A query containing
+    // regex metacharacters should match literally (or not at all) — never
+    // explode into a partial substring match driven by the metachar.
+    let idx = make_indexer();
+    idx.add_chunk(raw("a", "src/a.rs", "fn foo() {} // literal: a.b.c"))
+        .await
+        .unwrap();
+    idx.add_chunk(raw("b", "src/b.rs", "fn aXbYc() {}"))
+        .await
+        .unwrap();
+    // `.` is a regex metachar. With `regex::escape` it should only match the
+    // literal "a.b.c" in chunk `a` — not the wildcard-style "aXbYc" in `b`.
+    let hits = idx.grep_fallback_search("a.b.c", 5).await;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains(&"a"), "literal match in a missing: {ids:?}");
+    assert!(
+        !ids.contains(&"b"),
+        "wildcard-style match leaked through regex escape"
+    );
+}
+
+#[test]
+fn test_merge_grep_lane_appends_new_ids() {
+    // Why: merge_grep_lane must add brand-new ids to the fused list without
+    // dropping any of the existing fused entries, and the resulting order
+    // must be sorted by score descending.
+    use super::search::merge_grep_lane;
+    let fused = vec![("a".to_string(), 0.05), ("b".to_string(), 0.04)];
+    let grep_lane = vec![("c".to_string(), 0.001)];
+    let out = merge_grep_lane(fused, &grep_lane, 0.5, 10);
+    let ids: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains(&"a"));
+    assert!(ids.contains(&"b"));
+    assert!(ids.contains(&"c"));
+    // The previously-top entry must still be ranked at index 0.
+    assert_eq!(out[0].0, "a");
+}
+
+#[tokio::test]
+async fn test_archive_downrank_demotes_deprecated_chunks() {
+    // Why: chunks whose file path matches an archive keyword (here: "legacy")
+    // should be demoted below comparable clean-path chunks via the post-MMR
+    // archive pass, and their `archive_reason` field should be populated.
+    let idx = make_indexer();
+    idx.add_chunk(raw("live", "src/auth.rs", "fn authenticate_user_xyz() {}"))
+        .await
+        .unwrap();
+    idx.add_chunk(raw(
+        "old",
+        "src/legacy/auth_old.rs",
+        "fn authenticate_user_xyz_old() {}",
+    ))
+    .await
+    .unwrap();
+    let results = idx
+        .search(&SearchQuery {
+            text: "authenticate_user_xyz".to_string(),
+            top_k: 5,
+            expand_graph: false,
+            compact: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Both should appear — the live one must rank above the archived one,
+    // and the archived one must carry `archive_reason`.
+    let pos_live = results.iter().position(|c| c.id == "live");
+    let pos_old = results.iter().position(|c| c.id == "old");
+    assert!(pos_live.is_some(), "live chunk missing from results");
+    assert!(pos_old.is_some(), "archived chunk missing from results");
+    assert!(
+        pos_live.unwrap() < pos_old.unwrap(),
+        "live chunk should outrank archived chunk: live={pos_live:?} old={pos_old:?}"
+    );
+    let old_chunk = results.iter().find(|c| c.id == "old").unwrap();
+    assert!(
+        old_chunk.archive_reason.is_some(),
+        "archived chunk missing archive_reason: {:?}",
+        old_chunk
+    );
+    let reason = old_chunk.archive_reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("path:"),
+        "expected path-prefix reason, got {reason}"
+    );
+}
+
+#[tokio::test]
+async fn test_archive_downrank_skips_clean_chunks() {
+    // Why: a chunk with no archive signals must not receive an
+    // `archive_reason`, and its score must be unchanged by the downrank pass.
+    let idx = make_indexer();
+    idx.add_chunk(raw("clean", "src/main.rs", "fn run_main() {}"))
+        .await
+        .unwrap();
+    let results = idx
+        .search(&SearchQuery {
+            text: "run_main".to_string(),
+            top_k: 5,
+            expand_graph: false,
+            compact: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let chunk = results.iter().find(|c| c.id == "clean").unwrap();
+    assert!(chunk.archive_reason.is_none());
+}
+
+#[tokio::test]
+async fn test_search_result_preserves_line_numbers() {
+    // Why: issue #75 requires every search result to carry start_line and
+    // end_line. They are already on RawChunk; this guards against a future
+    // regression where the materializer drops them.
+    let idx = make_indexer();
+    let mut chunk = raw("a", "src/a.rs", "fn alpha_qwerty_unique() {}");
+    chunk.start_line = 42;
+    chunk.end_line = 50;
+    idx.add_chunk(chunk).await.unwrap();
+    let results = idx
+        .search(&SearchQuery {
+            text: "alpha_qwerty_unique".to_string(),
+            top_k: 5,
+            expand_graph: false,
+            compact: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].start_line, 42);
+    assert_eq!(results[0].end_line, 50);
+}

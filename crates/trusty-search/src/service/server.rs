@@ -1313,6 +1313,9 @@ async fn create_index_handler(
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
     }
 
+    // Issue #75: capture the current git HEAD SHA at registration; the search
+    // response uses it to flag stale results when the working tree advances.
+    let indexed_head_sha = crate::core::git::head_sha(&req.root_path);
     let handle = IndexHandle {
         id: id.clone(),
         indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -1324,6 +1327,7 @@ async fn create_index_handler(
         path_filter,
         context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
         context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+        indexed_head_sha: Arc::new(tokio::sync::RwLock::new(indexed_head_sha)),
     };
     state.registry.register(handle);
     // Issue #41 Phase 1: refresh the index-count gauge so /metrics reflects
@@ -1589,6 +1593,26 @@ async fn search_handler(
         query = %&query.text[..query.text.len().min(80)],
         "search"
     );
+
+    // Issue #75: surface index freshness in the response `meta` block so
+    // callers can show staleness banners without a follow-up status call.
+    //
+    // `last_indexed` is the mtime of `chunks.json` (rewritten on every
+    // successful commit) and matches what `GET /indexes/:id/status`
+    // already returns.
+    //
+    // `results_may_be_stale` compares the current git HEAD SHA against the
+    // SHA captured at index-registration time. False whenever either SHA
+    // is unavailable (non-git directory, missing git binary) or the SHAs
+    // match — i.e. defaults to "not stale" rather than scaring callers
+    // about indexes whose freshness we cannot verify.
+    let (_disk_bytes, last_indexed) = index_disk_and_mtime(&index_id.0);
+    let indexed_sha = handle.indexed_head_sha.read().await.clone();
+    let current_sha = crate::core::git::head_sha(&handle.root_path);
+    let results_may_be_stale = match (indexed_sha.as_deref(), current_sha.as_deref()) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
     Ok(Json(serde_json::json!({
         "results": results,
         "intent": format!("{:?}", intent),
@@ -1596,6 +1620,8 @@ async fn search_handler(
         "meta": {
             "graph_scoring": graph_scoring,
             "community_cohesion": community_cohesion,
+            "last_indexed": last_indexed,
+            "results_may_be_stale": results_may_be_stale,
         },
     })))
 }
@@ -2627,6 +2653,9 @@ async fn reindex_handler(
                     // scraped from the new root.
                     context_embedding: Arc::clone(&handle.context_embedding),
                     context_summary: Arc::clone(&handle.context_summary),
+                    // Preserve the indexed-HEAD SHA across the root_path
+                    // override — a subsequent reindex will refresh it.
+                    indexed_head_sha: Arc::clone(&handle.indexed_head_sha),
                 };
                 handle = state.registry.register(new_handle);
             }

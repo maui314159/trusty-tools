@@ -65,6 +65,10 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             .filter(|e| !e.is_empty())
             .collect();
         indexer.set_domain_terms(entry.domain_terms.clone());
+        // Issue #75: capture the current git HEAD SHA at registration so the
+        // search response can flag staleness when the working tree advances
+        // past the indexed commit. Best-effort: `None` outside a git repo.
+        let indexed_head_sha = crate::core::git::head_sha(&entry.root_path);
         let handle = IndexHandle {
             id: id.clone(),
             indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -76,6 +80,7 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             path_filter: entry.path_filter,
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+            indexed_head_sha: Arc::new(tokio::sync::RwLock::new(indexed_head_sha)),
         };
         state.registry.register(handle);
     }

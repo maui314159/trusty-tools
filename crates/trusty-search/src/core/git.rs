@@ -78,6 +78,33 @@ pub fn normalize_path(p: &str) -> &str {
     p.strip_prefix("./").unwrap_or(p)
 }
 
+/// Read the current `HEAD` SHA for the repo rooted at `root_path` (issue #75).
+///
+/// Why: the search response advertises `results_may_be_stale` so callers know
+/// when the index was built against an older commit than the working tree's
+/// current HEAD. The check is O(1) git read — `git rev-parse HEAD`.
+/// What: returns `Some(sha)` (40-char hex) on success, `None` for non-git
+/// directories, detached HEAD without commits, missing `git` binary, or any
+/// other best-effort failure. Never panics; never blocks the search hot path
+/// on slow git ops (this is the only call we make).
+/// Test: `test_head_sha_is_none_outside_git_repo`.
+pub fn head_sha(root_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +117,14 @@ mod tests {
         // git merge-base will fail with non-zero exit in a non-repo dir.
         let result = resolve_branch_files(tmp.path(), "nope");
         assert!(result.is_none(), "expected None outside a git repo");
+    }
+
+    #[test]
+    fn test_head_sha_is_none_outside_git_repo() {
+        // Why: `head_sha` must be best-effort. A non-git directory must
+        // produce `None`, not a panic.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(head_sha(tmp.path()).is_none());
     }
 
     #[test]

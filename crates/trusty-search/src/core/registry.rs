@@ -82,6 +82,20 @@ pub struct IndexHandle {
     /// summary that produced [`Self::context_embedding`]. Surfaced via
     /// `GET /indexes/:id/status` for operator visibility.
     pub context_summary: Arc<RwLock<Option<String>>>,
+
+    /// Git HEAD SHA captured at index time (issue #75).
+    ///
+    /// Why: lets the search response report `results_may_be_stale` by
+    /// comparing the indexed SHA against the working tree's current HEAD
+    /// SHA. Captured on a best-effort basis at handle registration (and
+    /// refreshed by any future reindex hook); `None` outside a git repo or
+    /// when `git` is unavailable.
+    /// What: an `Arc<RwLock<Option<String>>>` so the daemon can update it
+    /// after a successful reindex without rebuilding the handle. Reads are
+    /// O(1) and lock-free in practice (read-mostly).
+    /// Test: `test_results_may_be_stale_when_head_changes` (server-level
+    /// integration coverage).
+    pub indexed_head_sha: Arc<RwLock<Option<String>>>,
 }
 
 impl IndexHandle {
@@ -103,6 +117,7 @@ impl IndexHandle {
             path_filter: Vec::new(),
             context_embedding: Arc::new(RwLock::new(None)),
             context_summary: Arc::new(RwLock::new(None)),
+            indexed_head_sha: Arc::new(RwLock::new(None)),
         }
     }
 }
