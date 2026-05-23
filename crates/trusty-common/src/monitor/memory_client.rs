@@ -445,6 +445,10 @@ pub enum MemoryEvent {
         palace_id: String,
         /// The palace's drawer count after the addition.
         drawer_count: u64,
+        /// Short preview of the drawer's content (whitespace-collapsed,
+        /// truncated to ~80 chars). Empty when the daemon did not provide
+        /// the field (older daemons predate the wire field).
+        content_preview: String,
     },
     /// A drawer was deleted from a palace.
     DrawerDeleted {
@@ -490,6 +494,7 @@ pub fn parse_memory_event(value: &serde_json::Value) -> Option<MemoryEvent> {
         "drawer_added" => Some(MemoryEvent::DrawerAdded {
             palace_id: str_of("palace_id"),
             drawer_count: u64_of("drawer_count"),
+            content_preview: str_of("content_preview"),
         }),
         "drawer_deleted" => Some(MemoryEvent::DrawerDeleted {
             palace_id: str_of("palace_id"),
@@ -661,6 +666,21 @@ mod tests {
                 name: "notes".into(),
             })
         );
+        // drawer_added with a content preview round-trips the preview.
+        assert_eq!(
+            parse_memory_event(&serde_json::json!({
+                "type": "drawer_added",
+                "palace_id": "default",
+                "drawer_count": 14,
+                "content_preview": "How the migration system handles…",
+            })),
+            Some(MemoryEvent::DrawerAdded {
+                palace_id: "default".into(),
+                drawer_count: 14,
+                content_preview: "How the migration system handles…".into(),
+            })
+        );
+        // Older daemons omit `content_preview`; the field defaults to empty.
         assert_eq!(
             parse_memory_event(&serde_json::json!({
                 "type": "drawer_added", "palace_id": "default", "drawer_count": 14,
@@ -668,6 +688,7 @@ mod tests {
             Some(MemoryEvent::DrawerAdded {
                 palace_id: "default".into(),
                 drawer_count: 14,
+                content_preview: String::new(),
             })
         );
         assert_eq!(

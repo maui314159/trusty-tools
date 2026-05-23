@@ -659,11 +659,17 @@ pub fn apply_memory_event(state: &mut MemoryTuiState, event: MemoryEvent) {
         MemoryEvent::DrawerAdded {
             palace_id,
             drawer_count,
+            content_preview,
         } => {
-            state.log.push_scoped(
-                &palace_id,
-                format!("SSE: drawer added → {palace_id} ({drawer_count})"),
-            );
+            // Prefer a content preview when the daemon provided one; fall
+            // back to the legacy "(<count>)" format so older daemons still
+            // render a useful line.
+            let line = if content_preview.is_empty() {
+                format!("SSE: drawer added → {palace_id} ({drawer_count})")
+            } else {
+                format!("SSE: drawer added → {palace_id} ({drawer_count}): \"{content_preview}\"")
+            };
+            state.log.push_scoped(&palace_id, line);
         }
         MemoryEvent::DrawerDeleted {
             palace_id,
@@ -1754,6 +1760,7 @@ mod tests {
             MemoryEvent::DrawerAdded {
                 palace_id: "default".into(),
                 drawer_count: 14,
+                content_preview: "How the migration system handles…".into(),
             },
         );
         apply_memory_event(
@@ -1771,7 +1778,9 @@ mod tests {
         );
         let lines: Vec<&String> = state.log.iter().collect();
         assert_eq!(lines.len(), 3);
+        // With a content preview present, the log line shows it after the count.
         assert!(lines[0].contains("drawer added → default (14)"));
+        assert!(lines[0].contains("\"How the migration system handles…\""));
         assert!(lines[1].contains("drawer deleted → work (2)"));
         assert!(lines[2].contains("palace created → notes"));
 

@@ -89,6 +89,14 @@ pub enum DaemonEvent {
         /// receivers want to render "just now / 2m ago" relative to the
         /// daemon's clock, not the time the SSE frame happens to arrive.
         timestamp: chrono::DateTime<chrono::Utc>,
+        /// Short preview of the drawer's content (whitespace-collapsed,
+        /// truncated to ~80 chars with an ellipsis when cut). Why: the TUI
+        /// activity feed and dashboard ticker want to show *what* was
+        /// stored, not just the running drawer count. Empty when the
+        /// emitter could not resolve the content (legacy clients tolerate
+        /// the missing field via `#[serde(default)]`).
+        #[serde(default)]
+        content_preview: String,
     },
     DrawerDeleted {
         palace_id: String,

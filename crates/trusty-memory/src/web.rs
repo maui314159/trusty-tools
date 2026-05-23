@@ -653,6 +653,36 @@ struct CreateDrawerBody {
     importance: Option<f32>,
 }
 
+/// Maximum number of characters retained in a drawer's content preview.
+///
+/// Why: SSE consumers (TUI activity log, dashboard ticker) render the
+/// preview in a single line alongside the palace name; ~80 chars keeps the
+/// line readable on a 100-column terminal without truncating the palace
+/// label.
+const DRAWER_PREVIEW_MAX_CHARS: usize = 80;
+
+/// Build a single-line preview of drawer content for SSE events.
+///
+/// Why: the activity feed should show *what* was just stored, not only the
+/// running drawer count. Multiline / whitespace-heavy bodies otherwise blow
+/// out the log row, so we normalise whitespace and bound the length.
+/// What: collapses every run of ASCII / Unicode whitespace to a single space,
+/// trims leading/trailing whitespace, and truncates to
+/// [`DRAWER_PREVIEW_MAX_CHARS`] characters with a trailing `…` when cut.
+/// Test: `drawer_preview_collapses_whitespace_and_truncates`.
+fn drawer_content_preview(content: &str) -> String {
+    let normalised: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalised.chars().count() <= DRAWER_PREVIEW_MAX_CHARS {
+        normalised
+    } else {
+        let kept: String = normalised
+            .chars()
+            .take(DRAWER_PREVIEW_MAX_CHARS.saturating_sub(1))
+            .collect();
+        format!("{kept}…")
+    }
+}
+
 async fn create_drawer(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -665,6 +695,9 @@ async fn create_drawer(
         .map(RoomType::parse)
         .unwrap_or(RoomType::General);
     let importance = body.importance.unwrap_or(0.5);
+    // Compute the preview *before* moving `body.content` into `remember` so
+    // the SSE activity feed can show what was actually stored.
+    let content_preview = drawer_content_preview(&body.content);
     let drawer_id = handle
         .remember(body.content, room, body.tags, importance)
         .await
@@ -679,6 +712,7 @@ async fn create_drawer(
         palace_name,
         drawer_count,
         timestamp: chrono::Utc::now(),
+        content_preview,
     });
     state.emit(aggregate_status_event(&state));
     Ok(Json(json!({ "id": drawer_id })))
@@ -2586,6 +2620,34 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         AppState::new(root)
+    }
+
+    #[test]
+    fn drawer_preview_collapses_whitespace_and_truncates() {
+        // Short single-line content is returned verbatim.
+        assert_eq!(drawer_content_preview("hello world"), "hello world");
+
+        // Multiline / tab-laden content collapses to single-spaced text.
+        assert_eq!(
+            drawer_content_preview("first line\n\nsecond\tline   third"),
+            "first line second line third"
+        );
+
+        // Leading / trailing whitespace is stripped.
+        assert_eq!(drawer_content_preview("   padded   "), "padded");
+
+        // Empty content yields an empty preview (fallback signal for clients).
+        assert_eq!(drawer_content_preview(""), "");
+
+        // Long content is truncated to DRAWER_PREVIEW_MAX_CHARS with an ellipsis.
+        let long = "x".repeat(DRAWER_PREVIEW_MAX_CHARS + 50);
+        let preview = drawer_content_preview(&long);
+        assert_eq!(preview.chars().count(), DRAWER_PREVIEW_MAX_CHARS);
+        assert!(preview.ends_with('…'));
+
+        // Content right at the limit is not truncated.
+        let exact = "y".repeat(DRAWER_PREVIEW_MAX_CHARS);
+        assert_eq!(drawer_content_preview(&exact), exact);
     }
 
     #[tokio::test]
