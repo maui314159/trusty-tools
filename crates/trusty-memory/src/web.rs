@@ -131,7 +131,16 @@ pub fn router() -> Router<AppState> {
 /// `health_endpoint_includes_resource_fields` in this module's tests.
 #[derive(serde::Serialize)]
 struct HealthResponse {
-    status: &'static str,
+    /// `"ok"` when the round-trip smoke test succeeds (or no palace exists
+    /// yet), `"degraded"` when store/recall is broken (issue #71). Owned
+    /// `String` so the handler can report different statuses without
+    /// requiring static lifetimes.
+    status: String,
+    /// Populated only when `status == "degraded"` (issue #71). Carries a
+    /// short phrase identifying which round-trip stage failed so operators
+    /// can triage quickly (e.g. `"store failed: ..."`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     version: &'static str,
     /// Current process Resident Set Size in megabytes (issue #35). Sampled
     /// via the shared `SysMetrics` on each health request.
@@ -155,17 +164,26 @@ struct HealthResponse {
     addr: Option<String>,
 }
 
-/// `GET /health` — unauthenticated liveness probe.
+/// `GET /health` — unauthenticated liveness probe with store/recall smoke test.
 ///
 /// Why: Gives `daemon_probe` and external monitors a cheap way to confirm port
 /// ownership without touching palace state. Issue #35 additionally reports
-/// process RSS, CPU, the `data_root` disk footprint, and uptime.
+/// process RSS, CPU, the `data_root` disk footprint, and uptime. Issue #71
+/// upgrades the check to a full memory round-trip (store → recall → verify →
+/// delete) against the first palace so operators learn about store/recall
+/// regressions immediately instead of after a real request fails.
 /// What: Returns HTTP 200 with `{status, version, rss_mb, disk_bytes,
-/// cpu_pct, uptime_secs}`. RSS + CPU are sampled live via the shared
-/// `SysMetrics`; `disk_bytes` is read from the background-ticker atomic;
-/// `uptime_secs` is the elapsed time since `state.started_at`.
-/// Test: `health_endpoint_returns_ok` and
-/// `health_endpoint_includes_resource_fields`.
+/// cpu_pct, uptime_secs, detail?}`. RSS + CPU are sampled live; `disk_bytes`
+/// is read from the background ticker; `uptime_secs` is elapsed since
+/// `state.started_at`. When palaces exist, the handler attempts a full
+/// remember/recall/forget cycle on the first palace — `status` is `"ok"` on
+/// success (or when no palace exists yet), `"degraded"` with a `detail`
+/// string explaining the failing stage otherwise. The probe never returns
+/// non-200 so monitors keyed on HTTP status still see the daemon as up.
+/// Test: `health_endpoint_returns_ok`,
+/// `health_endpoint_includes_resource_fields`,
+/// `health_endpoint_round_trip_on_fresh_install_is_ok`,
+/// `health_endpoint_round_trip_with_palace_is_ok`.
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let (rss_mb, cpu_pct) = {
         let mut metrics = state.sys_metrics.lock().await;
@@ -174,8 +192,19 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let addr = state.bound_addr.get().map(|a| a.to_string());
+
+    let (status, detail) = match run_health_round_trip(&state).await {
+        Ok(()) => ("ok".to_string(), None),
+        Err(HealthProbeError::NoPalaces) => ("ok".to_string(), None),
+        Err(err) => {
+            tracing::warn!("/health round-trip degraded: {err}");
+            ("degraded".to_string(), Some(err.to_string()))
+        }
+    };
+
     Json(HealthResponse {
-        status: "ok",
+        status,
+        detail,
         version: env!("CARGO_PKG_VERSION"),
         rss_mb,
         disk_bytes,
@@ -183,6 +212,98 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         uptime_secs,
         addr,
     })
+}
+
+/// Stages of the `/health` round-trip that can fail (issue #71).
+///
+/// Why: `thiserror`-derived enum gives every failure point a stable phrase the
+/// handler can render into the `detail` field without printing implementation
+/// detail or full backtraces. `NoPalaces` is modelled as an error variant so
+/// the round-trip helper can short-circuit cleanly while letting the caller
+/// distinguish "skip" from real failures.
+/// What: One variant per stage (list, open, store, recall, missing-in-results,
+/// delete) plus the `NoPalaces` sentinel.
+/// Test: Exercised indirectly by the `health_endpoint_round_trip_*` tests.
+#[derive(Debug, thiserror::Error)]
+enum HealthProbeError {
+    #[error("no palaces present (skipped round-trip)")]
+    NoPalaces,
+    #[error("list palaces failed: {0}")]
+    ListPalaces(String),
+    #[error("open palace failed: {0}")]
+    OpenPalace(String),
+    #[error("store failed: {0}")]
+    Store(String),
+    #[error("recall failed: {0}")]
+    Recall(String),
+    #[error("recall did not return the probe drawer (id={0})")]
+    ProbeMissing(Uuid),
+    #[error("delete probe drawer failed: {0}")]
+    Delete(String),
+}
+
+/// Execute a remember/recall/forget cycle against the first persisted palace.
+///
+/// Why: `/health` used to return `status: "ok"` even when `POST /drawers` or
+/// the recall path was broken — only that the process was alive. Issue #71
+/// asks the probe to actually exercise the store and recall service layer
+/// (no HTTP loopback) so monitors detect data-plane regressions on the next
+/// poll instead of waiting for a real client to surface them.
+/// What: Lists palaces; if empty returns `NoPalaces` so the caller reports
+/// "ok" (no way to probe without a palace on a fresh install). Otherwise
+/// opens the first palace, stores a content-unique probe drawer via
+/// `PalaceHandle::remember`, runs `recall_with_default_embedder` with the
+/// probe phrase, asserts the new drawer is in the results, then deletes it
+/// via `PalaceHandle::forget`. Returns the first failing stage as a
+/// `HealthProbeError`.
+/// Test: Indirect — `health_endpoint_round_trip_with_palace_is_ok` and
+/// `health_endpoint_round_trip_on_fresh_install_is_ok`.
+async fn run_health_round_trip(state: &AppState) -> Result<(), HealthProbeError> {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root)
+        .map_err(|e| HealthProbeError::ListPalaces(format!("{e:#}")))?;
+    let Some(palace) = palaces.into_iter().next() else {
+        return Err(HealthProbeError::NoPalaces);
+    };
+    let handle = state
+        .registry
+        .open_palace(&state.data_root, &palace.id)
+        .map_err(|e| HealthProbeError::OpenPalace(format!("{e:#}")))?;
+
+    // Content-unique probe phrase. `__trusty_memory_healthcheck__` makes the
+    // probe identifiable in logs / drawer dumps if a forget step is ever
+    // skipped (e.g. handler panic between store and delete); the UUID
+    // guarantees uniqueness across concurrent probes.
+    let probe_token = Uuid::new_v4();
+    let probe_content = format!("__trusty_memory_healthcheck__ probe {probe_token}");
+
+    let drawer_id = handle
+        .remember(
+            probe_content.clone(),
+            RoomType::General,
+            vec!["healthcheck".to_string()],
+            0.0,
+        )
+        .await
+        .map_err(|e| HealthProbeError::Store(format!("{e:#}")))?;
+
+    let recall_result = recall_with_default_embedder(&handle, &probe_content, 5).await;
+
+    // Always attempt cleanup, even when recall failed, so the probe never
+    // leaves drawers behind. Cleanup errors are reported only when no earlier
+    // failure exists; otherwise we keep the upstream failure as the root cause.
+    let delete_result = handle.forget(drawer_id).await;
+
+    match recall_result {
+        Ok(hits) => {
+            if !hits.iter().any(|hit| hit.drawer.id == drawer_id) {
+                return Err(HealthProbeError::ProbeMissing(drawer_id));
+            }
+        }
+        Err(e) => return Err(HealthProbeError::Recall(format!("{e:#}"))),
+    }
+
+    delete_result.map_err(|e| HealthProbeError::Delete(format!("{e:#}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2705,6 +2826,93 @@ mod tests {
         assert_eq!(v["disk_bytes"].as_u64(), Some(0));
         // uptime_secs is present and a u64.
         assert!(v["uptime_secs"].is_u64(), "uptime_secs must be present");
+    }
+
+    /// Issue #71 — `GET /health` reports `status: "ok"` on a fresh install
+    /// (no palaces) and never carries a `detail` field.
+    ///
+    /// Why: A daemon with zero palaces cannot run a meaningful round-trip
+    /// (there is nothing to remember against), and reporting "degraded" in
+    /// that case would alarm operators on first boot. The handler must
+    /// treat "no palaces" as a clean state and skip the probe.
+    /// What: Drives `/health` through the router with an empty `data_root`
+    /// and asserts `status == "ok"` and the `detail` key is absent.
+    /// Test: this test.
+    #[tokio::test]
+    async fn health_endpoint_round_trip_on_fresh_install_is_ok() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(
+            v.get("detail").is_none() || v["detail"].is_null(),
+            "fresh-install health must not carry a degraded detail (got {v:?})"
+        );
+    }
+
+    /// Issue #71 — `GET /health` exercises the full store/recall/forget
+    /// cycle against the first palace and reports `status: "ok"` on success.
+    ///
+    /// Why: The whole point of issue #71 is to catch store/recall
+    /// regressions at probe time rather than via real client traffic. This
+    /// test creates a real palace, hits `/health`, and asserts the
+    /// round-trip path is happy. Marked `#[ignore]` because
+    /// `recall_with_default_embedder` pulls in the ONNX model and is too
+    /// heavy for the default CI matrix — run with
+    /// `cargo test -p trusty-memory -- --include-ignored` for local
+    /// verification.
+    /// What: Builds an `AppState` with a tempdir `data_root`, creates a
+    /// `health-probe-palace` via `registry.create_palace`, hits `/health`,
+    /// and asserts both the status and the absence of any `detail` field.
+    /// Test: this test.
+    #[tokio::test]
+    #[ignore = "loads the default ONNX embedder; run with --include-ignored"]
+    async fn health_endpoint_round_trip_with_palace_is_ok() {
+        let state = test_state();
+        let palace = trusty_common::memory_core::Palace {
+            id: PalaceId::new("health-probe-palace"),
+            name: "health-probe-palace".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("health-probe-palace"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create_palace");
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 2048).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["status"], "ok",
+            "round-trip should succeed against a fresh palace; got {v:?}"
+        );
+        assert!(
+            v.get("detail").is_none() || v["detail"].is_null(),
+            "successful round-trip must not carry a detail field (got {v:?})"
+        );
     }
 
     /// Issue #35 — `GET /api/v1/logs/tail` returns the most recent buffered
