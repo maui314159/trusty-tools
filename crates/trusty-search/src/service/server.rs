@@ -2819,6 +2819,11 @@ async fn reindex_handler(
         force,
         Some(Arc::clone(&state.reindex_progress)),
         Some(Arc::clone(&state.last_reindex_aborted_at)),
+        // Issue #81: hand the reindex tail the scorer cache so it can evict a
+        // stale (empty-community) `GraphScorer` once community detection has
+        // persisted the partition. Without this, `community_cohesion` stays
+        // 0.0 for any index whose scorer was cached before detection landed.
+        Some(Arc::clone(&state.graph_scorers)),
     );
 
     Ok(Json(serde_json::json!({
