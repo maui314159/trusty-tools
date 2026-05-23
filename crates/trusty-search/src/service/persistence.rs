@@ -106,6 +106,13 @@ pub fn index_data_dir(index_id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Crate-internal wrapper exposing [`sanitize_id`] for callers that need to
+/// derive the same on-disk path as [`index_data_dir`] without triggering its
+/// `create_dir_all` side effect.
+pub(crate) fn sanitize_id_for_path(id: &str) -> String {
+    sanitize_id(id)
+}
+
 /// Sanitize an index id for use as a filesystem path component. Replaces any
 /// character that isn't `[A-Za-z0-9._-]` with `_` so a user-supplied id can't
 /// escape the parent directory or trigger Windows reserved-name issues.

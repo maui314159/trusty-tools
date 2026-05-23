@@ -2066,9 +2066,16 @@ async fn search_similar_handler(
 /// Test: `index_disk_and_mtime_handles_missing_dir` covers the absent-dir
 /// degrade-to-`None` path.
 fn index_disk_and_mtime(index_id: &str) -> (Option<u64>, Option<String>) {
-    let Ok(dir) = crate::service::persistence::index_data_dir(index_id) else {
+    // Why: `persistence::index_data_dir` creates the directory as a side effect,
+    // which would defeat the "missing dir → None" contract this helper relies
+    // on. Compute the path manually (mirroring the persistence layer's logic)
+    // and only touch the filesystem to *read* metadata.
+    let Ok(data_dir) = crate::service::persistence::data_dir() else {
         return (None, None);
     };
+    let dir = data_dir
+        .join("indexes")
+        .join(crate::service::persistence::sanitize_id_for_path(index_id));
     if !dir.exists() {
         return (None, None);
     }
@@ -2076,9 +2083,8 @@ fn index_disk_and_mtime(index_id: &str) -> (Option<u64>, Option<String>) {
     // `chunks.json` is rewritten on every successful reindex commit, so its
     // mtime is the most accurate "last indexed" signal we have without
     // persisting a dedicated timestamp.
-    let last_indexed = crate::service::persistence::chunks_path(index_id)
+    let last_indexed = std::fs::metadata(dir.join("chunks.json"))
         .ok()
-        .and_then(|p| std::fs::metadata(&p).ok())
         .and_then(|m| m.modified().ok())
         .map(|t| {
             let dt: chrono::DateTime<chrono::Utc> = t.into();
