@@ -29,21 +29,54 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use crate::core::chunker::RawChunk;
 use crate::core::entity::RawEntity;
 
-/// Application-level page cache size for the redb corpus database.
+/// Default application-level page cache size for the redb corpus database, in
+/// megabytes (512 MB).
 ///
-/// Why (issue #29): redb's default application cache is 1 GiB. On a host
-/// indexing a large monorepo the on-disk `index.redb` corpus reaches ~14 GB,
-/// so the default cache holds well under 10% of the file — every search
-/// query that point-reads chunk text outside that window pays a disk read.
-/// trusty-search's `start` command already hard-requires ≥16 GB RAM, and the
-/// reference deployment host has 128 GB, so a 16 GiB cache keeps the hot
-/// working set resident without risking memory pressure. redb treats this as
-/// a ceiling, not a reservation — pages are only cached as they are touched,
-/// so smaller corpora never pay the full 16 GiB.
-/// What: 16 GiB expressed in bytes, passed to `Database::builder().set_cache_size`.
-/// Test: side-effect-only tuning of the redb cache; correctness is unaffected
-/// (covered by the existing `tests` submodule round-trips).
-const REDB_CACHE_SIZE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+/// Why (idle-memory audit): redb treats `set_cache_size` as a *ceiling* that
+/// fills lazily as pages are touched — so on a warm corpus the daemon's RSS
+/// climbs toward this value and parks there even while idle. The previous
+/// hardcoded 16 GiB was sized for the 128 GB reference deployment host; on a
+/// 16–32 GB developer machine that single knob consumed the entire daemon RSS
+/// budget once the page cache warmed up. 512 MB keeps the hot working set
+/// resident for the common case (recently-queried indexes) while leaving the
+/// idle footprint small. The trade-off is explicit: a *larger* cache means
+/// fewer disk reads for warm queries against a big corpus; a *smaller* cache
+/// means lower idle RSS at the cost of more page faults on cold reads.
+/// Operators on large-corpus hosts can raise it via `TRUSTY_REDB_CACHE_MB`.
+/// What: 512, multiplied by 1 MiB in [`redb_cache_size_bytes`].
+/// Test: `redb_cache_size_default_and_env_override` covers default + override.
+const DEFAULT_REDB_CACHE_MB: usize = 512;
+
+/// Resolve the redb application page-cache size (in bytes) from the
+/// environment, falling back to [`DEFAULT_REDB_CACHE_MB`].
+///
+/// Why: the cache size is the single biggest lever on the daemon's idle RSS
+/// (see [`DEFAULT_REDB_CACHE_MB`]). Making it configurable lets operators tune
+/// the warm-query-latency vs. idle-memory trade-off per host without a
+/// recompile — large-corpus hosts raise it, memory-constrained dev machines
+/// keep the small default.
+/// What: reads `TRUSTY_REDB_CACHE_MB`, parses it as `usize` megabytes, and
+/// returns the value in bytes (`mb * 1024 * 1024`). Falls back to
+/// [`DEFAULT_REDB_CACHE_MB`] when the var is unset, empty, unparseable, or
+/// zero, logging a `warn` on a non-empty unparseable value so typos surface.
+/// Test: `redb_cache_size_default_and_env_override`.
+fn redb_cache_size_bytes() -> usize {
+    let mb = match std::env::var("TRUSTY_REDB_CACHE_MB") {
+        Ok(v) if !v.is_empty() => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => DEFAULT_REDB_CACHE_MB,
+            Err(_) => {
+                tracing::warn!(
+                    "corpus: TRUSTY_REDB_CACHE_MB={v:?} is not a valid usize; \
+                     using default ({DEFAULT_REDB_CACHE_MB} MB)"
+                );
+                DEFAULT_REDB_CACHE_MB
+            }
+        },
+        _ => DEFAULT_REDB_CACHE_MB,
+    };
+    mb * 1024 * 1024
+}
 
 /// redb table holding the serialized chunk corpus, keyed by `chunk_id`.
 ///
@@ -133,22 +166,32 @@ impl CorpusStore {
     /// Why: the daemon resolves one `index.redb` per index under its data dir;
     /// opening here is the single entry point so table-creation and the
     /// create-if-missing semantics live in one place.
-    /// What: opens the database via `Database::builder()` with a 16 GiB
-    /// application cache ([`REDB_CACHE_SIZE_BYTES`], issue #29), then runs a
-    /// no-op write transaction that `open_table`s both tables so they exist
-    /// before any reader runs (redb requires a table to have been created in a
-    /// committed write txn before it can be opened read-only). This single
-    /// builder call is the only place a corpus `redb::Database` is opened, so
-    /// the cache size applies to the live `index.redb` and the `--force`
-    /// staging `index.redb.tmp` alike (`open_fresh` delegates here).
+    /// What: opens the database via `Database::builder()` with an application
+    /// page cache sized by [`redb_cache_size_bytes`] (default
+    /// [`DEFAULT_REDB_CACHE_MB`] MB, overridable via `TRUSTY_REDB_CACHE_MB`),
+    /// then runs a no-op write transaction that `open_table`s both tables so
+    /// they exist before any reader runs (redb requires a table to have been
+    /// created in a committed write txn before it can be opened read-only).
+    /// This single builder call is the only place a corpus `redb::Database` is
+    /// opened, so the cache size applies to the live `index.redb` and the
+    /// `--force` staging `index.redb.tmp` alike (`open_fresh` delegates here).
+    /// The effective cache size is logged at `info` so operators can confirm
+    /// the resolved value at daemon startup.
     /// Test: `roundtrip` and `missing_db_is_empty` both exercise `open`.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create parent of {}", path.display()))?;
         }
+        let cache_bytes = redb_cache_size_bytes();
+        tracing::info!(
+            "corpus: opening {} with redb page cache = {} MB \
+             (set TRUSTY_REDB_CACHE_MB to override)",
+            path.display(),
+            cache_bytes / (1024 * 1024),
+        );
         let db = Database::builder()
-            .set_cache_size(REDB_CACHE_SIZE_BYTES)
+            .set_cache_size(cache_bytes)
             .create(path)
             .with_context(|| format!("open redb corpus at {}", path.display()))?;
         // Materialize both tables in a committed write txn so later read-only
@@ -765,6 +808,54 @@ mod tests {
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
             virtual_terms: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn redb_cache_size_default_and_env_override() {
+        // Idle-memory audit: the redb page cache defaults to 512 MB and is
+        // overridable via TRUSTY_REDB_CACHE_MB. This test mutates a
+        // process-global env var, so it is intentionally self-contained
+        // (save/restore the prior value) — no other test in this module reads
+        // TRUSTY_REDB_CACHE_MB.
+        let prior = std::env::var("TRUSTY_REDB_CACHE_MB").ok();
+
+        // Default: unset → 512 MB.
+        // SAFETY: corpus tests do not mutate this env var concurrently.
+        unsafe { std::env::remove_var("TRUSTY_REDB_CACHE_MB") };
+        assert_eq!(
+            redb_cache_size_bytes(),
+            DEFAULT_REDB_CACHE_MB * 1024 * 1024
+        );
+
+        // Valid override wins.
+        // SAFETY: see above.
+        unsafe { std::env::set_var("TRUSTY_REDB_CACHE_MB", "1024") };
+        assert_eq!(redb_cache_size_bytes(), 1024 * 1024 * 1024);
+
+        // Zero falls back to the default.
+        // SAFETY: see above.
+        unsafe { std::env::set_var("TRUSTY_REDB_CACHE_MB", "0") };
+        assert_eq!(
+            redb_cache_size_bytes(),
+            DEFAULT_REDB_CACHE_MB * 1024 * 1024
+        );
+
+        // Garbage falls back to the default (with a warn).
+        // SAFETY: see above.
+        unsafe { std::env::set_var("TRUSTY_REDB_CACHE_MB", "not-a-number") };
+        assert_eq!(
+            redb_cache_size_bytes(),
+            DEFAULT_REDB_CACHE_MB * 1024 * 1024
+        );
+
+        // Restore.
+        // SAFETY: see above.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_REDB_CACHE_MB", v),
+                None => std::env::remove_var("TRUSTY_REDB_CACHE_MB"),
+            }
         }
     }
 
