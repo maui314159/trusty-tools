@@ -213,15 +213,17 @@ pub fn palace_activity_state(
 
 /// Whether to keep a palace in the visible list.
 ///
-/// Why: palaces with no vectors AND no KG triples carry no useful content for
-/// recall or graph queries, so they clutter the list. Filtering them out at the
-/// row-builder level keeps the filter / sort / group helpers downstream
-/// unchanged.
-/// What: returns `false` when both `vector_count == 0` and `kg_triple_count
-/// == 0`; otherwise `true`.
+/// Why: palaces with no vectors, no KG triples, AND no drawers carry no
+/// user-visible content and would only clutter the list. A palace with drawers
+/// but no vectors is one whose memories have been stored but not yet embedded
+/// (e.g. the embedding model has not run yet); hiding it causes confusion
+/// because the palace clearly exists and has written content. Including
+/// `drawer_count > 0` in the gate keeps such palaces visible in the TUI.
+/// What: returns `true` when any of `vector_count`, `kg_triple_count`, or
+/// `drawer_count` is non-zero; returns `false` only when all three are zero.
 /// Test: `test_filter_empty_palaces`.
 pub fn palace_has_content(palace: &PalaceRow) -> bool {
-    palace.vector_count > 0 || palace.kg_triple_count > 0
+    palace.vector_count > 0 || palace.kg_triple_count > 0 || palace.drawer_count > 0
 }
 
 /// Render a `chrono::Duration` as a compact human-readable relative time.
@@ -2338,8 +2340,10 @@ mod tests {
 
     #[test]
     fn test_filter_empty_palaces() {
-        // A palace with zero vectors AND zero KG triples is hidden; a palace
-        // with either non-zero count stays visible.
+        // A palace is hidden only when ALL of vector_count, kg_triple_count,
+        // and drawer_count are zero. A palace with drawers but no vectors (e.g.
+        // memories stored but not yet embedded) must remain visible — this was
+        // the root cause of the claude-mpm palace not appearing in the TUI.
         let mut state = MemoryTuiState::new("http://x");
         state.palaces = vec![
             PalaceRow {
@@ -2355,20 +2359,31 @@ mod tests {
                 ..Default::default()
             },
             PalaceRow {
+                id: "drawer-only".into(),
+                name: "drawer-only".into(),
+                drawer_count: 18,
+                ..Default::default()
+            },
+            PalaceRow {
                 id: "empty".into(),
                 name: "empty".into(),
                 ..Default::default()
             },
         ];
         let visible = filtered_sorted_palaces(&state);
-        assert_eq!(visible.len(), 2, "empty palace dropped");
+        assert_eq!(visible.len(), 3, "only truly empty palace dropped");
         assert!(visible.iter().any(|p| p.id == "vec-only"));
         assert!(visible.iter().any(|p| p.id == "kg-only"));
+        assert!(
+            visible.iter().any(|p| p.id == "drawer-only"),
+            "drawer-only palace must be visible (has stored memories, not yet embedded)"
+        );
         assert!(!visible.iter().any(|p| p.id == "empty"));
 
         // palace_lines reflects the same filter.
         let rows = palace_lines(&state);
         assert!(!rows.iter().any(|r| r.text.contains("empty")));
+        assert!(rows.iter().any(|r| r.text.contains("drawer-o")));
     }
 
     #[test]
