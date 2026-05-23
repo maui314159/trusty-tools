@@ -18,8 +18,16 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Default address for trusty-memory when `~/.trusty-memory/http_addr` is absent.
+///
+/// Why: must match the trusty-memory daemon's own `DEFAULT_HTTP_PORT` (7070,
+/// see `crates/trusty-memory/src/lib.rs`) — otherwise clients that fall through
+/// to this default hit a port nothing is listening on (issue: dream cycle log
+/// flood). The trusty-memory daemon picks dynamically from 7070..=7079 and
+/// writes the bound address to the lock file; the historical 3038 default did
+/// not match any port the daemon ever binds.
+/// What: `127.0.0.1:7070` — matches the trusty-memory daemon default.
 /// Only used as a last resort — never embed this literal at call sites.
-pub const TRUSTY_MEMORY_DEFAULT_ADDR: &str = "127.0.0.1:3038";
+pub const TRUSTY_MEMORY_DEFAULT_ADDR: &str = "127.0.0.1:7070";
 
 /// Default address for trusty-search when `~/.trusty-search/http_addr` is absent.
 /// Only used as a last resort — never embed this literal at call sites.

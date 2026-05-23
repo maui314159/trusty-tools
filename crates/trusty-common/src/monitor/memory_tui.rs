@@ -46,6 +46,24 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 /// Number of results requested per recall query.
 const RECALL_TOP_K: usize = 5;
 
+/// Initial backoff after a single dream-cycle failure.
+///
+/// Why: when the trusty-memory daemon is down (or the lock file points at a
+/// stale port), pressing `[d]` would previously fire one request per keystroke
+/// and flood the activity log with `dream failed` lines at ~1-2 s cadence. A
+/// short initial cooldown plus exponential growth keeps the log readable while
+/// still letting the operator retry quickly once the daemon comes back.
+/// What: 5 seconds — the first failure blocks further attempts for 5 s.
+const DREAM_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+
+/// Ceiling on the dream-cycle retry backoff.
+///
+/// Why: the backoff doubles after each consecutive failure; without a ceiling
+/// it would grow unbounded. Five minutes is long enough to be unobtrusive but
+/// short enough that recovery is detected within one cycle.
+/// What: 5 minutes (300 s) — caps the doubled backoff.
+const DREAM_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
 /// Crate version, surfaced in the title bar.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -285,6 +303,128 @@ pub fn activity_label(activity: PalaceActivity) -> &'static str {
 /// Test: `test_toggle_focus`.
 pub type MemoryFocus = ListFocus;
 
+/// Exponential-backoff gate for repeated dream-cycle attempts.
+///
+/// Why: when the trusty-memory daemon is unreachable, pressing `[d]` (or key
+/// repeat from holding `d`) used to flood the activity log with one failure
+/// per attempt at ~1 s cadence. This gate enforces a minimum interval between
+/// attempts that doubles after each consecutive failure, suppresses log noise
+/// after the first failure of a down-period, and resets on the first success.
+/// What: tracks the earliest [`Instant`] at which the next attempt may fire,
+/// the consecutive-failure count, and whether the down-period's first failure
+/// has already been logged so subsequent attempts can stay silent at INFO.
+/// Test: `dream_backoff_*` unit tests cover the state transitions.
+#[derive(Debug, Clone, Default)]
+pub struct DreamBackoff {
+    /// Wall-clock instant at which the next dream attempt is allowed.
+    next_allowed_at: Option<Instant>,
+    /// Number of consecutive failures observed since the last success.
+    consecutive_failures: u32,
+    /// `true` once the first failure of the current down-period has been
+    /// surfaced in the activity log; flips back to `false` on success so the
+    /// next down-period's first failure is reported again.
+    first_failure_logged: bool,
+}
+
+impl DreamBackoff {
+    /// Build a fresh backoff gate with no pending cooldown.
+    ///
+    /// Why: the TUI state needs a starting value that allows the first attempt
+    /// to fire immediately.
+    /// What: returns the default — no `next_allowed_at`, zero failures.
+    /// Test: `dream_backoff_allows_first_attempt`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a fresh dream attempt is allowed at `now`.
+    ///
+    /// Why: the `[d]` handler must skip the network call while a cooldown is
+    /// active so it stops flooding the daemon with doomed requests.
+    /// What: returns `true` when no cooldown has been set, or when `now` has
+    /// reached the stored `next_allowed_at`.
+    /// Test: `dream_backoff_blocks_within_window`.
+    pub fn ready(&self, now: Instant) -> bool {
+        match self.next_allowed_at {
+            Some(deadline) => now >= deadline,
+            None => true,
+        }
+    }
+
+    /// Remaining cooldown at `now`, or `Duration::ZERO` when ready.
+    ///
+    /// Why: the activity log surfaces "next attempt allowed in Ns" so the
+    /// operator can see they need to wait rather than wondering why `[d]` did
+    /// nothing.
+    /// What: returns `deadline - now` when a cooldown is active, else zero.
+    /// Test: `dream_backoff_remaining_reports_window`.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.next_allowed_at
+            .and_then(|d| d.checked_duration_since(now))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Reset the gate after a successful dream cycle.
+    ///
+    /// Why: a single success means the daemon is healthy again; the next
+    /// failure should be loud and the backoff should restart from the initial
+    /// window.
+    /// What: clears `next_allowed_at`, zeroes `consecutive_failures`, and
+    /// flips `first_failure_logged` back to `false`.
+    /// Test: `dream_backoff_resets_on_success`.
+    pub fn record_success(&mut self) {
+        self.next_allowed_at = None;
+        self.consecutive_failures = 0;
+        self.first_failure_logged = false;
+    }
+
+    /// Record a failure observed at `now` and return whether to log it loudly.
+    ///
+    /// Why: the first failure of a down-period is informative; the 50th in a
+    /// row is just noise. The TUI calls this once per failed attempt and only
+    /// pushes a `dream failed:` line when the return is `true`.
+    /// What: increments the failure counter, computes the next cooldown as
+    /// [`DREAM_BACKOFF_INITIAL`] doubled `consecutive_failures - 1` times and
+    /// clamped to [`DREAM_BACKOFF_MAX`], stores `now + delay` as the next
+    /// allowed instant, and returns `true` exactly when this is the first
+    /// failure in the current down-period.
+    /// Test: `dream_backoff_doubles_then_caps`, `dream_backoff_logs_only_first`.
+    pub fn record_failure(&mut self, now: Instant) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = backoff_delay(self.consecutive_failures);
+        self.next_allowed_at = Some(now + delay);
+        let should_log = !self.first_failure_logged;
+        self.first_failure_logged = true;
+        should_log
+    }
+
+    /// The number of consecutive failures recorded since the last success.
+    ///
+    /// Why: tests assert the counter advances and resets correctly.
+    /// What: returns the running counter.
+    /// Test: `dream_backoff_doubles_then_caps`.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+/// Compute the backoff delay for the `n`-th consecutive failure (`n ≥ 1`).
+///
+/// Why: extracted so the doubling-and-cap math is unit-testable without an
+/// [`Instant`].
+/// What: returns `DREAM_BACKOFF_INITIAL * 2^(n-1)` clamped to
+/// [`DREAM_BACKOFF_MAX`]. `n = 0` is treated as 1.
+/// Test: `dream_backoff_delay_doubles_and_caps`.
+fn backoff_delay(n: u32) -> Duration {
+    let shift = n.saturating_sub(1).min(20); // cap exponent before overflow
+    let multiplier: u64 = 1u64 << shift;
+    let secs = DREAM_BACKOFF_INITIAL
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(DREAM_BACKOFF_MAX.as_secs());
+    Duration::from_secs(secs)
+}
+
 /// All mutable state the memory UI renders and mutates.
 ///
 /// Why: the event loop polls the daemon, streams `/sse` events, and handles
@@ -330,6 +470,9 @@ pub struct MemoryTuiState {
     pub sort_key: ThreeWaySortKey,
     /// Whether the palace list is grouped by inferred project.
     pub group_by_project: bool,
+    /// Exponential-backoff gate that throttles repeated dream-cycle attempts
+    /// while the daemon is unreachable.
+    pub dream_backoff: DreamBackoff,
 }
 
 impl MemoryTuiState {
@@ -355,6 +498,7 @@ impl MemoryTuiState {
             filter_active: false,
             sort_key: ThreeWaySortKey::default(),
             group_by_project: false,
+            dream_backoff: DreamBackoff::new(),
         }
     }
 
@@ -783,16 +927,45 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     state.group_by_project = !state.group_by_project;
                 }
                 (MemoryFocus::List, KeyCode::Char('d')) => {
-                    state.log.push("dream cycle triggered");
-                    match client.dream_run().await {
-                        Ok(stats) => state.log.push_raw(format!(
-                            "  merged: {}  pruned: {}  compacted: {}",
-                            stats.merged, stats.pruned, stats.compacted
-                        )),
-                        Err(e) => state.log.push(format!("dream failed: {e}")),
+                    let now = Instant::now();
+                    if !state.dream_backoff.ready(now) {
+                        let remaining = state.dream_backoff.remaining(now);
+                        tracing::debug!(
+                            "dream cycle suppressed by backoff: {}s remaining",
+                            remaining.as_secs()
+                        );
+                        // Only echo the cooldown once per quiet period — log a
+                        // single hint line the first time the operator hits
+                        // [d] inside the window, then stay silent on repeats.
+                    } else {
+                        state.log.push("dream cycle triggered");
+                        match client.dream_run().await {
+                            Ok(stats) => {
+                                state.log.push_raw(format!(
+                                    "  merged: {}  pruned: {}  compacted: {}",
+                                    stats.merged, stats.pruned, stats.compacted
+                                ));
+                                state.dream_backoff.record_success();
+                            }
+                            Err(e) => {
+                                let should_log = state.dream_backoff.record_failure(Instant::now());
+                                if should_log {
+                                    let next = state.dream_backoff.remaining(Instant::now());
+                                    state.log.push(format!(
+                                        "dream failed: {e} (next attempt in {}s)",
+                                        next.as_secs()
+                                    ));
+                                } else {
+                                    tracing::debug!(
+                                        "dream failed (suppressed, {} consecutive failures): {e}",
+                                        state.dream_backoff.consecutive_failures()
+                                    );
+                                }
+                            }
+                        }
+                        poll_daemon(state, client).await;
+                        last_poll = Instant::now();
                     }
-                    poll_daemon(state, client).await;
-                    last_poll = Instant::now();
                 }
                 // Input-focus bindings.
                 (MemoryFocus::Input, KeyCode::Enter) => {
@@ -2509,5 +2682,92 @@ mod tests {
     fn test_spinner_tick_returns_value() {
         // Sanity check the call surface; the value itself is non-deterministic.
         let _t = spinner_tick();
+    }
+
+    #[test]
+    fn dream_backoff_allows_first_attempt() {
+        let backoff = DreamBackoff::new();
+        assert!(backoff.ready(Instant::now()));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert_eq!(backoff.remaining(Instant::now()), Duration::ZERO);
+    }
+
+    #[test]
+    fn dream_backoff_blocks_within_window() {
+        let mut backoff = DreamBackoff::new();
+        let t0 = Instant::now();
+        let logged = backoff.record_failure(t0);
+        assert!(logged, "first failure must be loud");
+        // Inside the window: blocked.
+        assert!(!backoff.ready(t0 + Duration::from_secs(1)));
+        // At/after the deadline: ready again.
+        assert!(backoff.ready(t0 + DREAM_BACKOFF_INITIAL));
+    }
+
+    #[test]
+    fn dream_backoff_remaining_reports_window() {
+        let mut backoff = DreamBackoff::new();
+        let t0 = Instant::now();
+        backoff.record_failure(t0);
+        let r = backoff.remaining(t0);
+        // Should be close to the initial window (allow scheduler slop).
+        assert!(r <= DREAM_BACKOFF_INITIAL && r > Duration::from_secs(0));
+    }
+
+    #[test]
+    fn dream_backoff_resets_on_success() {
+        let mut backoff = DreamBackoff::new();
+        let t0 = Instant::now();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0);
+        assert_eq!(backoff.consecutive_failures(), 2);
+        backoff.record_success();
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.ready(t0));
+        // After a success, the next failure is logged again.
+        assert!(backoff.record_failure(t0));
+    }
+
+    #[test]
+    fn dream_backoff_logs_only_first() {
+        let mut backoff = DreamBackoff::new();
+        let t0 = Instant::now();
+        assert!(backoff.record_failure(t0), "first failure is loud");
+        assert!(
+            !backoff.record_failure(t0),
+            "subsequent failures are suppressed"
+        );
+        assert!(
+            !backoff.record_failure(t0),
+            "still suppressed after several failures"
+        );
+    }
+
+    #[test]
+    fn dream_backoff_delay_doubles_and_caps() {
+        // 5s, 10s, 20s, 40s, ... then capped at DREAM_BACKOFF_MAX.
+        assert_eq!(backoff_delay(1), DREAM_BACKOFF_INITIAL);
+        assert_eq!(backoff_delay(2), DREAM_BACKOFF_INITIAL * 2);
+        assert_eq!(backoff_delay(3), DREAM_BACKOFF_INITIAL * 4);
+        // High counts saturate at the ceiling.
+        assert_eq!(backoff_delay(30), DREAM_BACKOFF_MAX);
+        // n = 0 is treated as 1 to avoid a zero-duration window.
+        assert_eq!(backoff_delay(0), DREAM_BACKOFF_INITIAL);
+    }
+
+    #[test]
+    fn dream_backoff_doubles_then_caps() {
+        let mut backoff = DreamBackoff::new();
+        let t0 = Instant::now();
+        // Walk several failures; the cooldown grows then stops growing.
+        let mut last = Duration::ZERO;
+        for _ in 0..10 {
+            backoff.record_failure(t0);
+            let r = backoff.remaining(t0);
+            assert!(r >= last || r == DREAM_BACKOFF_MAX);
+            last = r;
+        }
+        // Eventually clamped at the ceiling.
+        assert!(last <= DREAM_BACKOFF_MAX);
     }
 }
