@@ -2080,17 +2080,49 @@ fn index_disk_and_mtime(index_id: &str) -> (Option<u64>, Option<String>) {
         return (None, None);
     }
     let disk_bytes = Some(trusty_common::sys_metrics::dir_size_bytes(&dir));
-    // `chunks.json` is rewritten on every successful reindex commit, so its
-    // mtime is the most accurate "last indexed" signal we have without
-    // persisting a dedicated timestamp.
-    let last_indexed = std::fs::metadata(dir.join("chunks.json"))
-        .ok()
+    // Issue #80: after the redb cutover (issue #28), `chunks.json` is no
+    // longer rewritten on every commit — the durable corpus lives in
+    // `index.redb`. The previous implementation read `chunks.json` mtime
+    // unconditionally and returned `null` for every post-cutover index,
+    // making `last_indexed` permanently stale.
+    //
+    // Why: callers (admin UI, MCP `index_status`) rely on this field to
+    // show "indexed N seconds ago"; a permanent null hides actual freshness.
+    // What: probe `index.redb` first (current authoritative file rewritten
+    // by every redb commit / atomic swap), then fall back to `chunks.json`
+    // for un-migrated indexes (the legacy JSON snapshot still rewritten by
+    // the migration shim). The first existing file wins.
+    // Test: `index_disk_and_mtime_handles_missing_dir` (this fn) +
+    // `last_indexed_prefers_redb_then_chunks_json` (the pure selector below).
+    let last_indexed = first_existing_mtime_rfc3339(&dir, &["index.redb", "chunks.json"]);
+    (disk_bytes, last_indexed)
+}
+
+/// Return the modification time (as an RFC3339 string) of the first file in
+/// `candidates` that exists under `dir`.
+///
+/// Why (issue #80): after the redb cutover (issue #28) `chunks.json` is no
+/// longer rewritten on every commit, so reading its mtime returned `null`
+/// for every migrated index. The freshness signal must prefer the current
+/// authoritative file (`index.redb`, rewritten by every redb commit / atomic
+/// swap) and only fall back to the legacy JSON snapshot for un-migrated
+/// indexes. Extracting the selection into a pure function (path in, optional
+/// string out) makes the precedence rule unit-testable without mutating the
+/// process-wide data-dir env vars that `index_disk_and_mtime` depends on.
+/// What: probes each candidate filename in order, returns the RFC3339-encoded
+/// mtime of the first one that exists and whose metadata is readable, or
+/// `None` when none exist.
+/// Test: `last_indexed_prefers_redb_then_chunks_json` and
+/// `last_indexed_none_when_no_candidates_exist`.
+fn first_existing_mtime_rfc3339(dir: &std::path::Path, candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find_map(|name| std::fs::metadata(dir.join(name)).ok())
         .and_then(|m| m.modified().ok())
         .map(|t| {
             let dt: chrono::DateTime<chrono::Utc> = t.into();
             dt.to_rfc3339()
-        });
-    (disk_bytes, last_indexed)
+        })
 }
 
 async fn index_status_handler(
@@ -2130,10 +2162,26 @@ async fn index_status_handler(
     // per-index data directory; absent / unreadable values degrade to null
     // so a fresh (never-reindexed) index still returns a 200.
     let (disk_bytes, last_indexed) = index_disk_and_mtime(&index_id.0);
+    // Issue #80: surface a coarse lifecycle status. Read the `ReindexStatus`
+    // off the per-index `ReindexProgress` (when present) so we distinguish
+    // `Running` (still indexing) from `Complete` / `AbortedMemory` /
+    // `Failed` (terminal). The progress entry sticks around for ~60 s after
+    // completion so late SSE subscribers can replay the terminal event; we
+    // map any terminal state to `"ready"` so callers don't see `"indexing"`
+    // for a minute after a finished reindex.
+    let status = match state
+        .reindex_progress
+        .get(&index_id)
+        .map(|p| p.status.load())
+    {
+        Some(ReindexStatus::Running) => "indexing",
+        _ => "ready",
+    };
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "root_path": handle.root_path,
         "chunk_count": indexer.chunk_count(),
+        "status": status,
         "path_filter": path_filter,
         "has_context_embedding": has_context_embedding,
         "context_summary": context_summary,
@@ -3497,6 +3545,74 @@ mod tests {
         assert_eq!(json, "\"abortedmemory\"");
     }
 
+    /// Issue #80 — `GET /indexes/:id/status` reports `"indexing"` while a
+    /// reindex is `Running` and `"ready"` once it reaches a terminal state.
+    ///
+    /// Why: the admin UI / MCP `index_status` consumers relied on a `status`
+    /// field that previously did not exist, so a long-running reindex looked
+    /// identical to an idle index. Mapping the live `ReindexStatus` lets
+    /// callers show an "indexing…" spinner and avoids reporting `"ready"`
+    /// mid-reindex.
+    /// What: stages a bare index, drives the per-index `ReindexProgress`
+    /// through `Running` then `Complete`, and asserts the handler's `status`
+    /// field flips from `"indexing"` to `"ready"`.
+    /// Test: this test.
+    #[tokio::test]
+    async fn index_status_reports_indexing_then_ready() {
+        use crate::core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+        use crate::service::reindex::{ReindexProgress, ReindexStatus};
+        use tokio::sync::RwLock;
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("status-test");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(CodeIndexer::new("status-test", tmp.path()))),
+            tmp.path().to_path_buf(),
+        ));
+        let state = Arc::new(SearchAppState::new(registry));
+
+        // No progress entry yet → idle index reports "ready".
+        let Json(idle) = index_status_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path("status-test".to_string()),
+        )
+        .await
+        .expect("status 200");
+        assert_eq!(idle["status"], "ready", "idle index must report ready");
+
+        // A Running reindex must surface "indexing".
+        let progress = Arc::new(ReindexProgress::new()); // defaults to Running
+        state.reindex_progress.insert(id.clone(), progress.clone());
+        let Json(running) = index_status_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path("status-test".to_string()),
+        )
+        .await
+        .expect("status 200");
+        assert_eq!(
+            running["status"], "indexing",
+            "running reindex must report indexing"
+        );
+
+        // A terminal state maps back to "ready".
+        progress.status.store(ReindexStatus::Complete);
+        let Json(done) = index_status_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path("status-test".to_string()),
+        )
+        .await
+        .expect("status 200");
+        assert_eq!(
+            done["status"], "ready",
+            "completed reindex must report ready"
+        );
+    }
+
     /// Issue #35 — `GET /health` carries the enriched resource fields
     /// (`rss_mb`, `rss_limit_mb`, `disk_bytes`, `cpu_pct`).
     ///
@@ -3537,6 +3653,67 @@ mod tests {
         let (disk, mtime) = index_disk_and_mtime(&id);
         assert!(disk.is_none(), "missing dir yields no disk_bytes");
         assert!(mtime.is_none(), "missing dir yields no last_indexed");
+    }
+
+    /// Issue #80 — `first_existing_mtime_rfc3339` prefers `index.redb` over the
+    /// legacy `chunks.json`, and falls back to `chunks.json` when only it
+    /// exists.
+    ///
+    /// Why: the redb cutover left `last_indexed` permanently `null` because the
+    /// selector read `chunks.json` (no longer rewritten) instead of the live
+    /// `index.redb`. This pins the precedence so a regression re-introducing
+    /// the JSON-only read is caught without standing up a daemon.
+    /// What: writes both files into a tempdir, asserts the returned mtime
+    /// matches `index.redb` (made strictly newer than `chunks.json`); then a
+    /// chunks.json-only dir returns that file's mtime.
+    /// Test: this test.
+    #[test]
+    fn last_indexed_prefers_redb_then_chunks_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+
+        // Legacy snapshot first (older), then the authoritative redb (newer).
+        std::fs::write(dir.join("chunks.json"), b"[]").expect("write chunks.json");
+        // Ensure a strictly later mtime for index.redb so the assertion that we
+        // picked redb (not chunks.json) is unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.join("index.redb"), b"redb").expect("write index.redb");
+
+        let redb_mtime = std::fs::metadata(dir.join("index.redb"))
+            .and_then(|m| m.modified())
+            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+            .expect("redb mtime");
+
+        let got = first_existing_mtime_rfc3339(dir, &["index.redb", "chunks.json"]);
+        assert_eq!(
+            got.as_deref(),
+            Some(redb_mtime.as_str()),
+            "selector must prefer index.redb mtime over chunks.json"
+        );
+
+        // chunks.json-only fallback (un-migrated index).
+        let tmp2 = tempfile::tempdir().expect("tempdir2");
+        std::fs::write(tmp2.path().join("chunks.json"), b"[]").expect("write chunks.json");
+        let fallback = first_existing_mtime_rfc3339(tmp2.path(), &["index.redb", "chunks.json"]);
+        assert!(
+            fallback.is_some(),
+            "selector must fall back to chunks.json when index.redb is absent"
+        );
+    }
+
+    /// Issue #80 — `first_existing_mtime_rfc3339` returns `None` when none of
+    /// the candidate files exist.
+    ///
+    /// Why: a freshly-registered index has neither file; the selector must
+    /// degrade to `None` so the handler reports `last_indexed: null` rather
+    /// than panicking.
+    /// What: calls the selector against an empty tempdir and asserts `None`.
+    /// Test: this test.
+    #[test]
+    fn last_indexed_none_when_no_candidates_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let got = first_existing_mtime_rfc3339(tmp.path(), &["index.redb", "chunks.json"]);
+        assert!(got.is_none(), "no candidate files → None");
     }
 
     /// Issue #38 — `/health` includes the `embedder_info` block once an
