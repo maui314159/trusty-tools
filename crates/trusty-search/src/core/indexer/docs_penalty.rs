@@ -121,17 +121,59 @@ fn has_extension(path: &str, exts: &[&str]) -> bool {
     exts.iter().any(|ext| lower.ends_with(ext))
 }
 
+/// Path-fragment exclusions that drop chunks from `SearchMode::Code` regardless
+/// of extension (issue #78).
+///
+/// Why: vendored / patch directories that live under the workspace root but
+/// are not part of the primary source tree contaminate code-mode rankings
+/// with `.py` / `.md` chunks that happen to BM25-match a Rust symbol name.
+/// `claude-mpm-patch/` is the canonical offender in this repo — a vendored
+/// Python project whose docs and source routinely out-rank real Rust code
+/// for queries like "CodeChunk struct" and "apply_archive_downrank".
+/// What: case-insensitive substring check against the chunk file path (with
+/// `/` normalised). Any path containing one of these fragments is excluded
+/// from code-mode results. Text and Data modes are not affected — a user
+/// who asks for prose in `claude-mpm-patch/docs/` can still get it.
+/// Test: `test_code_mode_excludes_claude_mpm_patch_paths`.
+const CODE_EXCLUDED_PATH_FRAGMENTS: &[&str] = &["claude-mpm-patch/"];
+
+/// True iff `path` contains any of the code-mode path-exclusion fragments.
+///
+/// Why: shared between [`is_allowed_for_mode`] and [`doc_score_penalty`] so
+/// the two stay in lock-step.
+/// What: lowercases the path once (cheap — same as `has_extension`) and
+/// checks each fragment with `contains`. Fragments are authored with `/` so
+/// they will not false-match a similarly-named file (e.g. a `.rs` file with
+/// `claude-mpm-patch` in its name).
+/// Test: implicitly via `test_code_mode_excludes_claude_mpm_patch_paths`.
+fn has_excluded_code_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    CODE_EXCLUDED_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| lower.contains(frag))
+}
+
 /// Decide whether a chunk's file is in the allowed set for the requested
-/// search mode (issue #77, final design).
+/// search mode (issue #77, final design; #78 extends with path-exclusion).
 ///
 /// Why: post-RRF filtering — each mode returns ONLY chunks whose file type
 /// is in its allowed bucket. Replaces the prior penalty matrix entirely.
+/// Issue #78 adds a path-fragment blacklist that drops chunks from
+/// `SearchMode::Code` for vendored / patch directories that live under the
+/// workspace root but are not primary source.
 /// What: dispatches on [`SearchMode`] and runs the matching extension /
-/// name-prefix check. `SearchMode::All` short-circuits to `true`.
+/// name-prefix check. For `Code` mode additionally rejects any path
+/// containing a [`CODE_EXCLUDED_PATH_FRAGMENTS`] entry. `SearchMode::All`
+/// short-circuits to `true`.
 /// Test: see the per-mode tests in the `tests` submodule.
 pub(crate) fn is_allowed_for_mode(chunk_file: &str, mode: SearchMode) -> bool {
     match mode {
-        SearchMode::Code => has_extension(chunk_file, CODE_EXTENSIONS),
+        SearchMode::Code => {
+            if has_excluded_code_path(chunk_file) {
+                return false;
+            }
+            has_extension(chunk_file, CODE_EXTENSIONS)
+        }
         SearchMode::Text => {
             if has_extension(chunk_file, TEXT_EXTENSIONS) {
                 return true;
@@ -432,6 +474,46 @@ mod tests {
         assert!(is_allowed_for_mode("Cargo.toml", SearchMode::Data));
         assert!(!is_allowed_for_mode("Cargo.toml", SearchMode::Text));
         assert!(!is_allowed_for_mode("Cargo.toml", SearchMode::Code));
+    }
+
+    // ---- issue #78: cross-project path exclusion in code mode ----------
+
+    #[test]
+    fn test_code_mode_excludes_claude_mpm_patch_paths() {
+        // Why: `claude-mpm-patch/` is a vendored Python project under the
+        // trusty-tools workspace root. Its `.py` / `.md` chunks routinely
+        // out-ranked real Rust code in code-mode results because they
+        // BM25-match identifier names. Issue #78 hard-filters them out.
+        for path in &[
+            "claude-mpm-patch/src/main.py",
+            "claude-mpm-patch/docs/intro.md",
+            "claude-mpm-patch/CHANGELOG.md",
+            "CLAUDE-MPM-PATCH/src/foo.py",
+            "some/nested/claude-mpm-patch/file.py",
+        ] {
+            assert!(
+                !is_allowed_for_mode(path, SearchMode::Code),
+                "{path}: expected to be excluded from code mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_mode_exclusion_does_not_affect_other_modes() {
+        // Why: the exclusion is code-mode only. A user querying `text` mode
+        // for prose in the vendored project should still see those docs.
+        assert!(is_allowed_for_mode(
+            "claude-mpm-patch/docs/intro.md",
+            SearchMode::Text
+        ));
+        assert!(is_allowed_for_mode(
+            "claude-mpm-patch/config.json",
+            SearchMode::Data
+        ));
+        assert!(is_allowed_for_mode(
+            "claude-mpm-patch/src/main.py",
+            SearchMode::All
+        ));
     }
 
     #[test]

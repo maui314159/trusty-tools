@@ -554,6 +554,18 @@ impl CodeIndexer {
         // outside that set are dropped from the result list entirely.
         // `SearchMode::All` short-circuits to "everything allowed" so the
         // raw RRF ranking surfaces unchanged.
+        //
+        // Issue #78: in `SearchMode::Code` we additionally drop chunks whose
+        // `chunk_type` is `Docstring`. The docs_penalty file-type filter
+        // already rejects .md / prose extensions, but a `Docstring` chunk
+        // attached to a `.rs` file (extracted by the chunker from a `///`
+        // doc-comment block) still carries prose tokens that BM25 weights
+        // highly for symbol-name queries. Filtering by chunk_type at this
+        // stage keeps code-mode results to actual executable Rust.
+        if matches!(mode, super::SearchMode::Code) {
+            use crate::core::chunker::ChunkType;
+            results.retain(|chunk| !matches!(chunk.chunk_type, ChunkType::Docstring));
+        }
         results.retain(|chunk| docs_penalty::is_allowed_for_mode(&chunk.file, mode));
 
         // Issue #75: archive downranking still applies after the file-type
