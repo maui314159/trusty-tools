@@ -877,6 +877,112 @@ async fn test_conceptual_does_not_demote_docs() {
     );
 }
 
+/// Issue #79 regression: a Definition-intent query against a corpus where
+/// the matching content lives ONLY in markdown docs must still return
+/// results when the caller uses the default mode.
+///
+/// Why: production v0.4.4 reported "UserPromptSubmit hook registration"
+/// (Definition intent, default Code mode) returning zero results, because
+/// the intent override to `All` mode was being undermined elsewhere in the
+/// pipeline. The previous `test_conceptual_does_not_demote_docs` only
+/// checked that .md docs *survived* alongside .rs source; it did not
+/// exercise the docs-only path where the source-file fallback hides the
+/// bug.
+/// What: index a single .md chunk describing a hook registration concept
+/// (no matching .rs file at all), classify as Definition via a PascalCase
+/// trigger, run the search in default mode, and assert non-empty results.
+/// Test: this test.
+#[tokio::test]
+async fn test_definition_default_mode_returns_docs_when_no_source_matches() {
+    use crate::core::classifier::{QueryClassifier, QueryIntent};
+
+    // Sanity: ensure the query phrase classifies as Definition so this
+    // test exercises the intent-override code path.
+    let intent = QueryClassifier::classify("UserPromptSubmit hook registration");
+    assert_eq!(
+        intent,
+        QueryIntent::Definition,
+        "test pre-condition: PascalCase identifier should classify as Definition"
+    );
+
+    let idx = make_indexer();
+    idx.add_chunk(raw(
+        "doc:1",
+        "docs/HOOKS.md",
+        "# UserPromptSubmit hook registration\n\
+         The UserPromptSubmit hook fires whenever the user submits a prompt. \
+         Register your hook handler via the registration API to receive these events.",
+    ))
+    .await
+    .unwrap();
+
+    let q = SearchQuery {
+        text: "UserPromptSubmit hook registration".to_string(),
+        top_k: 10,
+        expand_graph: false,
+        compact: false,
+        // Default mode (SearchMode::Code) — the intent override must promote
+        // to All so the .md chunk survives the post-filter.
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert!(
+        !results.is_empty(),
+        "Definition-intent query against docs-only corpus returned 0 results — \
+         the intent-aware mode override is broken (issue #79)"
+    );
+    assert!(
+        results.iter().any(|c| c.file.ends_with(".md")),
+        "expected the .md chunk to survive the post-filter, got: {:?}",
+        results.iter().map(|c| &c.file).collect::<Vec<_>>()
+    );
+}
+
+/// Issue #79 regression: a Conceptual-intent query against a docs-only
+/// corpus must return results even when the caller uses the default mode.
+///
+/// Why: parallel to `test_definition_default_mode_returns_docs_when_no_source_matches`
+/// but for Conceptual intent ("how does the X work" queries that should
+/// retrieve architecture / overview docs).
+/// What: index a single .md chunk, run a "how does ..." query, assert
+/// non-empty results in default mode.
+/// Test: this test.
+#[tokio::test]
+async fn test_conceptual_default_mode_returns_docs_when_no_source_matches() {
+    use crate::core::classifier::{QueryClassifier, QueryIntent};
+
+    let intent = QueryClassifier::classify("how does the hook system work");
+    assert_eq!(
+        intent,
+        QueryIntent::Conceptual,
+        "test pre-condition: 'how does' should classify as Conceptual"
+    );
+
+    let idx = make_indexer();
+    idx.add_chunk(raw(
+        "doc:1",
+        "docs/ARCHITECTURE.md",
+        "## How the hook system works\n\
+         The hook system dispatches events to registered handlers in priority order.",
+    ))
+    .await
+    .unwrap();
+
+    let q = SearchQuery {
+        text: "how does the hook system work".to_string(),
+        top_k: 10,
+        expand_graph: false,
+        compact: false,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert!(
+        !results.is_empty(),
+        "Conceptual-intent query against docs-only corpus returned 0 results — \
+         the intent-aware mode override is broken (issue #79)"
+    );
+}
+
 #[tokio::test]
 async fn test_kg_results_survive_top_k_truncation() {
     // Why: issue #94 — KG-expanded neighbours used to be appended after
