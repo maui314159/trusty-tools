@@ -28,7 +28,7 @@ use trusty_common::memory_core::community::KnowledgeGap;
 use trusty_common::memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_common::memory_core::retrieval::{
-    recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
+    RecallResult, recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
     recall_with_default_embedder,
 };
 use trusty_common::memory_core::store::kg::Triple;
@@ -911,17 +911,34 @@ async fn recall_handler(
     }
     .map_err(|e| ApiError::internal(format!("recall: {e:#}")))?;
 
-    let payload: Vec<Value> = results
-        .into_iter()
-        .map(|r| {
-            json!({
-                "drawer": r.drawer,
-                "score": r.score,
-                "layer": r.layer,
-            })
-        })
-        .collect();
+    let payload: Vec<Value> = results.into_iter().map(recall_entry_json).collect();
     Ok(Json(json!(payload)))
+}
+
+/// Flatten a [`RecallResult`] into a single JSON object with the drawer's
+/// fields hoisted to the top level.
+///
+/// Why: Issue #69 — the recall API previously nested the drawer under a
+/// `"drawer"` wrapper (`{"drawer": {"content": …}, "score": …}`), so every
+/// client that looked for `content`/`tags`/`importance` at the top level of an
+/// entry got nothing and recall always appeared to return `[]`. Hoisting the
+/// drawer fields makes `content` directly reachable while keeping `score` and
+/// `layer` alongside as ranking metadata.
+/// What: Serializes the [`Drawer`](trusty_common::memory_core::Drawer) to a
+/// JSON object and inserts `score` and `layer`. The `Drawer` schema has no
+/// `score`/`layer` keys, so there is no field collision. Falls back to a
+/// `{"score", "layer"}`-only object if the drawer fails to serialize (it never
+/// should — `Drawer` is plain `#[derive(Serialize)]` data).
+/// Test: `recall_entry_json_hoists_drawer_fields` asserts `content` is at the
+/// top level and the `drawer` wrapper key is absent.
+fn recall_entry_json(r: RecallResult) -> Value {
+    let mut obj = match serde_json::to_value(&r.drawer) {
+        Ok(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("score".to_string(), json!(r.score));
+    obj.insert("layer".to_string(), json!(r.layer));
+    Value::Object(obj)
 }
 
 /// `GET /api/v1/recall?q=<query>&top_k=<n>&deep=<bool>` — cross-palace semantic
@@ -2912,6 +2929,61 @@ mod tests {
         assert!(
             v.get("detail").is_none() || v["detail"].is_null(),
             "successful round-trip must not carry a detail field (got {v:?})"
+        );
+    }
+
+    /// Issue #69 — `recall_entry_json` hoists the drawer's fields to the top
+    /// level so `content` is directly reachable.
+    ///
+    /// Why: The recall API previously wrapped the drawer under a `"drawer"`
+    /// key, so clients scanning the top level for `content`/`tags` found
+    /// nothing and recall always looked empty. This locks the flattened shape
+    /// in place so the regression cannot silently return.
+    /// What: Builds a `RecallResult`, runs it through `recall_entry_json`, and
+    /// asserts `content`, `tags`, and `importance` are at the top level, that
+    /// `score`/`layer` sit alongside them, and that the old `drawer` wrapper
+    /// key is gone.
+    /// Test: this test.
+    #[test]
+    fn recall_entry_json_hoists_drawer_fields() {
+        use trusty_common::memory_core::Drawer;
+
+        let room = Uuid::new_v4();
+        let mut drawer = Drawer::new(room, "the answer is 42");
+        drawer.tags = vec!["source:kuzu".to_string()];
+        drawer.importance = 0.7;
+
+        let entry = recall_entry_json(RecallResult {
+            drawer,
+            score: 0.699,
+            layer: 1,
+        });
+
+        // Content must be reachable WITHOUT a `drawer` wrapper (issue #69).
+        assert_eq!(
+            entry.get("content").and_then(|v| v.as_str()),
+            Some("the answer is 42"),
+            "content must be at the top level, got {entry:?}"
+        );
+        assert!(
+            entry.get("drawer").is_none(),
+            "the legacy `drawer` wrapper must not be present, got {entry:?}"
+        );
+        // Other drawer fields are hoisted too.
+        assert_eq!(
+            entry["importance"].as_f64().map(|f| (f * 10.0).round()),
+            Some(7.0)
+        );
+        assert_eq!(
+            entry["tags"][0].as_str(),
+            Some("source:kuzu"),
+            "tags must be hoisted, got {entry:?}"
+        );
+        // Ranking metadata sits alongside the hoisted fields.
+        assert_eq!(entry["layer"].as_u64(), Some(1));
+        assert!(
+            entry["score"].as_f64().is_some_and(|s| (s - 0.699).abs() < 1e-6),
+            "score must be preserved, got {entry:?}"
         );
     }
 
