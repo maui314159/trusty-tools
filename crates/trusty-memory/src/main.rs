@@ -93,6 +93,18 @@ enum Command {
     /// First-time setup: data dir + launchd (macOS) + Claude settings patch.
     Setup,
 
+    /// Diagnose daemon health: fastembed cache, launchd plist, HTTP /health,
+    /// and stale palace locks.
+    ///
+    /// Why: GH #62 — silent failures (missing `FASTEMBED_CACHE_PATH` in the
+    /// plist, missing model cache, daemon not bound) currently force users
+    /// to grep through several directories by hand. `doctor` runs the
+    /// equivalent checks in one shot.
+    /// What: a one-shot CLI command that prints a ✅/❌ line per check and
+    /// exits non-zero on any failure. See `commands::doctor`.
+    /// Test: `cargo run -p trusty-memory -- doctor` after `setup`.
+    Doctor,
+
     /// Manage the macOS launchd LaunchAgent for the daemon.
     Service {
         #[command(subcommand)]
@@ -178,6 +190,7 @@ async fn main() -> Result<()> {
         } => handle_migrate(target, dry_run, config_only),
         Command::Setup => handle_setup(),
         Command::Service { action } => handle_service(&action),
+        Command::Doctor => trusty_memory::commands::doctor::handle_doctor().await,
         Command::Monitor { target } => run_monitor(target).await,
     }
 }

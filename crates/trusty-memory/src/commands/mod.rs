@@ -9,6 +9,7 @@
 //! launchd + Claude settings patch).
 //! Test: Each submodule carries its own unit tests.
 
+pub mod doctor;
 pub mod migrate;
 pub mod monitor;
 pub mod service;

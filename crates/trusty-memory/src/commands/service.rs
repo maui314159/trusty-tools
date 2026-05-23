@@ -134,23 +134,28 @@ pub(crate) fn build_launchd_config(
 /// path that is **read-only** for the agent's UID. fastembed's default
 /// model retrieval path is derived from that `TMPDIR`, so the first
 /// `TextEmbedding::try_new` call fails with `EROFS (os error 30)` and the
-/// daemon never reaches a ready state (GH #58). Pinning
-/// `FASTEMBED_CACHE_DIR` to a writable user-owned directory in the plist
-/// solves the problem for every daemon start.
-/// What: returns `[("FASTEMBED_CACHE_DIR", "$HOME/.cache/fastembed")]`,
-/// expanding `$HOME` from the install-time user. If `HOME` is unset (very
-/// unusual), returns an empty list — `resolve_fastembed_cache_dir` will
-/// then fall back to its own logic at daemon startup.
+/// daemon never reaches a ready state (GH #58). Pinning the fastembed cache
+/// to a writable user-owned directory in the plist solves the problem for
+/// every daemon start. Both `FASTEMBED_CACHE_DIR` and `FASTEMBED_CACHE_PATH`
+/// are emitted so the daemon agrees with both fastembed's native env
+/// (`FASTEMBED_CACHE_DIR`) and the alternative name documented in our
+/// install flow / accepted by `resolve_fastembed_cache_dir` (GH #62).
+/// What: returns `[("FASTEMBED_CACHE_DIR", "$HOME/.cache/fastembed"),
+/// ("FASTEMBED_CACHE_PATH", "$HOME/.cache/fastembed")]`, expanding `$HOME`
+/// from the install-time user. If `HOME` is unset (very unusual), returns
+/// an empty list — `resolve_fastembed_cache_dir` will then fall back to
+/// its own logic at daemon startup.
 /// Test: `build_launchd_config_sets_fastembed_cache_dir` covers the happy
-/// path.
+/// path for both env var names.
 #[cfg(target_os = "macos")]
 fn fastembed_env_vars() -> Vec<(String, String)> {
     if let Some(home) = dirs::home_dir() {
         let cache = home.join(".cache").join("fastembed");
-        return vec![(
-            "FASTEMBED_CACHE_DIR".to_string(),
-            cache.to_string_lossy().into_owned(),
-        )];
+        let value = cache.to_string_lossy().into_owned();
+        return vec![
+            ("FASTEMBED_CACHE_DIR".to_string(), value.clone()),
+            ("FASTEMBED_CACHE_PATH".to_string(), value),
+        ];
     }
     Vec::new()
 }
@@ -181,12 +186,46 @@ fn service_install() -> Result<()> {
         "✓".green(),
         plist_path.display()
     );
+    ensure_fastembed_cache_dir();
     println!(
         "  Logs:    {}\n  Start:   {}",
         log_dir.display().to_string().dimmed(),
         "trusty-memory service start".cyan(),
     );
     Ok(())
+}
+
+/// Ensure the fastembed cache directory exists at install time.
+///
+/// Why: GH #62 — the launchd plist now pins `FASTEMBED_CACHE_PATH` to
+/// `$HOME/.cache/fastembed`, but if that directory does not yet exist the
+/// daemon's first `TextEmbedding::try_new` will still trip over fastembed's
+/// cache-creation path under launchd's restricted environment. Creating the
+/// directory up-front (cheap, no network) guarantees the env var resolves
+/// to a writable path on the very first daemon start. A full model pre-warm
+/// is performed by `trusty-memory setup`; here we only do the minimum
+/// (mkdir -p) so `service install` stays fast and side-effect-light.
+/// What: best-effort `create_dir_all` against `$HOME/.cache/fastembed`.
+/// Failures are logged to stdout as a hint but do not abort install.
+/// Test: side-effecting; covered manually via `trusty-memory service install`.
+#[cfg(target_os = "macos")]
+fn ensure_fastembed_cache_dir() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let cache = home.join(".cache").join("fastembed");
+    match std::fs::create_dir_all(&cache) {
+        Ok(()) => println!(
+            "{} fastembed cache dir ready at {}",
+            "✓".green(),
+            cache.display().to_string().dimmed()
+        ),
+        Err(e) => eprintln!(
+            "  {} could not pre-create {} ({e}); daemon will retry on first request.",
+            "·".dimmed(),
+            cache.display()
+        ),
+    }
 }
 
 /// `service start` — install the plist (if needed) and bootstrap the agent.
@@ -367,13 +406,25 @@ mod tests {
                 .join("fastembed")
                 .to_string_lossy()
                 .into_owned();
-            let value = cfg
+            let dir_value = cfg
                 .env_vars
                 .iter()
                 .find(|(k, _)| k == "FASTEMBED_CACHE_DIR")
                 .map(|(_, v)| v.clone())
                 .expect("FASTEMBED_CACHE_DIR must be present");
-            assert_eq!(value, expected);
+            assert_eq!(dir_value, expected);
+            // GH #62: also assert FASTEMBED_CACHE_PATH is present and
+            // points to the same path. Both names exist because fastembed
+            // reads `FASTEMBED_CACHE_DIR` natively, while
+            // `resolve_fastembed_cache_dir` (and our docs) prefer the
+            // `FASTEMBED_CACHE_PATH` alias.
+            let path_value = cfg
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == "FASTEMBED_CACHE_PATH")
+                .map(|(_, v)| v.clone())
+                .expect("FASTEMBED_CACHE_PATH must be present (GH #62)");
+            assert_eq!(path_value, expected);
         }
     }
 }
