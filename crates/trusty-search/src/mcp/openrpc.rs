@@ -50,7 +50,7 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
     use scopes::*;
     let s: &[&str] = match name {
         // Read-only / query / introspection
-        "search_all" | "search_code" | "search_similar" | "search_health" | "list_indexes"
+        "search_all" | "search" | "search_similar" | "search_health" | "list_indexes"
         | "index_status" | "list_chunks" | "chat" | "get_call_chain" => &[SEARCH_READ],
 
         // Mutating
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn read_write_classification() {
-        assert_eq!(scopes_for_tool("search_code"), vec!["search.read"]);
+        assert_eq!(scopes_for_tool("search"), vec!["search.read"]);
         assert_eq!(scopes_for_tool("search_all"), vec!["search.read"]);
         assert_eq!(scopes_for_tool("index_file"), vec!["search.write"]);
         assert_eq!(scopes_for_tool("delete_index"), vec!["search.write"]);

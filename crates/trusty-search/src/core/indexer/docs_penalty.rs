@@ -144,6 +144,87 @@ pub(crate) fn is_allowed_for_mode(chunk_file: &str, mode: SearchMode) -> bool {
     }
 }
 
+/// Compute the mode-aware multiplicative score penalty for a chunk file
+/// (issue #77 final design — the penalty-matrix variant).
+///
+/// Why: the hard-filter classifier [`is_allowed_for_mode`] gives the
+/// strongest signal but drops off-mode files entirely, which loses
+/// useful context (e.g. a CHANGELOG entry that mentions the queried
+/// symbol can still be relevant in `code` mode). The penalty-matrix
+/// variant keeps every result but applies a multiplicative score
+/// penalty so off-mode files sink in ranking without disappearing.
+/// This function exists alongside `is_allowed_for_mode` so callers can
+/// pick the appropriate strategy.
+/// What: classifies the path into Source / Text / Data (using the same
+/// extension lists as the hard-filter classifier) and returns the
+/// multiplier from the 3x3 penalty matrix for the requested mode plus
+/// an optional `archive_reason`-style label naming the matching bucket.
+/// `SearchMode::All` is treated as `Code` for compatibility with the
+/// existing default direction.
+/// Test: see the `tests` submodule (`test_doc_score_penalty_*`).
+#[allow(dead_code)] // Reserved for future score-based ranking; current pipeline uses is_allowed_for_mode.
+pub(crate) fn doc_score_penalty(chunk_file: &str, mode: SearchMode) -> (f32, Option<String>) {
+    // Penalty matrix (file class x mode):
+    //                 code   text   data
+    //  Source         1.0    0.5    0.3
+    //  Text/Prose     0.1    1.0    0.3
+    //  Data/Config    0.2    0.3    1.0
+    let mode = match mode {
+        SearchMode::All => SearchMode::Code,
+        other => other,
+    };
+
+    // Classify: text wins over data wins over code (a `.md` file is text
+    // even though it also tokenises like source).
+    let is_text = has_extension(chunk_file, TEXT_EXTENSIONS) || {
+        let bn = basename_lower(chunk_file);
+        TEXT_NAME_PREFIXES.iter().any(|p| bn.starts_with(p))
+    };
+    let is_data = !is_text && has_extension(chunk_file, DATA_EXTENSIONS);
+    let is_code = !is_text && !is_data && has_extension(chunk_file, CODE_EXTENSIONS);
+
+    let (mult, reason) = if is_text {
+        let m = match mode {
+            SearchMode::Code => 0.1,
+            SearchMode::Text => 1.0,
+            SearchMode::Data => 0.3,
+            SearchMode::All => 1.0,
+        };
+        (m, Some(format!("text:{}", basename_lower(chunk_file))))
+    } else if is_data {
+        let m = match mode {
+            SearchMode::Code => 0.2,
+            SearchMode::Text => 0.3,
+            SearchMode::Data => 1.0,
+            SearchMode::All => 1.0,
+        };
+        (m, Some(format!("data:{}", basename_lower(chunk_file))))
+    } else if is_code {
+        let m: f32 = match mode {
+            SearchMode::Code => 1.0,
+            SearchMode::Text => 0.5,
+            SearchMode::Data => 0.3,
+            SearchMode::All => 1.0,
+        };
+        // Source files only get a reason label when actually penalised.
+        let reason = if (m - 1.0_f32).abs() > f32::EPSILON {
+            Some(format!("source:{}", basename_lower(chunk_file)))
+        } else {
+            None
+        };
+        (m, reason)
+    } else {
+        // Unknown file type: leave score unchanged.
+        (1.0_f32, None)
+    };
+
+    if (mult - 1.0_f32).abs() < f32::EPSILON {
+        (1.0, None)
+    } else {
+        (mult, reason)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

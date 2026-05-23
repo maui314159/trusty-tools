@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn read_tool_scope_mapping() {
         assert_eq!(
-            SearchMcpService.scopes_for("search_code"),
+            SearchMcpService.scopes_for("search"),
             vec!["search.read".to_string()]
         );
     }

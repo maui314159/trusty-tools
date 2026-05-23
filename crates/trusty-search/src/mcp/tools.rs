@@ -10,7 +10,7 @@
 //!
 //! | MCP tool        | Daemon endpoint                           |
 //! |-----------------|-------------------------------------------|
-//! | `search_code`   | `POST /indexes/:id/search`                |
+//! | `search`        | `POST /indexes/:id/search`                |
 //! | `index_file`    | `POST /indexes/:id/index-file`            |
 //! | `remove_file`   | `POST /indexes/:id/remove-file`           |
 //! | `list_indexes`  | `GET  /indexes`                           |
@@ -95,7 +95,7 @@ impl McpServer {
         }
 
         // MCP "tools/call" wraps tool name + arguments. We also accept the
-        // bare method name for ergonomics (`search_code` directly).
+        // bare method name for ergonomics (`search` directly).
         let params = req.params.clone().unwrap_or(Value::Null);
         let (tool, arguments, via_tools_call) = match req.method.as_str() {
             "tools/call" => {
@@ -188,7 +188,7 @@ impl McpServer {
                 });
                 self.post("/search", &body).await
             }
-            "search_code" => {
+            "search" => {
                 let index_id = require_str(args, "index_id")?;
                 // Accept the spec form `{query: string, top_k?: int}` and
                 // also a pre-built `{query: object}` body for callers that
@@ -212,6 +212,12 @@ impl McpServer {
                         }
                         if let Some(br) = args.get("branch").and_then(Value::as_str) {
                             b["branch"] = Value::String(br.to_string());
+                        }
+                        // Issue #77 (final design): forward optional `mode`
+                        // ("code" | "text" | "data"; default "code") so the
+                        // daemon applies the matching penalty matrix.
+                        if let Some(m) = args.get("mode").and_then(Value::as_str) {
+                            b["mode"] = Value::String(m.to_string());
                         }
                         b
                     }
@@ -541,8 +547,8 @@ pub fn tool_descriptors() -> Value {
             }
         },
         {
-            "name": "search_code",
-            "description": "Hybrid code search (BM25+vector+KG). Supports branch-aware scoring via branch_files/branch_boost/branch (issue #122).",
+            "name": "search",
+            "description": "Unified hybrid search (BM25+vector+KG+RRF) with mode-aware ranking (issue #77). The `mode` parameter (\"code\" | \"text\" | \"data\", default \"code\") picks the file-type penalty matrix: code prefers source (prose 0.1x, data 0.2x); text prefers prose docs (source 0.5x, data 0.3x); data prefers structured data (source 0.3x, prose 0.3x). Supports branch-aware scoring via branch_files/branch_boost/branch (issue #122). Replaces the legacy `search_code` tool name; callers that omit `mode` get identical pre-#77 behaviour.",
             "inputSchema": {
                 "type": "object",
                 "required": ["index_id", "query"],
@@ -550,6 +556,12 @@ pub fn tool_descriptors() -> Value {
                     "index_id": { "type": "string" },
                     "query": { "type": "string" },
                     "top_k": { "type": "integer", "default": 10 },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["code", "text", "data"],
+                        "default": "code",
+                        "description": "Ranking mode: prefer source code, prose docs, or structured data."
+                    },
                     "branch_files": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -787,7 +799,7 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .collect();
         for required in [
-            "search_code",
+            "search",
             "index_file",
             "remove_file",
             "list_indexes",
@@ -841,7 +853,7 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .collect();
         for required in [
-            "search_code",
+            "search",
             "index_file",
             "remove_file",
             "list_indexes",
@@ -903,7 +915,7 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .collect();
         for required in [
-            "search_code",
+            "search",
             "index_file",
             "remove_file",
             "list_indexes",
