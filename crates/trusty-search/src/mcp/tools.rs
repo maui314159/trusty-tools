@@ -219,6 +219,13 @@ impl McpServer {
                         if let Some(m) = args.get("mode").and_then(Value::as_str) {
                             b["mode"] = Value::String(m.to_string());
                         }
+                        // Issue #74: forward optional `exclude_archived`
+                        // (default false) so callers can hard-filter archived
+                        // / deprecated / legacy chunks instead of only
+                        // downranking them.
+                        if let Some(ea) = args.get("exclude_archived").and_then(Value::as_bool) {
+                            b["exclude_archived"] = Value::Bool(ea);
+                        }
                         b
                     }
                     _ => {
@@ -548,7 +555,7 @@ pub fn tool_descriptors() -> Value {
         },
         {
             "name": "search",
-            "description": "Unified hybrid search (BM25+vector+KG+RRF) with mode-aware ranking (issue #77). The `mode` parameter (\"code\" | \"text\" | \"data\", default \"code\") picks the file-type penalty matrix: code prefers source (prose 0.1x, data 0.2x); text prefers prose docs (source 0.5x, data 0.3x); data prefers structured data (source 0.3x, prose 0.3x). Supports branch-aware scoring via branch_files/branch_boost/branch (issue #122). Replaces the legacy `search_code` tool name; callers that omit `mode` get identical pre-#77 behaviour.",
+            "description": "Unified hybrid search (BM25+vector+KG+RRF) with mode-aware ranking (issue #77). The `mode` parameter (\"code\" | \"text\" | \"data\", default \"code\") picks the file-type penalty matrix: code prefers source (prose 0.1x, data 0.2x); text prefers prose docs (source 0.5x, data 0.3x); data prefers structured data (source 0.3x, prose 0.3x). Set `exclude_archived: true` to drop archived/deprecated/legacy chunks entirely instead of downranking them (issue #74). Supports branch-aware scoring via branch_files/branch_boost/branch (issue #122). Replaces the legacy `search_code` tool name; callers that omit `mode` get identical pre-#77 behaviour.",
             "inputSchema": {
                 "type": "object",
                 "required": ["index_id", "query"],
@@ -561,6 +568,11 @@ pub fn tool_descriptors() -> Value {
                         "enum": ["code", "text", "data"],
                         "default": "code",
                         "description": "Ranking mode: prefer source code, prose docs, or structured data."
+                    },
+                    "exclude_archived": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Drop archived/deprecated/legacy chunks (paths like _archive/, archive/, _deprecated/, old/, .archive/; #[deprecated]; .archived/DEPRECATED markers) instead of downranking them."
                     },
                     "branch_files": {
                         "type": "array",

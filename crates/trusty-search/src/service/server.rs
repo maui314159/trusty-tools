@@ -1768,6 +1768,10 @@ async fn global_search_handler(
         // search_text / search_data callers use the per-index endpoint
         // directly and carry their own `mode` in the request body.
         mode: crate::core::indexer::SearchMode::default(),
+        // Cross-project fan-out keeps the downrank default (issue #74); a
+        // caller that wants archived chunks gone uses the per-index endpoint
+        // with `exclude_archived: true`.
+        exclude_archived: false,
     };
 
     // Run all per-index searches concurrently. Any index that errors is

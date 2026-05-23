@@ -1216,6 +1216,7 @@ fn make_branch_query(text: &str, files: Vec<String>, boost: f32) -> SearchQuery 
         branch_boost: boost,
         branch: None,
         mode: SearchMode::Code,
+        exclude_archived: false,
     }
 }
 
@@ -1377,6 +1378,7 @@ async fn test_no_boost_when_branch_files_absent() {
         branch_boost: SearchQuery::default_branch_boost(),
         branch: None,
         mode: SearchMode::Code,
+        exclude_archived: false,
     };
     let results = idx.search(&q).await.unwrap();
     assert!(!results.is_empty());
@@ -1721,6 +1723,79 @@ async fn test_archive_downrank_demotes_deprecated_chunks() {
     assert!(
         reason.starts_with("path:"),
         "expected path-prefix reason, got {reason}"
+    );
+}
+
+/// Issue #74: `exclude_archived: true` drops archived chunks from the
+/// result set entirely instead of downranking them, and the configurable
+/// path detection covers the requested directory conventions.
+///
+/// Why: archive downranking (issue #75) keeps legacy code in the results
+/// (sunk in ranking) which is the right default for exploratory queries.
+/// Code-navigation callers want archived code gone outright. This test
+/// pins the opt-in hard filter and verifies it fires for each of the
+/// `_archive/`, `archive/`, `_deprecated/`, `old/`, `.archive/` path
+/// conventions named in the issue.
+/// What: indexes one live `.rs` chunk plus several archived chunks (one
+/// per path convention), runs the same query with `exclude_archived: true`,
+/// and asserts only the live chunk survives.
+/// Test: this test.
+#[tokio::test]
+async fn test_exclude_archived_drops_archive_chunks() {
+    let idx = make_indexer();
+    idx.add_chunk(raw("live", "src/auth.rs", "fn authenticate_user_xyz() {}"))
+        .await
+        .unwrap();
+    // One archived chunk per path convention the issue enumerates. Each
+    // contains the query token so it would otherwise rank in the result set.
+    for (id, path) in [
+        ("a1", "src/_archive/auth.rs"),
+        ("a2", "src/archive/auth.rs"),
+        ("a3", "src/_deprecated/auth.rs"),
+        ("a4", "src/old/auth.rs"),
+        ("a5", "src/.archive/auth.rs"),
+    ] {
+        idx.add_chunk(raw(id, path, "fn authenticate_user_xyz_old() {}"))
+            .await
+            .unwrap();
+    }
+
+    // Baseline: without the flag, archived chunks are present (downranked).
+    let downranked = idx
+        .search(&SearchQuery {
+            text: "authenticate_user_xyz".to_string(),
+            top_k: 10,
+            expand_graph: false,
+            compact: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        downranked.iter().any(|c| c.id.starts_with('a')),
+        "pre-condition: archived chunks should be present (downranked) without the flag"
+    );
+
+    // With `exclude_archived`, every archived chunk must be gone.
+    let filtered = idx
+        .search(&SearchQuery {
+            text: "authenticate_user_xyz".to_string(),
+            top_k: 10,
+            expand_graph: false,
+            compact: false,
+            exclude_archived: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        filtered.iter().all(|c| c.id == "live"),
+        "exclude_archived must drop every archived chunk; got {:?}",
+        filtered.iter().map(|c| &c.file).collect::<Vec<_>>()
+    );
+    assert!(
+        filtered.iter().any(|c| c.id == "live"),
+        "the live chunk must still be returned"
     );
 }
 

@@ -554,7 +554,7 @@ impl CodeIndexer {
         //    look like archive / deprecated / legacy code and stamp the
         //    `archive_reason` label. Re-sort by score so demoted rows
         //    sink within the filtered set.
-        self.apply_archive_downrank(&mut result, effective_mode);
+        self.apply_archive_downrank(&mut result, effective_mode, query.exclude_archived);
         Ok(result)
     }
 
@@ -581,10 +581,23 @@ impl CodeIndexer {
     /// id as the stable tie-breaker. The marker-file cache is shared
     /// across the whole pass so K chunks under the same directory pay
     /// at most one filesystem hit.
+    /// Issue #74: when `exclude_archived` is `true`, chunks whose archive
+    /// classifier fires (path keyword, `#[deprecated]` annotation, or a
+    /// `.archived` / `DEPRECATED` marker file) are dropped from the result
+    /// list entirely rather than score-penalised. The lighter mtime-only
+    /// "stale" signal does NOT trigger exclusion — staleness alone is too
+    /// weak to justify hiding a result; only the strong archive signals do.
+    ///
     /// Test: `test_archive_downrank_demotes_deprecated_chunks`,
+    /// `test_exclude_archived_drops_archive_chunks`,
     /// `test_mode_filter_*` integration tests, and the per-mode unit
     /// tests in [`archive::tests`] / [`docs_penalty::tests`].
-    fn apply_archive_downrank(&self, results: &mut Vec<CodeChunk>, mode: super::SearchMode) {
+    fn apply_archive_downrank(
+        &self,
+        results: &mut Vec<CodeChunk>,
+        mode: super::SearchMode,
+        exclude_archived: bool,
+    ) {
         if results.is_empty() {
             return;
         }
@@ -620,6 +633,12 @@ impl CodeIndexer {
         // multiplier and gets a `text:` / `data:` / `source:` reason
         // stamp.
         let mut markers = MarkerCache::new();
+        // Issue #74: collect the chunk ids that fired a *strong* archive
+        // signal (path / annotation / marker — anything but the lighter
+        // `stale:` mtime signal) so we can drop them after the loop when
+        // `exclude_archived` is set. We can't `retain` mid-iteration because
+        // we hold `&mut` borrows of each chunk; defer the removal.
+        let mut archived_ids: HashSet<String> = HashSet::new();
         for chunk in results.iter_mut() {
             let (archive_mult, archive_reason_opt) =
                 archive::classify(&self.root_path, &chunk.file, &chunk.content, &mut markers);
@@ -634,11 +653,23 @@ impl CodeIndexer {
             if archive_reason_opt.is_some() {
                 chunk.score *= archive_mult;
             }
+            // Issue #74: only the strong archive signals (not `stale:`)
+            // qualify for hard exclusion. `archive::classify` returns a
+            // `stale:`-prefixed reason only when no strong signal fired, so
+            // we can distinguish on the prefix.
+            if let Some(reason) = &archive_reason_opt {
+                if exclude_archived && !reason.starts_with("stale:") {
+                    archived_ids.insert(chunk.id.clone());
+                }
+            }
             if archive_reason_opt.is_some() || docs_reason_opt.is_some() {
                 // Archive reason wins — issue #75 tests assert on its
                 // prefixes (`path:`/`annotation:`/`marker:`/`stale:`).
                 chunk.archive_reason = archive_reason_opt.or(docs_reason_opt);
             }
+        }
+        if exclude_archived && !archived_ids.is_empty() {
+            results.retain(|chunk| !archived_ids.contains(&chunk.id));
         }
         results.sort_by(|a, b| {
             b.score

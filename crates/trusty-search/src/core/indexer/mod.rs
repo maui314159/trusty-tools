@@ -316,6 +316,23 @@ pub struct SearchQuery {
     /// `"text"`, or `"data"`.
     #[serde(default)]
     pub mode: SearchMode,
+
+    /// Drop archived / deprecated / legacy chunks from the result set
+    /// entirely instead of merely downranking them (issue #74).
+    ///
+    /// Why: archive downranking (issue #75) sinks legacy code but still
+    /// returns it, which is the right default for exploratory queries. For
+    /// code-navigation queries where archived code is pure noise, callers
+    /// want it gone. This opt-in flag converts the downrank into a hard
+    /// filter for chunks that match any archive signal (path keyword such as
+    /// `_archive/`, `archive/`, `_deprecated/`, `old/`, `.archive/`; a
+    /// `#[deprecated]` annotation; a `.archived` / `DEPRECATED` marker file).
+    /// What: when `true`, the post-RRF `apply_archive_downrank` pass removes
+    /// any chunk whose archive classifier fired instead of multiplying its
+    /// score. Defaults to `false` so existing callers keep the downrank
+    /// behaviour.
+    #[serde(default)]
+    pub exclude_archived: bool,
 }
 
 impl SearchQuery {
@@ -343,6 +360,7 @@ impl Default for SearchQuery {
             branch_boost: SearchQuery::default_branch_boost(),
             branch: None,
             mode: SearchMode::default(),
+            exclude_archived: false,
         }
     }
 }
