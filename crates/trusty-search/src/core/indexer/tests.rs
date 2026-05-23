@@ -831,15 +831,18 @@ async fn test_definition_demotes_markdown_below_source() {
 
 #[tokio::test]
 async fn test_conceptual_does_not_demote_docs() {
-    // Why: the .md demotion is intent-scoped — Conceptual queries asked
-    // in the cross-bucket `SearchMode::All` must still surface
-    // documentation. (Issue #77 final design: in default
-    // `SearchMode::Code`, .md is hard-filtered out regardless of intent;
-    // see `test_mode_filter_code_excludes_markdown` for that contract.
-    // This test now exercises the cross-cutting `All` mode.)
-    // What: same corpus shape as before, but with `mode: All` so .md is
-    // permitted to surface alongside .rs.
-    // Test: this test.
+    // Why: issue #73 — Conceptual queries are documentation-retrieval by
+    // nature; they need `.md` content to answer correctly. When the
+    // caller uses the default `SearchMode::Code` (the implicit default,
+    // not an explicit override), the search pipeline must upgrade the
+    // effective mode to `All` so docs survive the post-filter. An
+    // explicit `SearchMode::Code` from the caller still excludes `.md`
+    // (covered by `test_mode_filter_code_excludes_markdown`).
+    // What: same corpus shape as before, but uses the default mode
+    // (i.e. `SearchMode::Code` via `..Default::default()`) and asserts
+    // that the intent-aware effective-mode override still surfaces docs.
+    // Test: this test plus `test_mode_filter_code_excludes_markdown` for
+    // the explicit-mode contract.
     let idx = make_indexer();
     idx.add_chunk(raw(
         "doc:1",
@@ -861,13 +864,16 @@ async fn test_conceptual_does_not_demote_docs() {
         top_k: 10,
         expand_graph: false,
         compact: false,
-        mode: SearchMode::All,
+        // Intentionally leave `mode` as default (`SearchMode::Code`) — the
+        // intent-aware override in `search()` should upgrade it to `All`
+        // for Conceptual intent so .md content can still surface.
         ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(
         results.iter().any(|c| c.file.ends_with(".md")),
-        "Conceptual queries in `all` mode must still surface .md docs"
+        "Conceptual queries in default mode must still surface .md docs \
+         (intent-aware effective-mode override, issue #73)"
     );
 }
 

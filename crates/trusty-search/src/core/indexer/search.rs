@@ -408,13 +408,41 @@ impl CodeIndexer {
         // `domain_terms` is empty (the common single-index case).
         let intent = QueryClassifier::classify_with_domain(&query.text, &self.domain_terms);
         let (alpha, beta, use_kg_first) = intent.weights();
+
+        // Issue #73: intent-aware effective mode. The mode field defaults to
+        // `SearchMode::Code` for backward compatibility (issue #77), which
+        // hard-filters out every `.md` chunk in `apply_archive_downrank`.
+        // Conceptual and Definition intents both need docs to answer
+        // correctly (READMEs, architecture guides, hook docs, YAML
+        // frontmatter), so when the caller did not override the default,
+        // upgrade the effective mode to `SearchMode::All`. Explicit
+        // `SearchMode::Code` from the caller still wins — only the implicit
+        // default gets nudged by intent.
+        //
+        // Why: without this, queries classified as Conceptual or Definition
+        // return 0 results on doc-heavy questions because the post-filter
+        // drops every chunk before materialisation.
+        // What: pattern-match the (intent, query.mode) tuple; promote
+        // `Code` → `All` for Conceptual/Definition; pass through every other
+        // combination unchanged.
+        // Test: `test_conceptual_does_not_demote_docs` (now exercises default
+        // Code mode), `test_mode_filter_code_excludes_markdown` (still
+        // asserts explicit Code excludes `.md`).
+        let effective_mode = match (&intent, query.mode) {
+            (QueryIntent::Conceptual, super::SearchMode::Code) => super::SearchMode::All,
+            (QueryIntent::Definition, super::SearchMode::Code) => super::SearchMode::All,
+            _ => query.mode,
+        };
+
         tracing::debug!(
-            "search index={} query={:?} intent={:?} alpha={} beta={}",
+            "search index={} query={:?} intent={:?} alpha={} beta={} mode={:?} effective_mode={:?}",
             self.index_id,
             query.text,
             intent,
             alpha,
-            beta
+            beta,
+            query.mode,
+            effective_mode
         );
 
         // 1) Embed (cache-first) — None when no embedder is wired.
@@ -515,7 +543,7 @@ impl CodeIndexer {
         //    look like archive / deprecated / legacy code and stamp the
         //    `archive_reason` label. Re-sort by score so demoted rows
         //    sink within the filtered set.
-        self.apply_archive_downrank(&mut result, query.mode);
+        self.apply_archive_downrank(&mut result, effective_mode);
         Ok(result)
     }
 
