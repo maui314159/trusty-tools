@@ -28,8 +28,8 @@ use trusty_common::memory_core::community::KnowledgeGap;
 use trusty_common::memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_common::memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_common::memory_core::retrieval::{
-    RecallResult, recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
-    recall_with_default_embedder,
+    recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
+    recall_with_default_embedder, RecallResult,
 };
 use trusty_common::memory_core::store::kg::Triple;
 use trusty_common::memory_core::{PalaceHandle, PalaceRegistry};
@@ -71,6 +71,19 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/v1/palaces/{id}/drawers/{drawer_id}",
+            delete(delete_drawer),
+        )
+        // Issue #70 — `/memories` is a backward-compatible alias for `/drawers`.
+        // Some clients (and earlier docs) POST/GET against `…/memories`, which
+        // 404'd because only `/drawers` was registered. Aliasing here keeps
+        // both vocabularies working against the same handlers without breaking
+        // existing `/drawers` callers.
+        .route(
+            "/api/v1/palaces/{id}/memories",
+            get(list_drawers).post(create_drawer),
+        )
+        .route(
+            "/api/v1/palaces/{id}/memories/{drawer_id}",
             delete(delete_drawer),
         )
         .route("/api/v1/palaces/{id}/recall", get(recall_handler))
@@ -2982,7 +2995,9 @@ mod tests {
         // Ranking metadata sits alongside the hoisted fields.
         assert_eq!(entry["layer"].as_u64(), Some(1));
         assert!(
-            entry["score"].as_f64().is_some_and(|s| (s - 0.699).abs() < 1e-6),
+            entry["score"]
+                .as_f64()
+                .is_some_and(|s| (s - 0.699).abs() < 1e-6),
             "score must be preserved, got {entry:?}"
         );
     }
@@ -3121,6 +3136,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #70 — `…/memories` is a working alias for `…/drawers`.
+    ///
+    /// Why: Clients that POST/GET against `…/memories` previously hit a 404
+    /// because only `/drawers` was registered, which silently broke every
+    /// store call (and pushed callers onto an OOM-prone CLI fallback). The
+    /// alias must route to the same handler as `/drawers`.
+    /// What: Creates a real palace via the registry, then GETs the `/memories`
+    /// alias and asserts a 200 with a JSON array body (the list-drawers shape).
+    /// Uses GET, not POST, so the test stays embedder-free (no ONNX load).
+    /// Test: this test.
+    #[tokio::test]
+    async fn memories_alias_routes_to_drawers() {
+        let state = test_state();
+        let palace = Palace {
+            id: PalaceId::new("alias-test"),
+            name: "alias-test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("alias-test"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create_palace");
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/alias-test/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the /memories alias must resolve to list_drawers, not 404"
+        );
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v.is_array(),
+            "the alias must return the list-drawers array shape, got {v:?}"
+        );
     }
 
     #[tokio::test]
