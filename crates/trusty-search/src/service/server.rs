@@ -772,6 +772,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         )
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
+        .route("/indexes/{id}/call_chain", get(call_chain_handler))
         .route(
             "/config",
             get(get_config_handler).patch(patch_config_handler),
@@ -2545,6 +2546,76 @@ async fn get_index_chunks_handler(
         "limit": limit,
         "chunks": chunks,
     })))
+}
+
+/// Query params for `GET /indexes/{id}/call_chain` (issue #76).
+///
+/// Why: HTTP callers (and the MCP `get_call_chain` tool that proxies through
+/// the daemon) need to specify an entry point and traversal options without
+/// posting a JSON body.
+/// What: mirrors the `get_call_chain` MCP tool args.
+/// Test: integration test `test_call_chain_handler_*`.
+#[derive(Debug, Deserialize)]
+struct CallChainParams {
+    entry_point: String,
+    direction: Option<String>,
+    max_depth: Option<u32>,
+    include_source: Option<bool>,
+}
+
+/// `GET /indexes/{id}/call_chain?entry_point=...&direction=...&...` —
+/// return an annotated call-tree report for a function (issue #76).
+///
+/// Why: LLM clients consume the response directly as plain text context, so
+/// the body is `text/plain` (not JSON). The MCP `get_call_chain` tool calls
+/// this endpoint and wraps the result in the standard `content[]` envelope.
+/// What: snapshots the indexer's symbol graph + raw chunk corpus, hands them
+/// to [`crate::service::call_chain::render_call_chain`], and returns the
+/// resulting `String`. Returns 400 for invalid params, 404 for unknown
+/// indexes or unresolvable entry points.
+/// Test: covered by `service::call_chain::tests` (renderer) and the MCP
+/// dispatch tests (transport contract).
+async fn call_chain_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<CallChainParams>,
+) -> Result<Response, (StatusCode, String)> {
+    use crate::service::call_chain::{render_call_chain, CallChainRequest};
+
+    let req = CallChainRequest {
+        index_id: id.clone(),
+        entry_point: params.entry_point,
+        direction: params.direction,
+        max_depth: params.max_depth,
+        include_source: params.include_source,
+    };
+    let validated = req
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("unknown index: {}", index_id.0),
+    ))?;
+    let (graph, chunks) = {
+        let indexer = handle.indexer.read().await;
+        let graph = indexer.snapshot_symbol_graph().await;
+        let chunks = indexer.raw_chunks_snapshot().await;
+        (graph, chunks)
+    };
+
+    let text = render_call_chain(&validated, graph.as_ref(), &chunks)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        text,
+    )
+        .into_response())
 }
 
 /// Optional body for `POST /indexes/:id/reindex`: lets the CLI override the

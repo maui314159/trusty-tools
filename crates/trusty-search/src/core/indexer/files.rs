@@ -48,6 +48,20 @@ impl CodeIndexer {
             .collect()
     }
 
+    /// Snapshot every `RawChunk` in the corpus (issue #76).
+    ///
+    /// Why: the `get_call_chain` tool needs the full source body and doc
+    /// comments of every candidate function, not the projected `CodeChunk`
+    /// shape returned by [`Self::all_chunks`]. Returning `RawChunk` clones
+    /// keeps the read lock window tiny and lets the caller process chunks
+    /// without holding any indexer lock.
+    /// What: clones every `RawChunk` while briefly holding the read lock.
+    /// Test: covered by `service::call_chain::tests`.
+    pub async fn raw_chunks_snapshot(&self) -> Vec<RawChunk> {
+        let chunks = self.chunks.read().await;
+        chunks.values().cloned().collect()
+    }
+
     /// Paginated snapshot of chunks in a stable order (file path, then
     /// `start_line`). Used by `GET /indexes/:id/chunks?offset=&limit=` and the
     /// `list_chunks` MCP tool for batch iteration over the corpus.

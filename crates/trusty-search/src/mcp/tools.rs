@@ -343,6 +343,26 @@ impl McpServer {
                 }
                 self.post("/chat", &body).await
             }
+            "get_call_chain" => {
+                // Issue #76 — annotated call tree for an entry-point function.
+                // The daemon endpoint returns `text/plain`; we wrap the body in
+                // the JSON envelope MCP clients consume.
+                let index_id = require_str(args, "index_id")?;
+                let entry_point = require_str(args, "entry_point")?;
+                let mut query: Vec<(&str, String)> = vec![("entry_point", entry_point.to_string())];
+                if let Some(dir) = args.get("direction").and_then(Value::as_str) {
+                    query.push(("direction", dir.to_string()));
+                }
+                if let Some(d) = args.get("max_depth").and_then(Value::as_u64) {
+                    query.push(("max_depth", d.to_string()));
+                }
+                if let Some(inc) = args.get("include_source").and_then(Value::as_bool) {
+                    query.push(("include_source", inc.to_string()));
+                }
+                self.get_text(&format!("/indexes/{index_id}/call_chain"), &query)
+                    .await
+                    .map(|text| serde_json::json!({ "text": text }))
+            }
             "list_chunks" => {
                 // Issue #54 — paginated enumeration of an index's corpus.
                 // Mirrors `GET /indexes/:id/chunks?offset=&limit=`.
@@ -356,6 +376,40 @@ impl McpServer {
             }
             _ => Err(DispatchError::UnknownTool),
         }
+    }
+
+    /// GET an endpoint that returns `text/plain` and return the body as a
+    /// `String`. Used by `get_call_chain` (issue #76), whose response is
+    /// prose intended for direct LLM consumption.
+    async fn get_text(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<String, DispatchError> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .get(&url)
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| DispatchError::Transport(format!("GET {url}: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| DispatchError::Transport(format!("decode {url}: {e}")))?;
+        if !status.is_success() {
+            // 400 from the daemon means invalid params; surface that to the
+            // caller as an INVALID_PARAMS error rather than INTERNAL_ERROR.
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                return Err(DispatchError::InvalidParams(body));
+            }
+            return Err(DispatchError::Transport(format!(
+                "GET {url} returned {status}: {body}"
+            )));
+        }
+        Ok(body)
     }
 
     async fn get(&self, path: &str) -> Result<Value, DispatchError> {
@@ -617,6 +671,27 @@ pub fn tool_descriptors() -> Value {
                     "index_id": { "type": "string" },
                     "offset":   { "type": "integer", "default": 0 },
                     "limit":    { "type": "integer", "default": 100 }
+                }
+            }
+        },
+        {
+            "name": "get_call_chain",
+            "description": "Annotated call tree for a function entry point (issue #76). \
+                            Returns plain-text prose with the entry function's signature, \
+                            Why/What doc lines, its depth-1 callees with full source, and \
+                            its depth-1 callers as signatures only. LLMs read this prose \
+                            tree more reliably than JSON. Entry point accepts an exact \
+                            symbol name, a case-insensitive fuzzy substring, or a \
+                            `file:line` reference; the most-connected match wins ties.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id", "entry_point"],
+                "properties": {
+                    "index_id":       { "type": "string" },
+                    "entry_point":    { "type": "string", "description": "Function name, fuzzy substring, or file:line" },
+                    "direction":      { "type": "string", "enum": ["both", "outgoing", "callers"], "default": "both" },
+                    "max_depth":      { "type": "integer", "minimum": 1, "maximum": 4, "default": 2 },
+                    "include_source": { "type": "boolean", "default": true, "description": "Embed full source at depth <= 1" }
                 }
             }
         },

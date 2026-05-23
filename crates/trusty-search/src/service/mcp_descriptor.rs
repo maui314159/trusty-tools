@@ -8,11 +8,12 @@
 //! without knowing about each one concretely. Closes trusty-search#115.
 //!
 //! What: A zero-sized `SearchMcpService` struct that delegates to the
-//! existing `crate::mcp::tools::tool_descriptors` (13 MCP tool definitions)
-//! and `crate::mcp::openrpc::scopes_for_tool` (read/write scope mapping),
-//! so there is exactly one source of truth for the tool surface.
+//! existing `crate::mcp::tools::tool_descriptors` (14 MCP tool definitions
+//! as of issue #76's `get_call_chain`) and
+//! `crate::mcp::openrpc::scopes_for_tool` (read/write scope mapping), so
+//! there is exactly one source of truth for the tool surface.
 //!
-//! Test: see `tests` below — verifies `name`, `tools().len() == 13`, and
+//! Test: see `tests` below — verifies `name`, `tools().len() == 14`, and
 //! that scope mappings match for both read and write tools.
 
 use trusty_common::mcp::ServiceDescriptor;
@@ -21,7 +22,7 @@ use trusty_common::mcp::ServiceDescriptor;
 /// directly and include its tools in a unified `rpc.discover` document.
 /// What: wraps the existing MCP tool descriptors and scope mapping; holds
 /// no state.
-/// Test: tests below verify all 13 tools are present and scopes correct.
+/// Test: tests below verify all 14 tools are present and scopes correct.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchMcpService;
 
@@ -72,12 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn tools_returns_exactly_thirteen() {
+    fn tools_returns_exactly_fourteen() {
+        // Issue #76 added `get_call_chain`, bringing the total to 14.
         let tools = SearchMcpService.tools();
         assert_eq!(
             tools.len(),
-            13,
-            "expected 13 MCP tools, got {}: {:?}",
+            14,
+            "expected 14 MCP tools, got {}: {:?}",
             tools.len(),
             tools
                 .iter()
@@ -123,6 +125,6 @@ mod tests {
         // make sure SearchMcpService is object-safe and dispatches correctly.
         let svc: Box<dyn ServiceDescriptor> = Box::new(SearchMcpService);
         assert_eq!(svc.name(), "trusty-search");
-        assert_eq!(svc.tools().len(), 13);
+        assert_eq!(svc.tools().len(), 14);
     }
 }

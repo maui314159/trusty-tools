@@ -1,3 +1,4 @@
+pub mod call_chain;
 #[cfg(feature = "candle")]
 pub mod candle_embedder;
 pub mod client;
