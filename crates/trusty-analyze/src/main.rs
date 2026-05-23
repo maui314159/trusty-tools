@@ -321,13 +321,18 @@ enum OutputFormat {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    // Why: when invoked as an MCP server (`serve --mcp` or `mcp`), stdin/stdout
+    // carry JSON-RPC 2.0 framing. Any tracing line emitted on stdout corrupts
+    // the protocol and breaks the client. trusty-common's `init_tracing`
+    // routes the subscriber to stderr, keeping stdout clean.
+    // What: install the shared trusty-common stderr subscriber with the
+    // default `info` verbosity (overridable via `RUST_LOG`). Replaces the
+    // ad-hoc `tracing_subscriber::fmt().init()` call, which defaulted to
+    // stdout and caused the #66 MCP framing corruption.
+    // Test: with the daemon running and a search-side error, `serve --mcp`
+    // no longer emits a non-JSON line on stdout; covered indirectly by the
+    // stdio MCP integration tests.
+    trusty_common::init_tracing(1);
 
     let cli = Cli::parse();
     let search = TrustySearchClient::new(&cli.search_url);
