@@ -162,7 +162,6 @@ pub(crate) fn is_allowed_for_mode(chunk_file: &str, mode: SearchMode) -> bool {
 /// `SearchMode::All` is treated as `Code` for compatibility with the
 /// existing default direction.
 /// Test: see the `tests` submodule (`test_doc_score_penalty_*`).
-#[allow(dead_code)] // Reserved for future score-based ranking; current pipeline uses is_allowed_for_mode.
 pub(crate) fn doc_score_penalty(chunk_file: &str, mode: SearchMode) -> (f32, Option<String>) {
     // Penalty matrix (file class x mode):
     //                 code   text   data

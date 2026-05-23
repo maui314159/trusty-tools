@@ -559,13 +559,26 @@ impl CodeIndexer {
         // Issue #75: archive downranking still applies after the file-type
         // filter — an `archived/` source file is still source code, but it
         // should sink relative to live source.
+        //
+        // Issue #77 (final design): on top of the hard filter we also apply
+        // the [`docs_penalty::doc_score_penalty`] matrix so any chunk that
+        // survived the filter but is still off-target for the requested
+        // mode (currently a no-op because the filter already keeps only
+        // on-mode files, but defensive when the filter relaxes or new
+        // file-type classifications land) sinks with its penalty
+        // multiplier and gets a `text:` / `data:` / `source:` reason
+        // stamp.
         let mut markers = MarkerCache::new();
         for chunk in results.iter_mut() {
             let (archive_mult, archive_reason_opt) =
                 archive::classify(&self.root_path, &chunk.file, &chunk.content, &mut markers);
-            if let Some(reason) = archive_reason_opt {
-                chunk.score *= archive_mult;
-                chunk.archive_reason = Some(reason);
+            let (docs_mult, docs_reason_opt) = docs_penalty::doc_score_penalty(&chunk.file, mode);
+            let combined = archive_mult * docs_mult;
+            if archive_reason_opt.is_some() || docs_reason_opt.is_some() {
+                chunk.score *= combined;
+                // Archive reason wins — issue #75 tests assert on its
+                // prefixes (`path:`/`annotation:`/`marker:`/`stale:`).
+                chunk.archive_reason = archive_reason_opt.or(docs_reason_opt);
             }
         }
         results.sort_by(|a, b| {
