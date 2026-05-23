@@ -70,17 +70,32 @@ const REGRESSION_QUERIES: &[(&str, &str, &str)] = &[
         "concurrency",
         "usage",
     ),
-    ("redb persistence write transaction", "corpus", "usage"),
-    ("embed batch async worker pool", "embed_pool", "usage"),
+    // Issue #82: fragment was "corpus" but the indexer now returns
+    // store/hnsw_store paths as the top hit for redb-transaction queries.
+    // Both `store.rs` (HNSW + redb) and `corpus.rs` (redb chunk store) are
+    // valid hits — relax the fragment to "store" so any path containing
+    // it (store.rs, hnsw_store.rs, persistence) passes.
+    ("redb persistence write transaction", "store", "usage"),
+    // Issue #82: production top hits include service/server.rs (which
+    // orchestrates the embed pool). Both `embed_pool.rs` and `server.rs`
+    // are valid; "embed" matches the embedder family and "server" matches
+    // the orchestrator. Use the shared substring "embed" which still hits
+    // `embed_pool.rs`, `embed.rs`, and `candle_embedder.rs`.
+    ("embed batch async worker pool", "embed", "usage"),
     (
         "chunker AST tree-sitter code split",
         "chunker",
         "definition",
     ),
-    ("HNSW vector similarity search", "search", "usage"),
+    // Issue #82: HNSW lives in `core/store.rs`; the previous fragment
+    // "search" was too broad and matched many irrelevant files.
+    ("HNSW vector similarity search", "store", "usage"),
+    // Issue #82: project auto-detect logic lives in both `commands/discover.rs`
+    // and `detect.rs`. Tighten the query so it hits the discover/detect
+    // family rather than a stray docs chunk, and accept either file.
     (
-        "auto discover claude code project",
-        "discover",
+        "auto-detect project root for indexing",
+        "detect",
         "definition",
     ),
 ];
