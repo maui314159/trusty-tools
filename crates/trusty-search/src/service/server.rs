@@ -1367,6 +1367,12 @@ async fn create_index_handler(
 /// Test: `create_index_rejects_relative_root_path`,
 /// `create_index_rejects_nonexistent_root_path`,
 /// `reindex_rejects_relative_root_path`.
+// `clippy::result_large_err` (added/tightened in clippy 1.94, newer than the
+// repo's MSRV 1.88 CI baseline) flags the large axum `Response` Err variant.
+// Boxing it would ripple through every `?` call site in the two handlers for
+// no runtime benefit on a cold validation path; suppress locally rather than
+// churn unrelated code.
+#[allow(clippy::result_large_err)]
 fn validate_root_path(path: &std::path::Path) -> Result<(), Response> {
     if path.as_os_str().is_empty() {
         return Err((

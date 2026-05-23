@@ -491,6 +491,11 @@ fn render_entry_block(
     }
 }
 
+// `clippy::too_many_arguments` (8/7) fires under clippy 1.94 (newer than the
+// repo's MSRV 1.88 CI baseline) on this private render helper. Bundling the
+// args into a struct would add a single-use type for no clarity gain on an
+// internal call-chain formatter; suppress locally.
+#[allow(clippy::too_many_arguments)]
 fn render_neighbor_block(
     out: &mut String,
     symbol: &str,
