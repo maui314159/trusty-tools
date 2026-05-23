@@ -877,6 +877,84 @@ async fn test_conceptual_does_not_demote_docs() {
     );
 }
 
+/// Issue #72 regression: in explicit `SearchMode::Code`, a high-BM25-TF
+/// prose chunk must not crowd a genuine source-file match out of `top_k`
+/// before the post-RRF hard filter runs.
+///
+/// Why: production reported code-navigation queries returning docs-heavy
+/// or empty result sets. The `doc_score_penalty` matrix used to fire only
+/// *after* the `take(top_k)` truncation, so a long CHANGELOG.md with many
+/// keyword repeats could fill every top_k slot, the source chunk got
+/// truncated away, and then the hard file-type filter dropped the prose —
+/// leaving zero results. Issue #72 moved the penalty into
+/// `apply_score_adjustments` (pre-truncation) so prose sinks before the
+/// cut and the source chunk claims a slot.
+/// What: builds a corpus with a high-TF `.md` chunk and a single `.rs`
+/// source chunk, runs a BugDebt-intent query (which keeps the explicit
+/// `Code` mode — it is not upgraded to `All` like Definition/Conceptual)
+/// with `top_k = 1`, and asserts the surviving result is the `.rs` source
+/// chunk rather than nothing.
+/// Test: this test.
+#[tokio::test]
+async fn test_code_mode_source_outranks_changelog_pre_truncation() {
+    use crate::core::classifier::{QueryClassifier, QueryIntent};
+
+    // Pre-condition: the query must NOT classify as Definition/Conceptual,
+    // otherwise the intent-aware override promotes mode to All and the
+    // hard filter no longer drops the .md — defeating the scenario.
+    let intent = QueryClassifier::classify("error handling retry logic deprecated path");
+    assert_eq!(
+        intent,
+        QueryIntent::BugDebt,
+        "test pre-condition: query should classify as BugDebt so explicit Code mode survives"
+    );
+
+    let idx = make_indexer();
+    // High-TF prose chunk: repeats the query terms many times so its raw
+    // BM25 score dominates the single source chunk pre-penalty.
+    idx.add_chunk(raw(
+        "doc:1",
+        "CHANGELOG.md",
+        "error handling error handling error handling retry logic retry logic \
+         deprecated path deprecated path error handling retry logic deprecated \
+         error handling retry logic deprecated path error handling retry logic",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "src:1",
+        "src/retry.rs",
+        "fn handle_error_with_retry() { /* error handling + retry logic, deprecated path */ }",
+    ))
+    .await
+    .unwrap();
+
+    let q = SearchQuery {
+        text: "error handling retry logic deprecated path".to_string(),
+        top_k: 1,
+        expand_graph: false,
+        compact: false,
+        // Explicit Code mode — BugDebt intent does not upgrade it, so the
+        // .md chunk must be penalised pre-truncation, not after.
+        mode: crate::core::indexer::SearchMode::Code,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "with top_k=1 the source chunk must survive into the single slot \
+         (pre-truncation penalty, issue #72) — got {:?}",
+        results.iter().map(|c| &c.file).collect::<Vec<_>>()
+    );
+    assert!(
+        results[0].file.ends_with(".rs"),
+        "code-mode query must return the source file, not be crowded out by \
+         high-TF prose (issue #72); got {}",
+        results[0].file
+    );
+}
+
 /// Issue #79 regression: a Definition-intent query against a corpus where
 /// the matching content lives ONLY in markdown docs must still return
 /// results when the caller uses the default mode.

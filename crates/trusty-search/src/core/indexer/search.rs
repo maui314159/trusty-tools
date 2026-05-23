@@ -473,15 +473,20 @@ impl CodeIndexer {
         };
 
         // 3) RRF fuse, then MMR diversity.
-        let fused_raw = rrf_fuse(
-            &hnsw_results,
-            &bm25_results,
-            alpha,
-            beta,
-            RRF_K,
-            query.top_k,
-        );
-        let fused_raw = merge_grep_lane(fused_raw, &grep_lane, beta, query.top_k);
+        //
+        // Issue #72: fuse / merge / rerank over the oversampled `want`
+        // candidate budget, NOT the caller's `top_k`. `rrf_fuse` truncates
+        // its output, so truncating to `top_k` here would discard
+        // source-file candidates *before* the mode-aware `doc_score_penalty`
+        // in `apply_score_adjustments` ever runs. A long high-TF prose chunk
+        // (e.g. CHANGELOG.md) would then occupy the only surviving slots, the
+        // genuine `.rs` match would be gone, and the post-RRF hard file-type
+        // filter would drop the prose — yielding zero results for a
+        // code-navigation query. Keeping `want` candidates alive through the
+        // penalty pass lets the docs sink and the source rows claim the final
+        // `top_k` slots, which are cut once at materialization.
+        let fused_raw = rrf_fuse(&hnsw_results, &bm25_results, alpha, beta, RRF_K, want);
+        let fused_raw = merge_grep_lane(fused_raw, &grep_lane, beta, want);
 
         // 3a) Issue #75: empty-result fallback. When both primary lanes (and
         //     the optional Definition grep lane) produced nothing, scan the
@@ -493,11 +498,11 @@ impl CodeIndexer {
         //     none of the (in_hnsw, in_bm25, in_kg) sets the materializer
         //     consults.
         let fused_raw = if fused_raw.is_empty() {
-            self.grep_fallback_search(&query.text, query.top_k).await
+            self.grep_fallback_search(&query.text, want).await
         } else {
             fused_raw
         };
-        let fused = self.apply_mmr_rerank(fused_raw, query.top_k).await;
+        let fused = self.apply_mmr_rerank(fused_raw, want).await;
 
         // 4) KG expand (conditional). Track which IDs came **only** from KG
         //    so the materialization step can label them "hybrid+kg".
@@ -520,7 +525,13 @@ impl CodeIndexer {
         //     ahead of equivalent off-branch matches.
         let (branch_set, branch_boost) = resolve_branch_set(query, &self.root_path);
         let all = self
-            .apply_score_adjustments(all, &intent, branch_set.as_ref(), branch_boost)
+            .apply_score_adjustments(
+                all,
+                &intent,
+                branch_set.as_ref(),
+                branch_boost,
+                effective_mode,
+            )
             .await;
 
         // 5) Materialise the top-k IDs into `CodeChunk`s.
@@ -612,10 +623,18 @@ impl CodeIndexer {
         for chunk in results.iter_mut() {
             let (archive_mult, archive_reason_opt) =
                 archive::classify(&self.root_path, &chunk.file, &chunk.content, &mut markers);
-            let (docs_mult, docs_reason_opt) = docs_penalty::doc_score_penalty(&chunk.file, mode);
-            let combined = archive_mult * docs_mult;
+            // Issue #72: the docs_penalty multiplier is now applied in
+            // `apply_score_adjustments` (pre-truncation) so that prose
+            // chunks can't crowd source matches out of top_k before the
+            // penalty fires. We still call `doc_score_penalty` here purely
+            // to recover the `archive_reason`-style label (e.g.
+            // `text:CHANGELOG.md`) for the UI — the multiplier is NOT
+            // re-applied to the score.
+            let (_docs_mult, docs_reason_opt) = docs_penalty::doc_score_penalty(&chunk.file, mode);
+            if archive_reason_opt.is_some() {
+                chunk.score *= archive_mult;
+            }
             if archive_reason_opt.is_some() || docs_reason_opt.is_some() {
-                chunk.score *= combined;
                 // Archive reason wins — issue #75 tests assert on its
                 // prefixes (`path:`/`annotation:`/`marker:`/`stale:`).
                 chunk.archive_reason = archive_reason_opt.or(docs_reason_opt);
@@ -637,18 +656,33 @@ impl CodeIndexer {
     /// rank `.md` docs above source files because they had high BM25 TF for
     /// symbol names (issue #92). We solve both by adjusting every candidate's
     /// score in a single pass and re-sorting before truncation.
+    ///
+    /// Issue #72: the mode-aware `doc_score_penalty` matrix used to fire
+    /// *after* the `take(top_k)` truncation in `apply_archive_downrank`. That
+    /// meant prose / config files with high BM25 TF could fill the top-k
+    /// slots and crowd out genuine source-file matches before the penalty
+    /// ever got a chance to demote them. We now apply the matrix here, in
+    /// the pre-truncation pass, so the docs sink in ranking and the source
+    /// chunks they would have displaced get to claim top-k slots. The
+    /// post-truncation pass in `apply_archive_downrank` still runs (idempotent
+    /// — multiplier 1.0 leaves the score unchanged) so the `archive_reason`
+    /// label stays attached for the UI.
+    ///
     /// What: for `Definition` intent, multiplies the score of each candidate
-    /// by `0.5` if its file extension is in `DOC_EXTENSIONS`; for every other
-    /// intent the multiplier is `1.0`. Then re-sorts by score descending,
-    /// with id as a stable tie-breaker.
-    /// Test: covered by `test_definition_demotes_markdown_below_source` and
-    /// `test_kg_results_survive_top_k_truncation`.
+    /// by `0.5` if its file extension is in `DOC_EXTENSIONS`. Then multiplies
+    /// by the mode-aware `doc_score_penalty` matrix (e.g. 0.1× for prose
+    /// chunks under Code mode). Finally re-sorts by score descending with
+    /// id as a stable tie-breaker.
+    /// Test: covered by `test_definition_demotes_markdown_below_source`,
+    /// `test_kg_results_survive_top_k_truncation`, and
+    /// `test_code_mode_source_outranks_changelog_pre_truncation` (issue #72).
     async fn apply_score_adjustments(
         &self,
         candidates: Vec<(String, f32)>,
         intent: &QueryIntent,
         branch_files: Option<&HashSet<String>>,
         branch_boost: f32,
+        effective_mode: super::SearchMode,
     ) -> Vec<(String, f32)> {
         let demote_docs = matches!(intent, QueryIntent::Definition);
         // Issue #28 deferred item: read the candidate chunks from the durable
@@ -666,6 +700,19 @@ impl CodeIndexer {
                     if let Some(r) = raw {
                         multiplier *= file_type_score_multiplier(&r.file);
                     }
+                }
+                // Issue #72: apply the mode-aware doc/source penalty here,
+                // BEFORE the top_k truncation, so high-TF prose can't
+                // crowd source-file matches out of the result list. The
+                // post-truncation pass in `apply_archive_downrank` is now
+                // a no-op for the score (the matrix is idempotent under
+                // repeat application — second multiplication is by the
+                // same value, but we deliberately don't double-apply: see
+                // `apply_archive_downrank` which inspects the stamped
+                // `archive_reason` to skip the second multiply).
+                if let Some(r) = raw {
+                    let (docs_mult, _) = docs_penalty::doc_score_penalty(&r.file, effective_mode);
+                    multiplier *= docs_mult;
                 }
                 // Branch-modified file boost (issue #122). Apply after the
                 // file-type multiplier so doc-on-branch never out-ranks
