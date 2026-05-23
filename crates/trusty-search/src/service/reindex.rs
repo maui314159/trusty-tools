@@ -16,7 +16,7 @@
 use crate::core::indexer::{CommitTimings, ParsedBatch};
 use crate::core::memguard::{current_rss_mb, index_memory_limit_mb};
 use crate::core::registry::{IndexHandle, IndexId};
-use crate::service::walker::{should_skip_content, walk_source_files};
+use crate::service::walker::{should_skip_content, walk_source_files_with_options, WalkOptions};
 use anyhow::Context;
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
@@ -266,8 +266,11 @@ fn collect_files_to_index(handle: &IndexHandle) -> crate::service::walker::WalkR
     };
     let mut walked_files: Vec<PathBuf> = Vec::new();
     let mut total_skipped_dirs: usize = 0;
+    let walk_opts = WalkOptions {
+        include_docs: handle.include_docs,
+    };
     for subtree in &include_paths {
-        let w = walk_source_files(subtree);
+        let w = walk_source_files_with_options(subtree, walk_opts);
         walked_files.extend(w.files);
         total_skipped_dirs = total_skipped_dirs.saturating_add(w.skipped_dirs);
     }
@@ -1550,6 +1553,7 @@ mod tests {
             exclude_globs: vec![],
             extensions: vec![],
             domain_terms: vec![],
+            include_docs: false,
             path_filter: vec![],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1622,6 +1626,7 @@ mod tests {
             exclude_globs: vec![],
             extensions: vec![],
             domain_terms: vec![],
+            include_docs: false,
             path_filter: vec!["common-*".to_string()],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),

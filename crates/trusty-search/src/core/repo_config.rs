@@ -32,7 +32,7 @@ pub struct RepoConfig {
 }
 
 /// One named index slice within a repo.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct IndexConfig {
     pub name: String,
 
@@ -55,6 +55,24 @@ pub struct IndexConfig {
     /// nudged toward `Definition` intent when no other pattern matched.
     #[serde(default)]
     pub domain_terms: Vec<String>,
+
+    /// Opt-in to indexing prose docs (`*.md`, `*.mdx`, `*.rst`, `*.txt`,
+    /// `*.adoc`) and metadata files (`CHANGELOG*`, `LICENSE*`, `NOTICE*`).
+    /// Default `false` — issue #77.
+    ///
+    /// Why: code search benchmarks vs grep showed that prose files
+    /// consistently outrank actual source code on BM25 because query terms
+    /// appear verbatim in headings and explanation text. Excluding them by
+    /// default fixes the noise; documentation-focused projects can opt in via
+    /// `include_docs: true` in `trusty-search.yaml`.
+    /// What: `false` (default) → the walker prunes doc/CHANGELOG files;
+    /// `true` → walker behaves as before. The post-RRF mode-based file-type
+    /// filter in `core::indexer::docs_penalty` then drops any docs that
+    /// slip into the index when the caller is searching in `code` mode, so
+    /// opt-in indexes still surface source files for code queries.
+    /// Test: covered by walker tests and `test_default_excludes_markdown_and_changelog`.
+    #[serde(default)]
+    pub include_docs: bool,
 }
 
 fn default_version() -> u32 {
@@ -257,10 +275,7 @@ indexes:
     fn test_resolved_paths_default_is_root() {
         let cfg = IndexConfig {
             name: "x".into(),
-            paths: vec![],
-            exclude: vec![],
-            languages: vec![],
-            domain_terms: vec![],
+            ..Default::default()
         };
         let root = Path::new("/tmp/repo");
         let resolved = RepoConfig::resolved_paths(&cfg, root);
@@ -272,9 +287,7 @@ indexes:
         let cfg = IndexConfig {
             name: "x".into(),
             paths: vec!["src/api".into(), "services/".into(), ".".into()],
-            exclude: vec![],
-            languages: vec![],
-            domain_terms: vec![],
+            ..Default::default()
         };
         let root = Path::new("/tmp/repo");
         let resolved = RepoConfig::resolved_paths(&cfg, root);
@@ -383,10 +396,8 @@ indexes:
     fn test_resolved_extensions() {
         let cfg = IndexConfig {
             name: "x".into(),
-            paths: vec![],
-            exclude: vec![],
             languages: vec!["typescript".into(), "javascript".into()],
-            domain_terms: vec![],
+            ..Default::default()
         };
         let exts = RepoConfig::resolved_extensions(&cfg);
         assert!(exts.contains(&"ts"));

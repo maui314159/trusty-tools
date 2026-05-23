@@ -54,6 +54,13 @@ pub struct PersistedIndex {
     /// repo-name pattern.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_filter: Vec<String>,
+
+    /// Issue #77: opt-in to indexing prose docs (`*.md`, `CHANGELOG*`, ...).
+    /// Default `false`. Persisted so per-index opt-ins survive daemon
+    /// restarts. `#[serde(default)]` keeps older `indexes.toml` files
+    /// loading without rewrite.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_docs: bool,
 }
 
 /// TOML wrapper so the file uses `[[index]]` array-of-tables syntax —

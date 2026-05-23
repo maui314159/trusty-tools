@@ -45,6 +45,11 @@ pub struct IndexHandle {
     /// at search time. Empty = standard classifier behaviour.
     pub domain_terms: Vec<String>,
 
+    /// Issue #77: opt-in to indexing prose docs (`*.md`, `CHANGELOG*`, ...).
+    /// Default `false` — the walker excludes them so they never contaminate
+    /// BM25 results. Set via `include_docs: true` in `trusty-search.yaml`.
+    pub include_docs: bool,
+
     /// Glob patterns matched against the *immediate subdirectory name* under
     /// `root_path`. When non-empty, the reindex walker keeps only files
     /// whose first path component (relative to `root_path`) matches one of
@@ -114,6 +119,7 @@ impl IndexHandle {
             exclude_globs: Vec::new(),
             extensions: Vec::new(),
             domain_terms: Vec::new(),
+            include_docs: false,
             path_filter: Vec::new(),
             context_embedding: Arc::new(RwLock::new(None)),
             context_summary: Arc::new(RwLock::new(None)),

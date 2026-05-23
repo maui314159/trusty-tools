@@ -127,6 +127,83 @@ pub const SKIP_FILES: &[&str] = &[
     "go.sum",
 ];
 
+/// Documentation / metadata file extensions excluded by default (issue #77).
+///
+/// Why: prose files (Markdown, reStructuredText, AsciiDoc, plain text) contain
+/// natural-language descriptions of code that score very high on BM25 — query
+/// terms appear verbatim in headings and explanation paragraphs. A benchmark
+/// against grep showed `CHANGELOG.md` and other docs polluted 6 of 8 queries.
+/// These extensions are skipped at walk time unless the index opts in via
+/// `include_docs: true`.
+/// What: lowercase extensions (no leading dot) matched against the file
+/// extension.
+/// Test: `test_default_excludes_markdown_and_changelog` below.
+pub const DOC_EXCLUDE_EXTS: &[&str] = &["md", "mdx", "rst", "adoc", "txt"];
+
+/// Filename basename substrings (case-insensitive) excluded by default
+/// (issue #77).
+///
+/// Why: standard metadata files (`CHANGELOG*`, `LICENSE*`, `NOTICE*`) repeat
+/// human-readable summaries that outrank source code on BM25. They are
+/// uninteresting for code search regardless of extension.
+/// What: a lowercased substring of the file basename triggers a match. So
+/// `CHANGELOG`, `CHANGELOG.md`, `CHANGELOG-old.txt` all match `"changelog"`.
+/// Test: `test_default_excludes_markdown_and_changelog`.
+pub const DOC_EXCLUDE_BASENAME_SUBSTRINGS: &[&str] = &["changelog", "license", "notice"];
+
+/// Walk options controlling default-exclusion behaviour (issue #77).
+///
+/// Why: most indexes want the default exclusion of `*.md`, `CHANGELOG*`, etc.
+/// applied at walk time so docs never enter the BM25 / vector lanes. A small
+/// number of indexes (documentation-focused projects, conceptual search) need
+/// to opt in via `include_docs: true`. Keeping the toggle as a struct makes
+/// future additions (e.g. `include_configs`) non-breaking.
+/// What: a `Copy` struct passed to [`walk_source_files_with_options`]. The
+/// default is `include_docs: false` (the new behaviour for issue #77); the
+/// legacy [`walk_source_files`] entry point preserves the previous behaviour
+/// by calling through with `include_docs: false`.
+/// Test: `test_default_excludes_markdown_and_changelog`,
+///   `test_include_docs_keeps_markdown`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalkOptions {
+    /// When `false` (default), files matching [`DOC_EXCLUDE_EXTS`] or
+    /// [`DOC_EXCLUDE_BASENAME_SUBSTRINGS`] are pruned before they reach the
+    /// indexer. When `true`, they are walked normally.
+    pub include_docs: bool,
+}
+
+/// Return `true` when `path` matches one of the default doc-exclusion rules
+/// (issue #77).
+///
+/// Why: a single predicate shared between the walker and the watcher so a
+/// `CHANGELOG.md` write event never sneaks past `path_in_skipped_dir`.
+/// What: lowercases the basename once, checks both the extension allowlist
+/// and the basename substring list.
+/// Test: `test_is_default_doc_excluded`.
+pub fn is_default_doc_excluded(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name_lower = name.to_ascii_lowercase();
+
+    if let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    {
+        if DOC_EXCLUDE_EXTS.contains(&ext.as_str()) {
+            return true;
+        }
+    }
+
+    for needle in DOC_EXCLUDE_BASENAME_SUBSTRINGS {
+        if name_lower.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// File extensions that are always binary or non-parseable. These are skipped
 /// before the file is opened, so the walker never reads their bytes.
 const BINARY_EXTS: &[&str] = &[
@@ -280,11 +357,34 @@ pub struct WalkResult {
 
 /// Walk `root` recursively and return every source file under it.
 ///
+/// Why: most callers want the standard, default-excluding walk (no Markdown,
+/// no `CHANGELOG`, etc.). Issue #77 added a doc-exclusion default; this entry
+/// point preserves the legacy short-name signature while applying that
+/// default via [`WalkOptions::default`].
+/// What: thin wrapper over [`walk_source_files_with_options`] with
+/// `WalkOptions::default()`.
+/// Test: every existing walker test exercises this entry point.
+pub fn walk_source_files(root: &Path) -> WalkResult {
+    walk_source_files_with_options(root, WalkOptions::default())
+}
+
+/// Walk `root` recursively, applying the supplied [`WalkOptions`].
+///
+/// Why: indexes that want documentation indexed (conceptual-search-focused
+/// projects, `include_docs: true` in `trusty-search.yaml`) need to bypass the
+/// issue #77 default doc exclusion without losing the rest of the walker's
+/// hygiene (binary skip, minified detection, SKIP_DIRS pruning).
+/// What:
 /// - Filtered by [`SOURCE_EXTS`].
 /// - Skips any directory whose basename is in [`SKIP_DIRS`].
 /// - Skips files matching [`should_skip_path`] (minified/binary/large).
+/// - When `opts.include_docs` is `false` (default), skips files matching
+///   [`is_default_doc_excluded`] (Markdown, CHANGELOG, LICENSE, ...).
 /// - Skips entries that fail to stat (does not error out the whole walk).
-pub fn walk_source_files(root: &Path) -> WalkResult {
+///
+/// Test: `test_default_excludes_markdown_and_changelog`,
+/// `test_include_docs_keeps_markdown`.
+pub fn walk_source_files_with_options(root: &Path, opts: WalkOptions) -> WalkResult {
     let mut files = Vec::new();
     let mut skipped_dirs = 0usize;
 
@@ -325,6 +425,11 @@ pub fn walk_source_files(root: &Path) -> WalkResult {
         if should_skip_path(path) {
             continue;
         }
+        // Issue #77: default doc/changelog/license exclusion. Skipped before
+        // the file is read so prose never enters BM25 / vector lanes.
+        if !opts.include_docs && is_default_doc_excluded(path) {
+            continue;
+        }
         files.push(path.to_path_buf());
     }
 
@@ -361,10 +466,86 @@ mod tests {
             .collect();
         assert!(names.contains(&"main.rs".to_string()));
         assert!(names.contains(&"lib.py".to_string()));
-        assert!(names.contains(&"README.md".to_string()));
+        // Issue #77: README.md is now excluded by the default walk options.
+        assert!(
+            !names.contains(&"README.md".to_string()),
+            "Markdown excluded by default (issue #77)"
+        );
         assert!(!names.contains(&"build.o".to_string()));
         assert!(!names.contains(&"index.js".to_string()));
         assert!(!names.contains(&"binary.bin".to_string()));
+    }
+
+    // --- Issue #77 default doc-exclusion tests ---
+
+    #[test]
+    fn test_is_default_doc_excluded() {
+        // Markdown / RST / AsciiDoc / TXT are excluded by extension.
+        assert!(is_default_doc_excluded(Path::new("README.md")));
+        assert!(is_default_doc_excluded(Path::new("docs/guide.mdx")));
+        assert!(is_default_doc_excluded(Path::new("docs/intro.rst")));
+        assert!(is_default_doc_excluded(Path::new("CONTRIBUTING.adoc")));
+        assert!(is_default_doc_excluded(Path::new("notes.txt")));
+        // CHANGELOG / LICENSE / NOTICE excluded by basename substring,
+        // case-insensitive, regardless of extension.
+        assert!(is_default_doc_excluded(Path::new("CHANGELOG")));
+        assert!(is_default_doc_excluded(Path::new("CHANGELOG.md")));
+        assert!(is_default_doc_excluded(Path::new("changelog.txt")));
+        assert!(is_default_doc_excluded(Path::new("LICENSE")));
+        assert!(is_default_doc_excluded(Path::new("License.txt")));
+        assert!(is_default_doc_excluded(Path::new("NOTICE")));
+        // Normal source files are not flagged.
+        assert!(!is_default_doc_excluded(Path::new("src/main.rs")));
+        assert!(!is_default_doc_excluded(Path::new("src/lib.py")));
+        assert!(!is_default_doc_excluded(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn test_default_excludes_markdown_and_changelog() {
+        // Issue #77: by default, the walker must skip Markdown docs and
+        // CHANGELOG/LICENSE files so prose hits never enter BM25.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("README.md"), "# project").unwrap();
+        fs::write(root.join("CHANGELOG.md"), "# 1.0.0").unwrap();
+        fs::write(root.join("LICENSE"), "MIT").unwrap();
+        fs::write(root.join("NOTICE"), "(c)").unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/intro.mdx"), "# intro").unwrap();
+
+        let names: Vec<String> = walk_source_files(root)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"main.rs".to_string()));
+        assert!(!names.contains(&"README.md".to_string()));
+        assert!(!names.contains(&"CHANGELOG.md".to_string()));
+        assert!(!names.contains(&"LICENSE".to_string()));
+        assert!(!names.contains(&"NOTICE".to_string()));
+        assert!(!names.contains(&"intro.mdx".to_string()));
+    }
+
+    #[test]
+    fn test_include_docs_keeps_markdown() {
+        // Issue #77: the `include_docs: true` opt-in re-enables the legacy
+        // behaviour for doc-focused indexes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("README.md"), "# project").unwrap();
+        fs::write(root.join("CHANGELOG.md"), "# 1.0.0").unwrap();
+
+        let names: Vec<String> =
+            walk_source_files_with_options(root, WalkOptions { include_docs: true })
+                .files
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect();
+        assert!(names.contains(&"main.rs".to_string()));
+        assert!(names.contains(&"README.md".to_string()));
+        assert!(names.contains(&"CHANGELOG.md".to_string()));
     }
 
     // --- should_skip_path tests ---

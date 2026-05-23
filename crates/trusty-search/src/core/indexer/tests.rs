@@ -831,13 +831,14 @@ async fn test_definition_demotes_markdown_below_source() {
 
 #[tokio::test]
 async fn test_conceptual_does_not_demote_docs() {
-    // Why: the .md demotion is intent-scoped — Conceptual queries must
-    // still surface documentation.
-    // What: same corpus shape as above, but a Conceptual query phrasing
-    // ("how does ...") ⇒ no multiplier applied. We only assert that the
-    // markdown chunk is present in results (ordering for Conceptual is
-    // dominated by the vector lane in real runs; in this BM25-only test
-    // we just verify no hard demotion happens).
+    // Why: the .md demotion is intent-scoped — Conceptual queries asked
+    // in the cross-bucket `SearchMode::All` must still surface
+    // documentation. (Issue #77 final design: in default
+    // `SearchMode::Code`, .md is hard-filtered out regardless of intent;
+    // see `test_mode_filter_code_excludes_markdown` for that contract.
+    // This test now exercises the cross-cutting `All` mode.)
+    // What: same corpus shape as before, but with `mode: All` so .md is
+    // permitted to surface alongside .rs.
     // Test: this test.
     let idx = make_indexer();
     idx.add_chunk(raw(
@@ -860,12 +861,13 @@ async fn test_conceptual_does_not_demote_docs() {
         top_k: 10,
         expand_graph: false,
         compact: false,
+        mode: SearchMode::All,
         ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(
         results.iter().any(|c| c.file.ends_with(".md")),
-        "Conceptual queries must still surface .md docs"
+        "Conceptual queries in `all` mode must still surface .md docs"
     );
 }
 
@@ -1023,6 +1025,7 @@ fn make_branch_query(text: &str, files: Vec<String>, boost: f32) -> SearchQuery 
         branch_files: Some(files),
         branch_boost: boost,
         branch: None,
+        mode: SearchMode::Code,
     }
 }
 
@@ -1183,6 +1186,7 @@ async fn test_no_boost_when_branch_files_absent() {
         branch_files: None,
         branch_boost: SearchQuery::default_branch_boost(),
         branch: None,
+        mode: SearchMode::Code,
     };
     let results = idx.search(&q).await.unwrap();
     assert!(!results.is_empty());
@@ -1575,4 +1579,202 @@ async fn test_search_result_preserves_line_numbers() {
     assert!(!results.is_empty());
     assert_eq!(results[0].start_line, 42);
     assert_eq!(results[0].end_line, 50);
+}
+
+// ---- Issue #77 final design: mode-based hard file-type filter ---------
+
+/// Build a mixed corpus across the three file-type buckets so each mode
+/// test can assert which slice of the index is admitted.
+///
+/// Why: the mode-filter contract is about which file types are returned,
+/// not about which is ranked highest. Seeding one chunk per bucket with
+/// the same query-matching content lets each test verify inclusion /
+/// exclusion in isolation.
+/// What: registers a source (`.rs`), a prose doc (`.md`), a named doc
+/// (`LICENSE` with no extension), a config file (`.toml`), and a data
+/// file (`.json`) — all containing the literal token "alpha_qwerty" so
+/// every chunk matches the same query.
+/// Test: used by every `test_mode_filter_*` test below.
+async fn seed_mode_filter_corpus(idx: &CodeIndexer) {
+    idx.add_chunk(raw(
+        "src:1",
+        "src/lib.rs",
+        "fn alpha_qwerty() -> bool { true }",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "doc:1",
+        "docs/intro.md",
+        "# alpha_qwerty\nDocumentation about alpha_qwerty.",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "named:1",
+        "LICENSE",
+        "MIT licence text mentioning alpha_qwerty.",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "cfg:1",
+        "Cargo.toml",
+        "[package]\nname = \"alpha_qwerty\"",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "data:1",
+        "fixtures/alpha.json",
+        "{\"name\": \"alpha_qwerty\"}",
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_mode_filter_code_returns_only_source() {
+    // Why: code mode (the default) must return strictly source-code
+    // extensions. Prose docs, named docs, configs, and data files must
+    // be dropped from results entirely — not merely demoted.
+    let idx = make_indexer();
+    seed_mode_filter_corpus(&idx).await;
+    let q = SearchQuery {
+        text: "alpha_qwerty".to_string(),
+        top_k: 20,
+        expand_graph: false,
+        compact: false,
+        mode: SearchMode::Code,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    let files: Vec<&str> = results.iter().map(|c| c.file.as_str()).collect();
+    assert!(
+        files.contains(&"src/lib.rs"),
+        "code mode must include source: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".md")),
+        "code mode must exclude .md: {files:?}"
+    );
+    assert!(
+        !files.contains(&"LICENSE"),
+        "code mode must exclude named docs: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".toml")),
+        "code mode must exclude config: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".json")),
+        "code mode must exclude data: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mode_filter_text_returns_only_prose_and_named_docs() {
+    // Why: text mode must return only prose extensions and path-based
+    // named docs (README*, LICENSE*, CHANGELOG*, …). Source, config,
+    // and data files must be excluded.
+    let idx = make_indexer();
+    seed_mode_filter_corpus(&idx).await;
+    let q = SearchQuery {
+        text: "alpha_qwerty".to_string(),
+        top_k: 20,
+        expand_graph: false,
+        compact: false,
+        mode: SearchMode::Text,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    let files: Vec<&str> = results.iter().map(|c| c.file.as_str()).collect();
+    assert!(
+        files.iter().any(|f| f.ends_with(".md")),
+        "text mode must include prose: {files:?}"
+    );
+    assert!(
+        files.contains(&"LICENSE"),
+        "text mode must include named docs without extension: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".rs")),
+        "text mode must exclude source: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".toml")),
+        "text mode must exclude config: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".json")),
+        "text mode must exclude data: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mode_filter_data_returns_only_structured_data() {
+    // Why: data mode must return only structured-data / config / schema
+    // files. Source and prose must be excluded.
+    let idx = make_indexer();
+    seed_mode_filter_corpus(&idx).await;
+    let q = SearchQuery {
+        text: "alpha_qwerty".to_string(),
+        top_k: 20,
+        expand_graph: false,
+        compact: false,
+        mode: SearchMode::Data,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    let files: Vec<&str> = results.iter().map(|c| c.file.as_str()).collect();
+    assert!(
+        files.iter().any(|f| f.ends_with(".toml")),
+        "data mode must include config: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with(".json")),
+        "data mode must include data files: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".rs")),
+        "data mode must exclude source: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".md")),
+        "data mode must exclude prose: {files:?}"
+    );
+    assert!(
+        !files.contains(&"LICENSE"),
+        "data mode must exclude named docs: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mode_filter_all_returns_everything() {
+    // Why: `all` mode is the escape hatch — no file-type filter applies.
+    // Every seeded chunk must appear in results.
+    let idx = make_indexer();
+    seed_mode_filter_corpus(&idx).await;
+    let q = SearchQuery {
+        text: "alpha_qwerty".to_string(),
+        top_k: 20,
+        expand_graph: false,
+        compact: false,
+        mode: SearchMode::All,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    let files: Vec<&str> = results.iter().map(|c| c.file.as_str()).collect();
+    for expected in &[
+        "src/lib.rs",
+        "docs/intro.md",
+        "LICENSE",
+        "Cargo.toml",
+        "fixtures/alpha.json",
+    ] {
+        assert!(
+            files.contains(expected),
+            "all mode must include {expected}: {files:?}"
+        );
+    }
 }

@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::service::indexed_files::IndexedFiles;
-use crate::service::walker::{path_in_skipped_dir, should_skip_path};
+use crate::service::walker::{is_default_doc_excluded, path_in_skipped_dir, should_skip_path};
 use crate::service::watcher::{FileWatcher, WatchEvent};
 
 /// Handle for a running watch loop. Drop it to stop watching and join the
@@ -81,7 +81,11 @@ async fn handle_modified(
     // Apply the same exclusions as the recursive walker: a file modified
     // inside an excluded subtree (e.g. `cdk.out/`, `node_modules/`) or a
     // minified/binary/large file must not enter the index incrementally.
-    if path_in_skipped_dir(path) || should_skip_path(path) {
+    // Issue #77: also apply the default doc/CHANGELOG/LICENSE exclusion so a
+    // live `.md` edit never sneaks past the reindex-time default. Indexes
+    // that opt in via `include_docs: true` only get docs at reindex time —
+    // the minor inconsistency for live edits is intentional.
+    if path_in_skipped_dir(path) || should_skip_path(path) || is_default_doc_excluded(path) {
         tracing::debug!(?path, "skip excluded file");
         return;
     }

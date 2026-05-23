@@ -35,6 +35,7 @@ use crate::core::store::VectorStore;
 use crate::core::symbol_graph::SymbolGraph;
 
 pub(crate) mod archive;
+pub(crate) mod docs_penalty;
 mod files;
 pub mod graph_score;
 mod ingest;
@@ -228,6 +229,55 @@ pub struct CodeChunk {
     pub archive_reason: Option<String>,
 }
 
+/// File-type filter mode for the unified search tool (issue #77, final
+/// design).
+///
+/// Why: the same hybrid index serves four distinct callers — code search
+/// (source files only), text/doc search (prose docs only), data search
+/// (JSON/YAML/CSV/TOML/etc. only), and an unrestricted mode that returns
+/// whatever the index produced. The previous multiplicative-penalty
+/// design still let prose/config outrank source in code mode whenever the
+/// raw BM25 score was high enough — CHANGELOG.md routinely came back at
+/// rank 1. The revised design replaces the penalty matrix with a **hard
+/// file-type filter** applied once per result after RRF / MMR /
+/// materialization: chunks whose file is not in the allowed set for the
+/// requested mode are dropped entirely. No score distortion, no
+/// cross-contamination.
+/// What: `Code` (default) returns only chunks from source-code extensions
+/// (.rs, .ts, .py, .go, …). `Text` returns only prose / documentation
+/// extensions (.md, .rst, .txt, …) plus path-based named docs (README*,
+/// CHANGELOG*, LICENSE*, NOTICE*, CONTRIBUTING*) regardless of
+/// extension. `Data` returns only structured-data / config / schema files
+/// (.json, .yaml, .toml, .xml, .csv, .sql, lockfiles, …). `All` disables
+/// the filter and returns every chunk the index produced. Archive
+/// downranking (issue #75 — path keywords, `#[deprecated]`, marker files,
+/// stale git mtime) still applies within each mode. Exposed to MCP /
+/// HTTP callers as the lowercase strings `"code"`, `"text"`, `"data"`,
+/// `"all"`.
+/// Test: covered by `docs_penalty::tests` (per-mode allow/reject) and
+/// the per-mode integration tests in `indexer::tests`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Return only source-code chunks. Default for backward compatibility
+    /// — existing callers (which used to receive prose/config in the
+    /// top-k whenever it scored well) now get strictly source files,
+    /// which is the historical intent of the `search` MCP tool.
+    #[default]
+    Code,
+    /// Return only documentation / prose chunks (`.md`, `.rst`, `.txt`,
+    /// `.adoc`, `.html`, …) plus path-based named docs (README*,
+    /// CHANGELOG*, LICENSE*, NOTICE*, CONTRIBUTING*).
+    Text,
+    /// Return only structured-data / config / schema chunks (`.json`,
+    /// `.yaml`, `.toml`, `.xml`, `.csv`, `.sql`, `.proto`, `.graphql`,
+    /// lockfiles, Parquet/Avro, …).
+    Data,
+    /// No file-type filter — return whatever the index produced. Useful
+    /// for queries that span code, docs, and data simultaneously.
+    All,
+}
+
 /// Query parameters for hybrid search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
@@ -259,6 +309,13 @@ pub struct SearchQuery {
     /// a warning and falls back to no boost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+
+    /// Direction of the docs/source downranking penalty (issue #77).
+    /// Defaults to [`SearchMode::Code`] so existing callers retain their
+    /// behaviour. MCP / HTTP callers pass the lowercase strings `"code"`,
+    /// `"text"`, or `"data"`.
+    #[serde(default)]
+    pub mode: SearchMode,
 }
 
 impl SearchQuery {
@@ -271,10 +328,11 @@ impl SearchQuery {
 }
 
 impl Default for SearchQuery {
-    /// Why: with the addition of branch-aware fields (issue #122), call
-    /// sites that previously built a 4-field `SearchQuery` would otherwise
-    /// all need to spell out three new None/default fields. `Default`
-    /// keeps those sites readable via `..Default::default()`.
+    /// Why: with the addition of branch-aware fields (issue #122) and the
+    /// mode field (issue #77), call sites that previously built a 4-field
+    /// `SearchQuery` would otherwise all need to spell out the new
+    /// None/default fields. `Default` keeps those sites readable via
+    /// `..Default::default()`.
     fn default() -> Self {
         Self {
             text: String::new(),
@@ -284,6 +342,7 @@ impl Default for SearchQuery {
             branch_files: None,
             branch_boost: SearchQuery::default_branch_boost(),
             branch: None,
+            mode: SearchMode::default(),
         }
     }
 }

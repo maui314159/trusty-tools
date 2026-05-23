@@ -21,6 +21,7 @@ use crate::core::git::{normalize_path, resolve_branch_files};
 use crate::core::search::rrf::{rrf_fuse, RRF_K};
 
 use super::archive::{self, MarkerCache};
+use super::docs_penalty;
 use super::{
     build_compact_snippet, compute_match_reason, file_type_score_multiplier, hash_query,
     raw_to_code_chunk, CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS,
@@ -506,40 +507,65 @@ impl CodeIndexer {
             )
             .await;
 
-        // 6) Issue #75: archive downranking. Apply a multiplicative score
-        //    penalty to chunks that look like archive / deprecated / legacy
-        //    code. Done after MMR + materialization so the per-result
-        //    `archive_reason` label can be stamped onto the same `CodeChunk`
-        //    we return. Sort once more after stamping so demoted rows sink.
-        self.apply_archive_downrank(&mut result);
+        // 6) Issue #77 (final design) + #75: mode-based hard file-type
+        //    filter + archive downrank. First drop chunks whose file is
+        //    not in the allowed set for the requested `SearchMode`
+        //    (replaces the prior penalty matrix — see `docs_penalty`).
+        //    Then apply a multiplicative score penalty to chunks that
+        //    look like archive / deprecated / legacy code and stamp the
+        //    `archive_reason` label. Re-sort by score so demoted rows
+        //    sink within the filtered set.
+        self.apply_archive_downrank(&mut result, query.mode);
         Ok(result)
     }
 
-    /// Stamp `archive_reason` + apply score penalty to each result chunk
-    /// (issue #75).
+    /// Apply the mode-based hard file-type filter (issue #77, final
+    /// design) and then the archive score penalty (issue #75) to the
+    /// materialized result list.
     ///
-    /// Why: archived code shouldn't dominate the top-k for queries that ought
-    /// to surface live code. We demote (rather than drop) so the operator can
-    /// still see the archived row when nothing better matched, with a clear
-    /// label explaining why it sank.
-    /// What: walks `results`, runs [`archive::classify`] against each chunk's
-    /// (path, content), multiplies `score` by the returned multiplier, sets
-    /// `archive_reason`, then re-sorts by score desc. The marker-file cache
-    /// is shared across the whole pass so K chunks under the same directory
-    /// pay at most one filesystem hit.
-    /// Test: `test_archive_downrank_demotes_deprecated_chunks` and the unit
-    /// tests in [`archive::tests`].
-    fn apply_archive_downrank(&self, results: &mut Vec<CodeChunk>) {
+    /// Why: two distinct concerns share the post-materialisation step.
+    /// First, the unified search tool's `SearchMode` says which file
+    /// types are valid for this query — code, text, data, or all — and
+    /// chunks outside the allowed set are dropped entirely (no score
+    /// distortion, no cross-contamination). Second, even within the
+    /// allowed set, archived/legacy/deprecated code should sink so live
+    /// code surfaces first (path keywords like `deprecated/`,
+    /// `#[deprecated]` annotations, `.archived` marker files, stale
+    /// `git_mtime`). The archive penalty stamps `archive_reason` so the
+    /// UI can explain why a row sank.
+    /// What: walks `results` in two passes. (1) retain only chunks for
+    /// which [`docs_penalty::is_allowed_for_mode`] returns `true` for
+    /// the requested mode (skipped entirely when mode is `All`). (2)
+    /// for each surviving chunk, run [`archive::classify`] and multiply
+    /// `score` by the returned multiplier when an archive reason fires;
+    /// stamp `archive_reason`. Finally re-sort by score descending with
+    /// id as the stable tie-breaker. The marker-file cache is shared
+    /// across the whole pass so K chunks under the same directory pay
+    /// at most one filesystem hit.
+    /// Test: `test_archive_downrank_demotes_deprecated_chunks`,
+    /// `test_mode_filter_*` integration tests, and the per-mode unit
+    /// tests in [`archive::tests`] / [`docs_penalty::tests`].
+    fn apply_archive_downrank(&self, results: &mut Vec<CodeChunk>, mode: super::SearchMode) {
         if results.is_empty() {
             return;
         }
+        // Issue #77: hard file-type filter. Each `SearchMode` declares an
+        // allowed set of file extensions / named-doc prefixes; chunks
+        // outside that set are dropped from the result list entirely.
+        // `SearchMode::All` short-circuits to "everything allowed" so the
+        // raw RRF ranking surfaces unchanged.
+        results.retain(|chunk| docs_penalty::is_allowed_for_mode(&chunk.file, mode));
+
+        // Issue #75: archive downranking still applies after the file-type
+        // filter — an `archived/` source file is still source code, but it
+        // should sink relative to live source.
         let mut markers = MarkerCache::new();
         for chunk in results.iter_mut() {
-            let (mult, reason) =
+            let (archive_mult, archive_reason_opt) =
                 archive::classify(&self.root_path, &chunk.file, &chunk.content, &mut markers);
-            if reason.is_some() {
-                chunk.score *= mult;
-                chunk.archive_reason = reason;
+            if let Some(reason) = archive_reason_opt {
+                chunk.score *= archive_mult;
+                chunk.archive_reason = Some(reason);
             }
         }
         results.sort_by(|a, b| {

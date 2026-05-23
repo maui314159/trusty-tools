@@ -77,6 +77,7 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             exclude_globs: entry.exclude_globs,
             extensions,
             domain_terms: entry.domain_terms,
+            include_docs: entry.include_docs,
             path_filter: entry.path_filter,
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),

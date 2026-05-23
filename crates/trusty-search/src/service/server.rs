@@ -688,6 +688,14 @@ pub struct CreateIndexRequest {
     /// intended for filtering polyrepo monorepos by repo-name pattern.
     #[serde(default)]
     pub path_filter: Option<Vec<String>>,
+    /// Opt-in to indexing prose docs (`*.md`, `*.rst`, README, CHANGELOG, …)
+    /// — issue #77. Default `None` (which the daemon treats as `false`) keeps
+    /// existing callers' walker behaviour identical: docs are skipped so they
+    /// don't contaminate the corpus. Set `true` from `trusty-search.yaml` when
+    /// the operator wants `search_text` to return useful results against
+    /// this index.
+    #[serde(default)]
+    pub include_docs: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1300,6 +1308,7 @@ async fn create_index_handler(
     // Persist the registration so a daemon restart can re-register
     // automatically. Best-effort: a write failure is logged but doesn't fail
     // the request — the in-memory registry still has the index.
+    let include_docs: bool = req.include_docs.unwrap_or(false);
     if let Err(e) = crate::service::persistence::upsert_index_registry_entry(
         crate::service::persistence::PersistedIndex {
             id: req.id.clone(),
@@ -1309,6 +1318,7 @@ async fn create_index_handler(
             extensions: extensions.clone(),
             domain_terms: domain_terms.clone(),
             path_filter: path_filter.clone(),
+            include_docs,
         },
     ) {
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
@@ -1325,6 +1335,7 @@ async fn create_index_handler(
         exclude_globs,
         extensions,
         domain_terms,
+        include_docs,
         path_filter,
         context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
         context_summary: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1753,6 +1764,10 @@ async fn global_search_handler(
         branch_files: None,
         branch_boost: SearchQuery::default_branch_boost(),
         branch: None,
+        // Cross-project fan-out is code-shaped by convention; per-tool
+        // search_text / search_data callers use the per-index endpoint
+        // directly and carry their own `mode` in the request body.
+        mode: crate::core::indexer::SearchMode::default(),
     };
 
     // Run all per-index searches concurrently. Any index that errors is
@@ -2718,6 +2733,7 @@ async fn reindex_handler(
                     exclude_globs: handle.exclude_globs.clone(),
                     extensions: handle.extensions.clone(),
                     domain_terms: handle.domain_terms.clone(),
+                    include_docs: handle.include_docs,
                     path_filter: handle.path_filter.clone(),
                     // Preserve the previously inferred context (if any). A
                     // fresh reindex will overwrite this with the metadata
@@ -3351,6 +3367,7 @@ mod tests {
                 extensions: None,
                 domain_terms: None,
                 path_filter: None,
+                include_docs: None,
             }),
         )
         .await;
@@ -3628,6 +3645,7 @@ mod tests {
                 extensions: None,
                 domain_terms: None,
                 path_filter: None,
+                include_docs: None,
             }),
         )
         .await;
@@ -3663,6 +3681,7 @@ mod tests {
                 extensions: None,
                 domain_terms: None,
                 path_filter: None,
+                include_docs: None,
             }),
         )
         .await;
@@ -3693,6 +3712,7 @@ mod tests {
                 extensions: None,
                 domain_terms: None,
                 path_filter: None,
+                include_docs: None,
             }),
         )
         .await;
