@@ -499,6 +499,7 @@ daemon falls back to the Tiny tier (8 GB assumption) with a `tracing::warn!`.
 | `TRUSTY_BM25_CORPUS_CAP` | Maximum number of live BM25 documents per index. Once reached, new chunks are dropped from the lexical index (the HNSW lane still indexes them). Updates to existing chunks are always honoured. A single warn is logged on first cap hit. |
 | `TRUSTY_MAX_KG_NODES` | Maximum number of nodes in the symbol-graph per index. Set to `0` to disable the cap entirely. |
 | `TRUSTY_MEMORY_LIMIT_MB` | Soft RSS ceiling for the indexing pipeline. When hit, the reindex orchestrator skips remaining batches with a `tracing::warn!`; the partial index is preserved (already-committed chunks stay searchable); `memory_limit_hit: true` appears in the SSE `complete` event and the daemon log. |
+| `TRUSTY_CHUNKS_IDLE_EVICT_SECS` | Idle window (seconds) after which a durably-backed index's in-memory `chunks` map (raw `RawChunk` text) is evicted to reclaim heap. Default `300` (5 min). The query hot path materialises results from the mmap-backed redb corpus, so the in-memory map is only a convenience cache once a durable corpus is wired; evicting it on idle shrinks a quiet daemon to its durable baseline and the few in-memory readers (`grep` fallback, `list_chunks`, `get_call_chain`) lazily rehydrate from redb on next access. Set `0` to disable eviction entirely. BM25 + the symbol graph stay hot regardless. A background ticker drives eviction every 60 s. Indexes without a durable corpus (BM25-only / tests) are never evicted. |
 
 Additional internal caps (not env-tunable):
 

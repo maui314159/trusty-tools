@@ -21,6 +21,7 @@ impl CodeIndexer {
     /// the lowest-line-numbered chunk in the matching file. Returns the chunk
     /// id, or `None` when nothing matches.
     pub async fn find_chunk_id(&self, file_suffix: &str, function: Option<&str>) -> Option<String> {
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         let matching: Vec<&RawChunk> = chunks
             .values()
@@ -41,6 +42,7 @@ impl CodeIndexer {
     /// quality / complexity endpoints (issue #32) which need to materialize
     /// per-chunk metrics without going through the search pipeline.
     pub async fn all_chunks(&self) -> Vec<CodeChunk> {
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         chunks
             .values()
@@ -58,6 +60,7 @@ impl CodeIndexer {
     /// What: clones every `RawChunk` while briefly holding the read lock.
     /// Test: covered by `service::call_chain::tests`.
     pub async fn raw_chunks_snapshot(&self) -> Vec<RawChunk> {
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         chunks.values().cloned().collect()
     }
@@ -78,6 +81,7 @@ impl CodeIndexer {
     /// Test: `test_enumerate_chunks_paginates_stable_order` indexes a couple of
     /// files, pages through them, and asserts no overlap and full coverage.
     pub async fn enumerate_chunks(&self, offset: usize, limit: usize) -> (usize, Vec<CodeChunk>) {
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         let total = chunks.len();
         if limit == 0 || offset >= total {
@@ -109,6 +113,7 @@ impl CodeIndexer {
     ) -> Result<Vec<CodeChunk>> {
         let want = top_k.saturating_add(1).max(top_k);
         let hits = self.vector_search(embedding, want).await?;
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         let mut out = Vec::with_capacity(top_k);
         for (id, score) in hits {
@@ -149,6 +154,7 @@ impl CodeIndexer {
             // Multi-word queries are not symbol names; skip the exact-match path.
             return None;
         }
+        self.ensure_chunks_loaded().await;
         let entities = self.entities.read().await;
         let chunks = self.chunks.read().await;
         for (file, ents) in entities.iter() {
@@ -180,6 +186,9 @@ impl CodeIndexer {
     /// `FileWatcher` rename/remove events) needs to drop all of a file's
     /// chunks at once. Returns the number of chunks removed.
     pub async fn remove_file(&self, file_path: &str) -> Result<usize> {
+        // Rehydrate so an idle-evicted map still yields the file's chunk ids to
+        // remove (the redb delete below is keyed by those ids).
+        self.ensure_chunks_loaded().await;
         let ids: Vec<String> = {
             let chunks = self.chunks.read().await;
             chunks

@@ -182,6 +182,11 @@ impl CodeIndexer {
     /// `index_file` in `indexer::tests`; the public `add_chunk` path still
     /// guarantees a fresh symbol graph on return.
     pub(super) async fn add_chunk_inner(&self, chunk: RawChunk) -> Result<()> {
+        // An idle-evicted in-memory map must be rehydrated before we read its
+        // length for the cap check or insert into it — otherwise the cap check
+        // sees 0 and the map would diverge from the durable corpus.
+        self.ensure_chunks_loaded().await;
+        self.touch_activity();
         let id = chunk.id.clone();
 
         // Issue #75: hard cap per-index chunk count to bound RAM growth.
@@ -618,6 +623,11 @@ impl CodeIndexer {
         parsed: ParsedBatch,
         defer_graph_rebuild: bool,
     ) -> Result<CommitTimings> {
+        // Rehydrate an idle-evicted map before the cap check / insert below so
+        // the in-memory corpus stays consistent with the durable redb store,
+        // and mark the index active so eviction won't race this commit.
+        self.ensure_chunks_loaded().await;
+        self.touch_activity();
         let ParsedBatch {
             chunks: mut all_chunks,
             mut embeddings,

@@ -2043,3 +2043,129 @@ async fn test_mode_filter_all_returns_everything() {
         );
     }
 }
+
+/// Idle-eviction (issue #83 follow-up): `idle_evict_secs` honours the default
+/// and the `TRUSTY_CHUNKS_IDLE_EVICT_SECS` override, including `0` (disabled)
+/// and an unparseable value (falls back to default).
+#[test]
+fn idle_evict_secs_default_and_env_override() {
+    let prior = std::env::var("TRUSTY_CHUNKS_IDLE_EVICT_SECS").ok();
+
+    // Unset → default.
+    // SAFETY: this test is the only reader/writer of this env var.
+    unsafe { std::env::remove_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS") };
+    assert_eq!(idle_evict_secs(), DEFAULT_CHUNKS_IDLE_EVICT_SECS);
+
+    // Valid override wins.
+    // SAFETY: see above.
+    unsafe { std::env::set_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS", "30") };
+    assert_eq!(idle_evict_secs(), 30);
+
+    // Zero disables (returned verbatim; the caller treats 0 as "off").
+    // SAFETY: see above.
+    unsafe { std::env::set_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS", "0") };
+    assert_eq!(idle_evict_secs(), 0);
+
+    // Garbage falls back to default (with a warn).
+    // SAFETY: see above.
+    unsafe { std::env::set_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS", "nope") };
+    assert_eq!(idle_evict_secs(), DEFAULT_CHUNKS_IDLE_EVICT_SECS);
+
+    // Restore.
+    // SAFETY: see above.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS", v),
+            None => std::env::remove_var("TRUSTY_CHUNKS_IDLE_EVICT_SECS"),
+        }
+    }
+}
+
+/// Idle-eviction core behaviour: a durably-backed indexer drops its in-memory
+/// `chunks` map once idle past the threshold, and the next in-memory read
+/// transparently rehydrates it from redb.
+#[tokio::test]
+async fn idle_eviction_drops_and_lazily_rehydrates_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let redb_path = dir.path().join("index.redb");
+    let idx = make_indexer_with_corpus(&redb_path);
+
+    // Populate two chunks; they land in both the in-memory map and redb.
+    idx.index_files_batch(&[
+        ("src/auth.rs".into(), "fn authenticate() {}".into()),
+        ("src/token.rs".into(), "fn verify_token() {}".into()),
+    ])
+    .await
+    .expect("index batch");
+    let resident_before = idx.in_memory_chunk_count().await;
+    assert!(resident_before >= 2, "expected >= 2 resident chunks");
+
+    // A zero threshold disables eviction — nothing is dropped.
+    assert_eq!(idx.evict_chunks_if_idle(std::time::Duration::ZERO).await, 0);
+    assert_eq!(idx.in_memory_chunk_count().await, resident_before);
+
+    // A long threshold means the index isn't idle yet (it was just ingested,
+    // which calls touch_activity) — nothing is dropped.
+    assert_eq!(
+        idx.evict_chunks_if_idle(std::time::Duration::from_secs(3600))
+            .await,
+        0
+    );
+    assert_eq!(idx.in_memory_chunk_count().await, resident_before);
+
+    // A zero-length idle window (every elapsed duration exceeds it) forces
+    // eviction now. The durable corpus is wired, so this is safe.
+    let evicted = idx
+        .evict_chunks_if_idle(std::time::Duration::from_nanos(1))
+        .await;
+    assert_eq!(evicted, resident_before, "eviction should drop every chunk");
+    assert_eq!(
+        idx.in_memory_chunk_count().await,
+        0,
+        "map must be empty after eviction"
+    );
+    assert!(
+        idx.chunks_evicted.load(Ordering::Relaxed),
+        "chunks_evicted flag must be set after eviction"
+    );
+
+    // The durable corpus is untouched — redb still has every chunk.
+    assert!(idx.corpus_store().unwrap().chunk_count().unwrap() >= 2);
+
+    // An in-memory read (raw_chunks_snapshot) lazily rehydrates from redb.
+    let snapshot = idx.raw_chunks_snapshot().await;
+    assert_eq!(
+        snapshot.len(),
+        resident_before,
+        "raw_chunks_snapshot must rehydrate the evicted map"
+    );
+    assert_eq!(
+        idx.in_memory_chunk_count().await,
+        resident_before,
+        "map must be repopulated after a read"
+    );
+    assert!(
+        !idx.chunks_evicted.load(Ordering::Relaxed),
+        "chunks_evicted flag must clear after rehydration"
+    );
+}
+
+/// Idle-eviction safety: a BM25-only indexer (no durable corpus) is NEVER
+/// evicted — its in-memory map is the only copy of the data.
+#[tokio::test]
+async fn idle_eviction_skips_indexers_without_corpus() {
+    let idx = make_indexer(); // embedder + store, but corpus: None
+    idx.add_chunk(raw("a", "src/a.rs", "fn a() {}"))
+        .await
+        .unwrap();
+    let before = idx.in_memory_chunk_count().await;
+    assert_eq!(before, 1);
+
+    // Even with an always-idle window, eviction is a no-op without a corpus.
+    let evicted = idx
+        .evict_chunks_if_idle(std::time::Duration::from_nanos(1))
+        .await;
+    assert_eq!(evicted, 0, "must not evict without a durable corpus");
+    assert_eq!(idx.in_memory_chunk_count().await, before);
+    assert!(!idx.chunks_evicted.load(Ordering::Relaxed));
+}

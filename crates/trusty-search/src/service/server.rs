@@ -728,6 +728,7 @@ pub fn build_router(state: SearchAppState) -> Router {
     let state_arc = Arc::new(state);
     spawn_status_ticker(Arc::clone(&state_arc));
     spawn_disk_size_ticker(Arc::clone(&state_arc));
+    spawn_idle_chunk_eviction_ticker(Arc::clone(&state_arc));
 
     // Issue #41 Phase 1: concurrency limiter applied selectively to expensive
     // endpoints. Cheap endpoints (/health, /metrics, /indexes list, /ui/*)
@@ -887,6 +888,58 @@ fn spawn_disk_size_ticker(state: Arc<SearchAppState>) {
             state
                 .disk_bytes
                 .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Spawn a background ticker that evicts each index's in-memory `chunks` map
+/// after it has been idle past the configured window (issue #83 follow-up).
+///
+/// Why (idle-memory audit): the durable redb corpus already serves the query
+/// hot path, so an index that hasn't been queried or ingested for a while is
+/// holding hundreds of MB of `RawChunk` text in the process heap for nothing.
+/// `CodeIndexer::evict_chunks_if_idle` reclaims that heap and lazily rehydrates
+/// from redb on the next access; this ticker is what drives it on a fixed
+/// cadence across every registered index. It mirrors the `spawn_*_ticker`
+/// pattern: a detached task holding a `Weak<SearchAppState>` so it stops when
+/// the daemon drops its last `Arc`.
+/// What: every 60 s, resolves the idle window via
+/// `crate::core::indexer::idle_evict_secs()` (env-overridable;
+/// `0` disables eviction and the ticker idles), then walks the registry and
+/// calls `evict_chunks_if_idle` on each indexer. The per-indexer call is itself
+/// a no-op for active indexes, indexes without a durable corpus, and
+/// already-empty maps, so the walk is cheap. The eviction acquires each
+/// indexer's read lock only to check `corpus`/idle state and a brief write lock
+/// only when it actually clears the map.
+/// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks` covers the
+/// per-indexer logic directly; the ticker is a thin scheduling wrapper.
+fn spawn_idle_chunk_eviction_ticker(state: Arc<SearchAppState>) {
+    let weak = Arc::downgrade(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        // Skip the immediate first tick so a freshly-started daemon isn't
+        // evicting before it has served anything.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            let secs = crate::core::indexer::idle_evict_secs();
+            if secs == 0 {
+                // Eviction disabled by env; keep ticking cheaply so an operator
+                // re-enabling it (next process) is honoured without a restart
+                // of this loop — but do no work this tick.
+                continue;
+            }
+            let threshold = Duration::from_secs(secs);
+            for id in state.registry.list() {
+                let Some(handle) = state.registry.get(&id) else {
+                    continue;
+                };
+                let indexer = handle.indexer.read().await;
+                indexer.evict_chunks_if_idle(threshold).await;
+            }
         }
     });
 }

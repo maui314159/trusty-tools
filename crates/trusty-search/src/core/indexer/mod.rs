@@ -20,8 +20,9 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,57 @@ fn embedding_cache_cap() -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&n: &usize| n > 0)
         .unwrap_or(DEFAULT_EMBEDDING_CACHE_CAP)
+}
+
+/// Default idle window (seconds) after which a durably-backed index's
+/// in-memory `chunks` HashMap is evicted to reclaim heap.
+///
+/// Why (idle-memory audit, follow-up to the redb-cache + embedding-LRU quick
+/// wins): the earlier wins capped the redb page cache and the chunk-embedding
+/// LRU, but the raw `chunks: Arc<RwLock<HashMap<String, RawChunk>>>` still held
+/// every chunk's *text* resident for the index's entire lifetime — on a 200k
+/// chunk corpus that is hundreds of MB of `String` heap per index that the
+/// query hot path no longer even reads (since issue #28 it materialises top-k
+/// results straight from the mmap-backed redb corpus via
+/// `CorpusStore::get_chunks`). An idle index therefore parks that whole map in
+/// RAM for nothing. Evicting it after a quiet period reclaims the heap; the few
+/// remaining in-memory readers (`grep_fallback_search`, `all_chunks`,
+/// `enumerate_chunks`, the `fetch_chunks_for_ids` fallback) lazily rehydrate
+/// from redb on the next access. 300 s (5 min) is long enough that an actively
+/// queried index is never evicted mid-session, short enough that a daemon left
+/// idle overnight shrinks back to its durable baseline.
+/// What: 300 seconds, used by [`crate::core::indexer::idle_evict_secs`] when
+/// `TRUSTY_CHUNKS_IDLE_EVICT_SECS` is unset.
+/// Test: `idle_evict_secs_default_and_env_override`.
+const DEFAULT_CHUNKS_IDLE_EVICT_SECS: u64 = 300;
+
+/// Resolve the in-memory-chunks idle-eviction window (in seconds) from the
+/// environment, falling back to [`DEFAULT_CHUNKS_IDLE_EVICT_SECS`].
+///
+/// Why: operators on memory-constrained hosts may want a tighter window
+/// (evict sooner) while large-corpus hosts that re-query frequently may want
+/// to disable eviction entirely. Making it env-tunable mirrors the
+/// `TRUSTY_REDB_CACHE_MB` / `TRUSTY_EMBEDDING_CACHE` precedent without a
+/// recompile.
+/// What: reads `TRUSTY_CHUNKS_IDLE_EVICT_SECS` as `u64` seconds. A value of `0`
+/// **disables** idle eviction (the in-memory map is never dropped). An
+/// unset / empty / unparseable value falls back to the default (a warn is
+/// logged on a non-empty unparseable value so typos surface).
+/// Test: `idle_evict_secs_default_and_env_override`.
+pub(crate) fn idle_evict_secs() -> u64 {
+    match std::env::var("TRUSTY_CHUNKS_IDLE_EVICT_SECS") {
+        Ok(v) if !v.is_empty() => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "indexer: TRUSTY_CHUNKS_IDLE_EVICT_SECS={v:?} is not a valid u64; \
+                     using default ({DEFAULT_CHUNKS_IDLE_EVICT_SECS}s)"
+                );
+                DEFAULT_CHUNKS_IDLE_EVICT_SECS
+            }
+        },
+        _ => DEFAULT_CHUNKS_IDLE_EVICT_SECS,
+    }
 }
 
 /// Default hard cap on chunks per index. Also used as the HNSW
@@ -634,6 +686,39 @@ pub struct CodeIndexer {
     /// classifier behaviour.
     /// Test: `tests::search_uses_domain_terms_when_provided`.
     pub(super) domain_terms: Vec<String>,
+
+    /// Process-relative clock base for [`Self::last_activity_ms`].
+    ///
+    /// Why: `Instant` is not `Copy`-into-atomic, so we store activity as a
+    /// `u64` millisecond offset from this monotonic base, which makes the
+    /// touch on the search/ingest hot path a single relaxed atomic store
+    /// instead of a lock acquisition.
+    /// What: captured once at construction.
+    pub(super) created_at: Instant,
+
+    /// Milliseconds (relative to [`Self::created_at`]) of the most recent
+    /// query or ingest activity. Used by [`Self::evict_chunks_if_idle`] to
+    /// decide whether the in-memory `chunks` map can be dropped.
+    ///
+    /// Why: a lock-free activity timestamp lets a background ticker reclaim the
+    /// heap held by idle indexes without contending with live searches.
+    /// What: `AtomicU64`, updated by [`Self::touch_activity`] (relaxed store)
+    /// on every search and successful commit.
+    pub(super) last_activity_ms: Arc<AtomicU64>,
+
+    /// `true` once the in-memory `chunks` map has been evicted because the
+    /// index was idle and a durable corpus is wired.
+    ///
+    /// Why: the in-memory readers (`grep_fallback_search`, `all_chunks`,
+    /// `enumerate_chunks`, the `fetch_chunks_for_ids` fallback) must know to
+    /// rehydrate from redb before reading an empty map. A genuinely empty
+    /// corpus (never indexed) must NOT trigger repeated rehydration attempts,
+    /// so this flag distinguishes "evicted, reload on demand" from "empty".
+    /// What: set by [`Self::evict_chunks_if_idle`], cleared by
+    /// [`Self::ensure_chunks_loaded`] and by any ingest that repopulates the
+    /// map.
+    /// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks`.
+    pub(super) chunks_evicted: Arc<AtomicBool>,
 }
 
 /// Coalescing state for `spawn_incremental_persist`.
@@ -701,6 +786,149 @@ impl CodeIndexer {
             ner: crate::core::ner::NerExtractor::try_load(),
             persist_state: Arc::new(PersistState::default()),
             domain_terms: Vec::new(),
+            created_at: Instant::now(),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            chunks_evicted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Record that this index was just queried or ingested.
+    ///
+    /// Why: the idle-eviction ticker needs a cheap, lock-free "when was this
+    /// index last touched?" signal so it never drops the in-memory `chunks`
+    /// map out from under an actively-used index.
+    /// What: stores the milliseconds elapsed since [`Self::created_at`] into
+    /// [`Self::last_activity_ms`] with `Relaxed` ordering (a stale read by the
+    /// ticker only delays eviction by one tick — never causes incorrect
+    /// behaviour). Saturates at `u64::MAX` for absurdly long-lived processes.
+    /// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks` touches then
+    /// asserts eviction is skipped within the window.
+    pub(super) fn touch_activity(&self) {
+        let ms = self.created_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_activity_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last recorded activity (query/ingest).
+    ///
+    /// Why: lets the eviction logic compare elapsed idle time against the
+    /// configured window without exposing the raw atomic.
+    /// What: `created_at.elapsed() - last_activity_ms`, floored at 0.
+    /// Test: covered via `evict_chunks_if_idle`'s behaviour tests.
+    fn idle_duration(&self) -> std::time::Duration {
+        let now_ms = self.created_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        std::time::Duration::from_millis(now_ms.saturating_sub(last))
+    }
+
+    /// Number of chunks currently resident in the in-memory `chunks` map.
+    ///
+    /// Why: tests and the eviction ticker want a direct read of the in-memory
+    /// footprint (distinct from the durable `corpus.chunk_count()`), so they
+    /// can verify eviction actually dropped the map and rehydration refilled
+    /// it.
+    /// What: returns `self.chunks.read().len()`.
+    /// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks`.
+    pub async fn in_memory_chunk_count(&self) -> usize {
+        self.chunks.read().await.len()
+    }
+
+    /// Drop the in-memory `chunks` map when the index has been idle longer
+    /// than `idle_threshold` and a durable corpus can repopulate it.
+    ///
+    /// Why: see [`DEFAULT_CHUNKS_IDLE_EVICT_SECS`] — the raw chunk-text map is
+    /// the single largest idle-heap contributor per index and is unused on the
+    /// query hot path once a redb corpus is wired. Reclaiming it on idle shrinks
+    /// a quiet daemon back to its durable baseline without affecting an active
+    /// one.
+    /// What: a no-op when (a) `idle_threshold` is zero (eviction disabled), (b)
+    /// no durable `corpus` is wired (the map is then the *only* copy and cannot
+    /// be safely dropped), (c) the map is already empty, or (d) the index has
+    /// been active within the window. Otherwise clears the map, marks
+    /// [`Self::chunks_evicted`], and logs an `info` with the reclaimed count.
+    /// BM25 and the symbol graph are intentionally left hot — they are separate
+    /// structures the query path still reads, and they hold no large `String`
+    /// content. Returns the number of chunks evicted (0 when skipped).
+    /// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks`.
+    pub async fn evict_chunks_if_idle(&self, idle_threshold: std::time::Duration) -> usize {
+        if idle_threshold.is_zero() {
+            return 0;
+        }
+        // Without a durable corpus the in-memory map is the only copy — dropping
+        // it would lose data, so never evict in BM25-only / test mode.
+        if self.corpus.is_none() {
+            return 0;
+        }
+        if self.idle_duration() < idle_threshold {
+            return 0;
+        }
+        let mut chunks = self.chunks.write().await;
+        if chunks.is_empty() {
+            return 0;
+        }
+        let evicted = chunks.len();
+        chunks.clear();
+        chunks.shrink_to_fit();
+        drop(chunks);
+        self.chunks_evicted.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "index '{}': evicted {} in-memory chunks after {}s idle \
+             (durable corpus retained; lazily rehydrates on next access)",
+            self.index_id,
+            evicted,
+            idle_threshold.as_secs(),
+        );
+        evicted
+    }
+
+    /// Repopulate the in-memory `chunks` map from the durable corpus if it was
+    /// previously evicted while idle.
+    ///
+    /// Why: the in-memory readers (`grep_fallback_search`, `all_chunks`,
+    /// `raw_chunks_snapshot`, `enumerate_chunks`, and the `fetch_chunks_for_ids`
+    /// fallback) must observe a populated map. After an idle eviction the map
+    /// is empty *and* `chunks_evicted` is set; this restores it lazily on the
+    /// next such access so eviction is transparent to callers.
+    /// What: a fast no-op (single relaxed atomic load) when the map was never
+    /// evicted. When evicted, reloads every chunk from `CorpusStore` on a
+    /// blocking worker and refills the map, then clears the flag. Concurrency
+    /// is safe: the flag is cleared only after a successful refill, and a
+    /// double refill (two readers racing) is idempotent because each inserts
+    /// the same `id → chunk` rows. Errors are logged at `warn` and leave the
+    /// flag set so a later access retries — a transient redb read failure must
+    /// not permanently blank the map.
+    /// Test: `idle_eviction_drops_and_lazily_rehydrates_chunks`.
+    pub(super) async fn ensure_chunks_loaded(&self) {
+        if !self.chunks_evicted.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(corpus) = self.corpus.clone() else {
+            // No corpus to reload from — clear the flag so we don't spin.
+            self.chunks_evicted.store(false, Ordering::Relaxed);
+            return;
+        };
+        let index_id = self.index_id.clone();
+        let loaded = tokio::task::spawn_blocking(move || corpus.load_all_chunks()).await;
+        match loaded {
+            Ok(Ok(chunks)) => {
+                let n = chunks.len();
+                let mut map = self.chunks.write().await;
+                for chunk in chunks {
+                    map.insert(chunk.id.clone(), chunk);
+                }
+                drop(map);
+                self.chunks_evicted.store(false, Ordering::Relaxed);
+                tracing::info!(
+                    "index '{index_id}': rehydrated {n} chunks from redb after idle eviction"
+                );
+            }
+            Ok(Err(e)) => tracing::warn!(
+                "index '{index_id}': failed to rehydrate chunks from redb ({e}); \
+                 will retry on next access"
+            ),
+            Err(e) => tracing::warn!(
+                "index '{index_id}': chunk rehydration task panicked ({e}); \
+                 will retry on next access"
+            ),
         }
     }
 

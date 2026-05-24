@@ -173,7 +173,9 @@ impl CodeIndexer {
             }
         }
         // BM25-only / test indexer, or a redb read error: clone the requested
-        // entries out of the in-memory HashMap.
+        // entries out of the in-memory HashMap. Rehydrate first in case the map
+        // was evicted while idle (no-op unless `chunks_evicted` is set).
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         ids.iter()
             .filter_map(|id| chunks.get(id).map(|c| (id.clone(), c.clone())))
@@ -284,6 +286,10 @@ impl CodeIndexer {
         let Ok(re) = regex::Regex::new(&regex::escape(query)) else {
             return Vec::new();
         };
+        // Rehydrate the in-memory corpus if it was evicted while idle — the
+        // grep fallback scans chunk *content*, which only the in-memory map
+        // carries (redb point-reads are keyed by id, not content).
+        self.ensure_chunks_loaded().await;
         let chunks = self.chunks.read().await;
         let mut out: Vec<(String, f32)> = Vec::new();
         for raw in chunks.values() {
@@ -402,6 +408,9 @@ impl CodeIndexer {
     /// 6. Materialise the top `top_k` chunk IDs into `CodeChunk`s with the
     ///    fused score and per-result `match_reason`.
     pub async fn search(&self, query: &SearchQuery) -> Result<Vec<CodeChunk>> {
+        // Mark the index live so the idle-eviction ticker won't reclaim its
+        // in-memory chunk map out from under an actively-queried session.
+        self.touch_activity();
         // Use the domain-aware classifier so per-index vocabulary from
         // `trusty-search.yaml` (`domain_terms:`) nudges otherwise-`Unknown`
         // queries to `Definition` intent. Falls back to plain `classify` when
