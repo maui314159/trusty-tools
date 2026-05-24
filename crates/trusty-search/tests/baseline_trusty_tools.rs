@@ -91,10 +91,17 @@ const REGRESSION_QUERIES: &[(&str, &str, &str)] = &[
     // "search" was too broad and matched many irrelevant files.
     ("HNSW vector similarity search", "store", "usage"),
     // Issue #82: project auto-detect logic lives in both `commands/discover.rs`
-    // and `detect.rs`. Tighten the query so it hits the discover/detect
-    // family rather than a stray docs chunk, and accept either file.
+    // and `detect.rs`. The earlier phrasing "auto-detect project root for
+    // indexing" was too vague — the classifier scored it `Unknown` and the
+    // fusion returned `monitor/dashboard.rs` as the top hit. Anchoring the
+    // query on the concrete domain terms that actually appear in
+    // `detect.rs`/`discover.rs` (`detect`, `project context`, `git root`,
+    // `marker file`) routes it to `Conceptual` and surfaces the detect/discover
+    // family. The `"detect"` fragment matches both `detect.rs` and
+    // `discover.rs` chunks (the latter's doc text references `detect_project`),
+    // so the assertion stays meaningful rather than vacuous.
     (
-        "auto-detect project root for indexing",
+        "detect project context git root marker file",
         "detect",
         "definition",
     ),

@@ -2,8 +2,8 @@
 //!
 //! Why: ad-hoc spot checks aren't enough to know whether a refactor regressed
 //! retrieval. This harness fixes a small per-intent query set against the
-//! `trusty-search-core` source tree and reports MRR@5 + Recall@10 + latency.
-//! What: indexes `crates/trusty-search-core/src/` end-to-end (FastEmbedder +
+//! `trusty-search` crate source tree and reports MRR@5 + Recall@10 + latency.
+//! What: indexes `crates/trusty-search/src/` end-to-end (FastEmbedder +
 //! UsearchStore + BM25 via the live `CodeIndexer::search` pipeline), runs the
 //! query set, prints a per-intent table, and asserts a soft mean MRR@5 floor.
 //! Test: each `#[ignore] #[tokio::test]` corresponds to one intent class.
@@ -115,17 +115,24 @@ fn recall_at_k(results: &[CodeChunk], expected: &str, k: usize) -> bool {
 // Indexing fixture — shared across the four benchmark tests.
 // ---------------------------------------------------------------------------
 
-/// Locate `crates/trusty-search-core/src/` relative to the workspace root so
-/// the harness works regardless of which directory `cargo test` was launched in.
+/// Locate the crate's own `src/` directory so the harness works regardless of
+/// which directory `cargo test` was launched in.
+///
+/// Why: the previous path pointed at `crates/trusty-search-core/src/`, a
+/// sub-crate that was folded into `trusty-search` at v0.3.0 and no longer
+/// exists. The stale path silently indexed zero files, so every benchmark
+/// reported MRR@5 = 0.000.
+/// What: returns `<crate-root>/src`. `CARGO_MANIFEST_DIR` for a test in this
+/// crate resolves to `crates/trusty-search/`, so `.join("src")` is the real
+/// consolidated source tree (core / service / mcp modules).
+/// Test: exercised by the four benchmark tests in this file, which now index a
+/// non-empty corpus; also verifiable with `ls crates/trusty-search/src/`.
 fn core_src_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("crates")
-        .join("trusty-search-core")
-        .join("src")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Build a fresh `CodeIndexer` populated with every `.rs` file under
-/// `crates/trusty-search-core/src/`. Returns the indexer once population
+/// Build a fresh `CodeIndexer` populated with every `.rs` file under the
+/// crate's `src/`. Returns the indexer once population
 /// completes (synchronous from the caller's perspective).
 async fn build_indexer() -> CodeIndexer {
     let embedder: Arc<dyn Embedder> = Arc::new(
