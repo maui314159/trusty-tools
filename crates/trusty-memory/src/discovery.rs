@@ -426,10 +426,7 @@ fn extract_origin_url(config: &str) -> Option<String> {
 /// trailing `.git`. Returns `None` for empty inputs.
 /// Test: `short_repo_name_strips_git_suffix_and_path`.
 fn short_repo_name(url: &str) -> Option<String> {
-    let last = url
-        .rsplit(|c: char| c == '/' || c == ':')
-        .next()
-        .unwrap_or("");
+    let last = url.rsplit(['/', ':']).next().unwrap_or("");
     let stripped = last.strip_suffix(".git").unwrap_or(last).trim();
     if stripped.is_empty() {
         None

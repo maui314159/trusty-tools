@@ -202,6 +202,7 @@ impl ChatSessionStore {
     /// 4. Opens (or creates) the redb database and touches the SESSIONS
     ///    table in a write transaction so range scans on a fresh file
     ///    succeed.
+    ///
     /// Test: `create_then_get_session_round_trips`,
     /// `roundtrip_persists_across_reopen`, `migrates_legacy_sqlite_rows`.
     pub fn open(path: &Path) -> anyhow::Result<Self> {

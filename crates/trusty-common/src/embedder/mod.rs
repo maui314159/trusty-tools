@@ -66,6 +66,7 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 ///      writable under launchd.
 ///   4. As a last resort, the system temp dir with a `tracing::warn!`
 ///      noting the daemon is likely misconfigured.
+///
 /// Test: `resolve_fastembed_cache_dir_prefers_env_vars` covers (1)–(3).
 pub fn resolve_fastembed_cache_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("FASTEMBED_CACHE_DIR")

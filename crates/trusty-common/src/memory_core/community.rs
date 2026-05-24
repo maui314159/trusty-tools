@@ -268,7 +268,6 @@ impl WeightedGraph {
             }
         }
         let mut degree = vec![0.0; n];
-        let mut two_m = 0.0;
         for (u, neighbours) in adjacency.iter().enumerate() {
             for (&v, &w) in neighbours {
                 degree[u] += w;
@@ -276,15 +275,13 @@ impl WeightedGraph {
                     // Self-loop contributes once more to degree (standard
                     // convention).
                     degree[u] += w;
-                    two_m += 2.0 * w;
-                } else {
-                    two_m += w;
                 }
             }
         }
-        // The `two_m` accumulator above double-counts non-self edges
-        // (once from each endpoint). Halve back to true 2m.
-        // Recount cleanly to avoid floating-point drift:
+        // 2m is the sum of all node degrees (each undirected edge contributes
+        // to both endpoints' degrees, and self-loops contribute twice). Summing
+        // the degree vector gives 2m directly and avoids the floating-point
+        // drift of a separate edge-walk accumulator.
         let mut two_m_clean = 0.0;
         for d in &degree {
             two_m_clean += *d;

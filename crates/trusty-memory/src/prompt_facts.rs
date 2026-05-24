@@ -105,8 +105,10 @@ fn section_heading(predicate: &str) -> &str {
 /// `build_prompt_context_empty_when_no_hot_triples`.
 pub fn build_prompt_context(triples: &[(String, String, String)]) -> String {
     // Filter and group preserving HOT_PREDICATES ordering.
-    let mut sections: Vec<(&str, Vec<&(String, String, String)>)> =
-        HOT_PREDICATES.iter().map(|p| (*p, Vec::new())).collect();
+    // `(predicate, triples-in-that-section)`; aliased to satisfy clippy's
+    // `type_complexity` lint.
+    type Section<'a> = (&'a str, Vec<&'a (String, String, String)>);
+    let mut sections: Vec<Section<'_>> = HOT_PREDICATES.iter().map(|p| (*p, Vec::new())).collect();
     for triple in triples {
         if let Some(slot) = sections.iter_mut().find(|(p, _)| *p == triple.1.as_str()) {
             slot.1.push(triple);

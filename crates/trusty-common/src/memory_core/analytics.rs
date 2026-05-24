@@ -15,7 +15,10 @@
 //! plus reopen round-trip (events survive across reopens) and (gated on
 //! `sqlite-kg`) one-shot migration from a legacy `recall.db` SQLite file.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+// `anyhow!` is only used inside the `sqlite-kg`-gated legacy-migration path.
+#[cfg(feature = "sqlite-kg")]
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
@@ -149,15 +152,15 @@ impl RecallLog {
     pub fn open(path: &Path) -> Result<Self> {
         let redb_path = resolve_redb_path(path);
 
-        if let Some(parent) = redb_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "failed to create recall log parent dir {}",
-                        parent.display()
-                    )
-                })?;
-            }
+        if let Some(parent) = redb_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create recall log parent dir {}",
+                    parent.display()
+                )
+            })?;
         }
 
         // One-shot migration must run *before* we open the long-lived db
@@ -269,6 +272,10 @@ impl RecallLog {
     /// What: Opens a read transaction, decodes each row into `RecallEvent`,
     /// returns them in key order (insertion order).
     /// Test: covered by every public read method's tests.
+    // Retained as the shared full-scan helper for the read methods; not all
+    // build configurations exercise a caller, so silence the dead-code lint
+    // rather than delete the documented shared infrastructure.
+    #[allow(dead_code)]
     fn snapshot(&self) -> Result<Vec<RecallEvent>> {
         let db = self.db.clone();
         let path = self.path.clone();

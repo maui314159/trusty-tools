@@ -31,6 +31,17 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+/// Flat, undirected snapshot of the in-memory graph.
+///
+/// Why: [`KnowledgeGraph::snapshot_undirected`] returns the node-name table
+/// plus an undirected edge list keyed by indices into that table. Naming the
+/// tuple keeps the function signature readable and satisfies clippy's
+/// `type_complexity` lint without leaking the storage representation.
+/// What: `(node_names, edges)` where `edges[i] = (u, v)` and `u, v` index into
+/// `node_names`.
+/// Test: covered transitively by `community_tests::partition_covers_all_nodes`.
+pub(crate) type UndirectedSnapshot = (Vec<String>, Vec<(usize, usize)>);
+
 /// In-memory edge payload mirroring a knowledge-graph triple.
 ///
 /// Why: The redb TRIPLES table is optimised for transactional persistence and
@@ -883,7 +894,7 @@ impl KnowledgeGraph {
     /// `u, v` index into `node_names`.
     /// Test: `community_tests::partition_covers_all_nodes` exercises this
     /// snapshot transitively through `community::find_communities`.
-    pub(crate) fn snapshot_undirected(&self) -> Result<(Vec<String>, Vec<(usize, usize)>)> {
+    pub(crate) fn snapshot_undirected(&self) -> Result<UndirectedSnapshot> {
         let adj = self
             .adj
             .read()

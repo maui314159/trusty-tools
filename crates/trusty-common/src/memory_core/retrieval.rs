@@ -1994,10 +1994,14 @@ mod tests {
             )
             .await
             .expect("note should accept short curated fact");
-        let drawers = handle.drawers.read();
-        let stored = drawers.iter().find(|d| d.id == id).expect("present");
-        assert_eq!(stored.drawer_type, DrawerType::UserFact);
-        drop(drawers);
+        // Copy the field we need out under a tightly-scoped guard so no lock is
+        // held across the subsequent `.await` (clippy::await_holding_lock).
+        let stored_type = {
+            let drawers = handle.drawers.read();
+            let stored = drawers.iter().find(|d| d.id == id).expect("present");
+            stored.drawer_type
+        };
+        assert_eq!(stored_type, DrawerType::UserFact);
 
         // Noise still rejected even in note mode.
         let err = handle

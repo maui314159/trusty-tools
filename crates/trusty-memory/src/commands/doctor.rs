@@ -12,8 +12,10 @@
 //!      and contains the `FASTEMBED_CACHE_PATH` env var (macOS only)
 //!   3. The HTTP daemon responds to `GET /health` on its configured port
 //!   4. No obvious stale palace lock sidecar files (`*.lock`) under the data dir
+//!
 //! Each check prints a ✅ or ❌ line. The command exits 0 if all critical
 //! checks pass, 1 otherwise.
+//!
 //! Test: `fastembed_cache_check_reports_missing_dir` and
 //! `plist_check_detects_missing_env_var` cover the helpers; the full
 //! orchestrator is exercised manually via
@@ -445,9 +447,9 @@ mod tests {
     #[test]
     fn fastembed_cache_has_models_detects_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        assert_eq!(fastembed_cache_has_models(tmp.path()).unwrap(), false);
+        assert!(!fastembed_cache_has_models(tmp.path()).unwrap());
         std::fs::write(tmp.path().join("model.onnx"), b"x").unwrap();
-        assert_eq!(fastembed_cache_has_models(tmp.path()).unwrap(), true);
+        assert!(fastembed_cache_has_models(tmp.path()).unwrap());
     }
 
     /// Why: the plist check is the most operationally important diagnostic
@@ -462,9 +464,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let no_key = tmp.path().join("no_key.plist");
         std::fs::write(&no_key, "<plist><dict></dict></plist>").unwrap();
-        assert_eq!(
-            plist_contains_fastembed_cache_path(&no_key).unwrap(),
-            false,
+        assert!(
+            !plist_contains_fastembed_cache_path(&no_key).unwrap(),
             "plist without env var must report false"
         );
 
@@ -474,9 +475,8 @@ mod tests {
             "<plist><dict><key>FASTEMBED_CACHE_PATH</key><string>/x</string></dict></plist>",
         )
         .unwrap();
-        assert_eq!(
+        assert!(
             plist_contains_fastembed_cache_path(&with_key).unwrap(),
-            true,
             "plist with env var must report true"
         );
     }
