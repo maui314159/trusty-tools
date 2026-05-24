@@ -823,10 +823,7 @@ mod tests {
         // Default: unset → 512 MB.
         // SAFETY: corpus tests do not mutate this env var concurrently.
         unsafe { std::env::remove_var("TRUSTY_REDB_CACHE_MB") };
-        assert_eq!(
-            redb_cache_size_bytes(),
-            DEFAULT_REDB_CACHE_MB * 1024 * 1024
-        );
+        assert_eq!(redb_cache_size_bytes(), DEFAULT_REDB_CACHE_MB * 1024 * 1024);
 
         // Valid override wins.
         // SAFETY: see above.
@@ -836,18 +833,12 @@ mod tests {
         // Zero falls back to the default.
         // SAFETY: see above.
         unsafe { std::env::set_var("TRUSTY_REDB_CACHE_MB", "0") };
-        assert_eq!(
-            redb_cache_size_bytes(),
-            DEFAULT_REDB_CACHE_MB * 1024 * 1024
-        );
+        assert_eq!(redb_cache_size_bytes(), DEFAULT_REDB_CACHE_MB * 1024 * 1024);
 
         // Garbage falls back to the default (with a warn).
         // SAFETY: see above.
         unsafe { std::env::set_var("TRUSTY_REDB_CACHE_MB", "not-a-number") };
-        assert_eq!(
-            redb_cache_size_bytes(),
-            DEFAULT_REDB_CACHE_MB * 1024 * 1024
-        );
+        assert_eq!(redb_cache_size_bytes(), DEFAULT_REDB_CACHE_MB * 1024 * 1024);
 
         // Restore.
         // SAFETY: see above.
