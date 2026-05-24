@@ -8,6 +8,7 @@ pub mod constants;
 pub mod context_inference;
 pub mod daemon;
 pub mod embed_pool;
+pub mod grep;
 pub mod indexed_files;
 pub mod mcp_descriptor;
 pub mod metrics;

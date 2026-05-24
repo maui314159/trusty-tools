@@ -741,6 +741,8 @@ pub fn build_router(state: SearchAppState) -> Router {
     // an Extension so the middleware fn can pull it out per-request.
     let limited = Router::new()
         .route("/search", post(global_search_handler))
+        .route("/grep", post(global_grep_handler))
+        .route("/indexes/{id}/grep", post(grep_handler))
         .route("/indexes/{id}/search", post(search_handler))
         .route("/indexes/{id}/search_similar", post(search_similar_handler))
         .route("/indexes/{id}/index-file", post(index_file_handler))
@@ -2680,6 +2682,176 @@ async fn get_index_chunks_handler(
     })))
 }
 
+/// Grep a single index's files and append hits into `out`, honouring the
+/// remaining `max_results` budget.
+///
+/// Why: both the per-index (`POST /indexes/:id/grep`) and the global
+/// (`POST /grep`) handlers need the identical "for every file the index knows
+/// about, read it from disk and run the matcher" loop. Factoring it out keeps
+/// the two handlers thin and guarantees they behave identically.
+/// What: snapshots the index's `RawChunk` corpus to discover the distinct set
+/// of files (deduped, since one file produces many chunks), then for each file
+/// that passes the glob filter and lives within the index root, reads the file
+/// fresh from disk under `root_path` and runs [`grep::grep_file_content`]. Files
+/// that fail the glob, escape the root, or can't be read are skipped silently
+/// (a read failure is logged at debug — the file may have been deleted since it
+/// was indexed). Greps the real on-disk bytes, so no embedding is required and
+/// line numbers are exact. Stops once `out.len()` reaches `max_results`.
+/// Test: `grep::tests` covers the matcher; `grep_endpoint_*` server integration
+/// tests cover the file-walking + glob + root-confinement behaviour.
+async fn grep_one_index(
+    handle: &IndexHandle,
+    compiled: &crate::service::grep::CompiledGrep,
+    out: &mut Vec<crate::service::grep::GrepMatch>,
+    max_results: usize,
+) {
+    if out.len() >= max_results {
+        return;
+    }
+    let chunks = {
+        let indexer = handle.indexer.read().await;
+        indexer.raw_chunks_snapshot().await
+    };
+    // One file produces many chunks; dedupe to a sorted, distinct file set so
+    // each file is read and scanned exactly once in a deterministic order.
+    let mut files: Vec<String> = chunks.into_iter().map(|c| c.file).collect();
+    files.sort();
+    files.dedup();
+
+    for rel in files {
+        if out.len() >= max_results {
+            return;
+        }
+        // Glob filter (cheap) before defense-in-depth root confinement.
+        if !compiled.path_matches(&rel) {
+            continue;
+        }
+        if !file_is_within_root(&rel, &handle.root_path) {
+            continue;
+        }
+        let abs = if std::path::Path::new(&rel).is_absolute() {
+            std::path::PathBuf::from(&rel)
+        } else {
+            handle.root_path.join(&rel)
+        };
+        match tokio::fs::read_to_string(&abs).await {
+            Ok(content) => {
+                crate::service::grep::grep_file_content(&rel, &content, compiled, out, max_results);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    file = %rel,
+                    error = %e,
+                    "grep: skipping unreadable file (deleted or non-UTF-8 since index time)"
+                );
+            }
+        }
+    }
+}
+
+/// `POST /indexes/:id/grep` — grep-parity regex search over one index's files.
+///
+/// Why: complements `POST /indexes/:id/search` (fuzzy hybrid recall) with exact,
+/// deterministic, line-accurate matching for callers who need `grep`/`ripgrep`
+/// semantics (regex, `-i`, `-A`/`-B`/`-C`, `--include` glob, multiline) against
+/// a known project — without re-embedding.
+/// What: compiles the [`grep::GrepRequest`] (400 on bad regex/glob), resolves
+/// the index (404 if unknown), runs [`grep_one_index`], and returns a
+/// [`grep::GrepResponse`]. `truncated` is set when the `max_results` cap is hit.
+/// Test: `grep_endpoint_returns_matches`, `grep_endpoint_bad_regex_is_400`,
+/// `grep_endpoint_unknown_index_is_404`.
+async fn grep_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::service::grep::GrepRequest>,
+) -> Result<Json<crate::service::grep::GrepResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let compiled = crate::service::grep::CompiledGrep::compile(&req).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": format!("unknown index: {}", index_id.0) })),
+    ))?;
+
+    let started = std::time::Instant::now();
+    let mut matches = Vec::new();
+    grep_one_index(&handle, &compiled, &mut matches, req.max_results).await;
+    let truncated = matches.len() >= req.max_results;
+    tracing::info!(
+        index_id = %index_id,
+        matches = matches.len(),
+        truncated = truncated,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "grep"
+    );
+    let total = matches.len();
+    Ok(Json(crate::service::grep::GrepResponse {
+        matches,
+        total,
+        truncated,
+    }))
+}
+
+/// `POST /grep` — grep-parity regex search fanned out across indexes.
+///
+/// Why: callers that don't know which project a literal lives in want one grep
+/// over every (or a chosen) index, mirroring the global `POST /search` fan-out.
+/// What: compiles the request (400 on bad regex/glob), then iterates the
+/// registered indexes (restricted to `index_id` when supplied — unknown id ⇒
+/// empty result set, not 404, matching the global search's tolerant behaviour),
+/// running [`grep_one_index`] against each until the shared `max_results` budget
+/// is exhausted. Returns a [`grep::GrepResponse`].
+/// Test: `grep_global_fans_out`, `grep_global_respects_index_filter`.
+async fn global_grep_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Json(req): Json<crate::service::grep::GrepRequest>,
+) -> Result<Json<crate::service::grep::GrepResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let compiled = crate::service::grep::CompiledGrep::compile(&req).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let ids: Vec<IndexId> = match req.index_id.as_deref() {
+        Some(only) => state
+            .registry
+            .list()
+            .into_iter()
+            .filter(|id| id.0 == only)
+            .collect(),
+        None => state.registry.list(),
+    };
+
+    let started = std::time::Instant::now();
+    let mut matches = Vec::new();
+    for id in ids {
+        if matches.len() >= req.max_results {
+            break;
+        }
+        if let Some(handle) = state.registry.get(&id) {
+            grep_one_index(&handle, &compiled, &mut matches, req.max_results).await;
+        }
+    }
+    let truncated = matches.len() >= req.max_results;
+    tracing::info!(
+        matches = matches.len(),
+        truncated = truncated,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "grep_global"
+    );
+    let total = matches.len();
+    Ok(Json(crate::service::grep::GrepResponse {
+        matches,
+        total,
+        truncated,
+    }))
+}
+
 /// Query params for `GET /indexes/{id}/call_chain` (issue #76).
 ///
 /// Why: HTTP callers (and the MCP `get_call_chain` tool that proxies through
@@ -4011,5 +4183,174 @@ mod tests {
     fn file_is_within_root_rejects_empty() {
         let root = std::path::Path::new("/Users/me/proj");
         assert!(!file_is_within_root("", root));
+    }
+
+    // ── /grep endpoint ──────────────────────────────────────────────────────
+
+    /// Stage a single-index registry whose chunks point at real files written
+    /// under a tempdir root, so `grep_one_index` has something to read.
+    ///
+    /// Why: the grep handlers walk the index's distinct file set and read each
+    /// file fresh from disk; an integration test therefore needs both indexed
+    /// chunks *and* matching on-disk files. This helper wires both up with a
+    /// `MockEmbedder` (no ONNX) and returns the held `TempDir` so callers keep
+    /// the files alive for the duration of the test.
+    /// What: writes each `(rel_path, content)` under the tempdir, registers a
+    /// `CodeIndexer` with components, `add_chunk`s a `RawChunk` per file, and
+    /// returns `(state, index_id, tempdir)`.
+    /// Test: consumed by the `grep_*` tests below.
+    async fn stage_grep_index(
+        files: &[(&str, &str)],
+    ) -> (Arc<SearchAppState>, IndexId, tempfile::TempDir) {
+        use crate::core::chunker::{ChunkType, RawChunk};
+        use crate::core::embed::{Embedder, MockEmbedder};
+        use crate::core::indexer::CodeIndexer;
+        use crate::core::registry::{IndexHandle, IndexRegistry};
+        use crate::core::store::{UsearchStore, VectorStore};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dim = 16;
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
+        let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(dim).expect("usearch"));
+        let indexer = CodeIndexer::new("grep-test", tmp.path()).with_components(embedder, store);
+
+        for (i, (rel, content)) in files.iter().enumerate() {
+            let abs = tmp.path().join(rel);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).expect("mkdirs");
+            }
+            std::fs::write(&abs, content).expect("write file");
+            let chunk = RawChunk {
+                id: format!("c{i}"),
+                file: rel.to_string(),
+                start_line: 1,
+                end_line: 1 + content.lines().count(),
+                content: content.to_string(),
+                function_name: None,
+                language: Some("rust".to_string()),
+                chunk_type: ChunkType::Code,
+                calls: Vec::new(),
+                inherits_from: Vec::new(),
+                chunk_depth: 0,
+                parent_chunk_id: None,
+                child_chunk_ids: Vec::new(),
+                nlp_keywords: Vec::new(),
+                nlp_code_refs: Vec::new(),
+                virtual_terms: Vec::new(),
+            };
+            indexer.add_chunk(chunk).await.expect("add_chunk");
+        }
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("grep-test");
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(indexer)),
+            tmp.path().to_path_buf(),
+        ));
+        (Arc::new(SearchAppState::new(registry)), id, tmp)
+    }
+
+    fn grep_req(pattern: &str) -> crate::service::grep::GrepRequest {
+        serde_json::from_value(serde_json::json!({ "pattern": pattern }))
+            .expect("default grep request")
+    }
+
+    /// `POST /indexes/:id/grep` returns line-accurate matches read fresh from
+    /// the on-disk files the index knows about.
+    #[tokio::test]
+    async fn grep_endpoint_returns_matches() {
+        let (state, _id, _tmp) = stage_grep_index(&[
+            ("src/auth.rs", "// header\nfn authenticate() {}\n"),
+            ("src/util.rs", "fn helper() {}\n"),
+        ])
+        .await;
+
+        let Json(resp) = grep_handler(
+            State(state),
+            Path("grep-test".to_string()),
+            Json(grep_req("authenticate")),
+        )
+        .await
+        .expect("200");
+
+        assert_eq!(resp.total, 1);
+        assert!(!resp.truncated);
+        assert_eq!(resp.matches[0].file, "src/auth.rs");
+        assert_eq!(resp.matches[0].line, 2);
+        assert_eq!(resp.matches[0].text, "fn authenticate() {}");
+    }
+
+    /// The glob filter restricts which indexed files are read.
+    #[tokio::test]
+    async fn grep_endpoint_honours_glob() {
+        let (state, _id, _tmp) = stage_grep_index(&[
+            ("src/auth.rs", "fn target() {}\n"),
+            ("docs/readme.md", "target appears here too\n"),
+        ])
+        .await;
+
+        let mut req = grep_req("target");
+        req.glob = Some("**/*.rs".to_string());
+        let Json(resp) = grep_handler(State(state), Path("grep-test".to_string()), Json(req))
+            .await
+            .expect("200");
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.matches[0].file, "src/auth.rs");
+    }
+
+    /// A malformed regex yields `400 Bad Request` with a JSON error body.
+    #[tokio::test]
+    async fn grep_endpoint_bad_regex_is_400() {
+        let (state, _id, _tmp) = stage_grep_index(&[("a.rs", "fn x() {}\n")]).await;
+        let err = grep_handler(
+            State(state),
+            Path("grep-test".to_string()),
+            Json(grep_req("(unclosed")),
+        )
+        .await
+        .expect_err("400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0.get("error").is_some());
+    }
+
+    /// An unknown index id yields `404 Not Found`.
+    #[tokio::test]
+    async fn grep_endpoint_unknown_index_is_404() {
+        let (state, _id, _tmp) = stage_grep_index(&[("a.rs", "fn x() {}\n")]).await;
+        let err = grep_handler(
+            State(state),
+            Path("does-not-exist".to_string()),
+            Json(grep_req("x")),
+        )
+        .await
+        .expect_err("404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// `POST /grep` (global) fans out across every registered index.
+    #[tokio::test]
+    async fn grep_global_fans_out() {
+        let (state, _id, _tmp) =
+            stage_grep_index(&[("src/auth.rs", "fn authenticate() {}\n")]).await;
+        let Json(resp) = global_grep_handler(State(state), Json(grep_req("authenticate")))
+            .await
+            .expect("200");
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.matches[0].file, "src/auth.rs");
+    }
+
+    /// Global grep with an `index_id` that doesn't exist returns an empty set
+    /// (tolerant fan-out), not a 404.
+    #[tokio::test]
+    async fn grep_global_respects_index_filter() {
+        let (state, _id, _tmp) = stage_grep_index(&[("a.rs", "fn x() {}\n")]).await;
+        let mut req = grep_req("x");
+        req.index_id = Some("nope".to_string());
+        let Json(resp) = global_grep_handler(State(state), Json(req))
+            .await
+            .expect("200");
+        assert_eq!(resp.total, 0);
+        assert!(!resp.truncated);
     }
 }
