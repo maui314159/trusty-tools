@@ -180,7 +180,25 @@ pub fn migrate_if_needed(open_mpm_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// Serializes the two tests that read/write the process-global
+    /// `MEMORY_BACKEND_ENV` variable.
+    ///
+    /// Why: `std::env` is shared across every thread in the test binary, so two
+    /// tests that mutate `OPEN_MPM_MEMORY_BACKEND` can race when cargo runs them
+    /// concurrently — one test's `set_var("trusty")` could still be live when
+    /// the other reads it, flipping the default-backend test onto the trusty
+    /// branch (the original flake at `mod.rs:210`). Holding this mutex for the
+    /// whole env-dependent window guarantees the env var is in a known state for
+    /// exactly one test at a time.
+    /// What: a `std::sync::Mutex<()>` guard acquired at the top of each
+    /// env-mutating test and held until the assertion completes.
+    /// Test: `open_memory_store_defaults_to_redb` /
+    /// `open_memory_store_selects_trusty_via_env` no longer flake under
+    /// concurrent execution.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     /// Why: Default behaviour must remain `RedbUsearchStore` so unset
     /// environments behave identically before and after issue #52.
@@ -190,8 +208,12 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn open_memory_store_defaults_to_redb() {
-        // SAFETY: serial test (no #[cfg] parallelism guard needed for cargo
-        // default single-test ordering on this env var).
+        // Hold the env guard for the whole window so the trusty test's
+        // `set_var` cannot leak into our `open_memory_store` read. Recover the
+        // lock on poison — a panicking sibling test must not wedge this one.
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(MEMORY_BACKEND_ENV).ok();
+        // SAFETY: serialized by ENV_GUARD; restored before return.
         unsafe {
             std::env::remove_var(MEMORY_BACKEND_ENV);
         }
@@ -211,6 +233,13 @@ mod tests {
             dir.path().join("store.redb").exists(),
             "redb backend should create store.redb under data_dir"
         );
+        // SAFETY: serialized by ENV_GUARD.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(MEMORY_BACKEND_ENV, v),
+                None => std::env::remove_var(MEMORY_BACKEND_ENV),
+            }
+        }
     }
 
     /// Why: Setting `OPEN_MPM_MEMORY_BACKEND=trusty` must select the
@@ -220,14 +249,21 @@ mod tests {
     /// Test: This test itself.
     #[tokio::test]
     async fn open_memory_store_selects_trusty_via_env() {
+        // Serialize against the default-backend test (see ENV_GUARD).
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(MEMORY_BACKEND_ENV).ok();
         let dir = tempdir().unwrap();
-        // SAFETY: scoped to this test; cleared before return.
+        // SAFETY: serialized by ENV_GUARD; restored before return.
         unsafe {
             std::env::set_var(MEMORY_BACKEND_ENV, "trusty");
         }
         let result = open_memory_store(dir.path());
+        // SAFETY: serialized by ENV_GUARD.
         unsafe {
-            std::env::remove_var(MEMORY_BACKEND_ENV);
+            match prior {
+                Some(v) => std::env::set_var(MEMORY_BACKEND_ENV, v),
+                None => std::env::remove_var(MEMORY_BACKEND_ENV),
+            }
         }
         let store = result.expect("open trusty backend");
         store

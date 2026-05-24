@@ -35,8 +35,8 @@ use trusty_search::SearchMcpService;
 /// clients to probe individual daemons.
 /// What: Collects `ServiceDescriptor` impls for memory and search, delegates
 /// to `OpenRpcBuilder::from_services`, returns the finalised OpenRPC `Value`.
-/// Test: `tests::merged_doc_has_all_tools` asserts ≥ 24 methods (11 memory +
-/// 13 search); `tests::every_method_has_x_service_annotation` asserts every
+/// Test: `tests::merged_doc_has_all_tools` asserts ≥ 25 methods (11 memory +
+/// 14 search); `tests::every_method_has_x_service_annotation` asserts every
 /// method carries `x-service`.
 pub fn build_unified_discovery() -> Value {
     let memory = MemoryMcpService;
@@ -87,15 +87,18 @@ mod tests {
     #[test]
     fn search_service_tool_count() {
         let svc = SearchMcpService;
-        // Why: trusty-search advertises a 13-tool surface; drift here would
-        //      mean the upstream service descriptor changed unexpectedly.
-        assert_eq!(svc.tools().len(), 13);
+        // Why: trusty-search advertises a 14-tool surface (issue #76 added
+        //      `get_call_chain`); drift here would mean the upstream service
+        //      descriptor changed unexpectedly.
+        assert_eq!(svc.tools().len(), 14);
     }
 
     #[test]
     fn search_service_scopes_for_read_tool() {
         let svc = SearchMcpService;
-        assert_eq!(svc.scopes_for("search_code"), vec!["search.read"]);
+        // The hybrid-search read tool is named `search` (with `search_all` as
+        // its all-indexes variant); both map to the read scope.
+        assert_eq!(svc.scopes_for("search"), vec!["search.read"]);
     }
 
     #[test]
@@ -117,10 +120,10 @@ mod tests {
             .get("methods")
             .and_then(|v| v.as_array())
             .expect("methods array");
-        // 11 memory tools + 13 search tools = 24 minimum.
+        // 11 memory tools + 14 search tools = 25 minimum.
         assert!(
-            methods.len() >= 24,
-            "expected ≥ 24 merged methods, got {} — services: {:?}",
+            methods.len() >= 25,
+            "expected ≥ 25 merged methods, got {} — services: {:?}",
             methods.len(),
             methods
                 .iter()
