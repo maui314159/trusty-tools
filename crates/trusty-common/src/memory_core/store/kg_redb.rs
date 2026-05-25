@@ -702,7 +702,7 @@ impl KgStoreRedb {
             };
             rows.push((value.valid_from_ms, s, p, value));
         }
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0));
         let mut out = Vec::new();
         for (_, s, p, value) in rows.into_iter().skip(offset).take(limit) {
             out.push(triple_from_parts(s, p, value)?);

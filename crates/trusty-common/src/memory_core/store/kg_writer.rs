@@ -430,7 +430,7 @@ async fn commit_and_reply(store: &Arc<KgStoreRedb>, buf: &mut Vec<QueuedOp>) {
             // Pair each queued op's reply with its result. `apply_batch`
             // guarantees the result vector matches the input ops 1:1.
             debug_assert_eq!(per_op_results.len(), buf.len());
-            for (queued, op_result) in buf.drain(..).zip(per_op_results.into_iter()) {
+            for (queued, op_result) in buf.drain(..).zip(per_op_results) {
                 match (queued.reply, op_result) {
                     (ReplyTo::Unit(tx), BatchOpResult::Asserted)
                     | (ReplyTo::Unit(tx), BatchOpResult::DrawerUpserted)

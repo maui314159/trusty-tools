@@ -339,7 +339,7 @@ impl ChatSessionStore {
             });
         }
         // redb iterates in key order; we want recent-first by `updated_at`.
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated_at.timestamp_millis()));
         Ok(out)
     }
 
