@@ -6,7 +6,7 @@ description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
 readme = "README.md"
 
-exclude = [".fastembed_cache/"]
+exclude = [".fastembed_cache/", "ui/node_modules/**"]
 
 [lib]
 # Why: Explicit `rlib` keeps the crate linkable as a Rust library from
