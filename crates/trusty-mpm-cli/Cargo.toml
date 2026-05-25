@@ -30,9 +30,9 @@ gui = []
 # Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
 trusty-mpm-core.workspace = true
 trusty-mpm-client.workspace = true
-trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.2.14" }
-trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.2.14" }
-trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.2.14" }
+trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.3.0" }
+trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.3.0" }
+trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.3.0" }
 
 tokio.workspace = true
 # Async (not blocking) reqwest: `#[tokio::main]` covers every subcommand, so the
