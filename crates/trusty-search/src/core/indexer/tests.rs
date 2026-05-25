@@ -736,24 +736,29 @@ async fn test_index_files_batch_bm25_only_mode() {
 async fn search_uses_domain_terms_when_provided() {
     use crate::core::classifier::{QueryClassifier, QueryIntent};
 
-    // First, confirm the generic classifier *can't* route "PMS integration"
+    // First, confirm the generic classifier *can't* route the bare phrase
     // to Definition without the domain hint — otherwise the test would
     // pass for the wrong reason.
-    let plain = QueryClassifier::classify("PMS integration query");
+    // (Updated for issue #119: the original test used the acronym "PMS"
+    // which now classifies as Definition directly via the all-caps acronym
+    // hint. We switched to lowercase domain jargon — `rezo` — to keep this
+    // test focused on the domain-vocabulary upgrade path rather than the
+    // acronym hint.)
+    let plain = QueryClassifier::classify("rezo integration query");
     assert_eq!(
         plain,
         QueryIntent::Unknown,
-        "baseline: plain classifier must treat the PMS phrase as Unknown"
+        "baseline: plain classifier must treat the rezo phrase as Unknown"
     );
 
     let idx =
-        CodeIndexer::new("domain-test", "/tmp/domain").with_domain_terms(vec!["PMS".to_string()]);
-    idx.index_file("api.rs", "fn pms_handler() {}\nfn other() {}\n")
+        CodeIndexer::new("domain-test", "/tmp/domain").with_domain_terms(vec!["rezo".to_string()]);
+    idx.index_file("api.rs", "fn rezo_handler() {}\nfn other() {}\n")
         .await
         .expect("index_file ok");
     let r = idx
         .search(&SearchQuery {
-            text: "PMS integration query".into(),
+            text: "rezo integration query".into(),
             top_k: 5,
             expand_graph: false,
             compact: false,
@@ -761,11 +766,11 @@ async fn search_uses_domain_terms_when_provided() {
         })
         .await
         .expect("search ok");
-    // The corpus only has two functions; the PMS-named one should win
+    // The corpus only has two functions; the rezo-named one should win
     // under Definition's BM25-heavy weighting.
     assert!(
-        r.iter().any(|c| c.content.contains("pms_handler")),
-        "expected pms_handler chunk to appear in results: {:?}",
+        r.iter().any(|c| c.content.contains("rezo_handler")),
+        "expected rezo_handler chunk to appear in results: {:?}",
         r.iter().map(|c| &c.content).collect::<Vec<_>>()
     );
 }
@@ -1905,8 +1910,17 @@ async fn test_mode_filter_code_returns_only_source() {
     // be dropped from results entirely — not merely demoted.
     let idx = make_indexer();
     seed_mode_filter_corpus(&idx).await;
+    // Issue #119 update: query is `alpha` (no underscore, no PascalCase, no
+    // acronym) so it classifies as `Unknown` and the intent-aware
+    // effective-mode override in `search()` does not promote Code → All.
+    // The previous query `alpha_qwerty` started classifying as Definition
+    // under the v0.8.3 classifier rules, which (correctly) triggers the
+    // override for docs-only fallback paths and would defeat this test's
+    // explicit Code-mode contract. The corpus chunks all contain
+    // `alpha_qwerty`, which BM25-tokenises into `alpha` + `qwerty`, so the
+    // single-word `alpha` still matches every seeded chunk.
     let q = SearchQuery {
-        text: "alpha_qwerty".to_string(),
+        text: "alpha".to_string(),
         top_k: 20,
         expand_graph: false,
         compact: false,

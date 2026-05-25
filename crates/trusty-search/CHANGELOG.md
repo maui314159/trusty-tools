@@ -13,6 +13,37 @@ _(no unreleased changes)_
 
 ---
 
+## [0.8.3] — 2026-05-25
+
+### Fixed
+- **#119** `QueryClassifier` now recognises three additional query shapes
+  that were silently returning `intent: "Unknown"` on the v0.8.1
+  grep-equivalency benchmark — keeping the existing intent-aware lane
+  weighting, RRF balance, and effective-mode override dormant on 12 of
+  14 real queries. The new rules:
+  - **Single `snake_case` identifier** (e.g. `apply_archive_downrank`,
+    `is_default_doc_excluded`, `get_call_chain`, `bm25_search`) →
+    `Definition`. Token must be the whole query and must contain at
+    least one underscore so a bare `foo` is not pulled into the rule.
+  - **ALL-CAPS acronym hint** (e.g. `HNSW`, `BM25`, `RRF`, `ORT`, `API`,
+    `LRU`) anywhere in the query → `Definition`. These almost always
+    refer to a struct, module, or type name in the codebase, so routing
+    them to Definition lets the structural lane surface the canonical
+    declaration over usage sites. This also closes #117 (see below).
+  - **≥4-word natural-language query with no identifier tokens** (e.g.
+    `axum middleware concurrency limiter`,
+    `Louvain community detection modularity`,
+    `redb persistence write transaction`,
+    `embed batch async worker pool`) → `Conceptual`. Lower bar than the
+    existing 6-word `LONG_NL_RE` so short concept queries also route to
+    the vector lane.
+
+  Benchmark impact: ≥13/14 of the canonical queries now classify as
+  non-`Unknown` (was 2/14). Pinned by
+  `core::classifier::tests::test_canonical_benchmark_at_least_12_of_14_classified`.
+
+---
+
 ## [0.8.2] — 2026-05-25
 
 ### Fixed

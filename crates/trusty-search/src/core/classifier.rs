@@ -45,6 +45,20 @@ static LONG_NL_RE: OnceLock<Regex> = OnceLock::new();
 // Short identifier-dominated queries (issue #91): PascalCase identifier with
 // no other intent verb → Definition.
 static PASCAL_IDENT_RE: OnceLock<Regex> = OnceLock::new();
+// Single snake_case identifier (issue #119): a one-token query whose only
+// content is a snake_case function name → Definition.
+static SNAKE_IDENT_RE: OnceLock<Regex> = OnceLock::new();
+// All-caps acronym used as a struct/type hint (issue #119): one of the
+// query tokens is an ALL_CAPS acronym (with optional embedded digits, e.g.
+// `BM25`) that is also a plausible struct/type name. Routes to Definition
+// so the structural lane lifts the canonical declaration over usage sites.
+static ACRONYM_HINT_RE: OnceLock<Regex> = OnceLock::new();
+// Multi-word natural-language queries (issue #119): ≥3 whitespace-separated
+// tokens of which none are identifier tokens (no snake_case, no PascalCase,
+// no leading-acronym identifier, no code punctuation). Lower bar than the
+// existing 6-word `LONG_NL_RE` so 3-5 word concept queries also classify
+// as Conceptual instead of Unknown.
+static MULTI_NOUN_RE: OnceLock<Regex> = OnceLock::new();
 
 impl QueryClassifier {
     /// Classify a query string into a `QueryIntent` for routing weight selection.
@@ -184,10 +198,6 @@ impl QueryClassifier {
         //      `URLParser`). Identifiers whose acronym prefix runs into
         //      digits and PascalCase are common in Rust/Python and should be
         //      treated as symbol lookups.
-        // Pure snake_case identifiers are intentionally NOT a trigger: many
-        // long natural-language queries embed a function name without
-        // intending a definition lookup (see
-        // `test_long_query_with_code_token_not_long_nl_conceptual`).
         let pascal_ident_re = PASCAL_IDENT_RE.get_or_init(|| {
             Regex::new(
                 r"\b(?:[A-Z][a-z]+[A-Z][a-zA-Z0-9]*|[A-Z]{2,}(?:[0-9]+[A-Za-z][a-zA-Z0-9]*|[0-9]+|[A-Z][a-z][a-zA-Z0-9]*))\b",
@@ -196,6 +206,61 @@ impl QueryClassifier {
         });
         if pascal_ident_re.is_match(trimmed) {
             return QueryIntent::Definition;
+        }
+
+        // Single snake_case identifier (issue #119): one whitespace-separated
+        // token containing at least one underscore and only ASCII identifier
+        // chars (lowercase letters, digits, underscores). This is the shape
+        // of a function-name query like `apply_archive_downrank` or
+        // `get_call_chain`. Multi-word queries that *contain* a snake_case
+        // token are intentionally NOT matched here — they go to the
+        // multi-noun branch below or stay Unknown. Single tokens without an
+        // underscore are not matched (avoids treating a bare `foo` as a
+        // definition lookup).
+        let snake_ident_re = SNAKE_IDENT_RE.get_or_init(|| {
+            Regex::new(r"^[a-z][a-z0-9_]*_[a-z0-9_]+$").expect("static regex pattern must compile")
+        });
+        if snake_ident_re.is_match(trimmed) {
+            return QueryIntent::Definition;
+        }
+
+        // All-caps acronym hint (issue #119): the query contains a token that
+        // is ≥2 uppercase ASCII letters, optionally followed by digits
+        // (e.g. `HNSW`, `BM25`, `RRF`, `ORT`, `LRU`). These almost always
+        // refer to a struct or module name in the codebase; routing to
+        // Definition lets the structural lane surface `hnsw_store.rs` /
+        // `bm25.rs` over usage sites that merely mention the concept.
+        //
+        // Word-boundary anchored so a query containing the acronym as a
+        // substring of a larger word (`URLParser` — already matched by
+        // `pascal_ident_re` above) doesn't re-fire here.
+        let acronym_hint_re = ACRONYM_HINT_RE.get_or_init(|| {
+            Regex::new(r"\b[A-Z]{2,}[0-9]*\b").expect("static regex pattern must compile")
+        });
+        if acronym_hint_re.is_match(trimmed) {
+            return QueryIntent::Definition;
+        }
+
+        // Multi-noun query with no identifier tokens (issue #119): ≥4
+        // whitespace-separated words, none of which are snake_case, no
+        // PascalCase identifier (already handled above), no all-caps
+        // acronym (handled just above), and no code punctuation. Lower bar
+        // than the 6-word `LONG_NL_RE` so concept queries like
+        // "axum middleware concurrency limiter",
+        // "redb persistence write transaction", or
+        // "embed batch async worker pool" still classify as Conceptual.
+        // Threshold is 4 (not 3) so 3-word queries like "reservation
+        // booking flow" stay Unknown — see the existing
+        // `test_short_nl_query_not_forced_conceptual` regression test.
+        let multi_noun_re = MULTI_NOUN_RE.get_or_init(|| {
+            // 4+ tokens separated by whitespace; tokens contain no code
+            // punctuation (no `_`, `(`, `)`, `:`, `.`, `/`, `-`) so we never
+            // misclassify "axum-server" or "fn::foo" as a conceptual query.
+            Regex::new(r"^[A-Za-z0-9]+(?:\s+[A-Za-z0-9]+){3,}$")
+                .expect("static regex pattern must compile")
+        });
+        if multi_noun_re.is_match(trimmed) {
+            return QueryIntent::Conceptual;
         }
 
         QueryIntent::Unknown
@@ -495,15 +560,22 @@ mod tests {
 
     #[test]
     fn test_domain_term_upgrades_unknown_to_definition() {
-        // Bare "PMS integration" — no generic pattern matches → Unknown.
-        // With domain_terms containing "PMS", we upgrade to Definition.
-        let terms = vec!["PMS".to_string()];
+        // Bare "rezo customers" — lowercase domain jargon, no generic
+        // pattern matches → Unknown. With `domain_terms = ["rezo"]`,
+        // upgrade to Definition.
+        // (Updated for issue #119: the original test used "PMS integration"
+        // which now classifies as Definition directly via the all-caps
+        // acronym hint — see `test_acronym_struct_hint_is_definition`.
+        // We switched to a lowercase jargon term to keep this test focused
+        // on the domain-vocabulary upgrade path rather than the acronym
+        // hint.)
+        let terms = vec!["rezo".to_string()];
         assert_eq!(
-            QueryClassifier::classify("PMS integration"),
+            QueryClassifier::classify("rezo customers"),
             QueryIntent::Unknown
         );
         assert_eq!(
-            QueryClassifier::classify_with_domain("PMS integration", &terms),
+            QueryClassifier::classify_with_domain("rezo customers", &terms),
             QueryIntent::Definition
         );
     }
@@ -547,9 +619,11 @@ mod tests {
     #[test]
     fn test_domain_term_empty_list_passthrough() {
         // With no domain terms, behaviour matches plain `classify`.
+        // Use the same lowercase jargon as the upgrade test so the
+        // baseline path is exercised symmetrically.
         let terms: Vec<String> = vec![];
         assert_eq!(
-            QueryClassifier::classify_with_domain("PMS integration", &terms),
+            QueryClassifier::classify_with_domain("rezo customers", &terms),
             QueryIntent::Unknown
         );
     }
@@ -630,21 +704,165 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_acronym_does_not_trigger_definition() {
-        // "API" / "TODO" without digits or CamelCase suffix must NOT match
-        // the leading-acronym fallback (TODO is handled by bug regex, but
-        // API has no other match — should stay Unknown).
+    fn test_pure_acronym_now_triggers_definition() {
+        // Issue #119: ALL_CAPS acronyms (`HNSW`, `BM25`, `RRF`, `ORT`, `API`,
+        // ...) almost always refer to a struct or module name in the
+        // codebase, so route them to Definition. This is the policy reversal
+        // that closes #117 — "HNSW vector similarity search" must surface
+        // `hnsw_store.rs` (struct) over `retrieval.rs` (usage), which
+        // requires Definition intent for the structural lane to fire.
+        // Previously (before #119) this query classified as Unknown and the
+        // structural lane never engaged.
         assert_eq!(
             QueryClassifier::classify("API endpoints"),
-            QueryIntent::Unknown
+            QueryIntent::Definition
+        );
+        // TODO is still BugDebt because `bug_re` is checked before the
+        // acronym fallback.
+        assert_eq!(
+            QueryClassifier::classify("TODO items"),
+            QueryIntent::BugDebt
         );
     }
 
     #[test]
     fn test_short_nl_query_not_forced_conceptual() {
-        // Only 3 words — should not match the ≥6-word pattern
+        // Only 3 words — should not match the ≥4-word pattern
         let result = QueryClassifier::classify("reservation booking flow");
         // May be Unknown, not forced to Conceptual
         assert_ne!(result, QueryIntent::Conceptual);
+    }
+
+    // ── Single snake_case identifier tests (issue #119) ────────────────────
+
+    #[test]
+    fn test_single_snake_case_is_definition() {
+        // Three real function names from the trusty-search codebase that
+        // were producing `intent: Unknown` on the v0.8.1 benchmark.
+        assert_eq!(
+            QueryClassifier::classify("apply_archive_downrank"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            QueryClassifier::classify("is_default_doc_excluded"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            QueryClassifier::classify("get_call_chain"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_bare_snake_identifier_with_digits_is_definition() {
+        // Digit-suffixed snake_case like `bm25_search` or `parse_v2_response`.
+        assert_eq!(
+            QueryClassifier::classify("bm25_search"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            QueryClassifier::classify("parse_v2_response"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_multi_word_with_snake_does_not_match_snake_branch() {
+        // Multi-token queries containing a snake_case word do NOT trip the
+        // single-snake_case rule — only the lone identifier shape does.
+        // They may still be classified by other branches; the assertion
+        // here is that they aren't *forced* to Definition by this rule.
+        // `the payment_processor retries failed attempts five times` —
+        // 7 words with `_` — Unknown (existing regression test covers this).
+        assert_eq!(
+            QueryClassifier::classify("the payment_processor retries failed attempts five times"),
+            QueryIntent::Unknown
+        );
+    }
+
+    // ── ALL-CAPS acronym tests (issue #119 / #117) ──────────────────────────
+
+    #[test]
+    fn test_acronym_struct_hint_is_definition() {
+        // The four canonical struct-name acronyms in the trusty-search
+        // codebase: HNSW (HnswStore), BM25 (Bm25Index), RRF (rrf_fuse),
+        // ORT (ONNX Runtime types). All four were `Unknown` on v0.8.1.
+        assert_eq!(
+            QueryClassifier::classify("HNSW vector similarity search"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            QueryClassifier::classify("BM25 inverted index"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            QueryClassifier::classify("RRF fusion"),
+            QueryIntent::Definition
+        );
+        assert_eq!(QueryClassifier::classify("ORT"), QueryIntent::Definition);
+    }
+
+    // ── Multi-noun conceptual tests (issue #119) ────────────────────────────
+
+    #[test]
+    fn test_four_word_lowercase_is_conceptual() {
+        // Concept queries with no identifier tokens at all. ≥4 words.
+        assert_eq!(
+            QueryClassifier::classify("axum middleware concurrency limiter"),
+            QueryIntent::Conceptual
+        );
+        assert_eq!(
+            QueryClassifier::classify("redb persistence write transaction"),
+            QueryIntent::Conceptual
+        );
+        assert_eq!(
+            QueryClassifier::classify("embed batch async worker pool"),
+            QueryIntent::Conceptual
+        );
+        assert_eq!(
+            QueryClassifier::classify("Louvain community detection modularity"),
+            QueryIntent::Conceptual
+        );
+    }
+
+    // ── Canonical benchmark pinning (issue #119) ────────────────────────────
+
+    /// Pin the canonical 14-query benchmark from the v0.8.1 grep-equivalency
+    /// report. Of these, ≥12 must produce a non-`Unknown` intent so the
+    /// downstream intent-aware ranking, lane selection, and mode override all
+    /// engage on real queries. `install via cargo` (3 words) is the
+    /// intentional Unknown — too short for the multi-noun rule, no
+    /// identifier — and stays as a known limitation.
+    #[test]
+    fn test_canonical_benchmark_at_least_12_of_14_classified() {
+        let queries: &[&str] = &[
+            "SearchMode",
+            "WalkOptions",
+            "apply_archive_downrank",
+            "is_default_doc_excluded",
+            "get_call_chain",
+            "symbol graph BFS expansion",
+            "Louvain community detection modularity",
+            "axum middleware concurrency limiter",
+            "redb persistence write transaction",
+            "embed batch async worker pool",
+            "chunker AST tree-sitter code split",
+            "HNSW vector similarity search",
+            "install via cargo",
+            "what is BM25",
+        ];
+        let non_unknown = queries
+            .iter()
+            .filter(|q| QueryClassifier::classify(q) != QueryIntent::Unknown)
+            .count();
+        assert!(
+            non_unknown >= 12,
+            "expected ≥12/14 queries to classify as non-Unknown; got {non_unknown}/14. \
+             Per-query intents: {:?}",
+            queries
+                .iter()
+                .map(|q| (*q, QueryClassifier::classify(q)))
+                .collect::<Vec<_>>()
+        );
     }
 }
