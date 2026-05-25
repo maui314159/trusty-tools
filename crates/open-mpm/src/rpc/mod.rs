@@ -87,10 +87,11 @@ mod tests {
     #[test]
     fn search_service_tool_count() {
         let svc = SearchMcpService;
-        // Why: trusty-search advertises a 14-tool surface (issue #76 added
-        //      `get_call_chain`); drift here would mean the upstream service
+        // Why: trusty-search advertises a 15-tool surface (issue #76 added
+        //      `get_call_chain`; the `/grep` MCP tool added another in
+        //      commit 3f2f1c6); drift here would mean the upstream service
         //      descriptor changed unexpectedly.
-        assert_eq!(svc.tools().len(), 14);
+        assert_eq!(svc.tools().len(), 15);
     }
 
     #[test]

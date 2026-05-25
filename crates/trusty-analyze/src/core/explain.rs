@@ -189,7 +189,7 @@ pub fn build_explain_prompt(report: &ReviewReport, frameworks: &[String]) -> Str
     // Worst files (highest grade enum value wins). Stable sort preserves the
     // original ordering for files with the same grade.
     let mut worst: Vec<&_> = report.files.iter().collect();
-    worst.sort_by(|a, b| b.grade.cmp(&a.grade));
+    worst.sort_by_key(|b| std::cmp::Reverse(b.grade));
     worst.truncate(MAX_FILES_IN_PROMPT);
 
     if !worst.is_empty() {
