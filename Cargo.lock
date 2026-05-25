@@ -6305,7 +6305,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 2.0.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10790,7 +10790,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.4.18"
+version = "0.4.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10908,7 +10908,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.73"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10947,10 +10947,12 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-cli"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "colored 2.2.0",
+ "dirs 5.0.1",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -10960,6 +10962,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trusty-common",
  "trusty-mpm-client",
  "trusty-mpm-core",
  "trusty-mpm-daemon",
@@ -10969,7 +10972,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-client"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -10986,7 +10989,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-core"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11009,7 +11012,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-daemon"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11058,7 +11061,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-mcp"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11076,7 +11079,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-telegram"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -11096,7 +11099,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mpm-tui"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11129,7 +11132,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.4.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",

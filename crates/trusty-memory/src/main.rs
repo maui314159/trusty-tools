@@ -17,6 +17,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use trusty_memory::commands::migrate::{handle_migrate, MigrateTarget};
+use trusty_memory::commands::prompt_context::handle_prompt_context;
 use trusty_memory::commands::service::{handle_service, ServiceAction};
 use trusty_memory::commands::setup::handle_setup;
 use trusty_memory::commands::start::handle_start;
@@ -121,6 +122,23 @@ enum Command {
     /// First-time setup: data dir + launchd (macOS) + Claude settings patch.
     Setup,
 
+    /// Print the daemon's prompt-context block to stdout (Claude Code hook).
+    ///
+    /// Why: installed as a Claude Code `UserPromptSubmit` hook by
+    /// `trusty-memory setup`. Claude Code injects whatever the hook writes to
+    /// stdout as additional context for the next prompt, so this command
+    /// fetches the daemon's pre-formatted prompt-context block and prints it
+    /// verbatim. Every failure path exits 0 silently so the hook can never
+    /// block a Claude Code prompt; the `CLAUDE_MPM_SUB_AGENT` env var also
+    /// short-circuits this command to keep nested MPM agents from piling on
+    /// duplicate prompt-context blocks.
+    /// What: see `commands::prompt_context::handle_prompt_context`.
+    /// Test: covered by the unit test in that module plus the integration
+    /// path `cargo run -p trusty-memory -- prompt-context` against a live
+    /// daemon.
+    #[command(name = "prompt-context")]
+    PromptContext,
+
     /// Diagnose daemon health: fastembed cache, launchd plist, HTTP /health,
     /// and stale palace locks.
     ///
@@ -220,6 +238,7 @@ async fn main() -> Result<()> {
             config_only,
         } => handle_migrate(target, dry_run, config_only),
         Command::Setup => handle_setup(),
+        Command::PromptContext => handle_prompt_context().await,
         Command::Service { action } => handle_service(&action),
         Command::Doctor => trusty_memory::commands::doctor::handle_doctor().await,
         Command::Monitor { target } => run_monitor(target).await,

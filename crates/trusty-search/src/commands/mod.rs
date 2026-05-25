@@ -48,6 +48,7 @@ pub mod remove;
 pub mod search;
 pub mod serve;
 pub mod service;
+pub mod setup;
 pub mod start;
 pub mod status;
 pub mod stop;

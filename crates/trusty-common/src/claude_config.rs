@@ -44,6 +44,23 @@ pub const SCAN_SKIP_DIRS: &[&str] = &[
 /// Default recursion depth for [`discover_claude_settings`].
 const DEFAULT_SETTINGS_MAX_DEPTH: usize = 8;
 
+/// Environment variable name stamped on every MPM-spawned sub-agent process.
+///
+/// Why: MPM spawns nested Claude Code sessions ("sub-agents") whose stdout
+/// and audit traffic should not feed back into the parent's hook pipeline.
+/// Specifically, the `trusty-mpm hook` command short-circuits when this var
+/// is set so PreToolUse / PostToolUse / Stop events from a sub-agent never
+/// double-post to the daemon. Memory enrichment (`trusty-memory
+/// prompt-context`) deliberately does **not** guard on this var — sub-agents
+/// benefit from the parent palace's prompt-fact block as much as the PM does.
+/// Centralising the literal here keeps the spawn side (`open-mpm`) and the
+/// consumer side (`trusty-mpm-cli`) referencing the exact same string so a
+/// rename never silently breaks the guard.
+/// What: the literal `"CLAUDE_MPM_SUB_AGENT"`. Presence is what matters; the
+/// canonical value used by spawn helpers is `"1"`.
+/// Test: covered by `trusty-mpm-cli::tests::hook_guard_short_circuits`.
+pub const CLAUDE_MPM_SUB_AGENT_ENV_VAR: &str = "CLAUDE_MPM_SUB_AGENT";
+
 /// Scan `home` for every `.claude/settings.json` and `.claude/settings.local.json`.
 ///
 /// Why: a Claude Code user can have settings files scattered across many

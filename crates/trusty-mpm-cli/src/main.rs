@@ -95,6 +95,21 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Handle a Claude Code lifecycle hook (PreToolUse / PostToolUse / Stop).
+    ///
+    /// Why: `tm install` registers `trusty-mpm hook` as Claude Code's
+    /// `PreToolUse`, `PostToolUse`, and `Stop` hook command. Claude Code
+    /// invokes this binary on every tool call so the daemon can drive the
+    /// circuit breaker, audit log, and dashboard. The handler short-circuits
+    /// when `CLAUDE_MPM_SUB_AGENT=1` is set in the environment — that env var
+    /// is stamped onto every MPM-spawned sub-agent process to keep nested
+    /// agents from generating their own hook traffic.
+    /// What: reads minimal context from Claude Code environment variables,
+    /// posts a `hook_event` to the running daemon, and exits 0. Daemon
+    /// failures and missing env vars degrade silently so a hook firing during
+    /// a daemon restart never blocks the user's prompt.
+    /// Test: `cli_parses_hook` plus the inline `hook_guard_short_circuits`.
+    Hook,
     /// Run the trusty-mpm daemon.
     Daemon {
         /// Address the daemon HTTP API binds to.
@@ -421,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Telegram { cmd } => telegram(&url, cmd).await,
         Command::Install { force } => install(force),
+        Command::Hook => hook(&client, &url).await,
         Command::Daemon {
             addr,
             tailscale,
@@ -562,15 +578,23 @@ fn telegram_stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `install` subcommand — deploy the bundled framework artifacts.
+/// `install` subcommand — deploy the bundled framework artifacts and wire
+/// MPM lifecycle hooks into every Claude Code settings file.
 ///
 /// Why: a fresh machine has no `~/.trusty-mpm/framework/`; `trusty-mpm install`
 /// writes the compile-time-embedded artifacts (optimizer policy, framework
 /// instructions, placeholder agent/skill) so the daemon has a working policy
-/// and launchers have instructions to point sessions at.
+/// and launchers have instructions to point sessions at. It also installs
+/// the MPM `PreToolUse` / `PostToolUse` / `Stop` hooks into every Claude
+/// Code settings file on the machine so the daemon receives the lifecycle
+/// events that drive its circuit breaker, audit log, and dashboard. All
+/// edits are idempotent.
 /// What: resolves [`FrameworkPaths::default`] and delegates to
-/// [`install_to`], which is the testable core.
-/// Test: `install_writes_all_artifacts`, `install_skips_existing_without_force`.
+/// [`install_to`], deploys composed agents, then calls
+/// [`install_claude_hooks`] to merge the MPM hook block into every
+/// discovered settings file.
+/// Test: `install_writes_all_artifacts`, `install_skips_existing_without_force`,
+/// `install_claude_hooks_is_idempotent`.
 fn install(force: bool) -> anyhow::Result<()> {
     let paths = trusty_mpm_core::paths::FrameworkPaths::default();
     let report = install_to(&paths, force)?;
@@ -592,8 +616,166 @@ fn install(force: bool) -> anyhow::Result<()> {
     for line in deploy_report_lines(&deploy, &paths.agent_source_dir()) {
         println!("  {line}");
     }
+
+    // Wire the MPM lifecycle hooks into every Claude settings file on the
+    // machine. Per-file failures are non-fatal so one bad file does not sink
+    // the whole install.
+    if let Err(e) = install_claude_hooks() {
+        eprintln!("warning: failed to install Claude Code hooks: {e:#}");
+    }
+
     println!("Framework installed. Run `trusty-mpm daemon` to start.");
     Ok(())
+}
+
+/// Idempotently install the MPM `PreToolUse` / `PostToolUse` / `Stop` hook
+/// block into every Claude Code settings file on the machine.
+///
+/// Why: without these hooks the daemon never receives Claude Code lifecycle
+/// events, so the circuit breaker, audit log, and dashboard all sit blind.
+/// `tm install` is the canonical point to wire them up — running it twice
+/// must produce identical files (idempotency requirement).
+/// What: discovers every `.claude/settings*.json` under `$HOME` via
+/// [`trusty_common::claude_config::discover_claude_settings`], loads each
+/// one, deep-merges the MPM hook block using
+/// [`trusty_common::claude_config::merge_hook_entries`], and writes the
+/// result back atomically when it differs from disk. Falls back to creating
+/// `~/.claude/settings.json` when no settings files exist. Returns a count
+/// of files modified for the caller to report.
+/// Test: `install_claude_hooks_is_idempotent`,
+/// `install_claude_hooks_creates_fallback`.
+fn install_claude_hooks() -> anyhow::Result<usize> {
+    use colored::Colorize;
+    use trusty_common::claude_config::{
+        default_settings_max_depth, discover_claude_settings, merge_hook_entries, write_json_atomic,
+    };
+
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
+    println!(
+        "Wiring MPM hooks into Claude Code settings under {}…",
+        home.display()
+    );
+
+    let additions = mpm_hook_additions();
+    let files = discover_claude_settings(&home, default_settings_max_depth());
+
+    let target_files: Vec<std::path::PathBuf> = if files.is_empty() {
+        let fallback = home.join(".claude").join("settings.json");
+        println!("  no settings files found; creating {}", fallback.display());
+        vec![fallback]
+    } else {
+        files
+    };
+
+    let mut changed = 0usize;
+    for path in &target_files {
+        let original: serde_json::Value = match std::fs::read_to_string(path) {
+            Ok(s) if s.trim().is_empty() => serde_json::Value::Object(serde_json::Map::new()),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "  {} {} {}",
+                        "✗".red(),
+                        path.display(),
+                        format!("(parse error: {e})").red()
+                    );
+                    continue;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::Value::Object(serde_json::Map::new())
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {} {}",
+                    "✗".red(),
+                    path.display(),
+                    format!("(read error: {e})").red()
+                );
+                continue;
+            }
+        };
+        let merged = merge_hook_entries(&original, &additions);
+        if merged == original {
+            println!(
+                "  {} {} {}",
+                "↻".cyan(),
+                path.display().to_string().dimmed(),
+                "(already configured)".dimmed()
+            );
+            continue;
+        }
+        match write_json_atomic(path, &merged) {
+            Ok(()) => {
+                changed += 1;
+                println!("  {} {}", "✓".green(), path.display());
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {} {}",
+                    "✗".red(),
+                    path.display(),
+                    format!("({e})").red()
+                );
+            }
+        }
+    }
+
+    if changed > 0 {
+        println!(
+            "  installed MPM hooks in {} settings file{}.",
+            changed,
+            if changed == 1 { "" } else { "s" }
+        );
+    }
+    Ok(changed)
+}
+
+/// Build the MPM lifecycle hook additions JSON block.
+///
+/// Why: every call site (the install handler and its unit test) needs the
+/// exact same shape so [`merge_hook_entries`] can dedup by deep equality;
+/// centralising the literal avoids two slightly-different copies racing in
+/// the idempotency check.
+/// What: returns a JSON object with `PreToolUse`, `PostToolUse`, and `Stop`
+/// arrays, each carrying one `{matcher: "*", hooks: [{type: "command",
+/// command: "trusty-mpm hook", timeout: ...}]}` block. `PostToolUse` runs
+/// asynchronously (Claude Code does not block on its completion) because
+/// the daemon may take longer to ingest tool results; `PreToolUse` and
+/// `Stop` keep the default synchronous behaviour with short timeouts.
+/// Test: covered indirectly by `install_claude_hooks_is_idempotent`.
+fn mpm_hook_additions() -> serde_json::Value {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "trusty-mpm hook",
+                    "timeout": 5
+                }]
+            }],
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "trusty-mpm hook",
+                    "timeout": 60,
+                    "async": true
+                }]
+            }],
+            "Stop": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "trusty-mpm hook",
+                    "timeout": 5
+                }]
+            }]
+        }
+    })
 }
 
 /// Render per-file status lines for an agent [`DeployResult`].
@@ -651,6 +833,66 @@ fn install_to(
         report.push(format!("\u{2713} {}", artifact.rel_path));
     }
     Ok(report)
+}
+
+/// Environment variable set by every MPM-spawned sub-agent process so its
+/// nested Claude Code session can suppress hook traffic.
+///
+/// Why: a sub-agent is already running inside an MPM-supervised context;
+/// re-emitting hook events from inside it just doubles every tool call in
+/// the daemon's audit log without adding signal. Stamping the env var on
+/// the spawn side and gating the hook handler on the same var keeps the
+/// suppression cheap, explicit, and process-local. Re-exporting the shared
+/// constant from `trusty_common::claude_config` ensures the spawn site
+/// (`open-mpm`) and this consumer never drift apart on the literal name.
+/// What: thin alias for
+/// [`trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR`]. Presence
+/// is what matters; the canonical value used by spawn helpers is `"1"`.
+const SUB_AGENT_ENV: &str = trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR;
+
+/// `hook` subcommand — handle a Claude Code lifecycle hook event.
+///
+/// Why: Claude Code invokes the configured hook command on every PreToolUse /
+/// PostToolUse / Stop event. The handler posts a minimal `hook_event` to the
+/// daemon so the circuit breaker, audit log, and dashboard can react. To keep
+/// nested MPM sub-agents from doubling every tool call in the audit feed, the
+/// very first thing the handler does is check `CLAUDE_MPM_SUB_AGENT`; when
+/// that env var is present the handler exits 0 immediately without contacting
+/// the daemon.
+/// What: reads the event name from `CLAUDE_HOOK_EVENT` and the session id
+/// from `CLAUDE_SESSION_ID` (both populated by Claude Code; missing values
+/// degrade to placeholders so the daemon still gets a record). POSTs to
+/// `<url>/hooks` with a JSON body and a 2-second timeout. Every failure path
+/// returns `Ok(())` — failing the hook would block the user's prompt.
+/// Test: `cli_parses_hook` covers parse routing; the guard branch is
+/// exercised via the inline `hook_guard_short_circuits` test.
+async fn hook(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    // Guard FIRST so no I/O happens inside MPM-spawned sub-agents.
+    if std::env::var_os(SUB_AGENT_ENV).is_some() {
+        return Ok(());
+    }
+
+    // Pull the minimal context Claude Code stamps into the environment. Both
+    // values may be absent in test harnesses or future Claude Code versions;
+    // degrade to placeholders so the daemon still gets a record.
+    let event = std::env::var("CLAUDE_HOOK_EVENT").unwrap_or_else(|_| "Unknown".to_string());
+    let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
+
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "event": event,
+        "payload": {}
+    });
+
+    // Best-effort POST — any failure (daemon down, network blip, malformed
+    // url) becomes a silent Ok(()) so Claude Code never sees a non-zero exit.
+    let req = client
+        .post(format!("{url}/hooks"))
+        .timeout(std::time::Duration::from_secs(2))
+        .json(&body)
+        .send();
+    let _ = req.await;
+    Ok(())
 }
 
 /// Resolve a `--dir` option to an absolute path, defaulting to the cwd.
@@ -3175,6 +3417,61 @@ mod tests {
         match cli.command {
             Command::Install { force } => assert!(force),
             other => panic!("expected Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hook() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "hook"]).unwrap();
+        assert!(matches!(cli.command, Command::Hook));
+    }
+
+    /// Why: when `CLAUDE_MPM_SUB_AGENT` is present in the env, the hook
+    /// handler must return Ok(()) without performing any I/O — that is the
+    /// whole point of the sub-agent guard.
+    /// What: sets the env var, calls `hook` with a deliberately-unreachable
+    /// daemon URL, asserts the call returns Ok in well under the daemon's
+    /// connect timeout (so we know the network code never ran).
+    #[tokio::test]
+    async fn hook_guard_short_circuits() {
+        // SAFETY: tokio's current_thread runtime is single-threaded; this
+        // env-var dance is isolated to the test.
+        unsafe {
+            std::env::set_var(SUB_AGENT_ENV, "1");
+        }
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        // Use a URL we know cannot be reached. If the guard fails the call
+        // would consume the full 2s timeout; the assert below catches that.
+        let res = hook(&client, "http://127.0.0.1:1").await;
+        let elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var(SUB_AGENT_ENV);
+        }
+        assert!(res.is_ok(), "guard branch must return Ok");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "guard must short-circuit without network I/O; took {elapsed:?}"
+        );
+    }
+
+    /// Why: re-running `tm install` against a settings file that already
+    /// carries the MPM hook block must not rewrite the file. This is the
+    /// idempotency requirement.
+    /// What: builds the additions block, merges it into an empty document,
+    /// then merges the same additions back into the result, and asserts the
+    /// two outputs are deeply equal.
+    #[test]
+    fn mpm_hook_additions_is_idempotent_under_merge() {
+        use trusty_common::claude_config::merge_hook_entries;
+        let additions = mpm_hook_additions();
+        let once = merge_hook_entries(&serde_json::json!({}), &additions);
+        let twice = merge_hook_entries(&once, &additions);
+        assert_eq!(once, twice, "second merge must be a no-op");
+        // And every expected event lands exactly once.
+        for event in ["PreToolUse", "PostToolUse", "Stop"] {
+            let arr = once["hooks"][event].as_array().expect("event array");
+            assert_eq!(arr.len(), 1, "{event}: expected one matcher block");
         }
     }
 

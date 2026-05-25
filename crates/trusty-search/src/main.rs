@@ -525,6 +525,19 @@ enum Commands {
         indexes_only: bool,
     },
 
+    /// Wire trusty-search into Claude Code's settings.json files
+    ///
+    /// Scans `$HOME` for every `.claude/settings*.json` and idempotently
+    /// registers the trusty-search MCP server in each. Falls back to creating
+    /// `~/.claude/settings.json` when no settings files exist. No daemon
+    /// required — this command only edits local config files. Safe to run
+    /// any number of times.
+    ///
+    /// Examples:
+    ///   trusty-search setup
+    #[command(display_order = 27)]
+    Setup,
+
     /// Wire trusty-search into an IDE (Cursor, etc.)
     ///
     /// Writes MCP server config and AI rules files for the target IDE.
@@ -535,7 +548,7 @@ enum Commands {
     ///   trusty-search integrate cursor --dry-run       # preview without writing
     ///   trusty-search integrate cursor --global-only   # only ~/.cursor/mcp.json
     ///   trusty-search integrate cursor --no-rules      # MCP config only, skip rules file
-    #[command(display_order = 27)]
+    #[command(display_order = 28)]
     Integrate {
         /// IDE to integrate with: "cursor"
         #[arg(value_name = "IDE")]
@@ -567,7 +580,7 @@ enum Commands {
     /// Examples:
     ///   trusty-search doctor
     ///   trusty-search doctor --fix
-    #[command(display_order = 28)]
+    #[command(display_order = 29)]
     Doctor {
         /// Attempt to fix detected problems automatically
         #[arg(long)]
@@ -586,7 +599,7 @@ enum Commands {
     ///   trusty-search config set memory-limit 16384
     ///   trusty-search config set index-memory-limit 65536
     ///   trusty-search config set memory-limit off
-    #[command(display_order = 29)]
+    #[command(display_order = 30)]
     Config {
         #[command(subcommand)]
         action: commands::config::ConfigAction,
@@ -602,7 +615,7 @@ enum Commands {
     /// Examples:
     ///   trusty-search monitor web
     ///   trusty-search monitor tui
-    #[command(display_order = 30, subcommand_required = true)]
+    #[command(display_order = 31, subcommand_required = true)]
     Monitor {
         #[command(subcommand)]
         target: MonitorTarget,
@@ -613,7 +626,7 @@ enum Commands {
     /// Examples:
     ///   trusty-search completions zsh > ~/.zsh/completions/_trusty-search
     ///   trusty-search completions bash >> ~/.bashrc
-    #[command(display_order = 31)]
+    #[command(display_order = 32)]
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
@@ -869,6 +882,10 @@ async fn run() -> Result<()> {
             indexes_only,
         } => {
             commands::migrate::handle_migrate(target, dry_run, mcp_only, indexes_only).await?;
+        }
+
+        Commands::Setup => {
+            commands::setup::handle_setup()?;
         }
 
         Commands::Integrate {

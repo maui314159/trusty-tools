@@ -343,6 +343,20 @@ impl ClaudeCodeAgentRunner {
         if let Some(path) = &ctx.assigned_file {
             cmd.env("OPEN_MPM_ASSIGNED_FILE", path);
         }
+        // Mark this claude CLI invocation as an MPM-spawned sub-agent so the
+        // `trusty-mpm hook` command wired into its Claude Code settings
+        // short-circuits. Without this guard a nested claude session would
+        // re-emit PreToolUse / PostToolUse events (doubling the daemon's
+        // audit feed). The memory enrichment hook (`trusty-memory
+        // prompt-context`) deliberately does NOT guard on this variable —
+        // sub-agents benefit from the parent palace's prompt-fact block as
+        // much as the PM does. The variable name is sourced from
+        // `trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR` so
+        // every spawn site and consumer references the same literal.
+        cmd.env(
+            trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR,
+            "1",
+        );
 
         let mut child = cmd.spawn().with_context(|| {
             format!(

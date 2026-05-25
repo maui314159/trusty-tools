@@ -12,6 +12,7 @@
 pub mod doctor;
 pub mod migrate;
 pub mod monitor;
+pub mod prompt_context;
 pub mod service;
 pub mod setup;
 pub mod start;

@@ -430,6 +430,22 @@ async fn spawn_and_run_inner(cfg: SpawnConfig<'_>) -> Result<IpcMessage> {
         cmd.env("OPEN_MPM_CONFIG_DIR", cd);
     }
 
+    // Stamp the MPM sub-agent marker so any Claude Code instance running
+    // inside this child knows it is nested. The `trusty-mpm hook` consumer
+    // guards on this variable to suppress recursive PreToolUse / PostToolUse
+    // / Stop traffic from the sub-agent (which would otherwise double every
+    // audit-log entry). The `trusty-memory prompt-context` hook deliberately
+    // does NOT guard on this variable — sub-agents benefit from the parent
+    // palace's prompt-fact block as much as the PM does. The PM session
+    // never inherits this var; it is set per-spawn here so only the
+    // sub-agent subtree sees it. The literal lives in
+    // `trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR` so every
+    // spawn site and consumer references the same name.
+    cmd.env(
+        trusty_common::claude_config::CLAUDE_MPM_SUB_AGENT_ENV_VAR,
+        "1",
+    );
+
     // #193: Stamp the child process with `agent` identity so the memory tools
     // inside it can enforce a scope ceiling of `RecallCeiling::Agent`. The
     // harness controls these env vars; child agents have no way to override
