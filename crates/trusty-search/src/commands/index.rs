@@ -51,6 +51,7 @@ pub async fn handle_index(
     force: bool,
     cli_exclude: Vec<String>,
     timeout_secs: u64,
+    lexical_only: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
 
@@ -111,7 +112,12 @@ pub async fn handle_index(
                 );
             }
             for idx in &cfg.indexes {
-                let filters = filters_from_index_config(idx);
+                let mut filters = filters_from_index_config(idx);
+                // Issue #109, Phase 1: `--lexical-only` is a one-shot CLI
+                // flag that applies to every declared index in the
+                // multi-index YAML. Per-index YAML config does not yet
+                // carry a `lexical_only:` field (future work).
+                filters.lexical_only = lexical_only;
                 index_one_with_filters(&idx.name, &project_path, force, timeout_secs, &filters)
                     .await?;
             }
@@ -131,11 +137,15 @@ pub async fn handle_index(
     let index_name = resolve_index_name(cli_name, project_cfg.as_ref(), &project_path);
     let exclude_globs = resolve_excludes(cli_exclude, project_cfg.as_ref());
 
-    if exclude_globs.is_empty() {
+    // Issue #109, Phase 1: when `--lexical-only` is set, always go through
+    // the filtered path so the daemon receives the opt-in even when no
+    // other filter fields are populated.
+    if exclude_globs.is_empty() && !lexical_only {
         index_one(&index_name, &project_path, force, timeout_secs).await
     } else {
         let filters = RegisterFilters {
             exclude_globs,
+            lexical_only,
             ..RegisterFilters::default()
         };
         index_one_with_filters(&index_name, &project_path, force, timeout_secs, &filters).await
@@ -235,6 +245,9 @@ pub(crate) fn filters_from_index_config(idx: &IndexConfig) -> RegisterFilters {
         exclude_globs: idx.exclude.clone(),
         extensions,
         domain_terms: idx.domain_terms.clone(),
+        // YAML-driven multi-index config doesn't expose `lexical_only` in
+        // v0.9.0 — the CLI flag is the only way to opt in for now.
+        lexical_only: false,
     }
 }
 
@@ -270,10 +283,13 @@ async fn index_one_with_filters(
     timeout_secs: u64,
     filters: &RegisterFilters,
 ) -> Result<()> {
+    // Issue #109, Phase 1: `lexical_only` must always go through the
+    // filter-aware register call so the daemon receives the opt-in field.
     let result = if filters.include_paths.is_empty()
         && filters.exclude_globs.is_empty()
         && filters.extensions.is_empty()
         && filters.domain_terms.is_empty()
+        && !filters.lexical_only
     {
         register_index_with_daemon(index_name, project_path).await
     } else {

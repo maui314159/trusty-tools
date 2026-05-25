@@ -13,6 +13,76 @@ _(no unreleased changes)_
 
 ---
 
+## [0.9.0] — 2026-05-25
+
+### Added — staged-pipeline (Phase 1)
+
+- **#109 (Phase 1)** Staged indexing pipeline — initial cut. The reindex
+  pipeline now exposes per-stage progress so searches can run as soon as
+  the lexical lane (Stage 1) is ready, without blocking on the embedder
+  (Stage 2) or symbol-graph build (Stage 3).
+
+  - **Status surface.** `GET /indexes/{id}/status` gains two additive
+    fields (back-compat preserved):
+    - `stages: { lexical: …, semantic: …, graph: … }` carrying per-stage
+      `status` (`pending` | `in_progress` | `ready` | `skipped`),
+      timestamps, and counters.
+    - `search_capabilities: ["bm25", "literal", "exact_match", …]`
+      growing as each stage flips to `ready` (`+ ["vector"]` when
+      semantic ready, `+ ["kg"]` when graph ready).
+    The legacy top-level `status` field is unchanged for existing API
+    consumers.
+
+  - **Search handler graceful degradation.** The handler now consults
+    `search_capabilities` (not the top-level `status`) to decide which
+    lanes to run. Searches during a reindex hit only the BM25 lane until
+    the embedder catches up — the response carries
+    `meta.search_capabilities` so clients can show "lexical-only" badges
+    or retry once the semantic lane lands.
+
+  - **`?stage=lexical` query param.** Per-query opt-in to Stage-1-only
+    routing even on a fully-indexed index. Useful for
+    grep-replacement use cases that don't want semantic noise.
+
+  - **`--lexical-only` CLI flag and `lexical_only: true` API field.**
+    Permanent opt-out from Stage 2 and Stage 3 at index-create time.
+    The index stays at `status: indexed_lexical` forever; the reindex
+    pipeline skips the embedder entirely. Persisted to `indexes.toml`
+    so the choice survives daemon restarts. Useful for callers who
+    explicitly want a "daemonized ripgrep" without the embedder
+    overhead.
+
+  - **Backpressure stub.** Search calls ping a per-index
+    `tokio::sync::Notify` so the background Stage-2 task can yield
+    briefly. Phase-2 work will tune the policy.
+
+  Out of scope for Phase 1 (deferred to Phase 2): Stage 3 (Louvain) /
+  KG-edge resolution async split — they remain in the synchronous
+  reindex tail; file-watcher debouncing; full backpressure tuning.
+
+  Pinned by `service::reindex::tests::stage_1_completes_and_search_works_before_embedding`,
+  `lexical_only_index_never_runs_stage_2`,
+  `search_capabilities_grows_as_stages_complete`, and the per-stage
+  registry tests in `core::registry::tests::stage_status_*`.
+
+### Changed
+
+- **`CodeIndexer`** gains a `parse_files_only` method that mirrors
+  `parse_and_embed_files` but skips the ONNX embed step entirely. Used
+  exclusively by the `lexical_only` reindex path so a BM25-only index
+  never pays the embedder's session-arena cost. Existing callers are
+  untouched.
+- **`SearchQuery`** gains an optional `stage: Option<SearchStage>`
+  field. Defaults to `None` so existing callers see no behaviour
+  change; setting `Some(SearchStage::Lexical)` forces the
+  Stage-1-only lane routing.
+- **`PersistedIndex`** gains a `lexical_only: bool` field with
+  `#[serde(default)]` so legacy `indexes.toml` files load as `false`
+  (full pipeline). Only explicit-`true` is written to disk to keep
+  the on-disk format compact.
+
+---
+
 ## [0.8.3] — 2026-05-25
 
 ### Fixed

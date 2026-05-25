@@ -81,6 +81,22 @@ pub struct PersistedIndex {
         skip_serializing_if = "is_default_respect_gitignore"
     )]
     pub respect_gitignore: bool,
+
+    /// Staged-pipeline opt-out (issue #109, Phase 1): when `true`, the
+    /// reindex pipeline stops after Stage 1 (lexical / BM25 / redb) and
+    /// never embeds. Useful for callers who explicitly want a daemonized
+    /// ripgrep without the embedder overhead.
+    ///
+    /// Why: persisted so an `indexes.toml` round-trip preserves the
+    /// caller's choice across daemon restarts; otherwise the next warm
+    /// boot would silently re-enable the embedder lane and the operator's
+    /// disk + CPU savings would evaporate.
+    /// What: `#[serde(default)]` so older `indexes.toml` files load as
+    /// `false` (full pipeline), and `skip_serializing_if = "std::ops::Not::not"`
+    /// keeps the TOML compact — only `true` is written to disk.
+    /// Test: `lexical_only_round_trips` in this module.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lexical_only: bool,
 }
 
 /// Why: serde's `default` attribute needs a free function (closures aren't
@@ -130,6 +146,7 @@ impl Default for PersistedIndex {
             path_filter: Vec::new(),
             include_docs: true,
             respect_gitignore: true,
+            lexical_only: false,
         }
     }
 }
@@ -595,6 +612,57 @@ root_path = "/tmp/legacy"
         let entries = load_index_registry_at(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].include_docs);
+    }
+
+    /// Issue #109 Phase 1: `lexical_only` defaults to `false` and is
+    /// omitted from the TOML when unset, so existing `indexes.toml` files
+    /// keep their compact shape. An explicit `true` survives a save/load
+    /// cycle.
+    #[test]
+    fn lexical_only_round_trips() {
+        // Default constructor returns false.
+        assert!(!PersistedIndex::default().lexical_only);
+
+        // Loading legacy TOML without the field gives false (full pipeline).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(
+            &path,
+            r#"
+[[index]]
+id = "legacy"
+root_path = "/tmp/legacy"
+"#,
+        )
+        .unwrap();
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].lexical_only,
+            "missing field must default to false (issue #109 back-compat)"
+        );
+
+        // Explicit true survives round-trip and is written to disk.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        save_index_registry_at(
+            &path,
+            &[PersistedIndex {
+                id: "lex_only".into(),
+                root_path: PathBuf::from("/tmp/v"),
+                lexical_only: true,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            s.contains("lexical_only"),
+            "explicit true must be serialised — TOML was: {s}"
+        );
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].lexical_only);
     }
 
     #[test]

@@ -421,6 +421,33 @@ impl CodeIndexer {
     /// [`Self::commit_parsed_batch`].
     /// Test: covered indirectly by every `index_files_batch*` test.
     pub async fn parse_and_embed_files(&self, files: Vec<(String, String)>) -> Result<ParsedBatch> {
+        self.parse_files_inner(files, true).await
+    }
+
+    /// Parse-only variant for the staged-pipeline `lexical_only` opt-in
+    /// (issue #109, Phase 1).
+    ///
+    /// Why: callers who explicitly want a daemonized ripgrep set
+    /// `lexical_only: true` at index-create time. The reindex pipeline must
+    /// skip the embedder entirely on these indexes — otherwise warm-boot
+    /// daemons would still pay the ONNX session arena cost on every batch.
+    /// What: same as `parse_and_embed_files` but skips the embed step and
+    /// returns a `ParsedBatch` whose `embeddings` slot is all `None`.
+    /// Downstream `commit_parsed_batch` already handles all-`None`
+    /// embeddings (BM25-only mode) so no commit-side changes are needed.
+    /// Test: `service::reindex::tests::lexical_only_index_never_runs_stage_2`.
+    pub async fn parse_files_only(&self, files: Vec<(String, String)>) -> Result<ParsedBatch> {
+        self.parse_files_inner(files, false).await
+    }
+
+    /// Shared implementation for `parse_and_embed_files` and the
+    /// `lexical_only`-aware `parse_files_only`. The `embed` flag selects
+    /// whether the ONNX batched embed step runs.
+    async fn parse_files_inner(
+        &self,
+        files: Vec<(String, String)>,
+        embed: bool,
+    ) -> Result<ParsedBatch> {
         if files.is_empty() {
             return Ok(ParsedBatch::default());
         }
@@ -436,10 +463,19 @@ impl CodeIndexer {
         }
         let parse_ms = parse_start.elapsed().as_millis() as u64;
 
-        let embed_start = std::time::Instant::now();
-        let embeddings = self.embed_chunks_in_batches(&all_chunks).await?;
-        let embed_ms = embed_start.elapsed().as_millis() as u64;
-        let vector_count = embeddings.iter().filter(|e| e.is_some()).count();
+        let (embeddings, embed_ms, vector_count) = if embed {
+            let embed_start = std::time::Instant::now();
+            let embeddings = self.embed_chunks_in_batches(&all_chunks).await?;
+            let embed_ms = embed_start.elapsed().as_millis() as u64;
+            let vector_count = embeddings.iter().filter(|e| e.is_some()).count();
+            (embeddings, embed_ms, vector_count)
+        } else {
+            // Lexical-only: skip the embed step entirely. The commit phase
+            // accepts an all-`None` embedding vector and stores chunks in
+            // BM25 + redb without touching HNSW.
+            let embeddings: Vec<Option<Vec<f32>>> = vec![None; all_chunks.len()];
+            (embeddings, 0, 0)
+        };
 
         Ok(ParsedBatch {
             chunks: all_chunks,

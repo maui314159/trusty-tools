@@ -1337,6 +1337,7 @@ fn make_branch_query(text: &str, files: Vec<String>, boost: f32) -> SearchQuery 
         branch: None,
         mode: SearchMode::Code,
         exclude_archived: false,
+        stage: None,
     }
 }
 
@@ -1499,6 +1500,7 @@ async fn test_no_boost_when_branch_files_absent() {
         branch: None,
         mode: SearchMode::Code,
         exclude_archived: false,
+        stage: None,
     };
     let results = idx.search(&q).await.unwrap();
     assert!(!results.is_empty());

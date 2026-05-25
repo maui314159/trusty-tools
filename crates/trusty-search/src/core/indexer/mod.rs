@@ -385,6 +385,34 @@ pub struct SearchQuery {
     /// behaviour.
     #[serde(default)]
     pub exclude_archived: bool,
+
+    /// Staged-pipeline lane selector (issue #109, Phase 1).
+    ///
+    /// Why: explicit caller opt-in to Stage-1-only search even on a
+    /// fully-indexed index. Useful for grep-replacement use cases that
+    /// don't want semantic noise. Independent of the index's `lexical_only`
+    /// flag (which is a permanent setting at index-create time) — this is
+    /// a per-query override.
+    /// What: `None` (default) routes through all currently-ready stages.
+    /// `Some(SearchStage::Lexical)` skips the HNSW lane regardless of
+    /// what's ready.
+    /// Test: `service::reindex::tests::stage_1_completes_and_search_works_before_embedding`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<SearchStage>,
+}
+
+/// Stage selector for a single search query (issue #109, Phase 1).
+///
+/// Why: `?stage=lexical` lets callers force Stage-1-only lanes even when
+/// the index is fully ready. Routes the query through BM25 + grep-fallback
+/// and skips HNSW + KG entirely.
+/// What: a tiny enum, serialised in lowercase. Phase 1 ships only `Lexical`;
+/// future phases may add `Semantic` for HNSW-only queries.
+/// Test: `stage_1_completes_and_search_works_before_embedding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchStage {
+    Lexical,
 }
 
 impl SearchQuery {
@@ -413,6 +441,7 @@ impl Default for SearchQuery {
             branch: None,
             mode: SearchMode::default(),
             exclude_archived: false,
+            stage: None,
         }
     }
 }

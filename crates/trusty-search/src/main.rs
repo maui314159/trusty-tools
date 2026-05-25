@@ -186,6 +186,18 @@ enum Commands {
         #[arg(long, default_value_t = 600)]
         timeout: u64,
 
+        /// Create a Stage-1-only ("daemonized ripgrep") index (issue #109, Phase 1).
+        ///
+        /// When set, the reindex pipeline returns after Stage 1 (walker +
+        /// chunker + BM25 + redb persist) and never embeds. The index stays
+        /// at `status: indexed_lexical` permanently. Useful for callers who
+        /// want exact-match / BM25 search without paying for the embedder's
+        /// disk + CPU cost. The choice is persisted to `indexes.toml` so it
+        /// survives daemon restarts; to opt back in, delete and re-create
+        /// the index without this flag.
+        #[arg(long)]
+        lexical_only: bool,
+
         /// Optional subcommand. When absent, the default register+reindex flow runs.
         #[command(subcommand)]
         action: Option<IndexAction>,
@@ -791,13 +803,15 @@ async fn run() -> Result<()> {
             force,
             exclude,
             timeout,
+            lexical_only,
             action,
         } => match action {
             Some(IndexAction::Remove { path: rm_path }) => {
                 commands::index_remove::handle_index_remove(rm_path).await?;
             }
             None => {
-                commands::index::handle_index(path, name, force, exclude, timeout).await?;
+                commands::index::handle_index(path, name, force, exclude, timeout, lexical_only)
+                    .await?;
             }
         },
 

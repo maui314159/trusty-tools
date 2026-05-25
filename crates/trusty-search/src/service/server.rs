@@ -710,6 +710,14 @@ pub struct CreateIndexRequest {
     /// the opt-out reachable for callers that need it.
     #[serde(default)]
     pub respect_gitignore: Option<bool>,
+    /// Staged-pipeline opt-out (issue #109, Phase 1). When `true`, the
+    /// reindex pipeline returns after Stage 1 (lexical / BM25 / redb) and
+    /// permanently skips the embedder + symbol-graph stages. Useful for
+    /// callers who want a daemonized ripgrep without the embedder overhead.
+    /// Persisted to `indexes.toml` so the choice survives daemon restarts.
+    /// Default `None` (treated as `false` — full pipeline).
+    #[serde(default)]
+    pub lexical_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1397,6 +1405,9 @@ async fn create_index_handler(
     // so existing callers (CLI, MCP, integrators) get the fix automatically
     // without having to pass a new field.
     let respect_gitignore: bool = req.respect_gitignore.unwrap_or(true);
+    // Issue #109, Phase 1: staged-pipeline opt-out. `None` on the wire ⇒
+    // `false` (full pipeline) so existing callers see no behaviour change.
+    let lexical_only: bool = req.lexical_only.unwrap_or(false);
     if let Err(e) = crate::service::persistence::upsert_index_registry_entry(
         crate::service::persistence::PersistedIndex {
             id: req.id.clone(),
@@ -1408,6 +1419,7 @@ async fn create_index_handler(
             path_filter: path_filter.clone(),
             include_docs,
             respect_gitignore,
+            lexical_only,
         },
     ) {
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
@@ -1416,6 +1428,17 @@ async fn create_index_handler(
     // Issue #75: capture the current git HEAD SHA at registration; the search
     // response uses it to flag stale results when the working tree advances.
     let indexed_head_sha = crate::core::git::head_sha(&req.root_path);
+    // Issue #109, Phase 1: pre-mark semantic + graph as `Skipped` for
+    // lexical-only indexes so the search handler never tries the HNSW lane.
+    let stages = if lexical_only {
+        crate::core::registry::IndexStages {
+            lexical: crate::core::registry::StageState::pending(),
+            semantic: crate::core::registry::StageState::skipped(),
+            graph: crate::core::registry::StageState::skipped(),
+        }
+    } else {
+        crate::core::registry::IndexStages::default()
+    };
     let handle = IndexHandle {
         id: id.clone(),
         indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -1430,6 +1453,9 @@ async fn create_index_handler(
         context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
         context_summary: Arc::new(tokio::sync::RwLock::new(None)),
         indexed_head_sha: Arc::new(tokio::sync::RwLock::new(indexed_head_sha)),
+        lexical_only,
+        stages: Arc::new(tokio::sync::RwLock::new(stages)),
+        search_pressure: Arc::new(tokio::sync::Notify::new()),
     };
     state.registry.register(handle);
     // Issue #41 Phase 1: refresh the index-count gauge so /metrics reflects
@@ -1637,13 +1663,35 @@ async fn delete_index_handler(
 async fn search_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
-    Json(query): Json<SearchQuery>,
+    Json(mut query): Json<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
     // Use the same domain-aware classifier as `CodeIndexer::search` so the
     // intent reported back to the caller matches what was used for routing.
     let intent = QueryClassifier::classify_with_domain(&query.text, &handle.domain_terms);
+    // Issue #109 Phase 1: derive lane availability from the staged-pipeline
+    // status surface. The search handler MUST consult `search_capabilities`
+    // (NOT the legacy top-level `status` field) when deciding whether the
+    // semantic / KG lanes are queryable. The indexer's `search` honours
+    // `query.stage = Some(Lexical)`, so we down-shift the query to lexical
+    // when either (a) the caller explicitly asked for it, or (b) the
+    // semantic stage is not yet ready. Doing this here keeps the indexer
+    // unaware of the index-handle-level capability surface.
+    let caps = { handle.stages.read().await.search_capabilities() };
+    let semantic_ready = caps.contains(&"vector");
+    let kg_ready = caps.contains(&"kg");
+    if query.stage.is_none() && !semantic_ready {
+        // Force lexical lane until the embedder catches up. The caller's
+        // request is preserved if they explicitly asked for `mode = all`
+        // / similar; we only override the lane selector, not the file-type
+        // filter.
+        query.stage = Some(crate::core::indexer::SearchStage::Lexical);
+    }
+    // Issue #109 Phase 1 backpressure stub: ping the per-index pressure
+    // notifier so the background Stage-2 task briefly yields. The notifier
+    // is a hint — the embedder loop waits at most 100 ms.
+    handle.search_pressure.notify_one();
     let started = std::time::Instant::now();
     let indexer = handle.indexer.read().await;
     let mut results = indexer
@@ -1681,45 +1729,54 @@ async fn search_handler(
     // post-MMR ranking. Cohesion = fraction of top-10 results sharing the top
     // result's community. Both are best-effort — search must never block on a
     // missing scorer.
-    let (graph_scoring, community_cohesion) = match state.graph_scorer(&index_id).await {
-        Some(scorer) => {
-            for result in results.iter_mut() {
-                if let Some(sym) = graph_snapshot.symbol_for_chunk(&result.id) {
-                    result.score += scorer.bonus(sym);
+    //
+    // Issue #109 Phase 1: when the KG lane is not yet ready (or the index
+    // is `lexical_only`), skip the scorer lookup entirely. Asking for a
+    // scorer that hasn't been built yet would spin up Louvain detection
+    // on the hot path; that work belongs to the reindex tail, not search.
+    let (graph_scoring, community_cohesion) = if !kg_ready {
+        (false, 0.0_f32)
+    } else {
+        match state.graph_scorer(&index_id).await {
+            Some(scorer) => {
+                for result in results.iter_mut() {
+                    if let Some(sym) = graph_snapshot.symbol_for_chunk(&result.id) {
+                        result.score += scorer.bonus(sym);
+                    }
                 }
-            }
-            results.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top_n = results.iter().take(10).collect::<Vec<_>>();
-            let cohesion = if let Some(head) = top_n.first() {
-                if let Some(head_sym) = graph_snapshot.symbol_for_chunk(&head.id) {
-                    let total = top_n.len() as f32;
-                    let matches = top_n
-                        .iter()
-                        .filter(|r| {
-                            graph_snapshot
-                                .symbol_for_chunk(&r.id)
-                                .map(|s| scorer.same_community(head_sym, s))
-                                .unwrap_or(false)
-                        })
-                        .count() as f32;
-                    if total > 0.0 {
-                        matches / total
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top_n = results.iter().take(10).collect::<Vec<_>>();
+                let cohesion = if let Some(head) = top_n.first() {
+                    if let Some(head_sym) = graph_snapshot.symbol_for_chunk(&head.id) {
+                        let total = top_n.len() as f32;
+                        let matches = top_n
+                            .iter()
+                            .filter(|r| {
+                                graph_snapshot
+                                    .symbol_for_chunk(&r.id)
+                                    .map(|s| scorer.same_community(head_sym, s))
+                                    .unwrap_or(false)
+                            })
+                            .count() as f32;
+                        if total > 0.0 {
+                            matches / total
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     }
                 } else {
                     0.0
-                }
-            } else {
-                0.0
-            };
-            (true, cohesion)
+                };
+                (true, cohesion)
+            }
+            None => (false, 0.0_f32),
         }
-        None => (false, 0.0_f32),
     };
 
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1760,6 +1817,10 @@ async fn search_handler(
             "community_cohesion": community_cohesion,
             "last_indexed": last_indexed,
             "results_may_be_stale": results_may_be_stale,
+            // Issue #109 Phase 1: surface which lanes contributed to this
+            // result set. Lets clients display "lexical-only" badges or
+            // retry once the semantic lane is ready.
+            "search_capabilities": caps,
         },
     })))
 }
@@ -1898,6 +1959,10 @@ async fn global_search_handler(
         // caller that wants archived chunks gone uses the per-index endpoint
         // with `exclude_archived: true`.
         exclude_archived: false,
+        // Cross-project fan-out leaves stage selection up to each index's
+        // own capability surface — the per-index loop below downshifts to
+        // lexical when the semantic lane isn't ready (issue #109 Phase 1).
+        stage: None,
     };
 
     // Run all per-index searches concurrently. Any index that errors is
@@ -2292,14 +2357,14 @@ async fn index_status_handler(
     // per-index data directory; absent / unreadable values degrade to null
     // so a fresh (never-reindexed) index still returns a 200.
     let (disk_bytes, last_indexed) = index_disk_and_mtime(&index_id.0);
-    // Issue #80: surface a coarse lifecycle status. Read the `ReindexStatus`
-    // off the per-index `ReindexProgress` (when present) so we distinguish
-    // `Running` (still indexing) from `Complete` / `AbortedMemory` /
-    // `Failed` (terminal). The progress entry sticks around for ~60 s after
-    // completion so late SSE subscribers can replay the terminal event; we
-    // map any terminal state to `"ready"` so callers don't see `"indexing"`
-    // for a minute after a finished reindex.
-    let status = match state
+    // Issue #80: surface a coarse lifecycle status. The legacy top-level
+    // `status` field stays for back-compat — it collapses to `indexing` while
+    // any reindex task is running and `ready` otherwise (mirrors the v0.8.x
+    // contract). Callers wanting per-stage granularity should consult the
+    // `stages` block introduced in v0.9.0 (issue #109, Phase 1) — that field
+    // tracks lexical → semantic → graph progress and grows
+    // `search_capabilities` as each lane comes online.
+    let legacy_status = match state
         .reindex_progress
         .get(&index_id)
         .map(|p| p.status.load())
@@ -2307,6 +2372,13 @@ async fn index_status_handler(
         Some(ReindexStatus::Running) => "indexing",
         _ => "ready",
     };
+    // Issue #109 Phase 1: snapshot the staged-pipeline state so the response
+    // can surface per-stage status and derive the public `search_capabilities`
+    // array. The legacy `status` field stays at the top level, but
+    // integrators wanting "is the vector lane ready" should consult
+    // `search_capabilities`.
+    let stages_snapshot = handle.stages.read().await.clone();
+    let search_capabilities = stages_snapshot.search_capabilities();
     // Issue #100: surface budget-truncation so callers can flag indexes that
     // hit the `TRUSTY_MAX_CHUNKS` cap during the last reindex. Defaults to
     // `false` / `0` when no `ReindexProgress` entry exists (i.e. the index
@@ -2325,7 +2397,10 @@ async fn index_status_handler(
         "index_id": index_id.0,
         "root_path": handle.root_path,
         "chunk_count": indexer.chunk_count(),
-        "status": status,
+        "status": legacy_status,
+        "stages": stages_snapshot,
+        "search_capabilities": search_capabilities,
+        "lexical_only": handle.lexical_only,
         "path_filter": path_filter,
         "has_context_embedding": has_context_embedding,
         "context_summary": context_summary,
@@ -3122,6 +3197,12 @@ async fn reindex_handler(
                     // Preserve the indexed-HEAD SHA across the root_path
                     // override — a subsequent reindex will refresh it.
                     indexed_head_sha: Arc::clone(&handle.indexed_head_sha),
+                    // Issue #109, Phase 1: preserve the lexical-only flag
+                    // and stages snapshot across the root override — a
+                    // root_path override is not an opt-out change.
+                    lexical_only: handle.lexical_only,
+                    stages: Arc::clone(&handle.stages),
+                    search_pressure: Arc::clone(&handle.search_pressure),
                 };
                 handle = state.registry.register(new_handle);
             }
@@ -3753,6 +3834,7 @@ mod tests {
                 path_filter: None,
                 include_docs: None,
                 respect_gitignore: None,
+                lexical_only: None,
             }),
         )
         .await;
@@ -4161,6 +4243,7 @@ mod tests {
                 path_filter: None,
                 include_docs: None,
                 respect_gitignore: None,
+                lexical_only: None,
             }),
         )
         .await;
@@ -4198,6 +4281,7 @@ mod tests {
                 path_filter: None,
                 include_docs: None,
                 respect_gitignore: None,
+                lexical_only: None,
             }),
         )
         .await;
@@ -4251,6 +4335,7 @@ mod tests {
                 path_filter: None,
                 include_docs: None,
                 respect_gitignore: None,
+                lexical_only: None,
             }),
         )
         .await;
@@ -4293,6 +4378,7 @@ mod tests {
                 path_filter: None,
                 include_docs: None,
                 respect_gitignore: None,
+                lexical_only: None,
             }),
         )
         .await;

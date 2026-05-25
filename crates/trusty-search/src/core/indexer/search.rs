@@ -455,8 +455,19 @@ impl CodeIndexer {
             effective_mode
         );
 
-        // 1) Embed (cache-first) — None when no embedder is wired.
-        let embedding = self.embed_query(&query.text).await?;
+        // Staged-pipeline lane selector (issue #109, Phase 1). When the
+        // caller pinned `stage=lexical` we route through BM25 + grep only,
+        // even if the index has a ready HNSW lane. Lets grep-replacement
+        // callers (`?stage=lexical`) skip semantic noise on demand.
+        let lexical_only = matches!(query.stage, Some(super::SearchStage::Lexical));
+
+        // 1) Embed (cache-first) — None when no embedder is wired OR the
+        //    caller has opted out of the semantic lane via `?stage=lexical`.
+        let embedding = if lexical_only {
+            None
+        } else {
+            self.embed_query(&query.text).await?
+        };
 
         // 2) Run lanes (HNSW + BM25), then inject entity-exact-match if applicable.
         let want = query.top_k.saturating_mul(HNSW_OVERSAMPLE).max(query.top_k);
@@ -516,9 +527,14 @@ impl CodeIndexer {
 
         // 4) KG expand (conditional). Track which IDs came **only** from KG
         //    so the materialization step can label them "hybrid+kg".
-        let (all, kg_ids) = self
-            .expand_with_kg(fused, &intent, use_kg_first, query.expand_graph)
-            .await;
+        //    `lexical_only` short-circuits the KG lane regardless of intent
+        //    (issue #109, Phase 1).
+        let (all, kg_ids) = if lexical_only {
+            (fused, std::collections::HashSet::new())
+        } else {
+            self.expand_with_kg(fused, &intent, use_kg_first, query.expand_graph)
+                .await
+        };
 
         // 4a) Re-rank by score after KG expansion (issue #94): KG-expanded
         //     neighbours are appended after the fused list, so a naïve

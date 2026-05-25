@@ -69,6 +69,21 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
         // search response can flag staleness when the working tree advances
         // past the indexed commit. Best-effort: `None` outside a git repo.
         let indexed_head_sha = crate::core::git::head_sha(&entry.root_path);
+        // Issue #109, Phase 1: warm-boot indexes inherit the persisted
+        // `lexical_only` flag. When set, the search handler and the next
+        // reindex skip Stage 2 / 3 permanently. Pre-mark semantic + graph
+        // as `Skipped` so the lifecycle state is correct before the next
+        // reindex flips lexical to `InProgress`.
+        let lexical_only = entry.lexical_only;
+        let stages = if lexical_only {
+            crate::core::registry::IndexStages {
+                lexical: crate::core::registry::StageState::pending(),
+                semantic: crate::core::registry::StageState::skipped(),
+                graph: crate::core::registry::StageState::skipped(),
+            }
+        } else {
+            crate::core::registry::IndexStages::default()
+        };
         let handle = IndexHandle {
             id: id.clone(),
             indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -83,6 +98,9 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
             indexed_head_sha: Arc::new(tokio::sync::RwLock::new(indexed_head_sha)),
+            lexical_only,
+            stages: Arc::new(tokio::sync::RwLock::new(stages)),
+            search_pressure: Arc::new(tokio::sync::Notify::new()),
         };
         state.registry.register(handle);
     }

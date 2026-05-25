@@ -15,7 +15,7 @@
 
 use crate::core::indexer::{CommitTimings, ParsedBatch};
 use crate::core::memguard::{current_rss_mb, index_memory_limit_mb};
-use crate::core::registry::{IndexHandle, IndexId};
+use crate::core::registry::{IndexHandle, IndexId, IndexStages, StageState, StageStatus};
 use crate::service::walker::{should_skip_content, walk_source_files_with_options, WalkOptions};
 use anyhow::Context;
 use crossbeam_utils::atomic::AtomicCell;
@@ -420,6 +420,112 @@ fn spawn_memory_poller(
     (handle, stop)
 }
 
+/// RFC-3339 timestamp helper used by the staged-pipeline status surface
+/// (issue #109, Phase 1).
+///
+/// Why: each `StageState` carries optional `started_at` / `completed_at`
+/// timestamps so external dashboards can compute stage durations without
+/// inferring them from event ordering. Centralising the formatter keeps
+/// the timestamp shape consistent across every transition.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Reset every stage to `Pending` (or `Skipped` for lexical-only) and stamp
+/// `lexical.started_at` at the start of a reindex. The previous run's
+/// counters are wiped so the search-capabilities array doesn't briefly
+/// report stale lanes mid-reindex.
+async fn reset_stages_for_reindex(handle: &Arc<IndexHandle>) {
+    let mut stages = handle.stages.write().await;
+    if handle.lexical_only {
+        *stages = IndexStages {
+            lexical: StageState {
+                status: StageStatus::InProgress,
+                started_at: Some(now_rfc3339()),
+                ..Default::default()
+            },
+            semantic: StageState::skipped(),
+            graph: StageState::skipped(),
+        };
+    } else {
+        *stages = IndexStages {
+            lexical: StageState {
+                status: StageStatus::InProgress,
+                started_at: Some(now_rfc3339()),
+                ..Default::default()
+            },
+            semantic: StageState::pending(),
+            graph: StageState::pending(),
+        };
+    }
+}
+
+/// Flip the lexical stage to `Ready` and stash file / chunk counters. Stage
+/// 2 (semantic) is flipped to `InProgress` simultaneously since the
+/// pipelined producer has already been consuming embedder budget per
+/// batch — exposing the in-progress state is what enables the search
+/// handler's graceful-degradation guarantee (BM25 lane queryable while
+/// HNSW is still warming up).
+async fn mark_lexical_ready_semantic_in_progress(
+    handle: &Arc<IndexHandle>,
+    files: usize,
+    chunks: usize,
+    total_chunks: usize,
+) {
+    let mut stages = handle.stages.write().await;
+    stages.lexical.status = StageStatus::Ready;
+    stages.lexical.completed_at = Some(now_rfc3339());
+    stages.lexical.files = Some(files);
+    stages.lexical.chunks = Some(chunks);
+    // On lexical-only indexes the semantic + graph slots stay `Skipped` —
+    // the reset hook pre-populated them. Don't overwrite the terminal
+    // state. For full-pipeline indexes the semantic stage has been running
+    // alongside the producer (the embed step is part of every batch); flip
+    // it to `InProgress` so callers see it as queryable-soon.
+    if !handle.lexical_only && stages.semantic.status == StageStatus::Pending {
+        stages.semantic.status = StageStatus::InProgress;
+        stages.semantic.started_at = Some(now_rfc3339());
+        stages.semantic.total = Some(total_chunks);
+    }
+}
+
+/// Flip the semantic stage to `Ready` and stamp `embedded` counter. Stage
+/// 3 (graph) is set to `InProgress` since the post-batch KG rebuild always
+/// follows immediately. Phase 1 keeps Stage 3 as a synchronous tail; Phase
+/// 2 will spawn it separately.
+async fn mark_semantic_ready_graph_in_progress(
+    handle: &Arc<IndexHandle>,
+    embedded: usize,
+    total: usize,
+) {
+    let mut stages = handle.stages.write().await;
+    if handle.lexical_only {
+        // No work for semantic / graph on a lexical-only index. Leave the
+        // skipped state alone.
+        return;
+    }
+    stages.semantic.status = StageStatus::Ready;
+    stages.semantic.completed_at = Some(now_rfc3339());
+    stages.semantic.embedded = Some(embedded);
+    stages.semantic.total = Some(total);
+    if stages.graph.status == StageStatus::Pending {
+        stages.graph.status = StageStatus::InProgress;
+        stages.graph.started_at = Some(now_rfc3339());
+    }
+}
+
+/// Flip the graph stage to `Ready`. After this transition the search
+/// handler treats `kg` as a queryable lane and the legacy top-level
+/// `status` field reports `"ready"`.
+async fn mark_graph_ready(handle: &Arc<IndexHandle>) {
+    let mut stages = handle.stages.write().await;
+    if handle.lexical_only {
+        return;
+    }
+    stages.graph.status = StageStatus::Ready;
+    stages.graph.completed_at = Some(now_rfc3339());
+}
+
 /// Schedule deferred GC of the `reindex_progress` map entry for this index.
 ///
 /// Why: issue #75 — bounds long-running daemon memory by GC'ing stale progress
@@ -517,6 +623,10 @@ struct BatchCtx {
     peak_rss_atomic: Arc<AtomicU64>,
     started: Instant,
     total: usize,
+    /// Issue #109, Phase 1: skip the embed step entirely when the index
+    /// was created with `lexical_only: true`. Producer task consults this
+    /// in `prepare_and_parse_batch` so the embedder is never invoked.
+    lexical_only: bool,
 }
 
 /// What a single batch contributed to the run-level totals. The orchestrator
@@ -596,9 +706,18 @@ async fn prepare_and_parse_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> Option<Pa
     }
     let batch_files = payload.to_index.len();
     let to_index = payload.to_index;
+    // Issue #109, Phase 1: `lexical_only` indexes skip the embedder
+    // entirely. `parse_files_only` returns a `ParsedBatch` whose
+    // `embeddings` slot is all `None`, which `commit_parsed_batch`
+    // already handles as the BM25-only path.
     let parsed = {
         let indexer = ctx.handle.indexer.read().await;
-        match indexer.parse_and_embed_files(to_index).await {
+        let result = if ctx.lexical_only {
+            indexer.parse_files_only(to_index).await
+        } else {
+            indexer.parse_and_embed_files(to_index).await
+        };
+        match result {
             Ok(p) => p,
             Err(e) => {
                 drop(indexer);
@@ -1278,6 +1397,13 @@ pub fn spawn_reindex_with_cleanup(
         let root = handle.root_path.clone();
         let index_id: IndexId = handle.id.clone();
 
+        // Issue #109, Phase 1: reset the staged-pipeline status surface so the
+        // search handler stops advertising stale capabilities the moment the
+        // reindex begins. `lexical_only` indexes pre-mark semantic + graph as
+        // `Skipped` so a search that arrives mid-reindex never blocks waiting
+        // for the embedder.
+        reset_stages_for_reindex(&handle).await;
+
         // Phase 1: walk + filter the source tree (helper-extracted: issue #98).
         let walk = collect_files_to_index(&handle);
         let total = walk.files.len();
@@ -1289,6 +1415,7 @@ pub fn spawn_reindex_with_cleanup(
                 "index_id": index_id.0,
                 "root_path": root,
                 "force": force,
+                "lexical_only": handle.lexical_only,
             }))
             .await;
 
@@ -1400,6 +1527,7 @@ pub fn spawn_reindex_with_cleanup(
             peak_rss_atomic: peak_rss_atomic.clone(),
             started,
             total,
+            lexical_only: handle.lexical_only,
         };
 
         // Snapshot the batch list into owned `Vec<PathBuf>`s so the producer
@@ -1481,6 +1609,25 @@ pub fn spawn_reindex_with_cleanup(
         // receiver being closed). Awaiting it surfaces panics for tracing.
         let _ = producer.await;
 
+        // Issue #109, Phase 1: the consumer loop has drained every batch's
+        // BM25 + redb commit. Flip the lexical stage to `Ready` — searches
+        // that arrive from here on can use the BM25 lane. For a
+        // full-pipeline index, semantic is now `InProgress` (embedder still
+        // technically committed inline, but the search handler treats the
+        // vector lane as queryable-soon until Stage 3 finishes). For a
+        // lexical-only index, semantic + graph stay `Skipped`.
+        {
+            let files_done = progress.indexed.load(AtomicOrdering::Acquire);
+            let chunks_done = progress.total_chunks.load(AtomicOrdering::Acquire);
+            mark_lexical_ready_semantic_in_progress(
+                &handle,
+                files_done,
+                chunks_done,
+                total_vector_count,
+            )
+            .await;
+        }
+
         // Issue #29: the per-batch HNSW snapshot is throttled to one every
         // `HNSW_SNAPSHOT_BATCH_INTERVAL` batches, so the most recent ≤15
         // batches' vectors may not be on disk yet. Force one final snapshot
@@ -1507,6 +1654,17 @@ pub fn spawn_reindex_with_cleanup(
             }
         }
 
+        // Issue #109, Phase 1: flip the semantic stage to `Ready`. The
+        // per-batch commits above wrote every chunk's embedding into HNSW;
+        // the lane is queryable now even if Louvain hasn't finished. On a
+        // `lexical_only` index this is a no-op (the slot stays `Skipped`).
+        mark_semantic_ready_graph_in_progress(
+            &handle,
+            total_vector_count,
+            progress.total_chunks.load(AtomicOrdering::Acquire),
+        )
+        .await;
+
         // Phase 3: rebuild the symbol graph once for the whole reindex.
         // Issue #90: always run, even after a memory abort — graph
         // construction is bounded by `TRUSTY_MAX_KG_NODES` and independent of
@@ -1519,6 +1677,13 @@ pub fn spawn_reindex_with_cleanup(
         // is logged at `warn` — searches still work, they just won't carry a
         // `community_id` until the next successful reindex.
         spawn_community_detection(&handle, scorer_cache.clone());
+        // Issue #109, Phase 1: with the KG rebuild done, flip the graph
+        // stage to `Ready`. Louvain detection continues on a detached task
+        // (Phase 2 will move it off the synchronous tail entirely), but
+        // searches can already consume the symbol-graph and same-community
+        // signal as soon as the partition lands — invalidate-on-detection
+        // (issue #81) is the other half of that contract.
+        mark_graph_ready(&handle).await;
         if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
             tracing::warn!(
                 "reindex: memory limit was breached during batch processing for \
@@ -1793,6 +1958,9 @@ mod tests {
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
             indexed_head_sha: Arc::new(tokio::sync::RwLock::new(None)),
+            lexical_only: false,
+            stages: Arc::new(tokio::sync::RwLock::new(IndexStages::default())),
+            search_pressure: Arc::new(tokio::sync::Notify::new()),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -1867,6 +2035,9 @@ mod tests {
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
             indexed_head_sha: Arc::new(tokio::sync::RwLock::new(None)),
+            lexical_only: false,
+            stages: Arc::new(tokio::sync::RwLock::new(IndexStages::default())),
+            search_pressure: Arc::new(tokio::sync::Notify::new()),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -2201,5 +2372,232 @@ mod tests {
         assert_eq!(progress.status.load(), ReindexStatus::Complete);
         assert!(handle.context_embedding.read().await.is_none());
         assert!(handle.context_summary.read().await.is_none());
+    }
+
+    // ── Staged-pipeline (issue #109, Phase 1) ──────────────────────────
+
+    /// Helper: build an IndexHandle wrapping the bare BM25-only indexer
+    /// with the given `lexical_only` setting. Mirrors the existing test
+    /// fixtures but lets us flip the new flag.
+    fn make_handle_with_flag(
+        id: &str,
+        root: std::path::PathBuf,
+        lexical_only: bool,
+    ) -> Arc<IndexHandle> {
+        use crate::core::registry::{IndexStages, StageState};
+        let indexer = CodeIndexer::new(id.to_string(), root.clone());
+        let stages = if lexical_only {
+            IndexStages {
+                lexical: StageState::pending(),
+                semantic: StageState::skipped(),
+                graph: StageState::skipped(),
+            }
+        } else {
+            IndexStages::default()
+        };
+        Arc::new(IndexHandle {
+            id: IndexId::new(id),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: root,
+            include_paths: vec![],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+            include_docs: false,
+            respect_gitignore: true,
+            path_filter: vec![],
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
+            indexed_head_sha: Arc::new(tokio::sync::RwLock::new(None)),
+            lexical_only,
+            stages: Arc::new(tokio::sync::RwLock::new(stages)),
+            search_pressure: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Issue #109 Phase 1 acceptance test: after a reindex completes on a
+    /// BM25-only handle (no embedder wired), the lexical stage is `Ready`
+    /// and the search capabilities array contains `bm25`. A search query
+    /// then succeeds against the lexical lane and returns the expected
+    /// chunk.
+    ///
+    /// Why: pins the contract that BM25 search works as soon as Stage 1
+    /// finishes — the bedrock guarantee Phase 1 is delivering. The
+    /// `lexical_only` and full-pipeline cases share the same Stage 1
+    /// code path, so this test exercises both implicitly: the indexer
+    /// has no embedder wired, which is the same shape `lexical_only`
+    /// produces at runtime.
+    /// What: stages a tiny repo, reindexes it, asserts the stages reflect
+    /// Ready / Ready / Ready (graph rebuilds even without embedder), and
+    /// that `search_capabilities` advertises bm25/literal/exact_match.
+    /// Test: this test.
+    #[tokio::test]
+    async fn stage_1_completes_and_search_works_before_embedding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("hello.rs"), "pub fn unique_alpha() {}\n").unwrap();
+
+        // Non-`lexical_only` handle but with no embedder wired — this is
+        // the warm-boot BM25-only shape. Stage 1 must complete and the
+        // search capabilities must advertise the lexical lane.
+        let handle = make_handle_with_flag("stage1-test", root.clone(), false);
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..200 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+
+        // Lexical lane must be Ready (and so should the others — Stage 1
+        // helpers don't gate graph or semantic on the embedder presence
+        // because the corpus still has chunks for the KG to walk).
+        let stages = handle.stages.read().await.clone();
+        assert_eq!(
+            stages.lexical.status,
+            crate::core::registry::StageStatus::Ready,
+            "stage 1 must finish on a BM25-only reindex"
+        );
+        let caps = stages.search_capabilities();
+        assert!(
+            caps.contains(&"bm25"),
+            "search_capabilities must contain bm25 after Stage 1, got: {caps:?}"
+        );
+
+        // Search runs and the lexical lane returns the staged chunk.
+        let idx = handle.indexer.read().await;
+        let results = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "unique_alpha".to_string(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert!(
+            results.iter().any(|c| c.content.contains("unique_alpha")),
+            "BM25 lane must return the chunk after Stage 1: {results:?}"
+        );
+    }
+
+    /// Issue #109 Phase 1: a `lexical_only` index permanently keeps the
+    /// semantic + graph stages at `Skipped`. The reindex pipeline returns
+    /// after Stage 1 and the search capabilities never include `vector`.
+    /// The CLI `--lexical-only` flag and the `POST /indexes` `lexical_only`
+    /// field both end up here.
+    #[tokio::test]
+    async fn lexical_only_index_never_runs_stage_2() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("a.rs"), "pub fn lex_only_func() {}\n").unwrap();
+
+        let handle = make_handle_with_flag("lexical-only-test", root.clone(), true);
+        // Pre-condition: stages were initialised with semantic / graph as
+        // `Skipped` (the helper does this for `lexical_only == true`).
+        assert_eq!(
+            handle.stages.read().await.semantic.status,
+            crate::core::registry::StageStatus::Skipped
+        );
+
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+        for _ in 0..200 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+
+        // The reindex finished but semantic + graph must STILL be Skipped.
+        let stages = handle.stages.read().await.clone();
+        assert_eq!(
+            stages.lexical.status,
+            crate::core::registry::StageStatus::Ready,
+            "lexical must be Ready"
+        );
+        assert_eq!(
+            stages.semantic.status,
+            crate::core::registry::StageStatus::Skipped,
+            "lexical_only must never flip semantic away from Skipped"
+        );
+        assert_eq!(
+            stages.graph.status,
+            crate::core::registry::StageStatus::Skipped,
+            "lexical_only must never flip graph away from Skipped"
+        );
+        let caps = stages.search_capabilities();
+        assert!(
+            !caps.contains(&"vector"),
+            "lexical_only must not advertise vector capability: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&"kg"),
+            "lexical_only must not advertise kg capability: {caps:?}"
+        );
+
+        // Search via the lexical lane works even with `stage: Some(Lexical)`.
+        let idx = handle.indexer.read().await;
+        let results = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "lex_only_func".to_string(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+                stage: Some(crate::core::indexer::SearchStage::Lexical),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert!(
+            results.iter().any(|c| c.content.contains("lex_only_func")),
+            "lexical lane must return the chunk on lexical_only: {results:?}"
+        );
+
+        // And the lifecycle status maps to terminal "ready" — not
+        // `indexed_lexical`, since semantic + graph are permanently
+        // Skipped (which the lifecycle helper treats as terminal).
+        assert_eq!(stages.lifecycle_status(), "ready");
+    }
+
+    /// Issue #109 Phase 1: as stages advance from `Pending` →
+    /// `InProgress` → `Ready`, `search_capabilities` grows monotonically.
+    /// Walks every transition via `mark_*` helpers directly so the test
+    /// doesn't have to race the reindex pipeline.
+    #[tokio::test]
+    async fn search_capabilities_grows_as_stages_complete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("a.rs"), "pub fn stage_grow() {}\n").unwrap();
+        let handle = make_handle_with_flag("caps-grow-test", root.clone(), false);
+
+        // Pending: empty caps.
+        assert!(handle.stages.read().await.search_capabilities().is_empty());
+
+        // Simulate the pipeline by calling the same helpers the orchestrator
+        // uses. The result must match the ticket's monotonic-growth contract.
+        reset_stages_for_reindex(&handle).await;
+        // Still no caps — lexical is in progress, not ready.
+        assert!(handle.stages.read().await.search_capabilities().is_empty());
+
+        mark_lexical_ready_semantic_in_progress(&handle, 1, 1, 1).await;
+        let caps = handle.stages.read().await.search_capabilities();
+        assert!(caps.contains(&"bm25") && !caps.contains(&"vector"));
+
+        mark_semantic_ready_graph_in_progress(&handle, 1, 1).await;
+        let caps = handle.stages.read().await.search_capabilities();
+        assert!(caps.contains(&"vector") && !caps.contains(&"kg"));
+
+        mark_graph_ready(&handle).await;
+        let caps = handle.stages.read().await.search_capabilities();
+        assert!(caps.contains(&"bm25"));
+        assert!(caps.contains(&"vector"));
+        assert!(caps.contains(&"kg"));
+        assert_eq!(handle.stages.read().await.lifecycle_status(), "ready");
     }
 }

@@ -3,6 +3,154 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Staged-pipeline lifecycle status of a single indexing stage (issue #109,
+/// Phase 1).
+///
+/// Why: the staged pipeline splits a reindex into three logical stages
+/// (lexical → semantic → graph). Callers need to see per-stage progress so a
+/// search can opt into the lanes that are ready without blocking on the
+/// embedder. A coarse-grained `Pending | InProgress | Ready | Skipped` keeps
+/// the wire payload tiny and is enough to drive graceful degradation in the
+/// search handler.
+/// What: a four-variant enum serialised in snake_case (`pending`,
+/// `in_progress`, `ready`, `skipped`) so the JSON wire format matches the
+/// ticket spec exactly.
+/// Test: `service::reindex::tests::stage_states_advance_through_pipeline`
+/// (Phase 1) and the e2e tests under `core::registry::tests`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    /// Stage has not started yet (default on registry).
+    #[default]
+    Pending,
+    /// Stage is currently running.
+    InProgress,
+    /// Stage completed successfully.
+    Ready,
+    /// Stage was deliberately skipped (e.g. `--lexical-only` opts out of
+    /// stages 2 and 3 permanently). Distinct from `Pending`/`Ready` so
+    /// callers can tell "never going to happen" from "not started yet".
+    Skipped,
+}
+
+impl StageStatus {
+    /// True when this stage's results are queryable.
+    pub fn is_ready(self) -> bool {
+        matches!(self, StageStatus::Ready)
+    }
+}
+
+/// Live per-stage state surfaced on `IndexHandle::stages`.
+///
+/// Why: the staged-pipeline status surface (issue #109) needs a place to
+/// store per-stage timing + counters that the search handler can consult to
+/// decide which lanes are available. Wrapped in `Arc<RwLock<>>` on the
+/// handle so reindex tasks can flip the state without rebuilding the entry.
+/// What: a tiny struct carrying the status plus optional started/completed
+/// RFC-3339 timestamps and stage-specific counters. All fields are optional
+/// so callers can read partial progress mid-reindex.
+/// Test: covered by the staged-pipeline e2e tests in `service::reindex`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StageState {
+    pub status: StageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Files processed (lexical stage). `None` when the field is not
+    /// applicable to this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
+    /// Chunks committed to the lexical stage. Surfaced as `chunks` in the
+    /// JSON payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<usize>,
+    /// Embedded chunks (semantic stage running counter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<usize>,
+    /// Total chunks to embed (semantic stage denominator).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+}
+
+impl StageState {
+    /// Build a fresh `Pending` stage.
+    pub fn pending() -> Self {
+        Self::default()
+    }
+
+    /// Build a stage that is permanently `Skipped` (used by `lexical_only`).
+    pub fn skipped() -> Self {
+        Self {
+            status: StageStatus::Skipped,
+            ..Self::default()
+        }
+    }
+}
+
+/// Per-index staged-pipeline snapshot. Three stages, in dependency order:
+/// `lexical` → `semantic` → `graph`. The search handler reads this to derive
+/// `search_capabilities` and gate lane participation.
+///
+/// Why: the v0.9.0 staged-pipeline refactor (issue #109) decouples the
+/// synchronous lexical lane from the heavier embedder + graph stages. A
+/// single struct holding all three states is cheaper to read than three
+/// separate `Arc<RwLock<>>`s and keeps the JSON status payload coherent.
+/// What: three `StageState` fields, serialised in the order the ticket spec
+/// expects.
+/// Test: `stage_status_capabilities_*` in this module.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct IndexStages {
+    pub lexical: StageState,
+    pub semantic: StageState,
+    pub graph: StageState,
+}
+
+impl IndexStages {
+    /// Compute the public `search_capabilities` array from the per-stage
+    /// statuses. Mirrors the wire schema documented on the ticket:
+    /// `["bm25", "literal", "exact_match"]` whenever lexical is ready,
+    /// `+ ["vector"]` once semantic is ready, `+ ["kg"]` once graph is
+    /// ready. Returned in deterministic order so caller diffs stay stable.
+    pub fn search_capabilities(&self) -> Vec<&'static str> {
+        let mut out = Vec::with_capacity(5);
+        if self.lexical.status.is_ready() {
+            out.push("bm25");
+            out.push("literal");
+            out.push("exact_match");
+        }
+        if self.semantic.status.is_ready() {
+            out.push("vector");
+        }
+        if self.graph.status.is_ready() {
+            out.push("kg");
+        }
+        out
+    }
+
+    /// Compute the coarse top-level lifecycle status string used by the
+    /// status endpoint's `status` field. Maps to:
+    /// `created` → `walking` → `indexed_lexical` → `indexed_vector` → `ready`
+    /// (or `ready` directly when stages 2 and 3 are `Skipped`).
+    pub fn lifecycle_status(&self) -> &'static str {
+        match (self.lexical.status, self.semantic.status, self.graph.status) {
+            (StageStatus::Pending, _, _) => "created",
+            (StageStatus::InProgress, _, _) => "walking",
+            // Lexical ready — categorise by semantic + graph
+            (StageStatus::Ready, StageStatus::Skipped, _) => "ready",
+            (StageStatus::Ready, StageStatus::Pending, _)
+            | (StageStatus::Ready, StageStatus::InProgress, _) => "indexed_lexical",
+            (StageStatus::Ready, StageStatus::Ready, StageStatus::Pending)
+            | (StageStatus::Ready, StageStatus::Ready, StageStatus::InProgress) => "indexed_vector",
+            (StageStatus::Ready, StageStatus::Ready, StageStatus::Ready) => "ready",
+            (StageStatus::Ready, StageStatus::Ready, StageStatus::Skipped) => "ready",
+            // Skipped lexical is not a state Phase 1 produces, but keep a
+            // sensible default so a future opt-in does not crash callers.
+            (StageStatus::Skipped, _, _) => "ready",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IndexId(pub String);
 
@@ -120,6 +268,46 @@ pub struct IndexHandle {
     /// Test: `test_results_may_be_stale_when_head_changes` (server-level
     /// integration coverage).
     pub indexed_head_sha: Arc<RwLock<Option<String>>>,
+
+    /// Staged-pipeline opt-out (issue #109, Phase 1).
+    ///
+    /// Why: callers who explicitly want a "daemonized ripgrep" without the
+    /// embedder cost can set this at create time. The reindex pipeline
+    /// returns after Stage 1 and permanently marks the semantic + graph
+    /// stages as `Skipped` so the search handler never tries to use the
+    /// vector lane on this index.
+    /// What: a bare `bool`, set once at `POST /indexes` and persisted to
+    /// `indexes.toml` so it survives daemon restarts. Defaults to `false`.
+    /// Test: `lexical_only_index_never_runs_stage_2` in
+    /// `service::reindex::tests`.
+    pub lexical_only: bool,
+
+    /// Per-stage lifecycle state surface for the staged pipeline
+    /// (issue #109, Phase 1).
+    ///
+    /// Why: the search handler reads this to compute `search_capabilities`
+    /// and skip lanes whose stage is not yet ready. Wrapped in
+    /// `Arc<RwLock<>>` so the reindex task can flip stage states between
+    /// `Pending` / `InProgress` / `Ready` without rebuilding the handle.
+    /// What: an `IndexStages` carrying three `StageState` slots (lexical /
+    /// semantic / graph). On a `lexical_only` index, semantic and graph
+    /// are pre-set to `Skipped` so the search handler never blocks.
+    /// Test: `stage_status_capabilities_*` (registry) and
+    /// `service::reindex::tests::stage_*` (e2e).
+    pub stages: Arc<RwLock<IndexStages>>,
+
+    /// Stage-2 backpressure notifier (issue #109, Phase 1 stub).
+    ///
+    /// Why: stage 2 runs concurrently with search traffic. When a search
+    /// arrives it pings this notifier so the embedder briefly yields,
+    /// keeping query latency responsive. Phase 1 ships a stub: the embedder
+    /// loop waits up to 100 ms on a `notified()` between batches. Phase 2
+    /// will tune the policy.
+    /// What: an `Arc<tokio::sync::Notify>` so handlers can call `notify_one`
+    /// without holding the indexer lock.
+    /// Test: not directly tested in Phase 1 — the stub is best-effort and
+    /// the search handler's existing latency tests cover regression.
+    pub search_pressure: Arc<tokio::sync::Notify>,
 }
 
 impl IndexHandle {
@@ -149,6 +337,9 @@ impl IndexHandle {
             context_embedding: Arc::new(RwLock::new(None)),
             context_summary: Arc::new(RwLock::new(None)),
             indexed_head_sha: Arc::new(RwLock::new(None)),
+            lexical_only: false,
+            stages: Arc::new(RwLock::new(IndexStages::default())),
+            search_pressure: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -280,6 +471,69 @@ mod tests {
             &root,
             &patterns,
         ));
+    }
+
+    /// Issue #109 Phase 1: `search_capabilities` grows monotonically as
+    /// stages advance from `Pending` → `Ready`. Mirrors the wire contract
+    /// the search handler relies on for graceful degradation.
+    #[test]
+    fn stage_status_capabilities_grow_with_stages() {
+        let mut stages = IndexStages::default();
+        // All pending → no capabilities.
+        assert!(stages.search_capabilities().is_empty());
+        assert_eq!(stages.lifecycle_status(), "created");
+
+        // Lexical ready → bm25 + literal + exact_match.
+        stages.lexical.status = StageStatus::Ready;
+        let caps = stages.search_capabilities();
+        assert_eq!(caps, vec!["bm25", "literal", "exact_match"]);
+        assert_eq!(stages.lifecycle_status(), "indexed_lexical");
+
+        // + semantic ready → adds vector.
+        stages.semantic.status = StageStatus::Ready;
+        let caps = stages.search_capabilities();
+        assert!(caps.contains(&"vector"));
+        assert!(!caps.contains(&"kg"));
+        assert_eq!(stages.lifecycle_status(), "indexed_vector");
+
+        // + graph ready → adds kg, top-level ready.
+        stages.graph.status = StageStatus::Ready;
+        let caps = stages.search_capabilities();
+        assert!(caps.contains(&"kg"));
+        assert_eq!(stages.lifecycle_status(), "ready");
+    }
+
+    /// `lexical_only` indexes pre-mark semantic + graph as `Skipped`. The
+    /// lifecycle status must report `ready` once stage 1 finishes, NOT
+    /// `indexed_lexical` (which would imply more stages are coming).
+    #[test]
+    fn stage_status_lexical_only_treats_skipped_as_terminal() {
+        let stages = IndexStages {
+            lexical: StageState {
+                status: StageStatus::Ready,
+                ..Default::default()
+            },
+            semantic: StageState::skipped(),
+            graph: StageState::skipped(),
+        };
+        // Lexical-only index: search_capabilities should be lexical-only.
+        let caps = stages.search_capabilities();
+        assert_eq!(caps, vec!["bm25", "literal", "exact_match"]);
+        assert!(!caps.contains(&"vector"));
+        assert!(!caps.contains(&"kg"));
+        // And the top-level status reflects terminal completion.
+        assert_eq!(stages.lifecycle_status(), "ready");
+    }
+
+    /// In-progress lexical → top-level status is `walking`. The search
+    /// handler treats this as "no capabilities available yet" and falls
+    /// back to grep.
+    #[test]
+    fn stage_status_walking_during_stage_1() {
+        let mut stages = IndexStages::default();
+        stages.lexical.status = StageStatus::InProgress;
+        assert_eq!(stages.lifecycle_status(), "walking");
+        assert!(stages.search_capabilities().is_empty());
     }
 
     /// Malformed glob pattern: falls back to literal match so a typo never

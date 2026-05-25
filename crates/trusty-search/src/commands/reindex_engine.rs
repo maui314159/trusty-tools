@@ -965,6 +965,10 @@ pub struct RegisterFilters {
     pub exclude_globs: Vec<String>,
     pub extensions: Vec<String>,
     pub domain_terms: Vec<String>,
+    /// Issue #109, Phase 1: when `true`, the CLI tells the daemon to register
+    /// this index as `lexical_only` — the reindex pipeline skips Stages 2/3
+    /// permanently. Persisted on the daemon side via `indexes.toml`.
+    pub lexical_only: bool,
 }
 
 /// Variant of [`register_index_with_daemon`] that forwards filter/domain
@@ -996,6 +1000,9 @@ pub async fn register_index_with_daemon_filtered(
     }
     if !filters.domain_terms.is_empty() {
         create_body["domain_terms"] = serde_json::json!(filters.domain_terms);
+    }
+    if filters.lexical_only {
+        create_body["lexical_only"] = serde_json::json!(true);
     }
     match client.post(&create_url).json(&create_body).send().await {
         Ok(resp) if resp.status().is_success() => {

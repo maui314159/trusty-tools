@@ -410,6 +410,7 @@ async fn search_for_context(
         branch: None,
         mode: crate::core::indexer::SearchMode::default(),
         exclude_archived: false,
+        stage: None,
     };
     let indexer = handle.indexer.read().await;
     let results = indexer.search(&q).await.map_err(|e| e.to_string())?;
