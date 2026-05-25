@@ -40,6 +40,19 @@ enum Command {
     Status,
     /// Start the daemon if not running, or show status if already running.
     Start,
+    /// Alias for `start` — start the daemon if not running, no-op if it is.
+    ///
+    /// Why: matches the trusty-search / trusty-memory CLI surface so users
+    /// moving between the three daemons get the same `start` / `serve` /
+    /// `stop` triad. `tm serve` does NOT speak MCP stdio — pass
+    /// `tm daemon --mcp` for the MCP-on-stdin/stdout mode.
+    Serve,
+    /// Stop every running trusty-mpm daemon process.
+    ///
+    /// Why: pairs with `start` so operators can take the daemon down
+    /// without a `restart` cycle. Uses `sysinfo` to find the daemon by
+    /// name + argv, sends SIGTERM, polls 5s, then SIGKILLs stragglers.
+    Stop,
     /// Stop the running daemon and start a fresh one.
     Restart,
     /// Define and manage projects (registered working directories).
@@ -379,6 +392,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Status => status(&client, &url).await,
         Command::Start => start(&client, &url).await,
+        Command::Serve => start(&client, &url).await,
+        Command::Stop => stop_daemon().await,
         Command::Restart => restart(&client, &url).await,
         Command::Project { action } => project(&client, &url, action).await,
         Command::Session { action } => session(&client, &url, action).await,
@@ -2073,6 +2088,174 @@ async fn restart(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     start(client, url).await
 }
 
+/// `stop` subcommand — terminate every running trusty-mpm daemon.
+///
+/// Why: pairs with `start` so operators can shut the daemon down without a
+/// full `restart` cycle. Mirrors `trusty-search stop` and `trusty-memory
+/// stop` so the three daemons share a single mental model. The daemon
+/// writes its address into `~/.trusty-mpm/daemon.lock`, but the lock-file
+/// PID can go stale (a SIGKILL leaves it behind), so the source of truth
+/// is the live process table.
+/// What: walks the process table via `sysinfo` for every `trusty-mpm` or
+/// `tm` process whose argv contains `daemon`, sends SIGTERM, polls 5 s for
+/// them to exit, then SIGKILLs stragglers. Removes the stale lock file
+/// when every targeted process has exited.
+/// Test: `cli_parses_stop`; the spawn/kill path is exercised by running
+/// `tm start` followed by `tm stop` against a clean environment.
+async fn stop_daemon() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let targets = find_daemon_pids();
+    if targets.is_empty() {
+        anyhow::bail!("No daemon running");
+    }
+
+    println!(
+        "Stopping trusty-mpm daemon ({} process(es): {:?})…",
+        targets.len(),
+        targets
+    );
+
+    // Phase 1: SIGTERM all targets.
+    for pid in &targets {
+        let _ = send_signal(*pid, "TERM");
+    }
+
+    // Phase 2: poll up to 5 s for every targeted PID to exit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let any_alive = targets.iter().any(|p| pid_alive(*p));
+        if !any_alive {
+            println!("Daemon stopped");
+            cleanup_lock_file();
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    // Phase 3: SIGKILL anything still alive.
+    let stragglers: Vec<u32> = targets.iter().copied().filter(|p| pid_alive(*p)).collect();
+    if !stragglers.is_empty() {
+        println!(
+            "{} process(es) ignored SIGTERM — sending SIGKILL: {:?}",
+            stragglers.len(),
+            stragglers
+        );
+        for pid in &stragglers {
+            let _ = send_signal(*pid, "KILL");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    if targets.iter().any(|p| pid_alive(*p)) {
+        println!("Daemon may still be shutting down");
+    } else {
+        println!("Daemon stopped");
+        cleanup_lock_file();
+    }
+    Ok(())
+}
+
+/// Remove the stale `~/.trusty-mpm/daemon.lock` after a successful stop.
+///
+/// Why: the daemon writes its lock file on bind and removes it on graceful
+/// shutdown, but SIGKILL leaves it behind; the next `tm status` call would
+/// then chase a dead address through the discovery timeout.
+/// What: best-effort `fs::remove_file` of `lock_file_path()`.
+/// Test: covered indirectly by the stop integration path.
+fn cleanup_lock_file() {
+    let path = trusty_mpm_core::lock_file_path();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Walk the process table and return every trusty-mpm daemon PID.
+///
+/// Why: `tm stop` needs to find the daemon regardless of which binary alias
+/// (`trusty-mpm` or `tm`) was used to launch it. Matching argv on `daemon`
+/// filters out short-lived CLI invocations (`tm status`, `tm doctor`) whose
+/// process names also match.
+/// What: refreshes the process list once, matches `name() in {trusty-mpm,
+/// tm}` AND `cmd().contains("daemon")`. Excludes the current process.
+/// Test: covered indirectly by the stop integration path.
+fn find_daemon_pids() -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for (pid, proc_) in sys.processes() {
+        let raw = pid.as_u32();
+        if raw == me {
+            continue;
+        }
+        let name = proc_.name().to_string_lossy();
+        let is_tm_binary = name == "trusty-mpm" || name == "tm";
+        if !is_tm_binary {
+            continue;
+        }
+        let is_daemon = proc_.cmd().iter().any(|a| a.to_string_lossy() == "daemon");
+        if is_daemon {
+            out.push(raw);
+        }
+    }
+    out
+}
+
+/// Send a POSIX signal to a PID by shelling out to `/bin/kill`.
+///
+/// Why: avoid adding a `nix` dependency for the sole purpose of sending
+/// SIGTERM / SIGKILL. `kill -SIGNAL pid` is universally available on
+/// every Unix the daemon supports (macOS, Linux).
+/// What: spawns `kill -<sig> <pid>` and returns an error if the exit
+/// status is non-zero.
+/// Test: covered indirectly by the stop integration path.
+#[cfg(unix)]
+fn send_signal(pid: u32, sig: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "kill -{sig} {pid} exited {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _sig: &str) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "signals unsupported on this platform",
+    ))
+}
+
+/// Check whether a PID is still alive (Unix only).
+///
+/// Why: the SIGTERM-then-SIGKILL poll loop needs a portable "is this PID
+/// alive?" probe. `kill -0` returns success when the process exists.
+/// What: invokes `kill -0 <pid>` via `Command` so no extra dep is needed.
+/// Test: covered indirectly by the stop integration path.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
 async fn start(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     // Prefer the lock file URL — it's the address our daemon actually bound to,
     // not whatever default URL the CLI was given (which may point at a different
@@ -2491,6 +2674,18 @@ mod tests {
     fn cli_parses_start() {
         let cli = Cli::try_parse_from(["trusty-mpm", "start"]).unwrap();
         assert!(matches!(cli.command, Command::Start));
+    }
+
+    #[test]
+    fn cli_parses_serve() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "serve"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve));
+    }
+
+    #[test]
+    fn cli_parses_stop() {
+        let cli = Cli::try_parse_from(["trusty-mpm", "stop"]).unwrap();
+        assert!(matches!(cli.command, Command::Stop));
     }
 
     #[test]

@@ -46,6 +46,9 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 # Used solely to query the terminal width (`TIOCGWINSZ`) for the launch banner.
 libc.workspace = true
+# Walks the process table for `tm stop` to locate every running daemon
+# by name + argv, matching the trusty-search / trusty-memory stop UX.
+sysinfo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

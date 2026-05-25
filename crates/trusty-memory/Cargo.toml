@@ -50,6 +50,11 @@ dirs = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 colored = { workspace = true }
+# Why: `commands::stop` walks the process table to find the running daemon by
+#      name + argv. `sysinfo` is the portable way to do that across macOS and
+#      Linux; the same crate is already a workspace dependency used by
+#      trusty-search and trusty-mpm-daemon, so this is zero new lockfile churn.
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

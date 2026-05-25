@@ -19,6 +19,8 @@ use std::net::SocketAddr;
 use trusty_memory::commands::migrate::{handle_migrate, MigrateTarget};
 use trusty_memory::commands::service::{handle_service, ServiceAction};
 use trusty_memory::commands::setup::handle_setup;
+use trusty_memory::commands::start::handle_start;
+use trusty_memory::commands::stop::handle_stop;
 use trusty_memory::{resolve_palace_registry_dir, run_http, run_http_dynamic, run_stdio, AppState};
 
 /// Top-level CLI for `trusty-memory`.
@@ -48,12 +50,29 @@ struct Cli {
 /// Test: clap's `--help` output enumerates both.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start the HTTP daemon in the background and return control to the shell.
+    ///
+    /// Why: matches `trusty-search start` so the trusty-* daemons share a
+    /// `start` / `serve` / `stop` surface. The detached child runs
+    /// `serve --foreground` so it does not respawn recursively.
+    Start,
+
+    /// Stop every running trusty-memory daemon process.
+    ///
+    /// Why: with `start` now self-spawning a detached daemon, operators need a
+    /// way to take it down that does not depend on launchd / systemd.
+    Stop,
+
     /// Run the daemon.
     ///
     /// Default mode is HTTP/SSE with dynamic port selection (7070..=7079, OS
-    /// fallback). Pass `--http <ADDR>` to bind a specific address, or
-    /// `--stdio` to speak MCP over stdin/stdout for direct Claude Code
-    /// integration.
+    /// fallback). Without `--stdio` or `--foreground`, `serve` self-spawns a
+    /// detached background daemon (alias for `start`) and returns immediately
+    /// so the parent shell gets its prompt back. Pass `--foreground` to keep
+    /// the daemon in the foreground (used internally by `start` to host the
+    /// actual HTTP server, and by launchd / systemd). Pass `--http <ADDR>` to
+    /// bind a specific address, or `--stdio` to speak MCP over stdin/stdout
+    /// for direct Claude Code integration.
     Serve {
         /// Bind the HTTP/SSE server to a specific address. When omitted (and
         /// `--stdio` is not set), the daemon binds dynamically.
@@ -67,6 +86,15 @@ enum Command {
         /// letting the default `serve` invocation run the HTTP daemon.
         #[arg(long, conflicts_with = "http")]
         stdio: bool,
+
+        /// Run the HTTP daemon in the foreground (do not self-spawn).
+        ///
+        /// Why: `serve` without `--stdio` defaults to background mode so the
+        /// trusty-* daemons share a `start` / `serve` UX. Long-running
+        /// supervisors (launchd, systemd, Docker) need a foreground process
+        /// to manage, so they pass `--foreground` to opt out of the spawn.
+        #[arg(long, conflicts_with = "stdio")]
+        foreground: bool,
 
         /// Bind every MCP tool call to this palace when the caller omits the
         /// `palace` argument.
@@ -178,11 +206,14 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
+        Command::Start => handle_start().await,
+        Command::Stop => handle_stop().await,
         Command::Serve {
             http,
             stdio,
+            foreground,
             palace,
-        } => run_serve(http, stdio, palace, log_buffer).await,
+        } => run_serve(http, stdio, foreground, palace, log_buffer).await,
         Command::Migrate {
             target,
             dry_run,
@@ -241,9 +272,22 @@ async fn run_monitor(target: MonitorTarget) -> Result<()> {
 async fn run_serve(
     http: Option<SocketAddr>,
     stdio: bool,
+    foreground: bool,
     palace: Option<String>,
     log_buffer: trusty_common::log_buffer::LogBuffer,
 ) -> Result<()> {
+    // Background self-spawn path: when invoked without `--stdio`, `--http`, or
+    // `--foreground`, fork a detached copy of ourselves with `serve
+    // --foreground` and return immediately. Mirrors `trusty-search start` so
+    // the parent shell keeps its prompt and tmux pane closures do not
+    // SIGHUP the daemon.
+    //
+    // Supervisors (launchd, systemd, Docker) always pass `--foreground` and
+    // stay on the inline path so they can manage the process lifecycle.
+    if !stdio && !foreground && http.is_none() {
+        return trusty_memory::commands::start::handle_start().await;
+    }
+
     // Resolve the standard data dir, then descend into `palaces/` if that
     // legacy-layout subdirectory exists. Using the resolved directory as
     // `data_root` keeps every call site (status, palace_list, open_palace,

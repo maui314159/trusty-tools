@@ -7,6 +7,7 @@
 //!   - Reject every write tool (`memory_remember`, `memory_forget`,
 //!     `kg_assert`) with a clear, actionable error string instead of a
 //!     panic or stack trace.
+//!
 //! Beyond the read-only matrix this file exercises the full tool surface
 //! end-to-end (content correctness), concurrent reader semantics, and
 //! gates a set of `#[ignore]`d performance budgets so regressions in the
