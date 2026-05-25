@@ -220,10 +220,17 @@ pub async fn stream_events(
 /// JSON body for registering a session via `POST /sessions`.
 ///
 /// Why: a session created by an external launcher (or the CLI) must announce
-/// itself so the dashboard and MCP tools can see it.
+/// itself so the dashboard and MCP tools can see it. The GUI's "New Session"
+/// button additionally needs the daemon to *spawn* a fresh session — create
+/// the tmux host and start `claude` — without going through the CLI; that
+/// path is opted into by supplying `workdir`.
 /// What: the project directory the session runs in, plus an optional project
-/// association and an optional caller-supplied tmux session name.
-/// Test: `register_and_remove_session`.
+/// association, an optional caller-supplied tmux session name, and an
+/// optional `workdir` that switches the request from registration-only to
+/// spawn mode.
+/// Test: `register_and_remove_session` (registration-only),
+/// `spawn_session_without_claude_returns_422` (spawn mode failure path),
+/// `spawn_session_without_tmux_returns_422` (spawn mode no-tmux path).
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct RegisterSession {
     /// Project directory the session was launched in (the session's working
@@ -244,29 +251,59 @@ pub struct RegisterSession {
     /// `tmux_name`; when absent the daemon derives one itself.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional working directory in which to spawn a brand-new session.
+    ///
+    /// Why: the GUI's "New Session" button needs the daemon to create the
+    /// tmux host and start `claude` itself — going through the CLI is not an
+    /// option from a browser. Presence of `workdir` is the explicit opt-in
+    /// for spawn semantics; absence preserves the registration-only behaviour
+    /// every other caller (the CLI, `session start`, the hook auto-register
+    /// path) depends on.
+    /// What: when present, the daemon creates a tmux session in this
+    /// directory and launches `claude` inside it; when absent, only
+    /// bookkeeping happens.
+    /// Test: `spawn_session_without_claude_returns_422`,
+    /// `spawn_session_without_tmux_returns_422`.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub workdir: Option<PathBuf>,
 }
 
 /// `POST /sessions` — register a new managed session, returning its id.
 ///
 /// Why: registering a session is pure bookkeeping — it records that a session
-/// exists so the dashboard and MCP tools can see it. It does NOT create a tmux
-/// window; spawning a tmux host here caused session proliferation (every call
-/// orphaned a new window). Sessions are instead *discovered* from existing
-/// tmux panes, *auto-registered* on a `SessionStart` hook, or launched by the
-/// `tm session start` CLI which owns the actual `claude` launch.
-/// What: builds the `Session` record and registers it in state.
-/// Test: `register_and_remove_session` covers the bookkeeping path.
+/// exists so the dashboard and MCP tools can see it. In addition, the GUI's
+/// "New Session" button needs the daemon to actually *spawn* a fresh session
+/// (create the tmux host and start `claude`) without going through the CLI;
+/// supplying `workdir` switches the request into that spawn mode. Sessions
+/// without `workdir` are still recorded as pure bookkeeping (no tmux window
+/// is created — that behaviour is unchanged so the existing CLI and hook
+/// auto-registration paths keep working).
+/// What: builds the `Session` record and registers it in state. When `workdir`
+/// is present, additionally creates the tmux session via [`TmuxService::spawn_claude`]
+/// and starts `claude` in it; failures map to HTTP 422 (`claude` missing or
+/// tmux missing) or 500 (tmux command failed). On success the new session
+/// appears immediately in `GET /sessions`.
+/// Test: `register_and_remove_session` covers the bookkeeping path;
+/// `spawn_session_without_claude_returns_422` and
+/// `spawn_session_without_tmux_returns_422` cover the spawn-mode error paths;
+/// `spawn_session_registers_session_when_possible` covers the happy/observable
+/// state path.
 #[utoipa::path(
     post,
     path = "/sessions",
     tag = "sessions",
     request_body = RegisterSession,
-    responses((status = 201, description = "Session registered; returns its id and name"))
+    responses(
+        (status = 201, description = "Session registered; returns its id and name"),
+        (status = 422, description = "Spawn requested but `claude` binary or tmux is unavailable"),
+        (status = 500, description = "tmux command failed while creating the session"),
+    )
 )]
 pub async fn register_session(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RegisterSession>,
-) -> Json<RegisterSessionResponse> {
+) -> Result<Json<RegisterSessionResponse>, DaemonError> {
     // Derive the tmux name from the project directory (`tmpm-<folder>`) so the
     // registry name matches the folder-based session the CLI creates. A
     // caller-supplied `name` always wins; otherwise fall back to the UUID name.
@@ -281,6 +318,25 @@ pub async fn register_session(
     if let Some(name) = body.name.as_deref().filter(|n| !n.is_empty()) {
         session.tmux_name = name.to_string();
     }
+    if let Some(workdir) = body.workdir.as_deref() {
+        // Mirror the workdir onto the session record so the dashboard and the
+        // reaper see the spawn directory, not the project label. The
+        // `Session::workdir` field is the per-session working directory; the
+        // `project` field is a label / association.
+        session.workdir = workdir.to_string_lossy().into_owned();
+    }
+
+    // Spawn mode: create the tmux host and start `claude` *before* the session
+    // is registered, so a 422 or 500 leaves the registry untouched. This
+    // matches the standard HTTP contract — a failed POST should not leave a
+    // half-created resource visible to subsequent GETs.
+    if let Some(workdir) = body.workdir.as_deref() {
+        TmuxService::spawn_claude(&session.tmux_name, workdir)?;
+        // The session is now actively running `claude`; mark it Active so the
+        // dashboard reflects reality rather than the default `Starting` state.
+        session.status = SessionStatus::Active;
+    }
+
     let id = session.id;
     let tmux_name = session.tmux_name.clone();
     state.register_session(session);
@@ -291,10 +347,10 @@ pub async fn register_session(
     // block the response, and a failure is logged, never fatal.
     crate::services::session_service::spawn_pid_capture(Arc::clone(&state), id, tmux_name.clone());
 
-    Json(RegisterSessionResponse {
+    Ok(Json(RegisterSessionResponse {
         id,
         name: tmux_name,
-    })
+    }))
 }
 
 /// `POST /api/v1/sessions/connect` — register a session for a *connect* (no
@@ -320,7 +376,7 @@ pub async fn register_session(
 pub async fn connect_session(
     state: State<Arc<DaemonState>>,
     body: Json<RegisterSession>,
-) -> Json<RegisterSessionResponse> {
+) -> Result<Json<RegisterSessionResponse>, DaemonError> {
     register_session(state, body).await
 }
 

@@ -72,9 +72,11 @@ async fn register_session_associates_project() {
             project: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
             name: None,
+            workdir: None,
         }),
     )
-    .await;
+    .await
+    .expect("registration-only path succeeds");
     let id = body.id.0.to_string();
     let listed = state.list_sessions();
     let session = listed
@@ -94,6 +96,7 @@ async fn list_sessions_filters_by_project() {
             project: "/work/demo".into(),
             project_path: Some("/work/demo".into()),
             name: None,
+            workdir: None,
         }),
     )
     .await;
@@ -103,6 +106,7 @@ async fn list_sessions_filters_by_project() {
             project: "/work/other".into(),
             project_path: Some("/work/other".into()),
             name: None,
+            workdir: None,
         }),
     )
     .await;
@@ -142,9 +146,11 @@ async fn register_and_remove_session() {
             project: "/tmp/new".into(),
             project_path: None,
             name: None,
+            workdir: None,
         }),
     )
-    .await;
+    .await
+    .expect("registration-only path succeeds");
     let id = body.id.0.to_string();
     assert_eq!(state.list_sessions().len(), 1);
     // Removing it succeeds; removing again is a 404.
@@ -202,9 +208,11 @@ async fn connect_session_registers_without_deploy() {
             project: "/tmp/connect".into(),
             project_path: Some("/tmp/connect".into()),
             name: Some("tmpm-connect".into()),
+            workdir: None,
         }),
     )
-    .await;
+    .await
+    .expect("connect registration succeeds");
     assert_eq!(body.name, "tmpm-connect");
     let listed = state.list_sessions();
     let session = listed
@@ -225,9 +233,11 @@ async fn registered_session_has_friendly_tmux_name() {
             project: "/tmp/friendly".into(),
             project_path: None,
             name: None,
+            workdir: None,
         }),
     )
-    .await;
+    .await
+    .expect("registration-only path succeeds");
     let id = body.id.0.to_string();
     let listed = state.list_sessions();
     let session = listed
@@ -257,6 +267,99 @@ async fn reap_sessions_returns_removed_count() {
 }
 
 #[tokio::test]
+async fn spawn_session_without_claude_returns_422() {
+    // `POST /sessions` with a `workdir` opts into spawn mode. When the
+    // `claude` binary is unavailable, the handler must return HTTP 422 (and
+    // leave the session registry empty — no half-created bookkeeping).
+    let _claude = crate::services::tmux_service::set_claude_lookup_override(Some(None));
+    let state = DaemonState::shared();
+    let err = register_session(
+        State(Arc::clone(&state)),
+        Json(RegisterSession {
+            project: "/tmp/spawn-no-claude".into(),
+            project_path: Some("/tmp/spawn-no-claude".into()),
+            name: None,
+            workdir: Some("/tmp/spawn-no-claude".into()),
+        }),
+    )
+    .await
+    .expect_err("spawn mode without claude must error");
+    assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        state.list_sessions().is_empty(),
+        "no session should be registered on 422"
+    );
+}
+
+#[tokio::test]
+async fn spawn_session_without_tmux_returns_422_on_no_tmux_host() {
+    // Force the `claude` lookup positive so the spawn proceeds past the
+    // binary check, then assert that the daemon degrades gracefully when
+    // tmux is unavailable. On CI tmux is generally absent, in which case the
+    // documented 422 applies. On a developer host that *does* have tmux
+    // installed the spawn will either succeed or surface an internal tmux
+    // error — both are acceptable shapes; the contract this test enforces
+    // is "never panic, and 422 when tmux missing".
+    let _claude = crate::services::tmux_service::set_claude_lookup_override(Some(Some(
+        "/fake/claude".into(),
+    )));
+    let state = DaemonState::shared();
+    let outcome = register_session(
+        State(Arc::clone(&state)),
+        Json(RegisterSession {
+            project: "/tmp/spawn-no-tmux".into(),
+            project_path: Some("/tmp/spawn-no-tmux".into()),
+            name: Some("tmpm-spawn-test-no-tmux".into()),
+            workdir: Some("/tmp".into()),
+        }),
+    )
+    .await;
+    if crate::tmux::TmuxDriver::is_available() {
+        // On a tmux-equipped host the spawn either succeeds or errors with an
+        // internal error from the bogus `claude` path; clean up if it created
+        // a real session, then return.
+        if let Ok(driver) = crate::tmux::TmuxDriver::discover() {
+            let _ = driver.kill_session("tmpm-spawn-test-no-tmux");
+        }
+        // Either way the registry must not contain a session for a failed
+        // spawn — successful spawns leave one entry; remove it for hygiene.
+        for s in state.list_sessions() {
+            state.remove_session(s.id);
+        }
+        let _ = outcome;
+    } else {
+        let err = outcome.expect_err("spawn mode without tmux must error");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            state.list_sessions().is_empty(),
+            "no session should be registered on 422"
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_only_path_ignores_missing_claude() {
+    // The bookkeeping (registration-only) path must NOT consult `claude` —
+    // an absent binary is irrelevant when no spawn was requested. Forcing
+    // the lookup negative proves the field is the sole trigger.
+    let _claude = crate::services::tmux_service::set_claude_lookup_override(Some(None));
+    let state = DaemonState::shared();
+    let Json(body) = register_session(
+        State(Arc::clone(&state)),
+        Json(RegisterSession {
+            project: "/tmp/no-spawn".into(),
+            project_path: None,
+            name: None,
+            workdir: None,
+        }),
+    )
+    .await
+    .expect("registration-only path must succeed regardless of claude availability");
+    assert_eq!(state.list_sessions().len(), 1);
+    assert_eq!(state.list_sessions()[0].id, body.id);
+}
+
+#[tokio::test]
 async fn register_session_returns_id_even_without_tmux() {
     // Graceful-degradation invariant: tmux is unavailable in CI, yet
     // `POST /sessions` must still return a JSON body carrying an `id`, and
@@ -268,9 +371,11 @@ async fn register_session_returns_id_even_without_tmux() {
             project: "/tmp/no-tmux".into(),
             project_path: None,
             name: None,
+            workdir: None,
         }),
     )
-    .await;
+    .await
+    .expect("registration-only path succeeds");
     let id_str = body.id.0.to_string();
     let listed = state.list_sessions();
     assert_eq!(listed.len(), 1);

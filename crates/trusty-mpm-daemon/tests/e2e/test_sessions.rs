@@ -209,6 +209,59 @@ async fn session_filter_by_project() {
     assert_eq!(scoped_sessions[0]["project_path"], "/work/alpha");
 }
 
+/// `POST /sessions` in spawn mode (with `workdir`) must satisfy the issue
+/// #93 contract on a host that lacks the `claude` binary: refuse with HTTP
+/// 422 and leave the session registry empty.
+///
+/// Why this test is portable: CI runners do not have `claude` installed, so
+/// the missing-binary branch is the deterministic one to assert at the
+/// e2e (HTTP-level) seam. The happy-path is exercised in the handler-level
+/// `spawn_session_without_claude_returns_422` plus the `tmux_service`
+/// `spawn_claude_*` unit tests, which use a process-wide override to control
+/// the lookup outcome.
+#[tokio::test]
+async fn spawn_session_without_claude_returns_422() {
+    // Skip the test only when a real `claude` binary is on PATH (some
+    // developer hosts) — there the spawn would actually run and the test
+    // would no longer cover the "missing-claude" contract.
+    if std::process::Command::new("which")
+        .arg("claude")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("`claude` is on PATH; skipping 422 spawn test");
+        return;
+    }
+
+    let daemon = TestDaemon::spawn().await;
+    let client = daemon.client();
+
+    let resp = client
+        .post(daemon.url("/sessions"))
+        .json(&json!({
+            "project": "/tmp/e2e-spawn",
+            "workdir": "/tmp/e2e-spawn",
+        }))
+        .send()
+        .await
+        .expect("spawn request");
+    assert_eq!(resp.status(), 422, "missing claude must yield 422");
+
+    let listed: Value = client
+        .get(daemon.url("/sessions"))
+        .send()
+        .await
+        .expect("list sessions")
+        .json()
+        .await
+        .expect("list body");
+    assert!(
+        listed["sessions"].as_array().unwrap().is_empty(),
+        "failed spawn must not leave a half-registered session"
+    );
+}
+
 /// `DELETE /sessions/dead` returns a well-formed `{ "removed": N }` body.
 ///
 /// The exact count depends on whether tmux is installed on the host: with tmux

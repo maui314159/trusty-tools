@@ -76,6 +76,18 @@ pub enum DaemonError {
     /// A requested capability is not configured on this daemon.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// The request is syntactically valid but semantically un-fulfillable.
+    ///
+    /// Why: a precondition the daemon cannot satisfy (e.g. `POST /sessions`
+    /// in spawn mode when the `claude` binary is missing from `PATH`) is not
+    /// a malformed request (`400`) and not a missing resource (`404`) — it
+    /// maps to HTTP 422 Unprocessable Entity, which exactly describes
+    /// "well-formed but unprocessable".
+    /// What: carries a human-readable reason.
+    /// Test: `error_status_codes_map`, `spawn_session_without_claude_returns_422`.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
 }
 
 impl DaemonError {
@@ -93,6 +105,7 @@ impl DaemonError {
             Self::InvalidRequest(_) | Self::InvalidPairCode => StatusCode::BAD_REQUEST,
             Self::TmuxUnavailable(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 }
@@ -164,6 +177,10 @@ mod tests {
         assert_eq!(
             DaemonError::ServiceUnavailable("x".into()).status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            DaemonError::Unprocessable("x".into()).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 
