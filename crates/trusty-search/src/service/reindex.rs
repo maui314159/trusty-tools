@@ -202,6 +202,14 @@ pub struct ReindexProgress {
     pub errors: std::sync::atomic::AtomicUsize,
     /// Files skipped because their content hash matched the previous reindex.
     pub skipped: std::sync::atomic::AtomicUsize,
+    /// Issue #100: number of chunks dropped during the most recent reindex
+    /// because the per-index `TRUSTY_MAX_CHUNKS` cap was reached. Non-zero ⇒
+    /// the index is incomplete and downstream search results may miss code
+    /// from the tail of the walk. Surfaced via `GET /indexes/:id/status` as
+    /// `walk_truncated_by_budget` (boolean) and `chunks_dropped_by_cap`
+    /// (count) so operators can distinguish a clean index from one that
+    /// silently lost source.
+    pub chunks_dropped_by_cap: std::sync::atomic::AtomicUsize,
     /// Append-only log of JSON-encoded events. Replayed to late SSE
     /// subscribers so they don't miss earlier `start` / `progress` events.
     pub events: Arc<Mutex<Vec<String>>>,
@@ -219,6 +227,7 @@ impl ReindexProgress {
             total_chunks: Default::default(),
             errors: Default::default(),
             skipped: Default::default(),
+            chunks_dropped_by_cap: Default::default(),
             events: Arc::new(Mutex::new(Vec::new())),
             sender,
         }
@@ -281,6 +290,7 @@ fn collect_files_to_index(handle: &IndexHandle) -> crate::service::walker::WalkR
     let mut total_skipped_dirs: usize = 0;
     let walk_opts = WalkOptions {
         include_docs: handle.include_docs,
+        respect_gitignore: handle.respect_gitignore,
     };
     for subtree in &include_paths {
         let w = walk_source_files_with_options(subtree, walk_opts);
@@ -522,6 +532,10 @@ struct BatchOutcome {
     /// True when the post-commit RSS check tripped the abort flag — caller
     /// must break out of the batch loop.
     mem_limit_hit: bool,
+    /// Issue #100: chunks dropped by the `TRUSTY_MAX_CHUNKS` cap in this
+    /// batch. Aggregated into `RunTotals.chunks_dropped_by_cap` for the
+    /// `complete` event and the index's `walk_truncated_by_budget` status flag.
+    chunks_dropped_by_cap: usize,
 }
 
 /// Process a single batch end-to-end: read files, filter (hash-skip,
@@ -646,6 +660,7 @@ async fn commit_parsed_and_finalize(ctx: &BatchCtx, ready: ParsedReadyBatch) -> 
         vector_upsert_ms: commit.vector_upsert_ms,
         vector_count,
         mem_limit_hit,
+        chunks_dropped_by_cap: commit.chunks_dropped_by_cap,
     }
 }
 
@@ -946,6 +961,11 @@ struct RunTotals {
     vector_upsert_ms: u64,
     vector_count: usize,
     mem_limit_hit: bool,
+    /// Issue #100: total chunks dropped by the per-index chunk cap across the
+    /// whole reindex. Non-zero ⇒ the walk was truncated by the budget and the
+    /// index is incomplete. Surfaced in the `complete` SSE event and in the
+    /// per-index status response as `walk_truncated_by_budget`.
+    chunks_dropped_by_cap: usize,
 }
 
 /// Emit the terminal `complete` SSE event with run-level timings + counters.
@@ -986,6 +1006,11 @@ async fn emit_complete_event(
             "chunks_per_sec": chunks_per_sec,
             "peak_rss_mb": peak_rss_mb,
             "memory_limit_hit": totals.mem_limit_hit,
+            // Issue #100: surface budget truncation so callers can flag
+            // indexes truncated by `TRUSTY_MAX_CHUNKS`. Mirrors
+            // `memory_limit_hit` — non-zero/true ⇒ the index is incomplete.
+            "walk_truncated_by_budget": totals.chunks_dropped_by_cap > 0,
+            "chunks_dropped_by_cap": totals.chunks_dropped_by_cap,
             "kg_skipped": kg.kg_skipped,
             "timings": {
                 "parse_ms": totals.parse_ms,
@@ -1293,6 +1318,12 @@ pub fn spawn_reindex_with_cleanup(
         let mut total_bm25_ms: u64 = 0;
         let mut total_vector_upsert_ms: u64 = 0;
         let mut total_vector_count: usize = 0;
+        // Issue #100: chunks the per-index `TRUSTY_MAX_CHUNKS` cap dropped
+        // across all batches. Surfaced in the `complete` event and the
+        // per-index status as `walk_truncated_by_budget` so operators can
+        // distinguish a clean index from one whose walk was cut short by
+        // the chunk budget.
+        let mut total_chunks_dropped_by_cap: usize = 0;
 
         // Memory-protection state (issues #76, #82). `mem_limit` is `Some`
         // only when `TRUSTY_MEMORY_LIMIT_MB` is set. The previous design
@@ -1417,6 +1448,14 @@ pub fn spawn_reindex_with_cleanup(
             total_vector_upsert_ms =
                 total_vector_upsert_ms.saturating_add(outcome.vector_upsert_ms);
             total_vector_count = total_vector_count.saturating_add(outcome.vector_count);
+            total_chunks_dropped_by_cap =
+                total_chunks_dropped_by_cap.saturating_add(outcome.chunks_dropped_by_cap);
+            if outcome.chunks_dropped_by_cap > 0 {
+                progress.chunks_dropped_by_cap.fetch_add(
+                    outcome.chunks_dropped_by_cap,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
             if outcome.mem_limit_hit {
                 mem_limit_hit = true;
                 // Close the receiver so the producer notices on its next
@@ -1541,6 +1580,7 @@ pub fn spawn_reindex_with_cleanup(
             vector_upsert_ms: total_vector_upsert_ms,
             vector_count: total_vector_count,
             mem_limit_hit,
+            chunks_dropped_by_cap: total_chunks_dropped_by_cap,
         };
         emit_complete_event(&progress, started, peak_rss_mb, &totals, &kg).await;
 
@@ -1722,6 +1762,7 @@ mod tests {
             extensions: vec![],
             domain_terms: vec![],
             include_docs: false,
+            respect_gitignore: true,
             path_filter: vec![],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1795,6 +1836,7 @@ mod tests {
             extensions: vec![],
             domain_terms: vec![],
             include_docs: false,
+            respect_gitignore: true,
             path_filter: vec!["common-*".to_string()],
             context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
             context_summary: Arc::new(tokio::sync::RwLock::new(None)),

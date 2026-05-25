@@ -50,6 +50,23 @@ pub struct IndexHandle {
     /// BM25 results. Set via `include_docs: true` in `trusty-search.yaml`.
     pub include_docs: bool,
 
+    /// Issue #100: honour `.gitignore` (plus `.ignore`, `.rgignore`,
+    /// `.git/info/exclude`, global gitignore) during the reindex walk.
+    /// Default `true`. Set to `false` via `trusty-search.yaml`'s
+    /// `respect_gitignore: false` or the `POST /indexes` `respect_gitignore`
+    /// field when the operator wants to index a vendored / gitignored
+    /// subtree on purpose.
+    ///
+    /// Why: the historical `walkdir`-based walker ignored gitignore, which
+    /// combined with the chunk budget (`TRUSTY_MAX_CHUNKS`) caused silent
+    /// partial-index failures — a gitignored subtree full of minified JS
+    /// would dominate the budget and the project's real source was never
+    /// reached. Surfacing the toggle on the handle lets the reindex walker
+    /// thread the operator's choice through to `WalkOptions`.
+    /// Test: covered by `service::walker::test_walker_honors_gitignore`
+    /// and the persistence-round-trip tests in `service::persistence`.
+    pub respect_gitignore: bool,
+
     /// Glob patterns matched against the *immediate subdirectory name* under
     /// `root_path`. When non-empty, the reindex walker keeps only files
     /// whose first path component (relative to `root_path`) matches one of
@@ -120,6 +137,7 @@ impl IndexHandle {
             extensions: Vec::new(),
             domain_terms: Vec::new(),
             include_docs: false,
+            respect_gitignore: true,
             path_filter: Vec::new(),
             context_embedding: Arc::new(RwLock::new(None)),
             context_summary: Arc::new(RwLock::new(None)),

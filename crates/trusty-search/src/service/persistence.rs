@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 /// On-disk record for one registered index. Kept tiny so the TOML file stays
 /// human-readable for ops debugging.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedIndex {
     pub id: String,
     pub root_path: PathBuf,
@@ -61,6 +61,53 @@ pub struct PersistedIndex {
     /// loading without rewrite.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_docs: bool,
+
+    /// Issue #100: honour `.gitignore` (plus `.ignore`, `.rgignore`,
+    /// `.git/info/exclude`, global gitignore) during the reindex walk.
+    /// Default `true` — matches ripgrep semantics. Older `indexes.toml`
+    /// files predate this field; the serde default deserialises them as
+    /// `true` so the fix takes effect on restart without rewriting state.
+    /// `skip_serializing_if` keeps the TOML compact: only the rare
+    /// opt-out (`respect_gitignore = false`) is written to disk.
+    #[serde(
+        default = "default_respect_gitignore",
+        skip_serializing_if = "is_default_respect_gitignore"
+    )]
+    pub respect_gitignore: bool,
+}
+
+/// Why: serde's `default` attribute needs a free function (closures aren't
+/// allowed). Centralising the default here keeps it identical for
+/// deserialisation and for the `PersistedIndex::default()` fallback.
+fn default_respect_gitignore() -> bool {
+    true
+}
+
+/// Why: skip writing `respect_gitignore = true` to TOML (it's the default)
+/// so existing `indexes.toml` files stay compact and we don't churn every
+/// existing index file on the first save.
+fn is_default_respect_gitignore(v: &bool) -> bool {
+    *v
+}
+
+impl Default for PersistedIndex {
+    /// `respect_gitignore` defaults to `true` (issue #100) so the manual
+    /// `Default` impl matches serde's missing-field behaviour. Without
+    /// this, `PersistedIndex::default()` would silently disable the
+    /// gitignore-honouring fix on test/fallback paths.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            root_path: PathBuf::new(),
+            include_paths: Vec::new(),
+            exclude_globs: Vec::new(),
+            extensions: Vec::new(),
+            domain_terms: Vec::new(),
+            path_filter: Vec::new(),
+            include_docs: false,
+            respect_gitignore: true,
+        }
+    }
 }
 
 /// TOML wrapper so the file uses `[[index]]` array-of-tables syntax —
@@ -422,6 +469,53 @@ mod tests {
         let entries = load_index_registry_at(&path).unwrap();
         assert_eq!(entries.len(), 1, "duplicate [[index]] block written");
         assert_eq!(entries[0].root_path, PathBuf::from("/new"));
+    }
+
+    /// Issue #100: `respect_gitignore` defaults to `true` on every code path —
+    /// constructor, missing-field deserialisation, and after a save/load
+    /// round-trip. This pins the back-compat contract: an `indexes.toml`
+    /// written by a previous trusty-search version must pick up the
+    /// gitignore-honouring fix automatically on warm boot.
+    #[test]
+    fn respect_gitignore_defaults_true_and_round_trips() {
+        // Default constructor returns true.
+        assert!(PersistedIndex::default().respect_gitignore);
+
+        // Loading legacy TOML without the field gives true.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(
+            &path,
+            r#"
+[[index]]
+id = "legacy"
+root_path = "/tmp/legacy"
+"#,
+        )
+        .unwrap();
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].respect_gitignore,
+            "missing field must default to true (issue #100 back-compat)"
+        );
+
+        // Explicit false survives save/load cycle.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        save_index_registry_at(
+            &path,
+            &[PersistedIndex {
+                id: "vendored".into(),
+                root_path: PathBuf::from("/tmp/v"),
+                respect_gitignore: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].respect_gitignore);
     }
 
     #[test]

@@ -11134,7 +11134,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11156,6 +11156,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hf-hub 0.3.2",
+ "ignore",
  "include_dir",
  "indicatif 0.17.11",
  "linfa",

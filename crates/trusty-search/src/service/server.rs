@@ -696,6 +696,19 @@ pub struct CreateIndexRequest {
     /// this index.
     #[serde(default)]
     pub include_docs: Option<bool>,
+    /// Honour `.gitignore` (plus `.ignore`, `.rgignore`, `.git/info/exclude`,
+    /// global gitignore) during the reindex walk — issue #100. Default
+    /// `None` (treated as `true` by the daemon, matching ripgrep semantics).
+    /// Set `false` from `trusty-search.yaml` when the operator wants to
+    /// index a gitignored / vendored subtree on purpose.
+    ///
+    /// Why: previously the walker used `walkdir` and ignored `.gitignore`,
+    /// which combined with the chunk budget caused silent partial-index
+    /// failures — a gitignored subtree dominated the budget before the
+    /// walker reached the real source. Exposing the toggle on the wire keeps
+    /// the opt-out reachable for callers that need it.
+    #[serde(default)]
+    pub respect_gitignore: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1375,6 +1388,10 @@ async fn create_index_handler(
     // automatically. Best-effort: a write failure is logged but doesn't fail
     // the request — the in-memory registry still has the index.
     let include_docs: bool = req.include_docs.unwrap_or(false);
+    // Issue #100: honour `.gitignore` by default. `None` on the wire ⇒ `true`
+    // so existing callers (CLI, MCP, integrators) get the fix automatically
+    // without having to pass a new field.
+    let respect_gitignore: bool = req.respect_gitignore.unwrap_or(true);
     if let Err(e) = crate::service::persistence::upsert_index_registry_entry(
         crate::service::persistence::PersistedIndex {
             id: req.id.clone(),
@@ -1385,6 +1402,7 @@ async fn create_index_handler(
             domain_terms: domain_terms.clone(),
             path_filter: path_filter.clone(),
             include_docs,
+            respect_gitignore,
         },
     ) {
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
@@ -1402,6 +1420,7 @@ async fn create_index_handler(
         extensions,
         domain_terms,
         include_docs,
+        respect_gitignore,
         path_filter,
         context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
         context_summary: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2283,6 +2302,20 @@ async fn index_status_handler(
         Some(ReindexStatus::Running) => "indexing",
         _ => "ready",
     };
+    // Issue #100: surface budget-truncation so callers can flag indexes that
+    // hit the `TRUSTY_MAX_CHUNKS` cap during the last reindex. Defaults to
+    // `false` / `0` when no `ReindexProgress` entry exists (i.e. the index
+    // was warm-booted from disk and hasn't been reindexed in this daemon
+    // session — exactly the back-compat case the task spec calls out).
+    let (walk_truncated_by_budget, chunks_dropped_by_cap) = state
+        .reindex_progress
+        .get(&index_id)
+        .map_or((false, 0), |p| {
+            let n = p
+                .chunks_dropped_by_cap
+                .load(std::sync::atomic::Ordering::Acquire);
+            (n > 0, n)
+        });
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "root_path": handle.root_path,
@@ -2293,6 +2326,9 @@ async fn index_status_handler(
         "context_summary": context_summary,
         "disk_bytes": disk_bytes,
         "last_indexed": last_indexed,
+        "respect_gitignore": handle.respect_gitignore,
+        "walk_truncated_by_budget": walk_truncated_by_budget,
+        "chunks_dropped_by_cap": chunks_dropped_by_cap,
     })))
 }
 
@@ -3071,6 +3107,7 @@ async fn reindex_handler(
                     extensions: handle.extensions.clone(),
                     domain_terms: handle.domain_terms.clone(),
                     include_docs: handle.include_docs,
+                    respect_gitignore: handle.respect_gitignore,
                     path_filter: handle.path_filter.clone(),
                     // Preserve the previously inferred context (if any). A
                     // fresh reindex will overwrite this with the metadata
@@ -3710,6 +3747,7 @@ mod tests {
                 domain_terms: None,
                 path_filter: None,
                 include_docs: None,
+                respect_gitignore: None,
             }),
         )
         .await;
@@ -4117,6 +4155,7 @@ mod tests {
                 domain_terms: None,
                 path_filter: None,
                 include_docs: None,
+                respect_gitignore: None,
             }),
         )
         .await;
@@ -4153,6 +4192,7 @@ mod tests {
                 domain_terms: None,
                 path_filter: None,
                 include_docs: None,
+                respect_gitignore: None,
             }),
         )
         .await;
@@ -4205,6 +4245,7 @@ mod tests {
                 domain_terms: None,
                 path_filter: None,
                 include_docs: None,
+                respect_gitignore: None,
             }),
         )
         .await;
@@ -4246,6 +4287,7 @@ mod tests {
                 domain_terms: None,
                 path_filter: None,
                 include_docs: None,
+                respect_gitignore: None,
             }),
         )
         .await;

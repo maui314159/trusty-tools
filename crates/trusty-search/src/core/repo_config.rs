@@ -32,7 +32,7 @@ pub struct RepoConfig {
 }
 
 /// One named index slice within a repo.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexConfig {
     pub name: String,
 
@@ -73,6 +73,43 @@ pub struct IndexConfig {
     /// Test: covered by walker tests and `test_default_excludes_markdown_and_changelog`.
     #[serde(default)]
     pub include_docs: bool,
+
+    /// Honour `.gitignore`, `.ignore`, `.rgignore`, and `.git/info/exclude`
+    /// during the walk (issue #100). Default `true`.
+    ///
+    /// Why: the walker historically used `walkdir`, which ignores all of the
+    /// above — so a gitignored subtree (e.g. `claude-mpm-patch/` full of
+    /// minified JS bundles) would dominate the chunk budget and silently
+    /// produce an index containing none of the project's real source.
+    /// Honouring `.gitignore` by default matches ripgrep / fd semantics.
+    /// What: `true` (default) → walker delegates to the `ignore` crate with
+    /// the standard ignore-file set enabled. `false` → bypass entirely (only
+    /// the hardcoded `SKIP_DIRS` / `should_skip_path` filters apply); useful
+    /// when indexing a vendored subtree the operator wants on purpose.
+    /// Test: `service::walker::test_walker_honors_gitignore` plus the
+    /// `respect_gitignore` opt-out test.
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for IndexConfig {
+    /// `respect_gitignore` defaults to `true` (issue #100) so the manual impl
+    /// keeps `Default` and serde's missing-field default in agreement.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            paths: Vec::new(),
+            exclude: Vec::new(),
+            languages: Vec::new(),
+            domain_terms: Vec::new(),
+            include_docs: false,
+            respect_gitignore: true,
+        }
+    }
 }
 
 fn default_version() -> u32 {
@@ -404,5 +441,47 @@ indexes:
         assert!(exts.contains(&"tsx"));
         assert!(exts.contains(&"js"));
         assert!(exts.contains(&"jsx"));
+    }
+
+    /// Issue #100: `respect_gitignore` defaults to `true`, both at construction
+    /// (`IndexConfig::default()`) and when deserialising an older YAML that
+    /// predates the field. The explicit `false` value also round-trips. This
+    /// pins the back-compat contract — an existing `trusty-search.yaml` must
+    /// pick up the gitignore-honouring fix automatically.
+    #[test]
+    fn respect_gitignore_defaults_true_and_round_trips() {
+        // Default constructor returns `true`.
+        let cfg = IndexConfig::default();
+        assert!(cfg.respect_gitignore);
+
+        // YAML without the field deserialises to `true`.
+        let tmp = tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            r#"
+version: 1
+indexes:
+  - name: legacy
+"#,
+        );
+        let cfg = RepoConfig::load(tmp.path()).unwrap().unwrap();
+        assert!(
+            cfg.indexes[0].respect_gitignore,
+            "missing field must default to true (issue #100 back-compat)"
+        );
+
+        // Explicit `false` round-trips.
+        let tmp = tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            r#"
+version: 1
+indexes:
+  - name: vendored
+    respect_gitignore: false
+"#,
+        );
+        let cfg = RepoConfig::load(tmp.path()).unwrap().unwrap();
+        assert!(!cfg.indexes[0].respect_gitignore);
     }
 }

@@ -13,6 +13,48 @@ _(no unreleased changes)_
 
 ---
 
+## [0.8.1] — 2026-05-25
+
+### Fixed
+- **#100** Walker now honours `.gitignore`. Previously the walker used
+  `walkdir` directly, which ignores all VCS-aware ignore files; combined with
+  the per-index chunk budget (`TRUSTY_MAX_CHUNKS`, auto-tuned from the memory
+  policy), this caused silent partial-index failures where a gitignored
+  subtree (e.g. `claude-mpm-patch/` full of minified bundles) dominated or
+  exhausted the budget before the walker reached the actual project source.
+  The walker now delegates to the `ignore` crate — the same engine ripgrep
+  uses — and respects `.gitignore`, `.git/info/exclude`, the global git
+  ignore, `.ignore`, `.rgignore`, and parent-directory ignore files. The
+  hardcoded `SKIP_DIRS` / `should_skip_path` filters still apply as
+  defence-in-depth for projects without a `.gitignore` (closes #100).
+
+### Added
+- **#100** `respect_gitignore` opt-out for indexes that intentionally walk a
+  gitignored / vendored subtree. The flag rides on `WalkOptions`, `IndexConfig`
+  (`trusty-search.yaml`), `IndexHandle`, `PersistedIndex` (with serde default
+  for back-compat with existing `indexes.toml` files), and the
+  `POST /indexes` `respect_gitignore` request field. Default `true` so every
+  existing caller picks up the fix automatically without a wire change.
+- **#100** `walk_truncated_by_budget` (boolean) and `chunks_dropped_by_cap`
+  (count) surfaced in `GET /indexes/:id/status` and the reindex `complete` SSE
+  event. Non-zero ⇒ the index is incomplete because the per-index chunk cap
+  was reached during the walk; operators previously had no way to distinguish
+  a clean index from one whose tail was silently dropped. Defaults to
+  `false` / `0` for indexes warm-booted from disk that haven't been reindexed
+  since the daemon started.
+
+### Internal
+- New `ignore = "0.4"` direct dependency in `crates/trusty-search/Cargo.toml`
+  (previously a transitive dep via globset / notify).
+- `CommitTimings.chunks_dropped_by_cap` plumbs the per-batch cap-drop count
+  from `core::indexer::ingest` up through `service::reindex` to
+  `ReindexProgress`.
+- 4 new walker unit tests pin the behaviour:
+  `test_walker_honors_gitignore`, `test_walker_respects_disable_flag`,
+  `test_walker_honors_dot_ignore`, `test_walker_still_skips_hardcoded_dirs`.
+
+---
+
 ## [0.3.57] — 2026-05-21
 
 ### Changed

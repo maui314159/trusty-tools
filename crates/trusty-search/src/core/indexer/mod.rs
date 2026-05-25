@@ -605,6 +605,13 @@ pub struct CommitTimings {
     /// Time spent rebuilding the symbol graph at the end of this commit. `0`
     /// when `defer_graph_rebuild=true` (the reindex orchestrator path).
     pub kg_ms: u64,
+    /// Issue #100: chunks dropped by the per-index `TRUSTY_MAX_CHUNKS` cap
+    /// inside this batch. Aggregated across the reindex by the orchestrator
+    /// so the `complete` SSE event and `GET /indexes/:id/status` can flag
+    /// indexes that were truncated by the budget — the silent partial-index
+    /// failure mode where a gitignored subtree consumes the cap before the
+    /// walker reaches the real source. Non-zero ⇒ the index is incomplete.
+    pub chunks_dropped_by_cap: usize,
 }
 
 /// `CodeIndexer`: hybrid search engine for one named index.

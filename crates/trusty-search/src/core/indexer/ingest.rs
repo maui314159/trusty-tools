@@ -706,7 +706,10 @@ impl CodeIndexer {
         let chunk_total = all_chunks.len();
         if chunk_total == 0 {
             self.commit_entities(entities_by_file).await;
-            return Ok(CommitTimings::default());
+            return Ok(CommitTimings {
+                chunks_dropped_by_cap: pre_filter_dropped,
+                ..CommitTimings::default()
+            });
         }
 
         let vec_start = std::time::Instant::now();
@@ -759,6 +762,7 @@ impl CodeIndexer {
             bm25_ms,
             vector_upsert_ms,
             kg_ms,
+            chunks_dropped_by_cap: pre_filter_dropped,
         })
     }
 

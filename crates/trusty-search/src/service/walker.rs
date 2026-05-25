@@ -3,13 +3,13 @@
 //! Why: Reindexing a project requires enumerating all source files under a
 //! root directory while skipping VCS/build/dependency dirs and binary noise.
 //! What: `walk_source_files(root)` returns every source file (filtered by
-//! [`SOURCE_EXTS`]) below `root`, skipping any directory whose name appears
-//! in [`SKIP_DIRS`], plus [`should_skip_path`] and [`should_skip_content`]
+//! [`SOURCE_EXTS`]) below `root`, honouring `.gitignore` (via the `ignore`
+//! crate, same engine ripgrep uses) and skipping any directory whose name
+//! appears in [`SKIP_DIRS`], plus [`should_skip_path`] and [`should_skip_content`]
 //! for minification / size guards applied at read time.
 //! Test: see the unit tests at the bottom.
 
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Source file extensions that the indexer can handle.
 ///
@@ -151,25 +151,47 @@ pub const DOC_EXCLUDE_EXTS: &[&str] = &["md", "mdx", "rst", "adoc", "txt"];
 /// Test: `test_default_excludes_markdown_and_changelog`.
 pub const DOC_EXCLUDE_BASENAME_SUBSTRINGS: &[&str] = &["changelog", "license", "notice"];
 
-/// Walk options controlling default-exclusion behaviour (issue #77).
+/// Walk options controlling default-exclusion behaviour (issue #77, #100).
 ///
 /// Why: most indexes want the default exclusion of `*.md`, `CHANGELOG*`, etc.
 /// applied at walk time so docs never enter the BM25 / vector lanes. A small
 /// number of indexes (documentation-focused projects, conceptual search) need
-/// to opt in via `include_docs: true`. Keeping the toggle as a struct makes
-/// future additions (e.g. `include_configs`) non-breaking.
+/// to opt in via `include_docs: true`. Issue #100 adds `respect_gitignore`:
+/// the walker honours `.gitignore` by default (matching ripgrep / fd
+/// semantics) and silent partial-index failures from a gitignored subtree
+/// dominating the chunk budget are no longer possible. A handful of indexes
+/// (e.g. a vendored subtree the operator wants to index on purpose) need to
+/// opt out. Keeping the toggle as a struct makes future additions
+/// (e.g. `include_configs`) non-breaking.
 /// What: a `Copy` struct passed to [`walk_source_files_with_options`]. The
-/// default is `include_docs: false` (the new behaviour for issue #77); the
-/// legacy [`walk_source_files`] entry point preserves the previous behaviour
-/// by calling through with `include_docs: false`.
+/// default is `include_docs: false`, `respect_gitignore: true`; the legacy
+/// [`walk_source_files`] entry point preserves these defaults.
 /// Test: `test_default_excludes_markdown_and_changelog`,
-///   `test_include_docs_keeps_markdown`.
-#[derive(Debug, Clone, Copy, Default)]
+///   `test_include_docs_keeps_markdown`, `test_walker_honors_gitignore`,
+///   `test_walker_respects_disable_flag`, `test_walker_honors_dot_ignore`.
+#[derive(Debug, Clone, Copy)]
 pub struct WalkOptions {
     /// When `false` (default), files matching [`DOC_EXCLUDE_EXTS`] or
     /// [`DOC_EXCLUDE_BASENAME_SUBSTRINGS`] are pruned before they reach the
     /// indexer. When `true`, they are walked normally.
     pub include_docs: bool,
+    /// When `true` (default), the walker honours `.gitignore`,
+    /// `.git/info/exclude`, the global git ignore file, `.ignore`, and
+    /// `.rgignore` — the same set of ignore files ripgrep respects. When
+    /// `false`, none of these files are consulted and only the hardcoded
+    /// [`SKIP_DIRS`] / [`should_skip_path`] filters apply. Default `true` is
+    /// the fix for issue #100; the opt-out exists for callers that need to
+    /// index a vendored subtree on purpose.
+    pub respect_gitignore: bool,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            include_docs: false,
+            respect_gitignore: true,
+        }
+    }
 }
 
 /// Return `true` when `path` matches one of the default doc-exclusion rules
@@ -373,18 +395,31 @@ pub fn walk_source_files(root: &Path) -> WalkResult {
 /// Why: indexes that want documentation indexed (conceptual-search-focused
 /// projects, `include_docs: true` in `trusty-search.yaml`) need to bypass the
 /// issue #77 default doc exclusion without losing the rest of the walker's
-/// hygiene (binary skip, minified detection, SKIP_DIRS pruning).
+/// hygiene (binary skip, minified detection, SKIP_DIRS pruning). Issue #100
+/// switches the underlying engine from `walkdir` to the `ignore` crate so
+/// `.gitignore` is honoured by default — previously a gitignored subtree
+/// (e.g. `claude-mpm-patch/` full of minified bundles) would dominate the
+/// chunk budget before the walker ever reached the actual source tree,
+/// producing a "successful" index containing zero real code.
 /// What:
 /// - Canonicalises `root` up front (resolves symlink components) so emitted
 ///   file paths are stable regardless of which alias the caller passed in.
 ///   When canonicalization fails (e.g. the root vanished mid-call), falls back
 ///   to the input path so the walker still tries — the daemon's
 ///   `validate_root_path` is the canonical guard, this is defence in depth.
+/// - Drives the walk through [`ignore::WalkBuilder`] (ripgrep's engine) with
+///   the standard ignore-file set enabled when `opts.respect_gitignore` is
+///   `true` (default): `.gitignore`, `.git/info/exclude`, global gitignore,
+///   `.ignore`, `.rgignore`, plus parent-directory ignores. When `false`, the
+///   walker behaves as it did before issue #100 — only the hardcoded
+///   [`SKIP_DIRS`] / [`should_skip_path`] filters apply.
 /// - Follows symlinks during traversal so symlinked subdirectories inside the
 ///   tree (vendored crates, monorepo aliases) are indexed instead of silently
 ///   skipped.
 /// - Filtered by [`SOURCE_EXTS`].
-/// - Skips any directory whose basename is in [`SKIP_DIRS`].
+/// - Belt-and-suspenders skip of any directory whose basename is in
+///   [`SKIP_DIRS`] (most are already gitignored, but defence in depth covers
+///   projects without a `.gitignore`).
 /// - Skips files matching [`should_skip_path`] (minified/binary/large).
 /// - When `opts.include_docs` is `false` (default), skips files matching
 ///   [`is_default_doc_excluded`] (Markdown, CHANGELOG, LICENSE, ...).
@@ -393,7 +428,11 @@ pub fn walk_source_files(root: &Path) -> WalkResult {
 /// Test: `test_default_excludes_markdown_and_changelog`,
 /// `test_include_docs_keeps_markdown`,
 /// `test_canonicalizes_symlinked_root`,
-/// `test_follows_symlinked_subdirectory`.
+/// `test_follows_symlinked_subdirectory`,
+/// `test_walker_honors_gitignore`,
+/// `test_walker_respects_disable_flag`,
+/// `test_walker_honors_dot_ignore`,
+/// `test_walker_still_skips_hardcoded_dirs`.
 pub fn walk_source_files_with_options(root: &Path, opts: WalkOptions) -> WalkResult {
     let mut files = Vec::new();
     let mut skipped_dirs = 0usize;
@@ -405,21 +444,31 @@ pub fn walk_source_files_with_options(root: &Path, opts: WalkOptions) -> WalkRes
     // belt-and-braces for callers that bypass the HTTP entry point.
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    let walker = WalkDir::new(&canonical_root).follow_links(true).into_iter();
-    let walker = walker.filter_entry(|e| {
-        if e.depth() == 0 {
-            return true;
-        }
-        if e.file_type().is_dir() {
-            let name = e.file_name().to_string_lossy();
-            if SKIP_DIRS.iter().any(|d| *d == name) {
-                return false;
-            }
-        }
-        true
-    });
+    // Configure the `ignore` crate. `standard_filters(true)` is a shorthand
+    // that flips on all the ripgrep-equivalent ignore sources at once
+    // (`.gitignore`, `.git/info/exclude`, global gitignore, `.ignore`, hidden
+    // files); we then explicitly re-enable each source we care about so a
+    // future `ignore` release that changes the standard-filter defaults
+    // doesn't silently flip behaviour.
+    //
+    // `hidden(false)` keeps dotfiles in the walk so e.g. `.github/workflows/*`
+    // remain indexable — the original `walkdir`-based walker did not skip
+    // hidden entries; the only hidden-directory exclusions came from
+    // SKIP_DIRS (`.git`, `.cargo`, ...). Honouring `.gitignore` is what
+    // prunes `.venv` / `.cache` / `.aws-sam` on projects that gitignore them.
+    let mut builder = ignore::WalkBuilder::new(&canonical_root);
+    builder
+        .follow_links(true)
+        .hidden(false)
+        .standard_filters(opts.respect_gitignore)
+        .git_ignore(opts.respect_gitignore)
+        .git_exclude(opts.respect_gitignore)
+        .git_global(opts.respect_gitignore)
+        .ignore(opts.respect_gitignore)
+        .parents(opts.respect_gitignore)
+        .require_git(false);
 
-    for entry in walker {
+    for entry in builder.build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -427,10 +476,28 @@ pub fn walk_source_files_with_options(root: &Path, opts: WalkOptions) -> WalkRes
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
+        // Directories aren't emitted as walker output, but `ignore` may still
+        // yield them when permission errors prevent recursion — skip
+        // defensively. The `file_type` is `None` for the root entry on some
+        // platforms; treat that as "not a file" (the root itself never has a
+        // source extension).
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+        if !is_file {
             continue;
         }
         let path = entry.path();
+        // Belt-and-suspenders: a project without a `.gitignore` (rare but
+        // real, e.g. a `target/` left over from someone else's build) still
+        // needs the hardcoded skip list to keep `node_modules` etc. out of
+        // the index. Match on any component's basename so a nested
+        // `vendor/foo/node_modules/bar.js` is still pruned.
+        if path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .any(|seg| SKIP_DIRS.contains(&seg))
+        {
+            continue;
+        }
         // Extension allow-list: only known source extensions enter the indexer.
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
@@ -554,12 +621,17 @@ mod tests {
         fs::write(root.join("README.md"), "# project").unwrap();
         fs::write(root.join("CHANGELOG.md"), "# 1.0.0").unwrap();
 
-        let names: Vec<String> =
-            walk_source_files_with_options(root, WalkOptions { include_docs: true })
-                .files
-                .iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                .collect();
+        let names: Vec<String> = walk_source_files_with_options(
+            root,
+            WalkOptions {
+                include_docs: true,
+                ..WalkOptions::default()
+            },
+        )
+        .files
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
         assert!(names.contains(&"main.rs".to_string()));
         assert!(names.contains(&"README.md".to_string()));
         assert!(names.contains(&"CHANGELOG.md".to_string()));
@@ -1045,6 +1117,145 @@ mod tests {
         assert!(
             names.contains(&"linked.rs".to_string()),
             "file inside symlinked subdir was not indexed: {names:?}",
+        );
+    }
+
+    // --- Issue #100: .gitignore honoured by default ----------------------
+
+    /// The walker must honour `.gitignore`. Without this, a project that
+    /// gitignores a noisy subtree (e.g. `claude-mpm-patch/` full of minified
+    /// JS bundles) sees that subtree dominate the chunk budget and the real
+    /// source tree is silently dropped — the failure mode described in
+    /// issue #100. The fix swaps `walkdir` for the `ignore` crate
+    /// (ripgrep's engine).
+    #[test]
+    fn test_walker_honors_gitignore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // A `.gitignore` that excludes the `excluded/` subtree.
+        fs::write(root.join(".gitignore"), "excluded/\n").unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::create_dir_all(root.join("included")).unwrap();
+        fs::write(root.join("excluded/foo.rs"), "fn foo() {}").unwrap();
+        fs::write(root.join("included/bar.rs"), "fn bar() {}").unwrap();
+
+        let names: Vec<String> = walk_source_files(root)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"bar.rs".to_string()),
+            "included file dropped: {names:?}"
+        );
+        assert!(
+            !names.contains(&"foo.rs".to_string()),
+            "gitignored file not pruned: {names:?}"
+        );
+    }
+
+    /// `respect_gitignore: false` restores the legacy walk-everything
+    /// behaviour for callers that want to index a vendored subtree
+    /// intentionally.
+    #[test]
+    fn test_walker_respects_disable_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join(".gitignore"), "excluded/\n").unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::create_dir_all(root.join("included")).unwrap();
+        fs::write(root.join("excluded/foo.rs"), "fn foo() {}").unwrap();
+        fs::write(root.join("included/bar.rs"), "fn bar() {}").unwrap();
+
+        let opts = WalkOptions {
+            include_docs: false,
+            respect_gitignore: false,
+        };
+        let names: Vec<String> = walk_source_files_with_options(root, opts)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"bar.rs".to_string()),
+            "included file dropped: {names:?}"
+        );
+        assert!(
+            names.contains(&"foo.rs".to_string()),
+            "respect_gitignore=false still pruned gitignored file: {names:?}"
+        );
+    }
+
+    /// `.ignore` (ripgrep's non-git ignore file) is honoured by the same
+    /// machinery as `.gitignore`. Projects use it to add walker-only
+    /// exclusions that they don't want committed to `.gitignore`.
+    #[test]
+    fn test_walker_honors_dot_ignore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join(".ignore"), "excluded/\n").unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::create_dir_all(root.join("included")).unwrap();
+        fs::write(root.join("excluded/foo.rs"), "fn foo() {}").unwrap();
+        fs::write(root.join("included/bar.rs"), "fn bar() {}").unwrap();
+
+        let names: Vec<String> = walk_source_files(root)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"bar.rs".to_string()),
+            "included file dropped: {names:?}"
+        );
+        assert!(
+            !names.contains(&"foo.rs".to_string()),
+            ".ignore file not honoured: {names:?}"
+        );
+    }
+
+    /// The hardcoded [`SKIP_DIRS`] list remains the floor: projects without
+    /// any `.gitignore` (a fresh `cargo new` that never ran git, a vendored
+    /// blob the operator dropped in raw) still get `target/` and
+    /// `node_modules/` pruned. This guards against regressions where
+    /// flipping the ignore engine accidentally relied on the gitignore to
+    /// carry those exclusions.
+    #[test]
+    fn test_walker_still_skips_hardcoded_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // No `.gitignore` — `ignore` has nothing to honour. The hardcoded
+        // SKIP_DIRS filter must still drop these subtrees.
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("node_modules/foo")).unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join("target/debug/build.rs"), "fn b() {}").unwrap();
+        fs::write(root.join("node_modules/foo/index.js"), "// pkg").unwrap();
+        // `.git` doesn't contain source extensions, but planting one
+        // proves the skip still applies even when extensions match.
+        fs::write(root.join(".git/objects/blob.rs"), "fn g() {}").unwrap();
+        fs::write(root.join("real.rs"), "fn real() {}").unwrap();
+
+        let names: Vec<String> = walk_source_files(root)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"real.rs".to_string()),
+            "real source dropped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "build.rs"),
+            "target/ leaked into walk: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "index.js"),
+            "node_modules/ leaked into walk: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "blob.rs"),
+            ".git/ leaked into walk: {names:?}"
         );
     }
 }

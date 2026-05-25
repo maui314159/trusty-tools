@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 readme = "README.md"
@@ -121,6 +121,13 @@ notify = "6"
 notify-debouncer-mini = "0.4"
 fs4 = { version = "0.8", features = ["sync"] }
 walkdir = "2"
+# `ignore` (the engine that powers ripgrep): honours `.gitignore`,
+# `.git/info/exclude`, the global gitignore, `.ignore`, and `.rgignore`. Used
+# by `service::walker` to avoid walking subtrees the user has explicitly told
+# git to ignore — a partial-index failure mode tracked in issue #100. Already
+# a transitive dep (via `globset`/`notify`); declared directly here so the
+# walker can rely on the API surface without leaning on someone else's pin.
+ignore = "0.4"
 crossbeam-utils = "0.8"
 dirs = "5"
 
