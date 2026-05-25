@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.88"
 # Inherited by the trusty-mpm-* crates which declare `version.workspace = true`.
 # Other crates set their own `version` and are unaffected.
-version = "0.2.14"
+version = "0.2.15"
 # NOTE: workspace-level license preserved because several existing crates
 # (trusty-common, trusty-mcp-core, trusty-mpm-core, …) reference it via
 # `license.workspace = true`. Per migration instructions we must not alter
@@ -26,14 +26,14 @@ authors = ["Bob Matsuoka <bob@matsuoka.com>"]
 
 [workspace.dependencies]
 # ── Internal crates (path deps so the monorepo builds without publish cycles) ──
-trusty-common = { path = "crates/trusty-common", version = "0.4.18" }
+trusty-common = { path = "crates/trusty-common", version = "0.4.20" }
 trusty-mcp-core = { path = "crates/trusty-mcp-core", version = "0.1" }
 trusty-embedder = { path = "crates/trusty-embedder", version = "0.1" }
 trusty-symgraph = { path = "crates/trusty-symgraph", version = "0.2.6" }
 # trusty-mpm internal crates (consumed by trusty-mpm-* sub-crates).
-trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.2.14" }
-trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp", version = "0.2.14" }
-trusty-mpm-client = { path = "crates/trusty-mpm-client", version = "0.2.14" }
+trusty-mpm-core = { path = "crates/trusty-mpm-core", version = "0.2.15" }
+trusty-mpm-mcp = { path = "crates/trusty-mpm-mcp", version = "0.2.15" }
+trusty-mpm-client = { path = "crates/trusty-mpm-client", version = "0.2.15" }
 
 # ── Async runtime / HTTP ────────────────────────────────────────────────────
 anyhow = "1"
