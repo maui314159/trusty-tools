@@ -13,6 +13,33 @@ _(no unreleased changes)_
 
 ---
 
+## [0.9.1] — 2026-05-25
+
+### Fixed
+
+- **#135** Warm-boot stages restoration — fixes silent BM25-only fallback on
+  existing indexes. The v0.9.0 staged-pipeline refactor introduced a regression
+  in the daemon's warm-boot path: every index restored from `indexes.toml`
+  came back with `stages = Pending` for lexical / semantic / graph, regardless
+  of what was on disk. Because the search handler now derives
+  `search_capabilities` from `stages` (not the legacy top-level `status`), the
+  hybrid pipeline was silently disabled on every fully-indexed registered
+  project until the operator force-reindexed.
+
+  The fix inspects each index's on-disk artifacts after warm-boot:
+  `corpus.chunk_count()` (lexical readiness), `hnsw.usearch` presence
+  (semantic readiness), and the rehydrated symbol graph's `node_count()`
+  (graph readiness). A `lexical_only` index forces semantic + graph to
+  `Skipped` regardless of on-disk state. An index with `chunk_count == 0`
+  but a registered entry is treated as mid-reindex recovery (lexical →
+  `InProgress`) so the next reindex resumes via the hash-skip path.
+
+  No schema change: the existing on-disk artifacts are authoritative, so
+  `indexes.toml` did not need a `stages_marker` field. Existing daemons
+  pick up the fix on the next restart with no migration step.
+
+---
+
 ## [0.9.0] — 2026-05-25
 
 ### Added — staged-pipeline (Phase 1)

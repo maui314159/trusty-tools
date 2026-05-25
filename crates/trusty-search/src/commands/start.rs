@@ -5,10 +5,130 @@ use colored::Colorize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::registry::{IndexHandle, IndexId};
+use crate::core::registry::{IndexHandle, IndexId, IndexStages, StageState, StageStatus};
 use crate::service::persistence::load_index_registry;
 use crate::service::persistence_loader::build_indexer_with_persisted_state;
 use crate::service::SearchAppState;
+
+/// Inputs to [`derive_warm_boot_stages`] — every signal the pure stage
+/// classifier needs in one struct so the call site can build it once and the
+/// tests can drive it without filesystem fixtures.
+///
+/// Why (issue #135): the warm-boot path was instantiating every restored
+/// handle with `stages = Pending` and never consulting the on-disk artifacts.
+/// Searches against existing indexes silently dropped the semantic + graph
+/// lanes because `search_capabilities` is derived from `stages`. Extracting
+/// the classification into a pure function lets the call site keep its single
+/// disk-inspection sweep and lets the unit tests pin every transition.
+/// What: a small data carrier — no `Default` impl, no methods. Construction
+/// is intentionally explicit so a future caller cannot forget to wire one of
+/// the four signals.
+/// Test: every `warm_boot_*` test in the colocated `mod tests` constructs one
+/// of these inputs directly and asserts the resulting [`IndexStages`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WarmBootInputs {
+    /// Number of chunks the durable corpus reports (`CorpusStore::chunk_count`).
+    /// Zero means the corpus is genuinely empty OR a previous reindex died
+    /// mid-flight before the first batch committed.
+    pub chunk_count: usize,
+    /// `true` when `<data_dir>/indexes/<id>/hnsw.usearch` exists on disk AND
+    /// was successfully restored into the indexer's vector store with a
+    /// dimension matching the embedder. We deliberately do not re-open the
+    /// file here: `build_indexer_with_persisted_state` already validates the
+    /// snapshot and falls back to a fresh store on any mismatch, so this flag
+    /// captures "we have a usable HNSW lane after warm-boot".
+    pub hnsw_snapshot_ready: bool,
+    /// Number of nodes in the symbol graph that
+    /// `build_indexer_with_persisted_state` rehydrated (via redb +
+    /// `load_or_rebuild_symbol_graph`). Zero means the graph is empty either
+    /// because the corpus is empty or because the build never produced any
+    /// callers/callees relationships (rare for non-trivial code).
+    pub graph_node_count: usize,
+    /// `lexical_only` flag persisted on the registry entry — when `true`,
+    /// semantic + graph stages are forced to `Skipped` regardless of what is
+    /// on disk. Defensive: a flapping operator could have an old HNSW snapshot
+    /// from a prior non-lexical-only life lying around; the staged pipeline
+    /// must not surface it.
+    pub lexical_only: bool,
+}
+
+/// Pure classifier: given the four warm-boot signals, decide where each of
+/// the three stages should land on the restored handle's [`IndexStages`].
+///
+/// Why (issue #135): see [`WarmBootInputs`]. This is the function the unit
+/// tests exercise — separating it from the disk-walking caller keeps the
+/// tests deterministic and the production path a thin wrapper.
+/// What: applies the rules from the ticket spec, in this order:
+///   1. `lexical_only == true` → semantic + graph are `Skipped`.
+///   2. `chunk_count > 0` → lexical is `Ready` (BM25 + redb both restored
+///      cleanly by the loader).
+///   3. `chunk_count == 0` → lexical is `InProgress` (mid-reindex recovery
+///      — the next reindex will resume via the hash-skip path).
+///   4. `hnsw_snapshot_ready` (and not lexical-only) → semantic is `Ready`.
+///   5. `graph_node_count > 0` (and not lexical-only) → graph is `Ready`.
+///
+/// Test: `warm_boot_*` tests in this module's `tests` submodule.
+pub(crate) fn derive_warm_boot_stages(inputs: WarmBootInputs) -> IndexStages {
+    // Lexical stage.
+    //
+    // Why: `chunk_count > 0` means the redb corpus restored cleanly AND
+    // `build_indexer_with_persisted_state::restore_corpus` rebuilt BM25 as a
+    // side effect of `load_chunks_from_redb`'s four-phase publish — so the
+    // lexical lane is queryable as soon as we register the handle. The
+    // `last_indexed` proxy lives outside this struct (the registry handle
+    // does not carry a timestamp; freshness is computed from
+    // `index.redb` mtime by `index_disk_and_mtime`), so we leave
+    // `completed_at` as `None` and rely on the existing freshness reporting
+    // for the wall-clock signal. A future ticket can plumb mtime through if
+    // operators need stage-level timestamps after warm-boot.
+    let lexical = if inputs.chunk_count > 0 {
+        StageState {
+            status: StageStatus::Ready,
+            ..Default::default()
+        }
+    } else {
+        // Mid-reindex recovery: redb is empty but the index is registered.
+        // Mark lexical `InProgress` so the search handler does not advertise
+        // BM25 as ready, and the next reindex (triggered manually or by the
+        // file watcher) will resume via the hash-skip path in
+        // `commit_parsed_batch`.
+        StageState {
+            status: StageStatus::InProgress,
+            ..Default::default()
+        }
+    };
+
+    // Semantic + graph: forced to `Skipped` for `lexical_only` indexes
+    // regardless of on-disk state. Otherwise read directly from the
+    // inspection signals.
+    let (semantic, graph) = if inputs.lexical_only {
+        (StageState::skipped(), StageState::skipped())
+    } else {
+        let semantic = if inputs.hnsw_snapshot_ready {
+            StageState {
+                status: StageStatus::Ready,
+                ..Default::default()
+            }
+        } else {
+            StageState::pending()
+        };
+        let graph = if inputs.graph_node_count > 0 {
+            StageState {
+                status: StageStatus::Ready,
+                ..Default::default()
+            }
+        } else {
+            StageState::pending()
+        };
+        (semantic, graph)
+    };
+
+    IndexStages {
+        lexical,
+        semantic,
+        graph,
+    }
+}
 
 /// Restore every index recorded in `indexes.toml` by re-registering it on the
 /// in-memory registry. For each entry we attempt to load the persisted HNSW
@@ -69,21 +189,46 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
         // search response can flag staleness when the working tree advances
         // past the indexed commit. Best-effort: `None` outside a git repo.
         let indexed_head_sha = crate::core::git::head_sha(&entry.root_path);
-        // Issue #109, Phase 1: warm-boot indexes inherit the persisted
-        // `lexical_only` flag. When set, the search handler and the next
-        // reindex skip Stage 2 / 3 permanently. Pre-mark semantic + graph
-        // as `Skipped` so the lifecycle state is correct before the next
-        // reindex flips lexical to `InProgress`.
         let lexical_only = entry.lexical_only;
-        let stages = if lexical_only {
-            crate::core::registry::IndexStages {
-                lexical: crate::core::registry::StageState::pending(),
-                semantic: crate::core::registry::StageState::skipped(),
-                graph: crate::core::registry::StageState::skipped(),
-            }
-        } else {
-            crate::core::registry::IndexStages::default()
-        };
+        // Issue #135: inspect the on-disk artifacts that
+        // `build_indexer_with_persisted_state` just restored and derive the
+        // staged-pipeline state from them. Before this, every warm-booted
+        // index landed with `stages = Pending` and `search_capabilities`
+        // computed from that — so the search handler silently disabled the
+        // vector + KG lanes on every existing index until the user ran a
+        // force reindex. That broke the v0.9.0 upgrade path for everyone with
+        // a populated `indexes.toml`.
+        //
+        // The inspection is cheap: `chunk_count` is one redb metadata read,
+        // `hnsw.usearch` is a `path.exists()` filesystem call (the dim /
+        // deserialise check already happened inside the loader), and the
+        // symbol-graph node count is an `Arc::clone` + in-memory read.
+        let chunk_count = indexer
+            .corpus_store()
+            .and_then(|c| c.chunk_count().ok())
+            .unwrap_or(0);
+        let hnsw_snapshot_ready = crate::service::persistence::hnsw_path(&entry.id)
+            .map(|p| crate::service::persistence::has_persisted_hnsw(&p))
+            .unwrap_or(false);
+        let graph_node_count = indexer.snapshot_symbol_graph().await.node_count();
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count,
+            hnsw_snapshot_ready,
+            graph_node_count,
+            lexical_only,
+        });
+        tracing::info!(
+            "warm-boot: index '{}' restored — chunks={} hnsw_snapshot={} graph_nodes={} \
+             lexical_only={} → stages(lexical={:?}, semantic={:?}, graph={:?})",
+            entry.id,
+            chunk_count,
+            hnsw_snapshot_ready,
+            graph_node_count,
+            lexical_only,
+            stages.lexical.status,
+            stages.semantic.status,
+            stages.graph.status,
+        );
         let handle = IndexHandle {
             id: id.clone(),
             indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -626,4 +771,136 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
         Err(e) => anyhow::bail!("daemon failed: {e}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Warm-boot stage-restoration tests (issue #135).
+    //!
+    //! Why: the warm-boot path in [`restore_indexes`] is async and pulls in
+    //! the full daemon-init machinery (memory policy detection, embedder
+    //! load, log buffer install). Driving it end-to-end from a unit test
+    //! requires a tempdir override of `dirs::data_local_dir` which the
+    //! current persistence layer does not expose. Instead we test the pure
+    //! classifier [`derive_warm_boot_stages`] which contains every business
+    //! rule the bug is about — the call site is a thin disk-inspection
+    //! adapter with no branches of its own. Each test below corresponds to
+    //! one bullet in the ticket spec.
+    //! Test: this module — `cargo test -p trusty-search --lib warm_boot`.
+    use super::*;
+    use crate::core::registry::StageStatus;
+
+    /// Helper: construct [`WarmBootInputs`] without spelling out every field
+    /// in every test. Defaults represent the "empty fresh index" baseline so
+    /// each test only overrides the signals it cares about.
+    fn inputs() -> WarmBootInputs {
+        WarmBootInputs {
+            chunk_count: 0,
+            hnsw_snapshot_ready: false,
+            graph_node_count: 0,
+            lexical_only: false,
+        }
+    }
+
+    /// A restored index whose redb corpus reports `chunk_count > 0` has the
+    /// lexical lane fully wired (`load_chunks_from_redb` rebuilt BM25 as a
+    /// side effect). The classifier must flip lexical → `Ready` so the
+    /// search handler advertises BM25 / literal / exact_match in
+    /// `search_capabilities`.
+    #[test]
+    fn warm_boot_marks_lexical_ready_when_chunks_present() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 14_823,
+            ..inputs()
+        });
+        assert_eq!(stages.lexical.status, StageStatus::Ready);
+        assert!(stages.search_capabilities().contains(&"bm25"));
+        assert!(stages.search_capabilities().contains(&"literal"));
+        assert!(stages.search_capabilities().contains(&"exact_match"));
+    }
+
+    /// When the HNSW sidecar exists on disk and the loader successfully
+    /// rehydrated it (the call site sets `hnsw_snapshot_ready = true`), the
+    /// semantic stage must come back as `Ready` and `vector` must appear in
+    /// `search_capabilities`.
+    #[test]
+    fn warm_boot_marks_semantic_ready_when_hnsw_snapshot_exists() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 14_823,
+            hnsw_snapshot_ready: true,
+            ..inputs()
+        });
+        assert_eq!(stages.semantic.status, StageStatus::Ready);
+        assert!(stages.search_capabilities().contains(&"vector"));
+    }
+
+    /// When the persisted symbol graph rehydrated with a non-zero node count
+    /// (`Indexer::snapshot_symbol_graph().node_count() > 0`), the graph
+    /// stage must be `Ready` and `kg` must appear in `search_capabilities`.
+    #[test]
+    fn warm_boot_marks_graph_ready_when_symbol_graph_nonempty() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 14_823,
+            hnsw_snapshot_ready: true,
+            graph_node_count: 7_402,
+            ..inputs()
+        });
+        assert_eq!(stages.graph.status, StageStatus::Ready);
+        assert!(stages.search_capabilities().contains(&"kg"));
+    }
+
+    /// Missing HNSW snapshot → semantic stays `Pending`. Lexical can still
+    /// be `Ready` (BM25 does not depend on the embedder), but the search
+    /// handler must not advertise `vector` until a reindex regenerates the
+    /// HNSW file.
+    #[test]
+    fn warm_boot_marks_semantic_pending_when_no_snapshot() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 14_823,
+            hnsw_snapshot_ready: false,
+            ..inputs()
+        });
+        assert_eq!(stages.lexical.status, StageStatus::Ready);
+        assert_eq!(stages.semantic.status, StageStatus::Pending);
+        assert!(!stages.search_capabilities().contains(&"vector"));
+    }
+
+    /// Defensive: a `lexical_only` index that happens to have a stale HNSW
+    /// file from a prior non-lexical-only life (or a graph populated by an
+    /// earlier reindex) must NOT surface the vector / kg lanes. The
+    /// `lexical_only` flag wins regardless of on-disk state.
+    #[test]
+    fn warm_boot_respects_lexical_only_flag() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 14_823,
+            hnsw_snapshot_ready: true,
+            graph_node_count: 7_402,
+            lexical_only: true,
+        });
+        assert_eq!(stages.lexical.status, StageStatus::Ready);
+        assert_eq!(stages.semantic.status, StageStatus::Skipped);
+        assert_eq!(stages.graph.status, StageStatus::Skipped);
+        let caps = stages.search_capabilities();
+        assert!(caps.contains(&"bm25"));
+        assert!(!caps.contains(&"vector"));
+        assert!(!caps.contains(&"kg"));
+    }
+
+    /// Mid-reindex recovery: the registry has the entry but the redb corpus
+    /// is empty (the previous reindex died before the first batch
+    /// committed). Lexical must come back as `InProgress` — not `Pending` —
+    /// so the lifecycle status surfaces "walking" and the next reindex
+    /// trigger can resume cleanly via the hash-skip path.
+    #[test]
+    fn warm_boot_marks_mid_reindex_as_in_progress() {
+        let stages = derive_warm_boot_stages(WarmBootInputs {
+            chunk_count: 0,
+            hnsw_snapshot_ready: false,
+            graph_node_count: 0,
+            lexical_only: false,
+        });
+        assert_eq!(stages.lexical.status, StageStatus::InProgress);
+        assert_eq!(stages.lifecycle_status(), "walking");
+        assert!(stages.search_capabilities().is_empty());
+    }
 }
