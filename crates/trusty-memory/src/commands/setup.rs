@@ -233,21 +233,34 @@ fn prewarm_embedder_phase() {
         cache_dir.display()
     );
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!(
-                "  {} could not build tokio runtime for pre-warm ({e}); skipping.",
-                "·".dimmed()
-            );
-            return;
-        }
+    // `prewarm_embedder_phase` is called from a `#[tokio::main]` context, so
+    // we must not call `block_on` on the current thread directly (that panics
+    // with "Cannot start a runtime from within a runtime"). `block_in_place`
+    // moves the blocking work off the async thread pool so we can build a
+    // dedicated single-thread runtime safely.
+    let result = tokio::task::block_in_place(|| {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!(
+                    "  {} could not build tokio runtime for pre-warm ({e}); skipping.",
+                    "·".dimmed()
+                );
+                return None;
+            }
+        };
+        Some(rt.block_on(trusty_common::embedder::FastEmbedder::new()))
+    });
+
+    let result = match result {
+        None => return,
+        Some(r) => r,
     };
 
-    match rt.block_on(trusty_common::embedder::FastEmbedder::new()) {
+    match result {
         Ok(_e) => {
             println!(
                 "{} Embedder model cached. First recall after daemon start will be instant.",
