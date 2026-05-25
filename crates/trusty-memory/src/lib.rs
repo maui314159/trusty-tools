@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub mod commands;
 pub mod discovery;
 pub mod kg_extract;
+pub mod messaging;
 pub mod openrpc;
 pub mod prompt_facts;
 pub mod service;
@@ -1105,7 +1106,8 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 20);
+        // Issue #99 adds `memory_send_message` on top of the baseline 20 tools.
+        assert_eq!(tools.len(), 21);
     }
 
     #[tokio::test]
