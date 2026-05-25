@@ -571,11 +571,7 @@ pub fn apply_reindex_event(state: &mut SearchTuiState, scoped: ScopedReindexEven
             indexed,
             total_files,
         } => {
-            let pct = if total_files > 0 {
-                indexed.saturating_mul(100) / total_files
-            } else {
-                0
-            };
+            let pct = indexed.saturating_mul(100).checked_div(total_files).unwrap_or(0);
             state
                 .log
                 .push_scoped(&id, format!("indexing: {indexed}/{total_files} ({pct}%)"));

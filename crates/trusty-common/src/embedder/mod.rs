@@ -563,7 +563,7 @@ impl Embedder for FastEmbedder {
             }
 
             let mut cache = self.cache.lock();
-            for ((idx, key), vector) in to_compute.into_iter().zip(computed.into_iter()) {
+            for ((idx, key), vector) in to_compute.into_iter().zip(computed) {
                 cache.put(key, vector.clone());
                 results[idx] = Some(vector);
             }
