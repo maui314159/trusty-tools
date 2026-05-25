@@ -180,7 +180,7 @@ impl SymbolGraph {
         // Sort symbols by start_line for deterministic node order in the
         // graph (preserves the previous behaviour of sorting `nodes`).
         let mut sorted: Vec<_> = symbols.iter().collect();
-        sorted.sort_by(|a, b| a.start_line.cmp(&b.start_line));
+        sorted.sort_by_key(|a| a.start_line);
 
         let mut graph = SymbolGraph::default();
         for s in &sorted {
