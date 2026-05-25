@@ -30,9 +30,9 @@ gui = []
 # Internal crates — the unified binary embeds every mode (daemon, TUI, Telegram).
 trusty-mpm-core.workspace = true
 trusty-mpm-client.workspace = true
-trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.3.0" }
-trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.3.0" }
-trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.3.0" }
+trusty-mpm-daemon = { path = "../trusty-mpm-daemon", version = "0.4.0" }
+trusty-mpm-tui = { path = "../trusty-mpm-tui", version = "0.4.0" }
+trusty-mpm-telegram = { path = "../trusty-mpm-telegram", version = "0.4.0" }
 # Shared Claude Code config helpers (discover_claude_settings,
 # merge_hook_entries, write_json_atomic). The `tm install` command uses these
 # to write the MPM lifecycle hooks into every Claude settings file on the
