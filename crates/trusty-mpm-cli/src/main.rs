@@ -1199,7 +1199,7 @@ async fn session(client: &reqwest::Client, url: &str, action: SessionAction) -> 
                 events: Vec<EventRow>,
             }
             let body: Body = client
-                .get(format!("{url}/sessions/{id}/events"))
+                .get(format!("{url}/sessions/{id}/events/poll"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -2616,8 +2616,10 @@ async fn print_status(client: &reqwest::Client, url: &str) -> anyhow::Result<()>
 
 /// `events` subcommand — print the recent hook-event feed.
 ///
-/// Why: gives operators a quick tail of daemon activity without the TUI.
-/// What: `GET /events`, printing `{timestamp} {session_short} {event}`.
+/// Why: gives operators a quick tail of daemon activity without the TUI. The
+/// daemon serves a live SSE stream at `/events`; this CLI command polls the
+/// legacy snapshot at `/events/poll`, which mirrors the historical behaviour.
+/// What: `GET /events/poll`, printing `{timestamp} {session_short} {event}`.
 /// Test: run against a daemon that has ingested hook events.
 async fn events(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     #[derive(Deserialize)]
@@ -2625,7 +2627,7 @@ async fn events(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
         events: Vec<EventRow>,
     }
     let body: Body = client
-        .get(format!("{url}/events"))
+        .get(format!("{url}/events/poll"))
         .send()
         .await?
         .error_for_status()?
@@ -2713,6 +2715,21 @@ async fn run_daemon(addr: SocketAddr, tailscale: bool, mcp: bool) -> anyhow::Res
     let state = trusty_mpm_daemon::DaemonState::shared();
     if mcp {
         return trusty_mpm_daemon::run_mcp(state).await;
+    }
+
+    // Refuse to start a second instance: read the lock-file address, probe
+    // `/health`, and bail out cleanly when an existing daemon answers. Without
+    // this guard, the `AddrInUse` fallback below would auto-pick an ephemeral
+    // port and silently spawn a duplicate daemon that splits traffic with the
+    // original. `resolve_daemon_url` already validates the recorded PID is
+    // alive (and clears stale lock files), so a `None`-ish result here means
+    // either no lock exists or the recorded daemon is dead — proceed normally.
+    let recorded_url = trusty_mpm_core::resolve_daemon_url(None);
+    if recorded_url != trusty_mpm_core::DEFAULT_DAEMON_URL
+        && trusty_common::probe_health(&recorded_url, "/health").await
+    {
+        eprintln!("trusty-mpm daemon is already running at {recorded_url}");
+        return Ok(());
     }
 
     // Auto port selection: try configured address; fall back to ephemeral.
