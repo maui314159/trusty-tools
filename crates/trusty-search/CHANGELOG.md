@@ -16,6 +16,26 @@ _(no unreleased changes)_
 ## [0.8.3] — 2026-05-25
 
 ### Fixed
+- **#117** Definition-intent searches now surface struct/enum/class/trait
+  declarations above usage sites. On the v0.8.1 benchmark the query
+  `HNSW vector similarity search` placed `hnsw_store.rs` at rank 8 behind
+  `retrieval.rs` and `mmr.rs` because the BM25 lane couldn't distinguish
+  "file mentions HNSW many times" from "file IS the HNSW declaration". Two
+  layered fixes:
+  - #119's classifier upgrade routes the query to `Definition` (was
+    `Unknown`), which already demotes docs and runs the grep lane.
+  - The post-RRF reranker (`apply_score_adjustments`) now multiplies the
+    score of any `Struct`/`Enum`/`Class`/`Trait`/`TypeAlias` chunk by
+    `STRUCT_DEFINITION_BOOST = 2.0` when the chunk's `function_name`
+    contains (case-insensitive) at least one query token. Substring
+    rather than exact match so `HnswStore`/`hnswstore` matches the
+    `hnsw` token; `is_struct_definition_chunk_type` enforces that only
+    declaration-shaped chunks qualify (free code and methods don't).
+
+  Acceptance pinned by `test_struct_definition_boost_surfaces_struct_over_usage`:
+  a corpus with one Struct declaration (`HnswStore` in `hnsw_store.rs`)
+  and three usage chunks now ranks the declaration in top-3 for the
+  canonical query.
 - **#119** `QueryClassifier` now recognises three additional query shapes
   that were silently returning `intent: "Unknown"` on the v0.8.1
   grep-equivalency benchmark — keeping the existing intent-aware lane

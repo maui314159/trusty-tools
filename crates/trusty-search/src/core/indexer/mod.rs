@@ -525,6 +525,71 @@ pub(crate) fn file_type_score_multiplier(path: &str) -> f32 {
     }
 }
 
+/// Structural-definition score boost applied to a chunk when Definition-intent
+/// queries hit a struct/enum/class/trait declaration whose `function_name`
+/// contains a query token as a substring (case-insensitive) (issue #117).
+///
+/// Why: queries containing struct-name acronyms (`HNSW`, `BM25`, `RRF`, `ORT`)
+/// or PascalCase identifiers were under-fired by the v0.8.2 ranker. The
+/// classifier upgrade (#119) routes them to `Definition`, which already
+/// demotes docs and runs the grep lane; the additional structural boost here
+/// closes the gap on the cross-file case where the canonical declaration
+/// (e.g. `hnsw_store.rs::HnswStore`) was being out-ranked by usage chunks
+/// elsewhere in the codebase (e.g. `retrieval.rs` calling into HNSW). A 2.0×
+/// multiplier is large enough to lift the declaration from rank ~8 to top-3
+/// on the v0.8.1 benchmark scenarios but small enough not to drown out the
+/// branch-modified boost (`1.0..=3.0`) when both fire on the same chunk.
+/// What: a flat `2.0` multiplier. Symbolic so the constant is easy to find
+/// when re-tuning.
+/// Test: `test_struct_definition_boost_surfaces_struct_over_usage` in
+/// `indexer::tests`.
+pub(crate) const STRUCT_DEFINITION_BOOST: f32 = 2.0;
+
+/// Decide whether `chunk_type` participates in the Definition-intent
+/// structural boost (issue #117).
+///
+/// Why: the boost is intentionally narrow — only chunks that ARE the
+/// declaration of a type are eligible. Free code, methods, and docstrings
+/// stay on the default multiplier so usage and method-of-struct chunks
+/// don't accidentally outrank the struct definition itself.
+/// What: returns `true` for `Struct`, `Enum`, `Class`, `Trait`, and
+/// `TypeAlias`; `false` for everything else (including `Function`/`Method`
+/// — those have their own ranking signal via `inject_entity_exact_match`).
+/// Test: covered indirectly by
+/// `test_struct_definition_boost_surfaces_struct_over_usage`.
+pub(crate) fn is_struct_definition_chunk_type(
+    chunk_type: &crate::core::chunker::ChunkType,
+) -> bool {
+    use crate::core::chunker::ChunkType;
+    matches!(
+        chunk_type,
+        ChunkType::Struct
+            | ChunkType::Enum
+            | ChunkType::Class
+            | ChunkType::Trait
+            | ChunkType::TypeAlias
+    )
+}
+
+/// Lowercase the meaningful query tokens for the Definition-intent structural
+/// boost (issue #117).
+///
+/// Why: the boost only fires when a chunk's `function_name` literally matches
+/// one of the query tokens. Tokenising the same way at boost-decision time
+/// keeps the rule predictable and unit-testable.
+/// What: splits on whitespace, drops tokens shorter than 2 characters, and
+/// lowercases each remaining token. Whitespace-only or empty inputs return
+/// an empty Vec.
+/// Test: covered indirectly by
+/// `test_struct_definition_boost_surfaces_struct_over_usage`.
+pub(crate) fn definition_boost_query_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
 /// Map (`in_hnsw`, `in_bm25`, `in_kg`) booleans to a stable `match_reason`
 /// label.
 ///

@@ -23,8 +23,9 @@ use crate::core::search::rrf::{rrf_fuse, RRF_K};
 use super::archive::{self, MarkerCache};
 use super::docs_penalty;
 use super::{
-    build_compact_snippet, compute_match_reason, file_type_score_multiplier, hash_query,
-    raw_to_code_chunk, CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS,
+    build_compact_snippet, compute_match_reason, definition_boost_query_tokens,
+    file_type_score_multiplier, hash_query, is_struct_definition_chunk_type, raw_to_code_chunk,
+    CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS, STRUCT_DEFINITION_BOOST,
 };
 
 /// Score assigned to grep-fallback hits (issue #75). Intentionally tiny so
@@ -537,6 +538,7 @@ impl CodeIndexer {
             .apply_score_adjustments(
                 all,
                 &intent,
+                &query.text,
                 branch_set.as_ref(),
                 branch_boost,
                 effective_mode,
@@ -711,20 +713,38 @@ impl CodeIndexer {
     /// What: for `Definition` intent, multiplies the score of each candidate
     /// by `0.5` if its file extension is in `DOC_EXTENSIONS`. Then multiplies
     /// by the mode-aware `doc_score_penalty` matrix (e.g. 0.1× for prose
-    /// chunks under Code mode). Finally re-sorts by score descending with
-    /// id as a stable tie-breaker.
+    /// chunks under Code mode). Issue #117 additionally multiplies by
+    /// [`STRUCT_DEFINITION_BOOST`] (2.0×) when the chunk is a
+    /// Struct/Enum/Class/Trait/TypeAlias declaration whose `function_name`
+    /// literally matches a query token — this surfaces canonical
+    /// declarations (`hnsw_store.rs::HnswStore`) above usage chunks
+    /// (`retrieval.rs`) for queries like `HNSW vector similarity search`.
+    /// Finally re-sorts by score descending with id as a stable tie-breaker.
     /// Test: covered by `test_definition_demotes_markdown_below_source`,
-    /// `test_kg_results_survive_top_k_truncation`, and
-    /// `test_code_mode_source_outranks_changelog_pre_truncation` (issue #72).
+    /// `test_kg_results_survive_top_k_truncation`,
+    /// `test_code_mode_source_outranks_changelog_pre_truncation` (issue #72),
+    /// and `test_struct_definition_boost_surfaces_struct_over_usage` (#117).
     async fn apply_score_adjustments(
         &self,
         candidates: Vec<(String, f32)>,
         intent: &QueryIntent,
+        query_text: &str,
         branch_files: Option<&HashSet<String>>,
         branch_boost: f32,
         effective_mode: super::SearchMode,
     ) -> Vec<(String, f32)> {
         let demote_docs = matches!(intent, QueryIntent::Definition);
+        // Issue #117: for Definition-intent queries, boost chunks that are
+        // *the* declaration of a type (Struct / Enum / Class / Trait /
+        // TypeAlias) whose `function_name` matches a literal query token.
+        // Pre-compute the lowercased token set once so the per-candidate
+        // loop is O(tokens) per chunk; for typical 4-word queries this is
+        // ~4 ASCII string compares.
+        let struct_boost_tokens: Vec<String> = if matches!(intent, QueryIntent::Definition) {
+            definition_boost_query_tokens(query_text)
+        } else {
+            Vec::new()
+        };
         // Issue #28 deferred item: read the candidate chunks from the durable
         // redb corpus (mmap-backed, OS-page-cached) instead of the in-memory
         // HashMap so the heap-resident corpus can be dropped from the query
@@ -753,6 +773,34 @@ impl CodeIndexer {
                 if let Some(r) = raw {
                     let (docs_mult, _) = docs_penalty::doc_score_penalty(&r.file, effective_mode);
                     multiplier *= docs_mult;
+                }
+                // Issue #117: Definition-intent structural boost — multiply
+                // by [`STRUCT_DEFINITION_BOOST`] when the chunk is the
+                // declaration of a Struct/Enum/Class/Trait/TypeAlias whose
+                // `function_name` contains (case-insensitive) at least one
+                // query token. Substring rather than exact match so the
+                // canonical case — query `HNSW vector similarity search` vs
+                // declaration `HnswStore` — fires: lowercased, the
+                // function-name `hnswstore` contains the token `hnsw`.
+                // Skipped when:
+                //   * intent != Definition (struct_boost_tokens is empty)
+                //   * chunk_type is not a struct-like declaration
+                //   * the chunk has no `function_name` (anonymous code)
+                //   * no query token is a substring of the function name
+                if !struct_boost_tokens.is_empty() {
+                    if let Some(r) = raw {
+                        if is_struct_definition_chunk_type(&r.chunk_type) {
+                            if let Some(name) = r.function_name.as_deref() {
+                                let name_lower = name.to_ascii_lowercase();
+                                if struct_boost_tokens
+                                    .iter()
+                                    .any(|t| name_lower.contains(t.as_str()))
+                                {
+                                    multiplier *= STRUCT_DEFINITION_BOOST;
+                                }
+                            }
+                        }
+                    }
                 }
                 // Branch-modified file boost (issue #122). Apply after the
                 // file-type multiplier so doc-on-branch never out-ranks

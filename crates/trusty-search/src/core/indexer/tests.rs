@@ -24,6 +24,23 @@ fn raw(id: &str, file: &str, content: &str) -> RawChunk {
     }
 }
 
+/// Convenience: build a `RawChunk` with a specific `chunk_type` and
+/// `function_name`. Used by the issue #117 structural-boost regression test
+/// (and any future test that needs to plant a declaration-shaped chunk into
+/// the in-memory indexer without going through the tree-sitter pipeline).
+fn raw_with_kind(
+    id: &str,
+    file: &str,
+    content: &str,
+    chunk_type: crate::core::chunker::ChunkType,
+    function_name: Option<&str>,
+) -> RawChunk {
+    let mut c = raw(id, file, content);
+    c.chunk_type = chunk_type;
+    c.function_name = function_name.map(|s| s.to_string());
+    c
+}
+
 fn make_indexer() -> CodeIndexer {
     let dim = 32;
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
@@ -831,6 +848,104 @@ async fn test_definition_demotes_markdown_below_source() {
         results[0].file.ends_with(".rs"),
         "Definition intent must rank source over docs, top result file = {}",
         results[0].file
+    );
+}
+
+#[tokio::test]
+async fn test_struct_definition_boost_surfaces_struct_over_usage() {
+    // Why: issue #117 — queries containing struct-name acronyms (`HNSW`,
+    // `BM25`, `RRF`, `ORT`) historically returned usage sites at top ranks
+    // because the BM25 lane couldn't distinguish "file mentions HNSW many
+    // times" from "file IS the HNSW declaration". On the v0.8.1 benchmark
+    // `HNSW vector similarity search` placed `hnsw_store.rs` at rank 8,
+    // behind `retrieval.rs` and `mmr.rs`.
+    //
+    // Combined fix:
+    //   1. #119 classifies the query as Definition (via the new ALL-CAPS
+    //      acronym hint).
+    //   2. The structural boost in `apply_score_adjustments` multiplies
+    //      the score of any Struct/Enum/Class/Trait chunk whose
+    //      `function_name` matches a query token by `STRUCT_DEFINITION_BOOST`.
+    //
+    // What: build a corpus with one declaration chunk (Struct, name
+    // `HnswStore`, in `hnsw_store.rs`) plus three usage chunks
+    // (`retrieval.rs`, `mmr.rs`, `search.rs`) that mention `HNSW` heavily
+    // but are typed as plain `Code` chunks. Run the canonical benchmark
+    // query and assert the declaration ranks in the top 3 (acceptance
+    // criterion from the ticket).
+    // Test: this test.
+    use crate::core::chunker::ChunkType;
+    use crate::core::classifier::{QueryClassifier, QueryIntent};
+
+    // Sanity: the query must classify as Definition. The acronym-hint rule
+    // from #119 is what makes this true; if it ever regresses, the test
+    // should fail loudly here rather than in the ranking assertion below.
+    assert_eq!(
+        QueryClassifier::classify("HNSW vector similarity search"),
+        QueryIntent::Definition,
+        "test pre-condition: ALL-CAPS acronym must classify as Definition (#119)"
+    );
+
+    let idx = make_indexer();
+    // 1) The canonical declaration: a Struct chunk whose function_name
+    //    (= the type name) is `HnswStore` — lowercased, this matches the
+    //    `hnsw` query token.
+    idx.add_chunk(raw_with_kind(
+        "def:1",
+        "src/hnsw_store.rs",
+        "pub struct HnswStore { index: Index, dim: usize }",
+        ChunkType::Struct,
+        Some("HnswStore"),
+    ))
+    .await
+    .unwrap();
+    // 2-4) Three usage chunks in plausible-looking files. They mention
+    //      `HNSW` and the other query tokens enough to dominate BM25 if
+    //      left unboosted (and on v0.8.1 they did exactly that).
+    idx.add_chunk(raw(
+        "use:1",
+        "src/retrieval.rs",
+        "// HNSW vector similarity search\n\
+         // Uses HNSW to retrieve top-k vectors with cosine similarity.\n\
+         // HNSW lookup HNSW lookup HNSW search HNSW search HNSW HNSW vector vector similarity similarity",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "use:2",
+        "src/mmr.rs",
+        "// MMR diversity reranker over HNSW vector similarity search results.\n\
+         // HNSW HNSW HNSW vector similarity similarity search search lambda lambda",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "use:3",
+        "src/search.rs",
+        "// Top-level hybrid search: BM25 lane + HNSW vector similarity search lane.\n\
+         // HNSW HNSW vector vector similarity similarity search search RRF fuse fuse",
+    ))
+    .await
+    .unwrap();
+
+    let q = SearchQuery {
+        text: "HNSW vector similarity search".to_string(),
+        top_k: 10,
+        expand_graph: false,
+        compact: false,
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert!(!results.is_empty(), "search must return results");
+    let top3_files: Vec<&str> = results.iter().take(3).map(|c| c.file.as_str()).collect();
+    assert!(
+        top3_files.contains(&"src/hnsw_store.rs"),
+        "issue #117 acceptance: hnsw_store.rs must rank in top-3 for \
+         the canonical query; got top-3 files = {top3_files:?}, full ranking = {:?}",
+        results
+            .iter()
+            .map(|c| (c.file.as_str(), c.score))
+            .collect::<Vec<_>>()
     );
 }
 
