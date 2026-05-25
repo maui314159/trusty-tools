@@ -13,6 +13,38 @@ _(no unreleased changes)_
 
 ---
 
+## [0.8.2] — 2026-05-25
+
+### Fixed
+- **#100 follow-up** Clarified the `reindex complete:` daemon log line so a
+  hash-skip-only run no longer looks like a walker → chunker regression. The
+  log now includes `indexed_new=` (files that actually re-chunked this run,
+  derived as `indexed - skipped`) alongside the existing counters. Previously
+  a second reindex of an unchanged workspace logged `files=N chunks=0` —
+  textually identical to a hypothetical walker bug that yields paths but
+  drops them — so operators kept misreading the fast path as a failure
+  (extensive investigation in the v0.8.1 issue thread). The same
+  `indexed_new` field is now surfaced on the reindex `complete` SSE event so
+  external callers (CLI, dashboard, open-mpm) read the same signal.
+
+### Added
+- New end-to-end integration test `reindex_persists_chunks_end_to_end` in
+  `service::reindex::tests` that runs the FULL pipeline (walker → chunker →
+  corpus) twice against a staged tempdir. The first reindex asserts
+  `total_chunks > 0`, `chunk_count() > 0`, and that a search for a unique
+  function name returns a chunk whose `file` field equals the canonical
+  `lib.rs` path. The second reindex asserts `total_chunks == 0` AND
+  `skipped == 1` — pinning the hash-skip fast path so the next bisection
+  doesn't waste another round chasing a non-existent walker bug. The
+  walker-only unit tests added in v0.8.1 catch the walker yield but not the
+  chunker / corpus end of the pipeline; this test closes that gap.
+
+### Internal
+- `apply_successful_commit` and `emit_complete_event` derive `indexed_new`
+  from the existing `indexed` and `skipped` counters — no new tracked state.
+
+---
+
 ## [0.8.1] — 2026-05-25
 
 ### Fixed

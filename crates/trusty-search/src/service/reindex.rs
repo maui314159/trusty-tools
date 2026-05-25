@@ -986,6 +986,15 @@ async fn emit_complete_event(
         .checked_div(elapsed_ms)
         .unwrap_or(0);
     let indexed_final = progress.indexed.load(Ordering::Acquire);
+    let skipped_final = progress.skipped.load(Ordering::Acquire);
+    // Why (issue #100 follow-up): clients reading just `indexed` /
+    // `total_chunks` mistook the hash-skip fast path for a walker
+    // regression. `indexed_new` = files actually re-chunked this run
+    // (i.e. those that hash-missed) — when it's 0 alongside a non-zero
+    // `skipped`, the run was a no-op fast path and `total_chunks: 0` is
+    // expected. Derived rather than tracked separately to keep the
+    // existing counters as the single source of truth.
+    let indexed_new = indexed_final.saturating_sub(skipped_final);
     // Issue #120: surface the terminal status string in the SSE payload so
     // external callers (CLI, dashboard, open-mpm) can distinguish a clean
     // completion from a memory-abort without reading the daemon log.
@@ -999,8 +1008,9 @@ async fn emit_complete_event(
             "event": "complete",
             "status": status_str,
             "indexed": indexed_final,
+            "indexed_new": indexed_new,
             "total_chunks": total_chunks,
-            "skipped": progress.skipped.load(Ordering::Acquire),
+            "skipped": skipped_final,
             "errors": progress.errors.load(Ordering::Acquire),
             "elapsed_ms": elapsed_ms,
             "chunks_per_sec": chunks_per_sec,
@@ -1561,12 +1571,28 @@ pub fn spawn_reindex_with_cleanup(
         let peak_rss_mb = peak_rss_atomic.load(AtomicOrdering::Acquire);
         let indexed_final = progress.indexed.load(Ordering::Acquire);
         let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+        let skipped_final = progress.skipped.load(Ordering::Acquire);
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        // Why (issue #100 follow-up): the `files=` counter is bumped by every
+        // processed file — *including* those hash-skipped by the per-process
+        // content cache. A subsequent reindex (force=false) on an unchanged
+        // workspace logs `files=N chunks=0`, which reads exactly like a
+        // walker → chunker regression but is in fact the expected fast path.
+        // Emitting `skipped=` (and the derived `indexed_new`) on the same
+        // line distinguishes "no new work because hashes matched" from
+        // "walker yielded N paths but chunker dropped them all", which is
+        // the failure mode operators actually need to flag. The SSE
+        // `complete` event already carries `skipped`; this propagates that
+        // signal into the daemon log so a tail-log workflow tells the same
+        // story without diving into the SSE stream.
+        let indexed_new = indexed_final.saturating_sub(skipped_final);
         tracing::info!(
-            "reindex complete: index={} files={} chunks={} elapsed_ms={} \
-             peak_rss_mb={} memory_limit_hit={}",
+            "reindex complete: index={} files={} indexed_new={} skipped={} chunks={} \
+             elapsed_ms={} peak_rss_mb={} memory_limit_hit={}",
             index_id.0,
             indexed_final,
+            indexed_new,
+            skipped_final,
             total_chunks,
             elapsed_ms,
             peak_rss_mb,
@@ -1924,6 +1950,173 @@ mod tests {
             .last()
             .map(|s| s.contains("\"complete\""))
             .unwrap_or(false));
+    }
+
+    /// Issue #100 follow-up: end-to-end guard that the walker → chunker →
+    /// corpus pipeline persists chunks, distinct from the walker-only unit
+    /// tests next to `walk_source_files_with_options`. The follow-up report
+    /// for issue #100 observed `files=N chunks=0` after a v0.8.0 → v0.8.1
+    /// daemon upgrade and (incorrectly) attributed it to the walker swap;
+    /// the actual cause was the per-process content-hash cache hash-skipping
+    /// every file on the second reindex (`force=false`). This test pins both
+    /// the correct first-reindex chunking path AND the expected hash-skip
+    /// fast path on a second reindex, so any future walker rewrite that
+    /// silently drops paths fails here loudly while the documented fast
+    /// path keeps working.
+    ///
+    /// Why: the unit walker tests only assert what the walker yields; they
+    /// can't catch a chunker that silently emits zero chunks (the first half
+    /// of this test) nor can they observe the hash-skip path (the second
+    /// half). Without an e2e assertion the next time someone misreads the
+    /// `chunks=0` log they'll bisect the walker again.
+    /// What: stages a small repo (`.gitignore` excluding `excluded/`, plus a
+    /// `crates/foo/src/lib.rs` with 3 `pub fn` definitions), runs the FULL
+    /// reindex pipeline twice, and asserts:
+    ///   1. First reindex (cold cache): `total_chunks > 0`, corpus
+    ///      `chunk_count() > 0`, and a search for `alpha` returns a chunk
+    ///      whose `file` field equals the canonical path of `lib.rs`.
+    ///   2. Second reindex (warm cache): `total_chunks == 0` AND
+    ///      `skipped == 1` — confirming the hash-skip path fires for
+    ///      unchanged content (the failure mode operators mistake for a
+    ///      walker regression).
+    /// Test: this test.
+    #[tokio::test]
+    async fn reindex_persists_chunks_end_to_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Stage a tiny `crates/foo/src/lib.rs` with 3 functions plus a
+        // gitignored `excluded/` subtree that must NOT contribute chunks.
+        fs::create_dir_all(root.join("crates/foo/src")).unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::write(root.join(".gitignore"), "excluded/\n").unwrap();
+        let lib_rs = root.join("crates/foo/src/lib.rs");
+        fs::write(
+            &lib_rs,
+            "pub fn alpha() {}\n\npub fn beta() -> i32 { 1 }\n\npub fn gamma(x: i32) -> i32 { x + 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("excluded/should_not_index.rs"),
+            "pub fn nope() {}\n",
+        )
+        .unwrap();
+
+        // Use a unique IndexId so the per-process `file_hashes` static (shared
+        // across tests in the same binary) doesn't interfere — earlier tests
+        // in this module reindex other temp dirs against unrelated index ids.
+        let id = IndexId::new("e2e-pipeline-test");
+        let indexer = CodeIndexer::new(id.0.clone(), root.clone());
+        let handle = Arc::new(IndexHandle::bare(
+            id.clone(),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+
+        // ----- First reindex: cold cache, chunks must be produced. -----
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+
+        // Walker yields exactly one file (`crates/foo/src/lib.rs`).
+        assert_eq!(
+            progress.total_files.load(Ordering::Acquire),
+            1,
+            "walker must yield exactly 1 file (gitignored subtree pruned)"
+        );
+
+        // The smoking-gun assertion the unit walker tests missed: the chunker
+        // must have *persisted* chunks, not just been handed paths.
+        let chunks = progress.total_chunks.load(Ordering::Acquire);
+        assert!(
+            chunks > 0,
+            "regression: walker yielded 1 file but chunker persisted 0 chunks \
+             on the first (cold-cache) reindex"
+        );
+
+        // On the cold-cache run the hash-skip path must NOT have fired.
+        assert_eq!(
+            progress.skipped.load(Ordering::Acquire),
+            0,
+            "first reindex hash-skipped a file (cold cache should hash-miss everything)"
+        );
+
+        // The indexer's corpus must hold those chunks and at least one chunk
+        // must reference the absolute path of `lib.rs`. The walker
+        // canonicalises root before yielding, so we compare against the
+        // canonical form.
+        let canonical_lib_rs = std::fs::canonicalize(&lib_rs).unwrap_or(lib_rs.clone());
+        {
+            let idx = handle.indexer.read().await;
+            assert!(
+                idx.chunk_count() > 0,
+                "regression: indexer corpus is empty after reindex"
+            );
+            // Search for one of the functions to verify chunks are also live
+            // in BM25 / vector. `alpha` is unique to the staged file.
+            let results = idx
+                .search(&crate::core::indexer::SearchQuery {
+                    text: "alpha".into(),
+                    top_k: 5,
+                    expand_graph: false,
+                    compact: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                results
+                    .iter()
+                    .any(|c| c.file == canonical_lib_rs.to_string_lossy()),
+                "no chunk references the canonical lib.rs path: {:?}",
+                results.iter().map(|c| c.file.clone()).collect::<Vec<_>>()
+            );
+        }
+
+        // ----- Second reindex: warm cache, all files must hash-skip. -----
+        //
+        // This is the path the v0.8.1 follow-up report misread as a walker
+        // regression. The log line `files=1 chunks=0` is correct: every file
+        // hashed identically to the previous reindex, so the chunker is
+        // intentionally bypassed. Pin this behaviour so the next bisection
+        // doesn't waste another round chasing a non-existent walker bug.
+        let progress2 = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress2.clone(), false);
+        for _ in 0..100 {
+            if progress2.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress2.status.load(), ReindexStatus::Complete);
+        assert_eq!(
+            progress2.total_files.load(Ordering::Acquire),
+            1,
+            "second reindex must still walk 1 file"
+        );
+        assert_eq!(
+            progress2.total_chunks.load(Ordering::Acquire),
+            0,
+            "second reindex of unchanged files MUST emit 0 new chunks (hash-skip path)"
+        );
+        assert_eq!(
+            progress2.skipped.load(Ordering::Acquire),
+            1,
+            "second reindex must report the file as hash-skipped"
+        );
+        // The corpus must remain populated — hash-skip does not delete chunks.
+        {
+            let idx = handle.indexer.read().await;
+            assert!(
+                idx.chunk_count() > 0,
+                "regression: corpus emptied by a hash-skip-only second reindex"
+            );
+        }
     }
 
     /// Issue #112: after a reindex completes, the handle's
