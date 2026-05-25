@@ -55,11 +55,18 @@ pub struct PersistedIndex {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_filter: Vec<String>,
 
-    /// Issue #77: opt-in to indexing prose docs (`*.md`, `CHANGELOG*`, ...).
-    /// Default `false`. Persisted so per-index opt-ins survive daemon
-    /// restarts. `#[serde(default)]` keeps older `indexes.toml` files
-    /// loading without rewrite.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Issue #77 / #118: index prose docs (`*.md`, `CHANGELOG*`, …).
+    /// Default `true` as of v0.8.3 (issue #118) — code-mode results stay
+    /// clean via the per-mode `is_allowed_for_mode` filter, and text-mode
+    /// searches need the docs to be indexed at all. Persisted so per-index
+    /// opt-outs (`include_docs = false` in `trusty-search.yaml`) survive
+    /// daemon restarts. The serde default deserialises missing fields as
+    /// `true`, so older `indexes.toml` entries written under v0.8.2 (where
+    /// the field was omitted because it matched the then-default `false`)
+    /// will now load as `true` on first read — the migration the ticket
+    /// calls out. Indexes that explicitly persisted `include_docs = false`
+    /// keep their opt-out.
+    #[serde(default = "default_include_docs", skip_serializing_if = "is_true")]
     pub include_docs: bool,
 
     /// Issue #100: honour `.gitignore` (plus `.ignore`, `.rgignore`,
@@ -83,6 +90,21 @@ fn default_respect_gitignore() -> bool {
     true
 }
 
+/// Why (issue #118): `include_docs` flipped from `false` → `true` in v0.8.3
+/// so `text` mode returns useful results out of the box. Centralised so the
+/// serde missing-field default and the manual `Default` impl agree.
+fn default_include_docs() -> bool {
+    true
+}
+
+/// Why: skip writing `true` to TOML when the field equals its default —
+/// only the rare opt-out (`include_docs = false`, `respect_gitignore =
+/// false`) is persisted. Shared by both `include_docs` and
+/// `respect_gitignore` since they're both now `true`-by-default booleans.
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 /// Why: skip writing `respect_gitignore = true` to TOML (it's the default)
 /// so existing `indexes.toml` files stay compact and we don't churn every
 /// existing index file on the first save.
@@ -91,10 +113,12 @@ fn is_default_respect_gitignore(v: &bool) -> bool {
 }
 
 impl Default for PersistedIndex {
-    /// `respect_gitignore` defaults to `true` (issue #100) so the manual
+    /// `respect_gitignore` defaults to `true` (issue #100) and
+    /// `include_docs` defaults to `true` (issue #118) so the manual
     /// `Default` impl matches serde's missing-field behaviour. Without
-    /// this, `PersistedIndex::default()` would silently disable the
-    /// gitignore-honouring fix on test/fallback paths.
+    /// this, `PersistedIndex::default()` would silently re-enable the
+    /// docs-exclusion footgun (#118) or disable the gitignore-honouring
+    /// fix (#100) on test / fallback paths.
     fn default() -> Self {
         Self {
             id: String::new(),
@@ -104,7 +128,7 @@ impl Default for PersistedIndex {
             extensions: Vec::new(),
             domain_terms: Vec::new(),
             path_filter: Vec::new(),
-            include_docs: false,
+            include_docs: true,
             respect_gitignore: true,
         }
     }
@@ -516,6 +540,61 @@ root_path = "/tmp/legacy"
         let entries = load_index_registry_at(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].respect_gitignore);
+    }
+
+    /// Issue #118: `include_docs` defaults to `true` on every code path —
+    /// constructor, missing-field deserialisation, and after a save/load
+    /// round-trip. This pins the back-compat migration story: an
+    /// `indexes.toml` written by v0.8.2 (where `include_docs = false` was
+    /// the default and would be omitted from the file by
+    /// `skip_serializing_if = "std::ops::Not::not"`) now reads back as
+    /// `true` under v0.8.3 — `mode=text` searches start returning results
+    /// on the next daemon restart without any explicit migration step.
+    /// Indexes that PERSISTED an explicit `include_docs = false` keep
+    /// their opt-out via the explicit-false round-trip case below.
+    #[test]
+    fn include_docs_defaults_true_and_round_trips() {
+        // Default constructor returns true.
+        assert!(PersistedIndex::default().include_docs);
+
+        // Loading legacy TOML without the field gives true — this is the
+        // v0.8.2 → v0.8.3 silent migration: missing field becomes the new
+        // default.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(
+            &path,
+            r#"
+[[index]]
+id = "legacy"
+root_path = "/tmp/legacy"
+"#,
+        )
+        .unwrap();
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].include_docs,
+            "missing field must default to true (issue #118 migration)"
+        );
+
+        // Explicit false survives save/load cycle — opt-out users keep their
+        // setting through the upgrade.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        save_index_registry_at(
+            &path,
+            &[PersistedIndex {
+                id: "docs_off".into(),
+                root_path: PathBuf::from("/tmp/v"),
+                include_docs: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].include_docs);
     }
 
     #[test]

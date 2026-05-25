@@ -688,12 +688,13 @@ pub struct CreateIndexRequest {
     /// intended for filtering polyrepo monorepos by repo-name pattern.
     #[serde(default)]
     pub path_filter: Option<Vec<String>>,
-    /// Opt-in to indexing prose docs (`*.md`, `*.rst`, README, CHANGELOG, …)
-    /// — issue #77. Default `None` (which the daemon treats as `false`) keeps
-    /// existing callers' walker behaviour identical: docs are skipped so they
-    /// don't contaminate the corpus. Set `true` from `trusty-search.yaml` when
-    /// the operator wants `search_text` to return useful results against
-    /// this index.
+    /// Index prose docs (`*.md`, `*.rst`, README, CHANGELOG, …) —
+    /// issues #77 and #118. Default `None` is now treated as `true` (was
+    /// `false` through v0.8.2); the per-mode filter
+    /// (`is_allowed_for_mode`) keeps these chunks out of `mode=code`
+    /// results, but `mode=text` needs them indexed at all. Set `false`
+    /// from `trusty-search.yaml` only when the operator genuinely does
+    /// not want any prose chunked (saves chunks on docs-heavy projects).
     #[serde(default)]
     pub include_docs: Option<bool>,
     /// Honour `.gitignore` (plus `.ignore`, `.rgignore`, `.git/info/exclude`,
@@ -1387,7 +1388,11 @@ async fn create_index_handler(
     // Persist the registration so a daemon restart can re-register
     // automatically. Best-effort: a write failure is logged but doesn't fail
     // the request — the in-memory registry still has the index.
-    let include_docs: bool = req.include_docs.unwrap_or(false);
+    // Issue #118: default `include_docs` is now `true` (was `false` through
+    // v0.8.2). `mode=text` searches were silently empty because docs were
+    // never indexed; the per-mode `is_allowed_for_mode` filter keeps
+    // `mode=code` results clean even with docs in the index.
+    let include_docs: bool = req.include_docs.unwrap_or(true);
     // Issue #100: honour `.gitignore` by default. `None` on the wire ⇒ `true`
     // so existing callers (CLI, MCP, integrators) get the fix automatically
     // without having to pass a new field.

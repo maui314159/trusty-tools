@@ -56,22 +56,26 @@ pub struct IndexConfig {
     #[serde(default)]
     pub domain_terms: Vec<String>,
 
-    /// Opt-in to indexing prose docs (`*.md`, `*.mdx`, `*.rst`, `*.txt`,
-    /// `*.adoc`) and metadata files (`CHANGELOG*`, `LICENSE*`, `NOTICE*`).
-    /// Default `false` — issue #77.
+    /// Index prose docs (`*.md`, `*.mdx`, `*.rst`, `*.txt`, `*.adoc`) and
+    /// metadata files (`CHANGELOG*`, `LICENSE*`, `NOTICE*`). Default `true`
+    /// as of v0.8.3 — issue #118 (was `false` through v0.8.2 — issue #77
+    /// original design).
     ///
-    /// Why: code search benchmarks vs grep showed that prose files
-    /// consistently outrank actual source code on BM25 because query terms
-    /// appear verbatim in headings and explanation text. Excluding them by
-    /// default fixes the noise; documentation-focused projects can opt in via
-    /// `include_docs: true` in `trusty-search.yaml`.
-    /// What: `false` (default) → the walker prunes doc/CHANGELOG files;
-    /// `true` → walker behaves as before. The post-RRF mode-based file-type
-    /// filter in `core::indexer::docs_penalty` then drops any docs that
-    /// slip into the index when the caller is searching in `code` mode, so
-    /// opt-in indexes still surface source files for code queries.
-    /// Test: covered by walker tests and `test_default_excludes_markdown_and_changelog`.
-    #[serde(default)]
+    /// Why: `mode=text` searches were silently empty through v0.8.2 because
+    /// the walker pruned every prose file at walk time. The original #77
+    /// design pre-dated the per-mode filter; with `is_allowed_for_mode`
+    /// (also #77, final form) now dropping `.md` / README chunks from
+    /// `mode=code` results on the way out, the walker pre-filter became
+    /// asymmetric — it kept code-mode clean but broke text mode. Issue
+    /// #118 flips the default so both modes work; the post-RRF filter is
+    /// the single source of truth for which file types each mode returns.
+    /// What: `true` (default) → walker indexes prose alongside source;
+    /// `false` → walker prunes doc/CHANGELOG files before the indexer
+    /// sees them (saves chunks on docs-heavy projects). Either way,
+    /// `mode=code` results never include `.md` files because the
+    /// post-RRF `is_allowed_for_mode` filter rejects them.
+    /// Test: covered by walker tests and `test_default_includes_markdown_and_changelog`.
+    #[serde(default = "default_true")]
     pub include_docs: bool,
 
     /// Honour `.gitignore`, `.ignore`, `.rgignore`, and `.git/info/exclude`
@@ -97,8 +101,11 @@ fn default_true() -> bool {
 }
 
 impl Default for IndexConfig {
-    /// `respect_gitignore` defaults to `true` (issue #100) so the manual impl
-    /// keeps `Default` and serde's missing-field default in agreement.
+    /// `respect_gitignore` defaults to `true` (issue #100) and
+    /// `include_docs` defaults to `true` (issue #118) so the manual impl
+    /// matches serde's missing-field behaviour. Without this,
+    /// `IndexConfig::default()` would silently re-enable the v0.8.2
+    /// docs-exclusion footgun on test / fallback paths.
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -106,7 +113,7 @@ impl Default for IndexConfig {
             exclude: Vec::new(),
             languages: Vec::new(),
             domain_terms: Vec::new(),
-            include_docs: false,
+            include_docs: true,
             respect_gitignore: true,
         }
     }

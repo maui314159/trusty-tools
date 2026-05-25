@@ -45,9 +45,11 @@ pub struct IndexHandle {
     /// at search time. Empty = standard classifier behaviour.
     pub domain_terms: Vec<String>,
 
-    /// Issue #77: opt-in to indexing prose docs (`*.md`, `CHANGELOG*`, ...).
-    /// Default `false` — the walker excludes them so they never contaminate
-    /// BM25 results. Set via `include_docs: true` in `trusty-search.yaml`.
+    /// Issue #77 / #118: index prose docs (`*.md`, `CHANGELOG*`, ...).
+    /// Default `true` as of v0.8.3 — the per-mode `is_allowed_for_mode`
+    /// filter keeps these chunks out of `mode=code` results, and
+    /// `mode=text` needs them indexed at all. Set via `include_docs:
+    /// false` in `trusty-search.yaml` to opt out.
     pub include_docs: bool,
 
     /// Issue #100: honour `.gitignore` (plus `.ignore`, `.rgignore`,
@@ -123,6 +125,11 @@ pub struct IndexHandle {
 impl IndexHandle {
     /// Construct a handle with empty filter/domain fields. Convenience for the
     /// many call sites (warm-boot, tests) that don't carry repo-level config.
+    ///
+    /// `include_docs` defaults to `true` (issue #118) so the bare handle
+    /// matches the documented v0.8.3 walk-time behaviour — `mode=text`
+    /// works out of the box, and `mode=code` results stay clean via the
+    /// post-RRF `is_allowed_for_mode` filter.
     pub fn bare(
         id: IndexId,
         indexer: Arc<RwLock<CodeIndexer>>,
@@ -136,7 +143,7 @@ impl IndexHandle {
             exclude_globs: Vec::new(),
             extensions: Vec::new(),
             domain_terms: Vec::new(),
-            include_docs: false,
+            include_docs: true,
             respect_gitignore: true,
             path_filter: Vec::new(),
             context_embedding: Arc::new(RwLock::new(None)),

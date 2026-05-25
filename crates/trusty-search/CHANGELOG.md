@@ -16,6 +16,34 @@ _(no unreleased changes)_
 ## [0.8.3] — 2026-05-25
 
 ### Fixed
+- **#118** `mode=text` searches no longer return silently empty result
+  sets. The walker's `include_docs` default flipped from `false` to
+  `true`: prose docs (`*.md`, `*.mdx`, `*.rst`, `*.txt`, `*.adoc`) and
+  `CHANGELOG*` / `LICENSE*` / `NOTICE*` files (with extensions) are now
+  indexed alongside source. The per-mode hard filter
+  (`is_allowed_for_mode`) is the single source of truth for which file
+  types each mode returns — code-mode results never include `.md` chunks
+  because the post-RRF filter rejects them, regardless of what the
+  walker indexed.
+
+  Migration: an `indexes.toml` entry written by v0.8.2 (where
+  `include_docs = false` was the default and omitted via
+  `skip_serializing_if`) now deserialises as `true` under v0.8.3 —
+  `mode=text` searches start working on the next daemon restart with no
+  explicit migration step. Indexes that PERSISTED an explicit
+  `include_docs = false` (e.g. via `trusty-search.yaml`) keep their
+  opt-out. Pinned by
+  `service::persistence::tests::include_docs_defaults_true_and_round_trips`.
+
+  The file watcher (`watch_loop`) follows the new default so live `.md`
+  edits flow into the index too; the v0.8.2 `is_default_doc_excluded`
+  guard there was removed.
+
+  Acceptance pinned by
+  `service::walker::tests::test_issue_118_acceptance_walks_both_source_and_docs`
+  (walk side) plus the existing
+  `core::indexer::tests::test_mode_filter_code_returns_only_source` /
+  `test_mode_filter_text_returns_only_prose_and_named_docs` (search side).
 - **#117** Definition-intent searches now surface struct/enum/class/trait
   declarations above usage sites. On the v0.8.1 benchmark the query
   `HNSW vector similarity search` placed `hnsw_store.rs` at rank 8 behind

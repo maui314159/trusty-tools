@@ -151,29 +151,47 @@ pub const DOC_EXCLUDE_EXTS: &[&str] = &["md", "mdx", "rst", "adoc", "txt"];
 /// Test: `test_default_excludes_markdown_and_changelog`.
 pub const DOC_EXCLUDE_BASENAME_SUBSTRINGS: &[&str] = &["changelog", "license", "notice"];
 
-/// Walk options controlling default-exclusion behaviour (issue #77, #100).
+/// Walk options controlling default-exclusion behaviour (issue #77, #100, #118).
 ///
-/// Why: most indexes want the default exclusion of `*.md`, `CHANGELOG*`, etc.
-/// applied at walk time so docs never enter the BM25 / vector lanes. A small
-/// number of indexes (documentation-focused projects, conceptual search) need
-/// to opt in via `include_docs: true`. Issue #100 adds `respect_gitignore`:
-/// the walker honours `.gitignore` by default (matching ripgrep / fd
-/// semantics) and silent partial-index failures from a gitignored subtree
-/// dominating the chunk budget are no longer possible. A handful of indexes
-/// (e.g. a vendored subtree the operator wants to index on purpose) need to
-/// opt out. Keeping the toggle as a struct makes future additions
-/// (e.g. `include_configs`) non-breaking.
-/// What: a `Copy` struct passed to [`walk_source_files_with_options`]. The
-/// default is `include_docs: false`, `respect_gitignore: true`; the legacy
-/// [`walk_source_files`] entry point preserves these defaults.
-/// Test: `test_default_excludes_markdown_and_changelog`,
-///   `test_include_docs_keeps_markdown`, `test_walker_honors_gitignore`,
-///   `test_walker_respects_disable_flag`, `test_walker_honors_dot_ignore`.
+/// Why: the original #77 design defaulted `include_docs: false` so prose
+/// files never reached BM25 / vector lanes. That design pre-dated the
+/// per-mode hard filter in [`crate::core::indexer::docs_penalty::is_allowed_for_mode`],
+/// which now (per #77's final form) drops `.md` / README chunks from
+/// `SearchMode::Code` results on the way out. With both layers in place,
+/// keeping the walker exclusion ALSO active was symmetric only against
+/// `code` mode — for `text` mode it produced empty results because there
+/// was no prose content to consult. Issue #118 flips the default to
+/// `include_docs: true` (Option A from the ticket) so `text` mode works
+/// out of the box. Code mode remains clean because `is_allowed_for_mode`
+/// continues to reject `.md` / README / LICENSE files. Indexes that
+/// genuinely don't want prose chunked at all can still opt out via
+/// `include_docs: false` in `trusty-search.yaml`.
+///
+/// Issue #100 adds `respect_gitignore`: the walker honours `.gitignore`
+/// by default (matching ripgrep / fd semantics) and silent partial-index
+/// failures from a gitignored subtree dominating the chunk budget are no
+/// longer possible. A handful of indexes (e.g. a vendored subtree the
+/// operator wants to index on purpose) need to opt out. Keeping the
+/// toggle as a struct makes future additions (e.g. `include_configs`)
+/// non-breaking.
+/// What: a `Copy` struct passed to [`walk_source_files_with_options`].
+/// As of v0.8.3 / #118, the default is `include_docs: true`,
+/// `respect_gitignore: true`; the legacy [`walk_source_files`] entry
+/// point preserves these defaults.
+/// Test: `test_default_includes_markdown_and_changelog` (replaces the
+///   v0.8.2 `test_default_excludes_markdown_and_changelog`),
+///   `test_include_docs_false_excludes_markdown`,
+///   `test_walker_honors_gitignore`,
+///   `test_walker_respects_disable_flag`,
+///   `test_walker_honors_dot_ignore`.
 #[derive(Debug, Clone, Copy)]
 pub struct WalkOptions {
-    /// When `false` (default), files matching [`DOC_EXCLUDE_EXTS`] or
-    /// [`DOC_EXCLUDE_BASENAME_SUBSTRINGS`] are pruned before they reach the
-    /// indexer. When `true`, they are walked normally.
+    /// When `true` (default as of v0.8.3 / issue #118), files matching
+    /// [`DOC_EXCLUDE_EXTS`] or [`DOC_EXCLUDE_BASENAME_SUBSTRINGS`] are
+    /// walked normally. When `false`, they are pruned before they reach
+    /// the indexer — preserving the v0.8.2 behaviour for indexes that
+    /// explicitly opt out (e.g. via `include_docs: false` in
+    /// `trusty-search.yaml`).
     pub include_docs: bool,
     /// When `true` (default), the walker honours `.gitignore`,
     /// `.git/info/exclude`, the global git ignore file, `.ignore`, and
@@ -186,9 +204,14 @@ pub struct WalkOptions {
 }
 
 impl Default for WalkOptions {
+    /// Default `include_docs: true` (issue #118) and `respect_gitignore:
+    /// true` (issue #100). The `code` vs `text` mode filter
+    /// (`is_allowed_for_mode`) is now the single source of truth for
+    /// which file types appear in results, so the walker no longer has
+    /// to pre-filter.
     fn default() -> Self {
         Self {
-            include_docs: false,
+            include_docs: true,
             respect_gitignore: true,
         }
     }
@@ -550,10 +573,12 @@ mod tests {
             .collect();
         assert!(names.contains(&"main.rs".to_string()));
         assert!(names.contains(&"lib.py".to_string()));
-        // Issue #77: README.md is now excluded by the default walk options.
+        // Issue #118: README.md is now INCLUDED by default — the per-mode
+        // filter (`is_allowed_for_mode`) keeps it out of code-mode results
+        // but text mode needs it to be indexed.
         assert!(
-            !names.contains(&"README.md".to_string()),
-            "Markdown excluded by default (issue #77)"
+            names.contains(&"README.md".to_string()),
+            "Markdown included by default (issue #118)"
         );
         assert!(!names.contains(&"build.o".to_string()));
         assert!(!names.contains(&"index.js".to_string()));
@@ -585,16 +610,25 @@ mod tests {
     }
 
     #[test]
-    fn test_default_excludes_markdown_and_changelog() {
-        // Issue #77: by default, the walker must skip Markdown docs and
-        // CHANGELOG/LICENSE files so prose hits never enter BM25.
+    fn test_default_includes_markdown_and_changelog() {
+        // Issue #118: by default, the walker now INCLUDES Markdown docs
+        // and CHANGELOG-with-extension files so `mode=text` searches have
+        // content to return. The per-mode filter (`is_allowed_for_mode`)
+        // keeps these chunks out of `mode=code` results, so code-search
+        // ranking is unaffected.
+        //
+        // Note: extension-less LICENSE / NOTICE files are still skipped
+        // because the walker's [`SOURCE_EXTS`] allow-list keys on
+        // extension. That is a pre-existing limitation independent of
+        // this ticket — `LICENSE.md` and `CHANGELOG.md` are the
+        // canonical extensioned forms that v0.8.3 now indexes.
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
         fs::write(root.join("README.md"), "# project").unwrap();
         fs::write(root.join("CHANGELOG.md"), "# 1.0.0").unwrap();
-        fs::write(root.join("LICENSE"), "MIT").unwrap();
-        fs::write(root.join("NOTICE"), "(c)").unwrap();
+        fs::write(root.join("LICENSE.md"), "MIT").unwrap();
+        fs::write(root.join("NOTICE.txt"), "(c)").unwrap();
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join("docs/intro.mdx"), "# intro").unwrap();
 
@@ -604,17 +638,65 @@ mod tests {
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
         assert!(names.contains(&"main.rs".to_string()));
-        assert!(!names.contains(&"README.md".to_string()));
-        assert!(!names.contains(&"CHANGELOG.md".to_string()));
-        assert!(!names.contains(&"LICENSE".to_string()));
-        assert!(!names.contains(&"NOTICE".to_string()));
-        assert!(!names.contains(&"intro.mdx".to_string()));
+        assert!(
+            names.contains(&"README.md".to_string()),
+            "README.md included by default (issue #118): {names:?}"
+        );
+        assert!(names.contains(&"CHANGELOG.md".to_string()));
+        assert!(names.contains(&"LICENSE.md".to_string()));
+        assert!(names.contains(&"NOTICE.txt".to_string()));
+        assert!(names.contains(&"intro.mdx".to_string()));
+    }
+
+    /// Issue #118 acceptance: a fresh reindex of a tempdir with a
+    /// `README.md`, `CHANGELOG.md`, and one `lib.rs` produces walk entries
+    /// for BOTH the source file and the docs. Pins the contract that
+    /// flipping the walker default actually feeds docs into the indexer
+    /// pipeline.
+    ///
+    /// The mode-filter side of the acceptance (`mode=text` returns docs;
+    /// `mode=code` returns only `lib.rs`) is covered end-to-end by
+    /// `core::indexer::tests::test_mode_filter_code_returns_only_source`
+    /// and `test_mode_filter_text_returns_only_prose_and_named_docs`,
+    /// which exercise `is_allowed_for_mode` against a seeded indexer.
+    #[test]
+    fn test_issue_118_acceptance_walks_both_source_and_docs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("lib.rs"), "pub fn entrypoint() {}").unwrap();
+        fs::write(
+            root.join("README.md"),
+            "# Project\nInstall via cargo install trusty-search.",
+        )
+        .unwrap();
+        fs::write(root.join("CHANGELOG.md"), "## 0.8.3\n- fix #118").unwrap();
+
+        let names: Vec<String> = walk_source_files(root)
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"lib.rs".to_string()),
+            "source must be walked: {names:?}"
+        );
+        assert!(
+            names.contains(&"README.md".to_string()),
+            "README.md must be walked under v0.8.3 default (issue #118): {names:?}"
+        );
+        assert!(
+            names.contains(&"CHANGELOG.md".to_string()),
+            "CHANGELOG.md must be walked under v0.8.3 default (issue #118): {names:?}"
+        );
     }
 
     #[test]
-    fn test_include_docs_keeps_markdown() {
-        // Issue #77: the `include_docs: true` opt-in re-enables the legacy
-        // behaviour for doc-focused indexes.
+    fn test_include_docs_false_excludes_markdown() {
+        // Issue #118: the `include_docs: false` opt-out preserves the
+        // v0.8.2 walker behaviour for indexes that genuinely don't want
+        // prose chunked at all (saves chunks on docs-heavy projects, or
+        // restores the legacy walk-time exclusion when the operator
+        // configured it explicitly in `trusty-search.yaml`).
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
@@ -624,7 +706,7 @@ mod tests {
         let names: Vec<String> = walk_source_files_with_options(
             root,
             WalkOptions {
-                include_docs: true,
+                include_docs: false,
                 ..WalkOptions::default()
             },
         )
@@ -633,8 +715,8 @@ mod tests {
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .collect();
         assert!(names.contains(&"main.rs".to_string()));
-        assert!(names.contains(&"README.md".to_string()));
-        assert!(names.contains(&"CHANGELOG.md".to_string()));
+        assert!(!names.contains(&"README.md".to_string()));
+        assert!(!names.contains(&"CHANGELOG.md".to_string()));
     }
 
     // --- should_skip_path tests ---
