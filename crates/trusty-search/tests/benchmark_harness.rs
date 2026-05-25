@@ -159,18 +159,24 @@ fn grep_term(query: &str) -> String {
 }
 
 /// Run the best available grep tool against `root` for a literal `term`,
-/// returning matched-line "chunks" in the tool's output order (best rank first).
+/// returning matched-line "chunks" plus the wall-clock latency of the shell-out.
 ///
 /// Why: trusty-search returns ranked `CodeChunk`s; to compute identical MRR@5 /
-/// Recall@10 the grep baseline must produce a comparably ranked list. What:
-/// prefers `rg --line-number --no-heading -i <term>`, falls back to
+/// Recall@10 the grep baseline must produce a comparably ranked list. Capturing
+/// latency alongside the result list lets the comparison table report a
+/// like-for-like wall-clock cost — trusty-search's semantic latency vs the
+/// system tool's I/O-bound cost — without a second sample run.
+/// What: prefers `rg --line-number --no-heading -i <term>`, falls back to
 /// `grep -rni --include=*.rs <term>`, parses `file:line:content`, and caps at
 /// `top_k` hits (grep has no relevance ranking, so file-walk order is its
-/// "ranking"). Test: exercised by the grep baseline tests; returns an empty vec
-/// on tool failure so callers degrade to MRR=0 rather than panicking.
-fn grep_search(root: &Path, term: &str, top_k: usize) -> Vec<CodeChunk> {
+/// "ranking"). Returns `(matches, elapsed_ms)`; `elapsed_ms` covers process
+/// spawn + scan + I/O and is `0` only when the tool failed to launch.
+/// Test: exercised by the grep baseline tests; returns an empty vec on tool
+/// failure so callers degrade to MRR=0 rather than panicking.
+fn grep_search(root: &Path, term: &str, top_k: usize) -> (Vec<CodeChunk>, u128) {
     // Prefer ripgrep; fall back to POSIX grep -r. We probe rg once per call —
     // cheap relative to the embedding work that dominates the bench.
+    let started = Instant::now();
     let output = if Command::new("rg").arg("--version").output().is_ok() {
         Command::new("rg")
             .args([
@@ -193,11 +199,13 @@ fn grep_search(root: &Path, term: &str, top_k: usize) -> Vec<CodeChunk> {
 
     let out = match output {
         Ok(o) => o,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 0),
     };
+    let elapsed_ms = started.elapsed().as_millis();
     let text = String::from_utf8_lossy(&out.stdout);
 
-    text.lines()
+    let chunks = text
+        .lines()
         .take(top_k)
         .filter_map(|line| {
             // Format: <path>:<lineno>:<content>
@@ -234,27 +242,48 @@ fn grep_search(root: &Path, term: &str, top_k: usize) -> Vec<CodeChunk> {
                 archive_reason: None,
             })
         })
-        .collect()
+        .collect();
+    (chunks, elapsed_ms)
 }
 
-/// Compute mean MRR@5 + Recall@10 for the grep baseline over a query set,
-/// returning `(mean_mrr, recall_hits, per_query)` for the comparison table.
-fn grep_metrics(root: &Path, queries: &[(&str, &str)]) -> (f32, usize, Vec<(String, f32, bool)>) {
+/// Per-query grep baseline row: `(query, mrr@5, recall@10, latency_ms)`.
+type GrepRow = (String, f32, bool, u128);
+
+/// Compute mean MRR@5 + Recall@10 + per-query latency for the grep baseline
+/// over a query set, returning
+/// `(mean_mrr, recall_hits, mean_latency_ms, per_query_rows)`.
+///
+/// Why: callers want one call site that produces every column the comparison
+/// table needs. Bundling latency in lets us print a fair side-by-side cost
+/// breakdown without re-shelling out per query in the renderer.
+/// What: shells out via [`grep_search`] for each query, captures the returned
+/// latency, and computes the mean. `mean_latency_ms` is in milliseconds.
+/// Test: exercised by the grep baseline tests and `print_comparison`.
+fn grep_metrics(root: &Path, queries: &[(&str, &str)]) -> (f32, usize, u128, Vec<GrepRow>) {
     let mut mrr_sum = 0.0_f32;
     let mut recall_hits = 0_usize;
-    let mut per_query = Vec::with_capacity(queries.len());
+    let mut latency_sum: u128 = 0;
+    let mut per_query: Vec<GrepRow> = Vec::with_capacity(queries.len());
     for (q, expected) in queries {
         let term = grep_term(q);
-        let results = grep_search(root, &term, 10);
+        let (results, latency_ms) = grep_search(root, &term, 10);
         let mrr = mrr_at_k(&results, expected, 5);
         let rec = recall_at_k(&results, expected, 10);
         mrr_sum += mrr;
         if rec {
             recall_hits += 1;
         }
-        per_query.push(((*q).to_string(), mrr, rec));
+        latency_sum += latency_ms;
+        per_query.push(((*q).to_string(), mrr, rec, latency_ms));
     }
-    (mrr_sum / queries.len() as f32, recall_hits, per_query)
+    let n = queries.len() as u128;
+    let mean_latency = latency_sum.checked_div(n).unwrap_or(0);
+    (
+        mrr_sum / queries.len() as f32,
+        recall_hits,
+        mean_latency,
+        per_query,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -387,16 +416,16 @@ async fn run_bench(
 /// Test: invoked from each `bench_*_queries` test under `--nocapture`.
 fn print_comparison(label: &str, search_rows: &[(String, f32, bool)], queries: &[(&str, &str)]) {
     let root = core_src_dir();
-    let (grep_mean, grep_recall, grep_rows) = grep_metrics(&root, queries);
+    let (grep_mean, grep_recall, grep_mean_latency, grep_rows) = grep_metrics(&root, queries);
 
     println!("\n--- {label}: trusty-search vs grep ---");
     println!(
-        "| {:<34} | {:<12} | {:>9} | {:>9} | {:<8} |",
-        "query", "grep term", "ts MRR@5", "gp MRR@5", "winner"
+        "| {:<34} | {:<12} | {:>9} | {:>9} | {:>9} | {:<8} |",
+        "query", "grep term", "ts MRR@5", "gp MRR@5", "gp ms", "winner"
     );
     println!(
-        "|{:-<36}|{:-<14}|{:-<11}|{:-<11}|{:-<10}|",
-        "", "", "", "", ""
+        "|{:-<36}|{:-<14}|{:-<11}|{:-<11}|{:-<11}|{:-<10}|",
+        "", "", "", "", "", ""
     );
 
     let mut ts_wins = 0_usize;
@@ -406,7 +435,7 @@ fn print_comparison(label: &str, search_rows: &[(String, f32, bool)], queries: &
 
     for (i, (q, _expected)) in queries.iter().enumerate() {
         let (_, ts_mrr, _) = &search_rows[i];
-        let (_, gp_mrr, _) = &grep_rows[i];
+        let (_, gp_mrr, _, gp_latency) = &grep_rows[i];
         ts_mrr_sum += *ts_mrr;
         let winner = if (ts_mrr - gp_mrr).abs() < f32::EPSILON {
             ties += 1;
@@ -419,23 +448,25 @@ fn print_comparison(label: &str, search_rows: &[(String, f32, bool)], queries: &
             "grep"
         };
         println!(
-            "| {:<34} | {:<12} | {:>9.3} | {:>9.3} | {:<8} |",
+            "| {:<34} | {:<12} | {:>9.3} | {:>9.3} | {:>9} | {:<8} |",
             truncate(q, 34),
             truncate(&grep_term(q), 12),
             ts_mrr,
             gp_mrr,
+            gp_latency,
             winner
         );
     }
 
     let n = queries.len() as f32;
     println!(
-        "trusty mean MRR@5 = {:.3}  |  grep mean MRR@5 = {:.3}  |  grep Recall@10 = {:.0}% ({}/{})",
+        "trusty mean MRR@5 = {:.3}  |  grep mean MRR@5 = {:.3}  |  grep Recall@10 = {:.0}% ({}/{})  |  grep mean latency = {} ms",
         ts_mrr_sum / n,
         grep_mean,
         (grep_recall as f32 / n) * 100.0,
         grep_recall,
-        queries.len()
+        queries.len(),
+        grep_mean_latency,
     );
     println!("winners — trusty: {ts_wins}  grep: {grep_wins}  ties: {ties}");
 }
@@ -513,31 +544,36 @@ async fn bench_bugdebt_queries() {
 /// Shared body: grep one intent class and print its MRR@5 / Recall@10 table.
 fn run_grep_baseline(label: &str, queries: &[(&str, &str)]) {
     let root = core_src_dir();
-    let (mean, recall_hits, rows) = grep_metrics(&root, queries);
+    let (mean, recall_hits, mean_latency, rows) = grep_metrics(&root, queries);
 
     println!("\n=== grep baseline: {label} ===");
     println!(
-        "| {:<40} | {:<14} | {:>6} | {:>9} |",
-        "query", "grep term", "MRR@5", "Recall@10"
+        "| {:<40} | {:<14} | {:>6} | {:>9} | {:>10} |",
+        "query", "grep term", "MRR@5", "Recall@10", "latency_ms"
     );
-    println!("|{:-<42}|{:-<16}|{:-<8}|{:-<11}|", "", "", "", "");
-    for ((q, mrr, rec), (orig_q, _)) in rows.iter().zip(queries.iter()) {
+    println!(
+        "|{:-<42}|{:-<16}|{:-<8}|{:-<11}|{:-<12}|",
+        "", "", "", "", ""
+    );
+    for ((q, mrr, rec, latency_ms), (orig_q, _)) in rows.iter().zip(queries.iter()) {
         debug_assert_eq!(q, orig_q);
         println!(
-            "| {:<40} | {:<14} | {:>6.3} | {:>9} |",
+            "| {:<40} | {:<14} | {:>6.3} | {:>9} | {:>10} |",
             truncate(q, 40),
             truncate(&grep_term(orig_q), 14),
             mrr,
-            if *rec { "yes" } else { "no" }
+            if *rec { "yes" } else { "no" },
+            latency_ms
         );
     }
     let n = queries.len() as f32;
     println!(
-        "grep mean MRR@5 = {:.3}  |  Recall@10 = {:.0}% ({}/{})",
+        "grep mean MRR@5 = {:.3}  |  Recall@10 = {:.0}% ({}/{})  |  mean latency = {} ms",
         mean,
         (recall_hits as f32 / n) * 100.0,
         recall_hits,
-        queries.len()
+        queries.len(),
+        mean_latency,
     );
 }
 
@@ -563,4 +599,142 @@ fn bench_conceptual_grep_baseline() {
 #[test]
 fn bench_bugdebt_grep_baseline() {
     run_grep_baseline("bugdebt", BUGDEBT_QUERIES);
+}
+
+// ---------------------------------------------------------------------------
+// Live-daemon `/grep` endpoint vs system ripgrep — `#[ignore]`-gated.
+//
+// Why: the line-oriented `/grep` endpoint is meant to be a drop-in replacement
+// for shelling out to ripgrep, but its real value depends on (a) returning the
+// same hits as ripgrep for the same pattern and (b) doing so at competitive
+// wall-clock latency. This bench drives the live daemon end-to-end so the two
+// dimensions can be inspected in one table.
+// What: requires a daemon at `http://127.0.0.1:7878` with the `trusty-search`
+// index registered. For each fixed pattern it issues `POST
+// /indexes/trusty-search/grep`, shells out `rg` against the indexed root, and
+// prints per-pattern hit count + latency. Reports P50/P95 and the latency
+// ratio. The test never asserts on absolute numbers — it's a baseline gate, not
+// a regression threshold (those live in `baseline_trusty_tools.rs`).
+// ---------------------------------------------------------------------------
+
+/// Representative grep patterns covering literal, regex, and word-boundary
+/// shapes — picked to mirror common LLM grep calls against trusty-search.
+const GREP_ENDPOINT_PATTERNS: &[(&str, &str)] = &[
+    ("CodeChunk", "literal struct name"),
+    ("fn search", "literal-with-space"),
+    (r"fn \w+_index", "regex"),
+    ("HnswIndex", "literal type"),
+    (r"impl\s+\w+\s+for", "regex impl block"),
+];
+
+#[ignore]
+#[tokio::test]
+async fn bench_grep_endpoint_vs_ripgrep() {
+    const DAEMON: &str = "http://127.0.0.1:7878";
+    const INDEX: &str = "trusty-search";
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest client");
+
+    // Resolve the indexed root by asking the daemon — the test should still
+    // work if the index was registered against a different on-disk path.
+    let status = client
+        .get(format!("{DAEMON}/indexes/{INDEX}/status"))
+        .send()
+        .await
+        .expect("daemon must be running on 127.0.0.1:7878 with the trusty-search index registered");
+    assert!(
+        status.status().is_success(),
+        "GET /indexes/{INDEX}/status returned {}: register the index first",
+        status.status()
+    );
+    let status_json: serde_json::Value = status.json().await.expect("JSON status");
+    let root_path = status_json["root_path"]
+        .as_str()
+        .expect("status.root_path must be a string");
+    let root = std::path::Path::new(root_path);
+
+    println!("\n=== /grep endpoint vs ripgrep ===");
+    println!("daemon: {DAEMON}   index: {INDEX}   root: {root_path}");
+    println!(
+        "| {:<28} | {:>9} | {:>9} | {:>9} | {:>9} | {:>6} |",
+        "pattern", "ep hits", "rg hits", "ep ms", "rg ms", "ratio"
+    );
+    println!(
+        "|{:-<30}|{:-<11}|{:-<11}|{:-<11}|{:-<11}|{:-<8}|",
+        "", "", "", "", "", ""
+    );
+
+    let mut ep_latencies: Vec<u128> = Vec::with_capacity(GREP_ENDPOINT_PATTERNS.len());
+    let mut rg_latencies: Vec<u128> = Vec::with_capacity(GREP_ENDPOINT_PATTERNS.len());
+
+    for (pattern, _label) in GREP_ENDPOINT_PATTERNS {
+        // (a) /grep endpoint.
+        let body = serde_json::json!({
+            "pattern": pattern,
+            "max_results": 500,
+        });
+        let t0 = Instant::now();
+        let resp = client
+            .post(format!("{DAEMON}/indexes/{INDEX}/grep"))
+            .json(&body)
+            .send()
+            .await
+            .expect("POST /grep transport");
+        let ep_ms = t0.elapsed().as_millis();
+        assert!(
+            resp.status().is_success(),
+            "POST /indexes/{INDEX}/grep returned {} for pattern {pattern}",
+            resp.status()
+        );
+        let ep_body: serde_json::Value = resp.json().await.expect("grep response JSON");
+        let ep_hits = ep_body["matches"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default();
+
+        // (b) shell-out rg with the same pattern.
+        let (rg_chunks, rg_ms) = grep_search(root, pattern, 500);
+        let rg_hits = rg_chunks.len();
+
+        let ratio = if rg_ms == 0 {
+            f64::INFINITY
+        } else {
+            ep_ms as f64 / rg_ms as f64
+        };
+        println!(
+            "| {:<28} | {:>9} | {:>9} | {:>9} | {:>9} | {:>6.2} |",
+            truncate(pattern, 28),
+            ep_hits,
+            rg_hits,
+            ep_ms,
+            rg_ms,
+            ratio
+        );
+
+        ep_latencies.push(ep_ms);
+        rg_latencies.push(rg_ms);
+    }
+
+    ep_latencies.sort_unstable();
+    rg_latencies.sort_unstable();
+    let p = |xs: &[u128], pct: usize| -> u128 {
+        if xs.is_empty() {
+            return 0;
+        }
+        let i = ((xs.len() * pct) / 100).min(xs.len() - 1);
+        xs[i]
+    };
+    println!(
+        "/grep   P50={} ms  P95={} ms",
+        p(&ep_latencies, 50),
+        p(&ep_latencies, 95)
+    );
+    println!(
+        "ripgrep P50={} ms  P95={} ms",
+        p(&rg_latencies, 50),
+        p(&rg_latencies, 95)
+    );
 }

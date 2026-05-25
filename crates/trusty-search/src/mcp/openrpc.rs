@@ -51,7 +51,7 @@ pub fn scopes_for_tool(name: &str) -> Vec<String> {
     let s: &[&str] = match name {
         // Read-only / query / introspection
         "search_all" | "search" | "search_similar" | "search_health" | "list_indexes"
-        | "index_status" | "list_chunks" | "chat" | "get_call_chain" => &[SEARCH_READ],
+        | "index_status" | "list_chunks" | "chat" | "get_call_chain" | "grep" => &[SEARCH_READ],
 
         // Mutating
         "index_file" | "remove_file" | "create_index" | "delete_index" | "reindex" => {

@@ -26,6 +26,8 @@
 //! - Community count:   >= 5   (indicates Louvain completed)
 //! - Modularity:        >= 0.1 (indicates graph structure is non-degenerate)
 
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -553,5 +555,205 @@ async fn test_concurrent_queries_no_errors() {
     assert!(
         total_ms < 5_000,
         "8 concurrent queries took {total_ms} ms — exceeds 5 000 ms wall-clock budget"
+    );
+}
+
+// ── Live grep endpoint vs system ripgrep ────────────────────────────────────
+
+/// Five representative grep patterns covering literal, regex, and word-boundary
+/// shapes — picked to match real LLM grep calls against indexed Rust code.
+const GREP_LATENCY_PATTERNS: &[&str] = &[
+    "CodeChunk",
+    "fn search",
+    r"fn \w+_index",
+    "HnswIndex",
+    "tokenize",
+];
+
+/// Shell out to `rg` (preferred) or `grep` against `root` for `pattern`,
+/// returning `(hit_count, latency_ms)`.
+///
+/// Why: a fair latency comparison needs both tools to scan the same on-disk
+/// bytes. We mirror the `/grep` endpoint's `--include=*.rs`-ish behaviour via
+/// `rg -t rust` so the universe of files is comparable; the latency captured
+/// is the full process spawn + scan + I/O wall-clock.
+/// What: prefers `rg --count` so we don't pay for parsing match text; falls
+/// back to `grep -rEc` which prints `<path>:<count>` per file we then sum.
+/// Returns `(hits, ms)`; on failure to launch returns `(0, 0)` so the caller
+/// still sees a row.
+/// Test: used by `test_grep_endpoint_latency_vs_ripgrep`.
+fn ripgrep_count(root: &Path, pattern: &str) -> (usize, u128) {
+    let started = Instant::now();
+    let output = if Command::new("rg").arg("--version").output().is_ok() {
+        // `rg --count-matches` reports total match count per file; summing
+        // gives a comparable hit count to `/grep`'s `matches.len()`.
+        Command::new("rg")
+            .args(["--count-matches", "--no-heading", "-t", "rust", pattern])
+            .arg(root)
+            .output()
+    } else {
+        Command::new("grep")
+            .args(["-rEoc", "--include=*.rs", pattern])
+            .arg(root)
+            .output()
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+    let out = match output {
+        Ok(o) => o,
+        Err(_) => return (0, 0),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut hits = 0_usize;
+    for line in text.lines() {
+        if let Some((_, count)) = line.rsplit_once(':') {
+            if let Ok(n) = count.trim().parse::<usize>() {
+                hits += n;
+            }
+        }
+    }
+    (hits, elapsed_ms)
+}
+
+/// Compare `/grep` endpoint latency and hit count against system ripgrep for
+/// a representative pattern set.
+///
+/// Why: the `/grep` endpoint must be (a) at least as recall-complete as
+/// ripgrep over the indexed source tree and (b) within reach of ripgrep's
+/// wall-clock latency — otherwise callers will just shell out themselves and
+/// we lose the centralised regex/glob/context surface plus rate limiting.
+/// What: hits `GET /indexes` to pick the first index, resolves its root via
+/// `GET /indexes/:id/status`, then for each of `GREP_LATENCY_PATTERNS` runs
+/// `POST /indexes/:id/grep` and `rg --count-matches` and prints both
+/// latencies, both hit counts, and the ratio. Asserts the `/grep` endpoint
+/// returns at least as many matches as ripgrep for each pattern
+/// (correctness check).
+/// Test: this IS the test. Marked `#[ignore]` so the default `cargo test`
+/// run stays fast.
+#[tokio::test]
+#[ignore]
+async fn test_grep_endpoint_latency_vs_ripgrep() {
+    let client = make_client();
+
+    // 1. Pick the first registered index.
+    let resp = client
+        .get(format!("{DAEMON_URL}/indexes"))
+        .send()
+        .await
+        .expect("GET /indexes must reach the daemon — is it running?");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.expect("indexes response JSON");
+    let indexes = body["indexes"]
+        .as_array()
+        .expect("indexes.indexes should be an array");
+    let index_id = indexes
+        .first()
+        .and_then(Value::as_str)
+        .expect(
+            "at least one index must be registered; run `trusty-search index <path> --name <id>`",
+        )
+        .to_string();
+
+    // 2. Resolve the on-disk root for that index.
+    let resp = client
+        .get(format!("{DAEMON_URL}/indexes/{index_id}/status"))
+        .send()
+        .await
+        .expect("status request");
+    assert_eq!(resp.status().as_u16(), 200);
+    let status: Value = resp.json().await.expect("status JSON");
+    let root_path = status["root_path"]
+        .as_str()
+        .expect("status.root_path must be a string")
+        .to_string();
+    let root = Path::new(&root_path);
+
+    println!("\n=== /grep endpoint vs ripgrep ===");
+    println!("daemon: {DAEMON_URL}   index: {index_id}   root: {root_path}");
+    println!(
+        "| {:<28} | {:>9} | {:>9} | {:>9} | {:>9} | {:>6} |",
+        "pattern", "ep hits", "rg hits", "ep ms", "rg ms", "ratio"
+    );
+    println!(
+        "|{:-<30}|{:-<11}|{:-<11}|{:-<11}|{:-<11}|{:-<8}|",
+        "", "", "", "", "", ""
+    );
+
+    let mut shortfalls: Vec<String> = Vec::new();
+    let mut ep_latencies: Vec<u128> = Vec::with_capacity(GREP_LATENCY_PATTERNS.len());
+    let mut rg_latencies: Vec<u128> = Vec::with_capacity(GREP_LATENCY_PATTERNS.len());
+
+    for pattern in GREP_LATENCY_PATTERNS {
+        // /grep endpoint.
+        let req_body = json!({ "pattern": pattern, "max_results": 1000 });
+        let t0 = Instant::now();
+        let resp = client
+            .post(format!("{DAEMON_URL}/indexes/{index_id}/grep"))
+            .json(&req_body)
+            .send()
+            .await
+            .expect("POST /grep transport");
+        let ep_ms = t0.elapsed().as_millis();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "POST /grep returned non-200 for pattern {pattern}"
+        );
+        let ep_body: Value = resp.json().await.expect("grep response JSON");
+        let ep_hits = ep_body["matches"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default();
+
+        // System ripgrep against the same root.
+        let (rg_hits, rg_ms) = ripgrep_count(root, pattern);
+
+        let ratio = if rg_ms == 0 {
+            f64::INFINITY
+        } else {
+            ep_ms as f64 / rg_ms as f64
+        };
+        println!(
+            "| {:<28} | {:>9} | {:>9} | {:>9} | {:>9} | {:>6.2} |",
+            pattern, ep_hits, rg_hits, ep_ms, rg_ms, ratio
+        );
+
+        ep_latencies.push(ep_ms);
+        rg_latencies.push(rg_ms);
+
+        // Correctness: the endpoint walks the indexed file set and may legitimately
+        // see *more* matches than rg when the index covers files rg's type filter
+        // misses. Require ep_hits >= rg_hits as the floor.
+        if ep_hits < rg_hits {
+            shortfalls.push(format!(
+                "pattern={pattern:?}: /grep returned {ep_hits} matches, rg returned {rg_hits}"
+            ));
+        }
+    }
+
+    ep_latencies.sort_unstable();
+    rg_latencies.sort_unstable();
+    let pctl = |xs: &[u128], p: usize| -> u128 {
+        if xs.is_empty() {
+            return 0;
+        }
+        let idx = ((xs.len() * p) / 100).min(xs.len() - 1);
+        xs[idx]
+    };
+    println!(
+        "/grep   P50={} ms  P95={} ms",
+        pctl(&ep_latencies, 50),
+        pctl(&ep_latencies, 95)
+    );
+    println!(
+        "ripgrep P50={} ms  P95={} ms",
+        pctl(&rg_latencies, 50),
+        pctl(&rg_latencies, 95)
+    );
+
+    assert!(
+        shortfalls.is_empty(),
+        "/grep returned fewer matches than ripgrep for {} pattern(s):\n  {}",
+        shortfalls.len(),
+        shortfalls.join("\n  ")
     );
 }

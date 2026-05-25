@@ -73,13 +73,14 @@ mod tests {
     }
 
     #[test]
-    fn tools_returns_exactly_fourteen() {
-        // Issue #76 added `get_call_chain`, bringing the total to 14.
+    fn tools_returns_exactly_fifteen() {
+        // Issue #76 added `get_call_chain` (→ 14); the grep MCP tool brings
+        // the total to 15.
         let tools = SearchMcpService.tools();
         assert_eq!(
             tools.len(),
-            14,
-            "expected 14 MCP tools, got {}: {:?}",
+            15,
+            "expected 15 MCP tools, got {}: {:?}",
             tools.len(),
             tools
                 .iter()
@@ -125,6 +126,6 @@ mod tests {
         // make sure SearchMcpService is object-safe and dispatches correctly.
         let svc: Box<dyn ServiceDescriptor> = Box::new(SearchMcpService);
         assert_eq!(svc.name(), "trusty-search");
-        assert_eq!(svc.tools().len(), 14);
+        assert_eq!(svc.tools().len(), 15);
     }
 }

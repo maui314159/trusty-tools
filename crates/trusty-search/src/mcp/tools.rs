@@ -387,6 +387,51 @@ impl McpServer {
                 ))
                 .await
             }
+            "grep" => {
+                // grep-parity regex/literal search over an index's files.
+                // Mirrors `POST /grep` (global) and `POST /indexes/:id/grep`.
+                // `index_id` is optional — when omitted, the daemon fans out
+                // across every registered index.
+                let pattern = require_str(args, "pattern")?;
+                let mut body = serde_json::json!({ "pattern": pattern });
+                if let Some(v) = args.get("case_insensitive").and_then(Value::as_bool) {
+                    body["case_insensitive"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("context").and_then(Value::as_u64) {
+                    body["context"] = Value::from(v);
+                }
+                if let Some(v) = args.get("context_before").and_then(Value::as_u64) {
+                    body["context_before"] = Value::from(v);
+                }
+                if let Some(v) = args.get("context_after").and_then(Value::as_u64) {
+                    body["context_after"] = Value::from(v);
+                }
+                if let Some(v) = args.get("glob").and_then(Value::as_str) {
+                    body["glob"] = Value::String(v.to_string());
+                }
+                if let Some(v) = args.get("multiline").and_then(Value::as_bool) {
+                    body["multiline"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("fixed_strings").and_then(Value::as_bool) {
+                    body["fixed_strings"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("files_with_matches").and_then(Value::as_bool) {
+                    body["files_with_matches"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("invert_match").and_then(Value::as_bool) {
+                    body["invert_match"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("word_regexp").and_then(Value::as_bool) {
+                    body["word_regexp"] = Value::Bool(v);
+                }
+                if let Some(v) = args.get("max_results").and_then(Value::as_u64) {
+                    body["max_results"] = Value::from(v);
+                }
+                match args.get("index_id").and_then(Value::as_str) {
+                    Some(id) => self.post(&format!("/indexes/{id}/grep"), &body).await,
+                    None => self.post("/grep", &body).await,
+                }
+            }
             _ => Err(DispatchError::UnknownTool),
         }
     }
@@ -720,6 +765,34 @@ pub fn tool_descriptors() -> Value {
             }
         },
         {
+            "name": "grep",
+            "description": "Search indexed files using regex/literal patterns with ripgrep-compatible options. \
+                            Greps the on-disk bytes of files the index already knows about, so no \
+                            re-embedding occurs and line numbers are exact. Supports regex or fixed-string \
+                            matching, case folding (-i), context windows (-A/-B/-C), include globs, \
+                            multiline mode, files-with-matches (-l), invert (-v), and word-regexp (-w). \
+                            When `index_id` is omitted the daemon fans out across every registered index.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern":            { "type": "string", "description": "Regex (default) or literal when fixed_strings=true" },
+                    "index_id":           { "type": "string", "description": "Optional index id; omit to fan out across all indexes" },
+                    "case_insensitive":   { "type": "boolean", "default": false, "description": "-i / --ignore-case" },
+                    "context":            { "type": "integer", "description": "-C: equal before/after context, overrides context_before/context_after" },
+                    "context_before":     { "type": "integer", "description": "-B: lines of context before each match" },
+                    "context_after":      { "type": "integer", "description": "-A: lines of context after each match" },
+                    "glob":                { "type": "string", "description": "--include glob (e.g. '**/*.rs')" },
+                    "multiline":          { "type": "boolean", "default": false, "description": "Let `.` span newlines" },
+                    "fixed_strings":      { "type": "boolean", "default": false, "description": "-F: treat pattern as literal" },
+                    "files_with_matches": { "type": "boolean", "default": false, "description": "-l: return one path per matching file" },
+                    "invert_match":       { "type": "boolean", "default": false, "description": "-v: return lines that do NOT match" },
+                    "word_regexp":        { "type": "boolean", "default": false, "description": "-w: require word boundaries" },
+                    "max_results":        { "type": "integer", "default": 100, "description": "Hard cap on returned matches" }
+                }
+            }
+        },
+        {
             "name": "chat",
             "description": "Ask a natural-language question about the indexed codebase. \
                             Automatically searches for the top_k most relevant chunks and \
@@ -967,5 +1040,37 @@ mod tests {
             .await;
         let err = resp.error.expect("expected error");
         assert_eq!(err.code, error_codes::INVALID_PARAMS);
+    }
+
+    /// `grep` is listed and missing-pattern fast-fails before any HTTP hop.
+    #[tokio::test]
+    async fn grep_missing_pattern_returns_invalid_params() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("grep", serde_json::json!({}))).await;
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
+    }
+
+    /// `grep` appears in `tools/list` with a `pattern`-required schema.
+    #[tokio::test]
+    async fn grep_listed_in_tools_with_required_pattern() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
+        let grep = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("grep"))
+            .expect("grep tool missing from tools/list");
+        let required = grep["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("pattern")),
+            "grep schema must require 'pattern'"
+        );
     }
 }

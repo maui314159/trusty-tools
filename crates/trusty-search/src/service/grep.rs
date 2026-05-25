@@ -74,6 +74,33 @@ pub struct GrepRequest {
     #[serde(default)]
     pub multiline: bool,
 
+    /// `-F` / `--fixed-strings` parity: when true, `pattern` is treated as a
+    /// literal string with no regex metacharacters. The literal is escaped via
+    /// `regex::escape` before being handed to the regex engine so dots,
+    /// brackets, etc. lose their special meaning.
+    #[serde(default)]
+    pub fixed_strings: bool,
+
+    /// `-l` / `--files-with-matches` parity: when true, return at most one
+    /// `GrepMatch` per file (the path of the first match) and short-circuit
+    /// further scans of that file. The emitted match carries `line: 0`,
+    /// `column: 0`, empty `text`, and empty context windows.
+    #[serde(default)]
+    pub files_with_matches: bool,
+
+    /// `-v` / `--invert-match` parity: when true, return lines that do NOT
+    /// match the pattern. Composes with `case_insensitive` and `word_regexp`.
+    /// Not honoured in `multiline` mode (line-orientation is intrinsic to
+    /// inversion); requesting both leaves `multiline` semantics in place.
+    #[serde(default)]
+    pub invert_match: bool,
+
+    /// `-w` / `--word-regexp` parity: when true, the pattern only matches at
+    /// word boundaries (`\b<pattern>\b`). When combined with `fixed_strings`
+    /// the literal is escaped first, then wrapped in boundaries.
+    #[serde(default)]
+    pub word_regexp: bool,
+
     /// Hard cap on the number of matches returned across all files. Defaults
     /// to [`DEFAULT_MAX_RESULTS`]. The response `truncated` flag is set when
     /// the cap is hit.
@@ -175,6 +202,8 @@ pub struct CompiledGrep {
     context_before: usize,
     context_after: usize,
     multiline: bool,
+    files_with_matches: bool,
+    invert_match: bool,
 }
 
 impl CompiledGrep {
@@ -189,7 +218,26 @@ impl CompiledGrep {
     /// Test: `compile_folds_context_C_over_A_B`, `invalid_regex_is_rejected`,
     /// `invalid_glob_is_rejected`.
     pub fn compile(req: &GrepRequest) -> Result<Self, GrepError> {
-        let regex = regex::RegexBuilder::new(&req.pattern)
+        // Step 1: optionally escape the pattern so regex metacharacters lose
+        // their meaning (`-F` parity). When `fixed_strings` is false we feed
+        // the user's pattern through verbatim, matching the default regex
+        // behaviour callers expect.
+        let escaped = if req.fixed_strings {
+            regex::escape(&req.pattern)
+        } else {
+            req.pattern.clone()
+        };
+        // Step 2: optionally wrap in word boundaries (`-w` parity). Applied
+        // *after* fixed-string escaping so `\b<literal>\b` works on patterns
+        // that would otherwise contain regex metacharacters. We use `(?:...)`
+        // to avoid mutating capture-group numbering callers may rely on.
+        let final_pattern = if req.word_regexp {
+            format!(r"\b(?:{escaped})\b")
+        } else {
+            escaped
+        };
+
+        let regex = regex::RegexBuilder::new(&final_pattern)
             .case_insensitive(req.case_insensitive)
             // `dot_matches_new_line` makes `.` span newlines so a single
             // pattern can match across lines — the multiline parity we want.
@@ -217,6 +265,8 @@ impl CompiledGrep {
             context_before,
             context_after,
             multiline: req.multiline,
+            files_with_matches: req.files_with_matches,
+            invert_match: req.invert_match,
         })
     }
 
@@ -272,6 +322,16 @@ pub fn grep_file_content(
     if out.len() >= max_results {
         return;
     }
+
+    // `-l` short-circuit: when the caller only wants the path of matching
+    // files we use a fast probe (single regex find over the whole content)
+    // and emit a synthetic `GrepMatch`. `invert_match` flips the predicate
+    // (emit when *no* line matches), matching `rg -lv` / `grep -lv`.
+    if compiled.files_with_matches {
+        emit_files_with_matches(file, content, compiled, out);
+        return;
+    }
+
     // Pre-split into lines once; reused for both match text and context.
     let lines: Vec<&str> = content.lines().collect();
 
@@ -282,7 +342,58 @@ pub fn grep_file_content(
     }
 }
 
+/// `-l` / `--files-with-matches`: emit at most one synthetic match per file.
+///
+/// Why: callers that just want the list of matching paths (e.g. an LLM
+/// driving a follow-up `read_file`) get O(1) wire size per file instead of
+/// O(matches). Honours `invert_match` so `grep -Lv` semantics also work.
+/// What: probes `content` for any match (single line in the non-multiline
+/// case, whole-file in multiline mode), then emits a `GrepMatch` with
+/// `line: 0, column: 0, text: ""` so downstream callers can detect the
+/// "path only" shape unambiguously. Returns without emitting when the
+/// predicate is unsatisfied.
+/// Test: `files_with_matches_returns_path_once`,
+/// `files_with_matches_honours_invert`.
+fn emit_files_with_matches(
+    file: &str,
+    content: &str,
+    compiled: &CompiledGrep,
+    out: &mut Vec<GrepMatch>,
+) {
+    // The predicate "file has any matching line" reduces to a single
+    // regex find over the full content — `\n` is not in the default
+    // dot-character class, so a line-oriented pattern still matches.
+    let any_match = compiled.regex.is_match(content);
+    let should_emit = if compiled.invert_match {
+        // `grep -Lv`: emit when at least one line does NOT match. We have
+        // to scan line-by-line because "any non-matching line" cannot be
+        // derived from a single whole-content probe.
+        content
+            .lines()
+            .any(|line| !compiled.regex.is_match(line))
+            // An empty file has zero lines — match grep's behaviour where
+            // `-Lv` on an empty file emits nothing.
+            && content.lines().next().is_some()
+    } else {
+        any_match
+    };
+    if should_emit {
+        out.push(GrepMatch {
+            file: file.to_string(),
+            line: 0,
+            column: 0,
+            text: String::new(),
+            context_before: Vec::new(),
+            context_after: Vec::new(),
+        });
+    }
+}
+
 /// Line-oriented scan: one `GrepMatch` per matching line (grep default).
+///
+/// When `invert_match` is set, emit one `GrepMatch` per line that does NOT
+/// match. The reported `column` for inverted matches is always `1` (there
+/// is no match offset to point at) and the line text is the full line.
 fn grep_line_by_line(
     file: &str,
     lines: &[&str],
@@ -294,7 +405,11 @@ fn grep_line_by_line(
         if out.len() >= max_results {
             return;
         }
-        if let Some(m) = compiled.regex.find(line) {
+        if compiled.invert_match {
+            if !compiled.regex.is_match(line) {
+                out.push(build_match(file, lines, idx, 1, compiled));
+            }
+        } else if let Some(m) = compiled.regex.find(line) {
             out.push(build_match(
                 file,
                 lines,
@@ -399,6 +514,10 @@ mod tests {
             context: None,
             glob: None,
             multiline: false,
+            fixed_strings: false,
+            files_with_matches: false,
+            invert_match: false,
+            word_regexp: false,
             max_results: DEFAULT_MAX_RESULTS,
         }
     }
@@ -421,11 +540,19 @@ mod tests {
         assert!(r.context.is_none());
         assert!(r.glob.is_none());
         assert!(!r.multiline);
+        assert!(!r.fixed_strings);
+        assert!(!r.files_with_matches);
+        assert!(!r.invert_match);
+        assert!(!r.word_regexp);
         assert_eq!(r.max_results, DEFAULT_MAX_RESULTS);
         // Round-trip the documented default through serde.
         let parsed: GrepRequest = serde_json::from_str(r#"{"pattern":"x"}"#).unwrap();
         assert_eq!(parsed.max_results, DEFAULT_MAX_RESULTS);
         assert!(!parsed.case_insensitive);
+        assert!(!parsed.fixed_strings);
+        assert!(!parsed.files_with_matches);
+        assert!(!parsed.invert_match);
+        assert!(!parsed.word_regexp);
     }
 
     /// A literal match reports the 1-based line and column.
@@ -572,5 +699,129 @@ mod tests {
         let matches = run("a.rs", content, &req("X"));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].column, 6);
+    }
+
+    /// `-F` / `fixed_strings`: regex metacharacters are treated literally.
+    #[test]
+    fn fixed_strings_treats_pattern_as_literal() {
+        let content = "a.b\nacb\nax\n";
+        // As a regex, "a.b" matches both "a.b" and "acb"; as a literal, only "a.b".
+        let mut r = req("a.b");
+        let regex_hits = run("a.rs", content, &r);
+        assert_eq!(regex_hits.len(), 2);
+
+        r.fixed_strings = true;
+        let literal_hits = run("a.rs", content, &r);
+        assert_eq!(literal_hits.len(), 1);
+        assert_eq!(literal_hits[0].text, "a.b");
+    }
+
+    /// `-F` rejects no input — a pattern that would be an invalid regex
+    /// compiles cleanly when `fixed_strings` is set.
+    #[test]
+    fn fixed_strings_accepts_invalid_regex_chars() {
+        // `vec[` is an unterminated character class as a regex but a perfectly
+        // legal literal byte sequence; fixed_strings should still compile and
+        // match it.
+        let content = "vec[0] = 1;\nvec.get(0);\n";
+        let mut r = req("vec[");
+        assert!(CompiledGrep::compile(&r).is_err());
+        r.fixed_strings = true;
+        let matches = run("a.rs", content, &r);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 1);
+    }
+
+    /// `-l` / `files_with_matches`: emit one synthetic match per matching
+    /// file, with line/column zero and empty context.
+    #[test]
+    fn files_with_matches_returns_path_once() {
+        let content = "fn a() {}\n// TODO refactor\nfn b() {}\n// TODO inline\n";
+        let mut r = req("TODO");
+        // Without -l: two matches.
+        assert_eq!(run("a.rs", content, &r).len(), 2);
+
+        r.files_with_matches = true;
+        let matches = run("src/a.rs", content, &r);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file, "src/a.rs");
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].column, 0);
+        assert!(matches[0].text.is_empty());
+        assert!(matches[0].context_before.is_empty());
+        assert!(matches[0].context_after.is_empty());
+    }
+
+    /// `-l` emits nothing when the file has no matching line.
+    #[test]
+    fn files_with_matches_skips_non_matching_files() {
+        let mut r = req("ZZZ");
+        r.files_with_matches = true;
+        let matches = run("a.rs", "fn a() {}\nfn b() {}\n", &r);
+        assert!(matches.is_empty());
+    }
+
+    /// `-Lv`: emit only files that have at least one non-matching line and
+    /// are not empty.
+    #[test]
+    fn files_with_matches_honours_invert() {
+        let mut r = req("fn");
+        r.files_with_matches = true;
+        r.invert_match = true;
+        // Every line matches → emit nothing.
+        let all_match = "fn a() {}\nfn b() {}\n";
+        assert!(run("a.rs", all_match, &r).is_empty());
+        // At least one line doesn't match → emit once.
+        let mixed = "fn a() {}\nstruct S;\n";
+        let hits = run("a.rs", mixed, &r);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, "a.rs");
+    }
+
+    /// `-v` / `invert_match`: return lines that do NOT match the pattern.
+    #[test]
+    fn invert_match_returns_non_matching_lines() {
+        let content = "fn a() {}\nstruct S;\nfn b() {}\n";
+        let mut r = req("^fn");
+        // Default: two matching lines.
+        assert_eq!(run("a.rs", content, &r).len(), 2);
+        // Inverted: one non-matching line (`struct S;`).
+        r.invert_match = true;
+        let matches = run("a.rs", content, &r);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].text, "struct S;");
+        assert_eq!(matches[0].line, 2);
+        // Column is 1 for inverted matches (no offset to point at).
+        assert_eq!(matches[0].column, 1);
+    }
+
+    /// `-w` / `word_regexp`: pattern only matches at word boundaries.
+    #[test]
+    fn word_regexp_requires_boundaries() {
+        let content = "let log = 1;\nlet catalog = 2;\nlet log_level = 3;\n";
+        let mut r = req("log");
+        // Without -w: every line matches (substring hits).
+        assert_eq!(run("a.rs", content, &r).len(), 3);
+
+        r.word_regexp = true;
+        let matches = run("a.rs", content, &r);
+        // Only the bare `log` token survives; `catalog` and `log_level` are
+        // both word-character continuations on at least one boundary.
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 1);
+    }
+
+    /// `-Fw`: word boundaries wrap the escaped literal so regex
+    /// metacharacters in `pattern` don't break boundary semantics.
+    #[test]
+    fn word_regexp_composes_with_fixed_strings() {
+        let content = "use a.b;\nuse a.bc;\n";
+        let mut r = req("a.b");
+        r.fixed_strings = true;
+        r.word_regexp = true;
+        let matches = run("a.rs", content, &r);
+        // Boundary after `b` excludes `a.bc`.
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 1);
     }
 }
