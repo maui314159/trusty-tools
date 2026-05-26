@@ -1,0 +1,177 @@
+{
+  "corpus": "open-mpm",
+  "version": "0.1.0",
+  "purpose": "First organic-corpus benchmark for trusty-search v0.10.0 per-lane MCP tools (#5). The 47-file synthetic corpus (#123 v2) was too small to differentiate search_kg from search_semantic — KG-leading collapsed to hybrid because of low inter-file call density. open-mpm is ~282 source files of real Rust code authored before these benchmark queries existed, so it answers: does the KG signal pull its weight on an organic Rust workspace?",
+  "schema_notes": "Each query carries a `type` (definition / conceptual / kg_seed / negative), a `mode_hint` (code / text / data), and `ground_truth_files` (paths relative to the open-mpm crate root). KG-seed queries additionally carry `kg_seed_query` — a lexical query string used in stage-1 to discover the seed chunk_id before stage-2 runs search_kg.",
+  "categories": {
+    "definition": "Single distinctive identifier — caller wants the file where it is defined.",
+    "conceptual": "Multi-word phrase describing what the code does, not the identifier itself.",
+    "kg_seed": "Two-stage KG-relevant query: stage-1 lexical seeds the chunk_id, stage-2 search_kg returns connected chunks. Designed to exercise the symbol graph specifically (callers / callees / contains).",
+    "negative": "Symbol that does NOT exist in open-mpm. All tools should return zero/empty results gracefully."
+  },
+  "queries": [
+    {
+      "id": "Q01",
+      "text": "SubprocessAgentRunner",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/subprocess.rs"],
+      "description": "PascalCase struct that implements the AgentRunner trait by spawning a CLI subprocess. Exact symbol — lexical lane should hit."
+    },
+    {
+      "id": "Q02",
+      "text": "SessionsRegistry",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/session_registry.rs"],
+      "description": "PascalCase struct holding the on-disk catalogue of MPM sessions."
+    },
+    {
+      "id": "Q03",
+      "text": "PluginManager",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/plugins/manager.rs"],
+      "description": "PascalCase struct managing MCP plugin lifecycle (start / stop / status)."
+    },
+    {
+      "id": "Q04",
+      "text": "atomic_write",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/state_writer.rs"],
+      "description": "snake_case function: lock + tmp + rename atomic write helper. Tests #119 snake_case Definition routing on an organic corpus."
+    },
+    {
+      "id": "Q05",
+      "text": "cost_usd",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/perf.rs"],
+      "description": "snake_case function computing per-call LLM cost in USD from token usage. Another snake_case definition probe."
+    },
+    {
+      "id": "Q06",
+      "text": "MAX_FILE_BYTES",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/tools/file_filter.rs"],
+      "description": "SCREAMING_SNAKE constant — 512KB hard cap on read-file tool inputs. Expected to MISS on Hit@1 until #142+#143 land (constant-Definition routing); useful baseline data point."
+    },
+    {
+      "id": "Q07",
+      "text": "FINISH_TASK_TOOL_NAME",
+      "type": "definition",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/tools/finish_task.rs"],
+      "description": "SCREAMING_SNAKE constant — the tool-name string for the finish_task tool. Second SCREAMING_SNAKE probe."
+    },
+    {
+      "id": "Q08",
+      "text": "broadcast events to subscribers of a process-wide channel",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/events.rs"],
+      "description": "Describes the events module's broadcast::Sender pattern without naming it. No literal identifier overlap; semantic lane should win."
+    },
+    {
+      "id": "Q09",
+      "text": "spawn a CLI subagent and capture its stdout output",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/subprocess.rs"],
+      "description": "Conceptual description of spawn_subagent_and_run. The literal words 'spawn'/'subagent'/'stdout' do appear in the file but not as a phrase."
+    },
+    {
+      "id": "Q10",
+      "text": "atomic file write using lock and rename for crash safety",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/state_writer.rs"],
+      "description": "Conceptual description of atomic_write / atomic_append_line. Words like 'crash-safe' / 'lock' appear in module docs but not all together."
+    },
+    {
+      "id": "Q11",
+      "text": "compute reciprocal rank fusion of hybrid search lanes",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/search/indexer.rs", "src/context/bm25.rs"],
+      "description": "Describes the RRF fusion step. Tests whether semantic retrieval can connect a query that uses precise terminology ('reciprocal rank fusion') to the search subsystem."
+    },
+    {
+      "id": "Q12",
+      "text": "persist conversation turns to disk between agent invocations",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/memory/session_store.rs", "src/interaction_log.rs", "src/ctrl_session.rs"],
+      "description": "Multi-file conceptual query about session persistence. Any of these files counts as a hit; tests semantic disambiguation between three related modules."
+    },
+    {
+      "id": "Q13",
+      "text": "load skill markdown frontmatter and register skill index",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/skills/registry.rs", "src/skills/index.rs", "src/tools/skill_loader.rs"],
+      "description": "Conceptual query about skill loading. Multiple plausible files; semantic should rank skills/registry.rs or skills/index.rs at top."
+    },
+    {
+      "id": "Q14",
+      "text": "dispatch JSON-RPC tool calls to MCP servers over stdio",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/plugins/stdio_mcp.rs", "src/plugins/manager.rs"],
+      "description": "Conceptual query about MCP stdio plumbing. 'dispatch', 'JSON-RPC', 'stdio' don't all appear together; semantic vs lexical comparison probe."
+    },
+    {
+      "id": "Q15",
+      "text": "compute LLM token usage cost in dollars from input output rates",
+      "type": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": ["src/perf.rs"],
+      "description": "Conceptual description of cost_usd. Tests whether the daemon can route a multi-word description of a single small utility to the right file."
+    },
+    {
+      "id": "Q16",
+      "text": "SubprocessAgentRunner",
+      "type": "kg_seed",
+      "mode_hint": "code",
+      "kg_seed_query": "SubprocessAgentRunner",
+      "ground_truth_files": ["src/subprocess.rs", "src/runtime.rs", "src/ctrl/mod.rs", "src/agents/in_process_runner.rs", "src/agents/claude_code_runner.rs"],
+      "description": "Two-stage KG query. Stage 1: lexical lookup of SubprocessAgentRunner finds the seed chunk in subprocess.rs. Stage 2: search_kg returns chunks connected via calls / called_by / inherits edges — runtime.rs uses it, ctrl/mod.rs dispatches into it, sibling AgentRunner impls. Ground truth is the union of plausible KG neighbours."
+    },
+    {
+      "id": "Q17",
+      "text": "ToolRegistry",
+      "type": "kg_seed",
+      "mode_hint": "code",
+      "kg_seed_query": "ToolRegistry",
+      "ground_truth_files": ["src/tools/mod.rs", "src/tools/registry/mod.rs", "src/tools/tm_tools.rs", "src/runtime.rs", "src/agents/in_process_runner.rs"],
+      "description": "Two-stage KG query. Stage 1: lexical lookup of ToolRegistry finds the seed in tools/mod.rs. Stage 2: search_kg returns the call neighbourhood — register_tm_tools mutates it, in_process_runner consumes it, runtime constructs it. Ground truth is the call/use neighbourhood."
+    },
+    {
+      "id": "Q18",
+      "text": "EVENT_LINE_PREFIX",
+      "type": "kg_seed",
+      "mode_hint": "code",
+      "kg_seed_query": "EVENT_LINE_PREFIX",
+      "ground_truth_files": ["src/events.rs", "src/subprocess.rs", "src/ipc/mod.rs"],
+      "description": "Two-stage KG query starting at a SCREAMING_SNAKE constant. Stage 1: lexical finds EVENT_LINE_PREFIX (defined in events.rs). Stage 2: search_kg should reach the call sites that prefix event lines on stdout (subprocess.rs, ipc/mod.rs)."
+    },
+    {
+      "id": "Q19",
+      "text": "WidgetFactoryMutex",
+      "type": "negative",
+      "mode_hint": "code",
+      "ground_truth_files": [],
+      "description": "Negative case: this symbol does not exist anywhere in open-mpm. All four tools should return zero or near-zero results gracefully — the harness asserts no false-positive ground-truth match (vacuously true) and prints the top-1 file for diagnostic purposes."
+    },
+    {
+      "id": "Q20",
+      "text": "encrypt outbound telemetry stream cipher",
+      "type": "negative",
+      "mode_hint": "code",
+      "ground_truth_files": [],
+      "description": "Negative conceptual case: this is a query string from the synthetic corpus (Q08 of glyphwarpen-observatory) which should have zero meaningful matches in open-mpm. Validates that semantic similarity does not hallucinate spurious matches when no relevant code exists."
+    }
+  ]
+}
