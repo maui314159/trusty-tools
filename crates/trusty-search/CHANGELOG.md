@@ -9,7 +9,48 @@ Versions correspond to `Cargo.toml` patch releases.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **#110 Phase 2 — `trusty-embedderd` is now a required runtime dependency.**
+  When `TRUSTY_EMBEDDER` is unset, `trusty-search start` auto-spawns
+  `trusty-embedderd --stdio` as a supervised child process and communicates via
+  piped stdin/stdout (JSON-RPC 2.0). The child is restarted automatically on
+  crash (up to `TRUSTY_EMBEDDERD_MAX_RESTARTS`, default 5) and is killed when
+  the parent exits (via `kill_on_drop`).
+
+  **BREAKING:** If `trusty-embedderd` is not found on PATH and
+  `TRUSTY_EMBEDDERD_BIN` is unset, `trusty-search start` now **exits with an
+  error** rather than silently falling back to in-process embedding. This is a
+  deployment error — the sidecar architecture is a core design commitment, not
+  an optional feature.
+
+  **Upgrade action required:** install `trusty-embedderd` alongside
+  `trusty-search`:
+  ```
+  cargo install trusty-embedderd --locked
+  ```
+  To run without the sidecar (CI, debugging), set `TRUSTY_EMBEDDER=in-process`
+  explicitly. The in-process path is an escape hatch, not a default.
+
 ### Added
+
+- New `service/embedder_supervisor.rs` façade module: `SupervisorConfig` (with
+  `from_env()` / `into_common()`), `locate_embedderd_binary()`, and
+  `default_socket_path()`.
+- Four `TRUSTY_EMBEDDER` modes: `auto`/unset (default stdio-sidecar),
+  `in-process`, `http://...`, `unix:/path`.
+- New `UdsEmbedderAdapter` for the `unix:` transport mode.
+- New `SlotEmbedderAdapter` for the stdio-sidecar default: reads through the
+  supervisor's `Arc<RwLock<Arc<dyn EmbedderClient>>>` slot so crash-restart
+  swaps are transparent to all call sites.
+- Integration test file `tests/embedder_supervisor_e2e.rs` with 7 `#[ignore]`-
+  tagged lifecycle tests (spawn, batch, concurrency, crash-restart, empty batch,
+  bit-identical, bad-path).
+- New environment variables:
+  - `TRUSTY_EMBEDDERD_STARTUP_TIMEOUT_SECS` (default 30)
+  - `TRUSTY_EMBEDDERD_RESTART_BACKOFF_MAX_SECS` (default 60)
+  - `TRUSTY_EMBEDDERD_MAX_RESTARTS` (default 5)
+  - `TRUSTY_EMBEDDERD_BIN` — explicit path to the binary (overrides PATH search)
 
 - **Schema migration framework.** Daemon startup now auto-migrates existing
   redb indexes when the schema version changes between releases. Migrations are

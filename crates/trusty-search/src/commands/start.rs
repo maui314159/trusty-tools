@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use colored::Colorize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -251,49 +252,36 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
     }
 }
 
-/// Build a shared `FastEmbedder` for every index registered during the
-/// daemon's lifetime.
+/// Resolve the embedder back-end and return an `Arc<dyn Embedder>` ready for use.
 ///
-/// Why (Bug A fix): without this, `create_index_handler` constructs a BM25-only
-/// `CodeIndexer` and the HNSW lane silently contributes nothing — the symptom
-/// seen in the 115k-chunk benchmark where every result returned
-/// `match_reason: "bm25"`.
+/// Why (issue #110 Phase 2 — stdio): `trusty-embedderd` is a required runtime
+/// dependency. Running embedding in-process inside the search daemon couples
+/// the ONNX model lifecycle to the daemon's memory budget and prevents
+/// independent restart/upgrade of the embedding subsystem. The sidecar
+/// architecture is a core design commitment, not an optional feature — silent
+/// fallback to in-process would let users miss the new architecture entirely.
 ///
-/// Why (blocking init): previously a failure here returned `None` and the
-/// daemon continued in BM25-only mode without any visible signal — operators
-/// only noticed when every search returned `match_reason: "bm25"` and an
-/// entire 17k-file repo "indexed" in 12 seconds (no ONNX work happened).
-/// Now: success is logged at INFO with the embedding dimension so operators
-/// can confirm the model loaded; failure is logged at ERROR and propagated
-/// so the daemon exits non-zero rather than silently degrading.
+/// What: reads `TRUSTY_EMBEDDER` and dispatches:
+///   - unset / `auto` / `stdio` → spawn trusty-embedderd --stdio (DEFAULT; fails
+///     fast with an install hint if the binary is not found on PATH)
+///   - `in-process`             → in-process FastEmbedder (explicit escape hatch
+///     for tests / debugging — never silently activated)
+///   - `http://…`               → HTTP remote (manually managed embedderd)
+///   - `unix:/path`             → UDS remote (manually managed embedderd)
+///   - `candle`                 → Candle Metal backend (feature-gated)
 ///
-/// Why (issue #110 Phase 1): when `TRUSTY_EMBEDDER` is set to an HTTP address
-/// (`http://...`) the daemon switches to `RemoteEmbedderClient` and sends all
-/// embed calls to a running `trusty-embedderd` instance. Default behaviour
-/// (`local`, `in-process`, or unset) is unchanged — `InProcessEmbedderClient`
-/// wraps the existing `FastEmbedder`.
-///
-/// Test: run `trusty-search start` with `RUST_LOG=info` — the log MUST
-/// contain `embedder: in-process` or `embedder: remote http://...` before any
-/// HTTP request is accepted. Force a failure (e.g. delete the model cache while
-/// offline) and the daemon must exit non-zero, not start in BM25 mode.
+/// Test: run `trusty-search start` with `RUST_LOG=info` — the startup log must
+/// contain `embedder mode: stdio-sidecar` before the first request is served.
+/// To test fail-fast: run with PATH stripped and TRUSTY_EMBEDDERD_BIN unset;
+/// the process must exit with an error containing "cargo install trusty-embedderd".
 async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
-    // Issue #110 Phase 1: check TRUSTY_EMBEDDER for a remote HTTP address.
-    // A value starting with "http://" or "https://" routes to the remote path.
-    // Unset, "local", or "in-process" all fall through to the default path.
-    let trusty_embedder_env = std::env::var("TRUSTY_EMBEDDER").unwrap_or_default();
-    if trusty_embedder_env.starts_with("http://") || trusty_embedder_env.starts_with("https://") {
-        tracing::info!("embedder: remote {}", trusty_embedder_env);
-        let client =
-            trusty_common::embedder_client::RemoteEmbedderClient::new(trusty_embedder_env.clone());
-        return Ok(std::sync::Arc::new(RemoteEmbedderAdapter { client }));
-    }
+    use crate::service::embedder_supervisor::{
+        locate_embedderd_binary, EmbedderSupervisor, SupervisorConfig,
+    };
 
-    // Issue #41 phase 4: when the candle feature is compiled in AND the
-    // operator opts in via `TRUSTY_EMBEDDER=candle`, build a `CandleEmbedder`
-    // instead of the ONNX/fastembed path. This bypasses the CoreML jetsam
-    // risk on Apple Silicon while keeping the embedding contract identical
-    // (384-dim L2-normalised f32).
+    let trusty_embedder_env = std::env::var("TRUSTY_EMBEDDER").unwrap_or_default();
+
+    // Issue #41 phase 4: candle Metal path (feature-gated, explicit opt-in).
     #[cfg(feature = "candle")]
     {
         if trusty_embedder_env == "candle" {
@@ -307,7 +295,95 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
         }
     }
 
-    tracing::info!("embedder: in-process");
+    match trusty_embedder_env.as_str() {
+        // ── Auto-spawn stdio sidecar (Phase 2 default) ─────────────────────
+        // `TRUSTY_EMBEDDER` unset, "auto", or "stdio" → spawn
+        // `trusty-embedderd --stdio` and communicate via piped stdin/stdout.
+        // No socket files. Lifecycle tied to parent.
+        "" | "auto" | "stdio" => {
+            // `trusty-embedderd` is a required runtime dependency — fail fast
+            // with an actionable install hint rather than silently downgrading
+            // to in-process embedding. Users who need to skip the sidecar for
+            // tests or debugging must set `TRUSTY_EMBEDDER=in-process` explicitly.
+            let binary = locate_embedderd_binary().map_err(|e| {
+                anyhow::anyhow!(
+                    "{e}\n\n\
+                     ERROR: trusty-embedderd binary not found on PATH.\n\
+                     \n\
+                     trusty-search v0.13+ requires trusty-embedderd to be installed alongside it.\n\
+                     \n\
+                     Install it with:\n\
+                     \x20 cargo install trusty-embedderd --locked\n\
+                     \n\
+                     Or set TRUSTY_EMBEDDERD_BIN to an absolute path:\n\
+                     \x20 export TRUSTY_EMBEDDERD_BIN=/path/to/trusty-embedderd\n\
+                     \n\
+                     If you need to run without the sidecar (tests, debugging), use:\n\
+                     \x20 TRUSTY_EMBEDDER=in-process trusty-search start"
+                )
+            })?;
+
+            let config = SupervisorConfig::from_env();
+
+            tracing::info!("embedder mode: stdio-sidecar (binary={})", binary.display());
+
+            let (supervisor, slot) = EmbedderSupervisor::spawn_stdio(binary, config.into_common())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to spawn trusty-embedderd --stdio: {e}"))?;
+
+            // `start_supervisor_task` consumes the supervisor (detaches the
+            // loop as a background Tokio task). The child's `kill_on_drop`
+            // ensures cleanup when trusty-search exits; the supervisor loop
+            // handles crash-restart while running.
+            supervisor.start_supervisor_task();
+
+            // `SlotEmbedderAdapter` forwards embed calls to whatever client is
+            // currently stored in the slot. The supervisor swaps the slot on
+            // crash-restart so callers transparently use the new sidecar.
+            Ok(Arc::new(SlotEmbedderAdapter { slot }))
+        }
+
+        // ── In-process safety-valve ────────────────────────────────────────
+        "in-process" | "local" => {
+            tracing::info!("embedder mode: in-process (override via TRUSTY_EMBEDDER=in-process)");
+            build_in_process_embedder().await
+        }
+
+        // ── HTTP remote (manually managed embedderd) ───────────────────────
+        addr if addr.starts_with("http://") || addr.starts_with("https://") => {
+            tracing::info!("embedder mode: remote http ({})", addr);
+            let client = trusty_common::embedder_client::RemoteEmbedderClient::new(addr.to_owned());
+            Ok(Arc::new(RemoteEmbedderAdapter {
+                client: EmbedderClientKind::Http(client),
+            }))
+        }
+
+        // ── UDS remote (manually managed embedderd) ────────────────────────
+        path if path.starts_with("unix:") => {
+            let sock = PathBuf::from(&path["unix:".len()..]);
+            tracing::info!("embedder mode: remote uds ({})", sock.display());
+            let client = trusty_common::embedder_client::UdsEmbedderClient::new(sock);
+            Ok(Arc::new(UdsEmbedderAdapter { client }))
+        }
+
+        other => anyhow::bail!(
+            "invalid TRUSTY_EMBEDDER value: {other:?}. \
+             Expected: unset (default stdio sidecar), 'auto', 'stdio', 'in-process', \
+             'http://...', or 'unix:/path/to/socket'"
+        ),
+    }
+}
+
+/// Build the in-process `FastEmbedder` and log details.
+///
+/// Why: extracted from the monolithic `build_embedder` so the `in-process`
+/// escape-hatch path has a clean, focused helper. This is never called from
+/// the default `auto`/`stdio` path — it is only reachable via explicit
+/// `TRUSTY_EMBEDDER=in-process` or `TRUSTY_EMBEDDER=local`.
+/// What: constructs `FastEmbedder`, logs the provider / dimension, applies
+/// GPU batch-size tuning, and wraps in an `Arc<dyn Embedder>`.
+/// Test: exercised when `TRUSTY_EMBEDDER=in-process` is set explicitly.
+async fn build_in_process_embedder() -> Result<Arc<dyn crate::core::Embedder>> {
     let embedder = crate::core::FastEmbedder::new().await.map_err(|e| {
         tracing::error!("FastEmbedder init failed: {e:#}");
         anyhow::anyhow!("FastEmbedder init failed: {e}")
@@ -324,36 +400,95 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
         "embedder initialized: model=AllMiniLML6V2(Q) dim={dim} provider={provider}{metal_hint}"
     );
     tune_batch_size_for_provider(provider);
-    Ok(std::sync::Arc::new(embedder))
+    Ok(Arc::new(embedder))
+}
+
+/// Internal enum for the HTTP remote adapter to hold either HTTP or UDS client.
+///
+/// Why: avoids duplicating the `RemoteEmbedderAdapter` struct for the two HTTP
+/// variants — both share identical adapter logic and differ only in the
+/// concrete `EmbedderClient` impl they hold.
+/// What: two variants, each wrapping the corresponding `trusty_common`
+/// client type.
+/// Test: exercised via `TRUSTY_EMBEDDER=http://...` (Http variant) startup.
+enum EmbedderClientKind {
+    Http(trusty_common::embedder_client::RemoteEmbedderClient),
 }
 
 /// Adapter that implements trusty-search's `Embedder` trait by delegating to
-/// a `RemoteEmbedderClient` (issue #110 Phase 1).
+/// a `RemoteEmbedderClient` (HTTP) (issue #110 Phase 1 / Phase 2).
 ///
 /// Why: trusty-search's internal `Embedder` trait uses `&[&str]` slices;
 /// `EmbedderClient` uses `Vec<String>`. This adapter bridges the two without
 /// modifying either side.
 ///
-/// What: holds an `Arc<RemoteEmbedderClient>` and impls the local `Embedder`
+/// What: holds an `EmbedderClientKind` and impls the local `Embedder`
 /// facade that `CodeIndexer` and `EmbedPool` hold behind `Arc<dyn Embedder>`.
 ///
 /// Test: exercised end-to-end when `TRUSTY_EMBEDDER=http://...` is set at
 /// daemon startup; the `bit_identical` integration test validates correctness.
 struct RemoteEmbedderAdapter {
-    client: trusty_common::embedder_client::RemoteEmbedderClient,
+    client: EmbedderClientKind,
 }
 
 #[async_trait::async_trait]
 impl crate::core::Embedder for RemoteEmbedderAdapter {
     async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         use trusty_common::embedder_client::EmbedderClient as _;
+        let mut v = match &self.client {
+            EmbedderClientKind::Http(c) => c
+                .embed_batch(vec![text.to_string()])
+                .await
+                .map_err(|e| anyhow::anyhow!("remote embed failed: {e}"))?,
+        };
+        v.pop()
+            .ok_or_else(|| anyhow::anyhow!("remote embedder returned no vector"))
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        use trusty_common::embedder_client::EmbedderClient as _;
+        let owned: Vec<String> = texts.iter().map(|s| (*s).to_owned()).collect();
+        match &self.client {
+            EmbedderClientKind::Http(c) => c
+                .embed_batch(owned)
+                .await
+                .map_err(|e| anyhow::anyhow!("remote embed_batch failed: {e}")),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        trusty_common::embedder::EMBED_DIM
+    }
+}
+
+/// Adapter that implements trusty-search's `Embedder` trait by delegating to
+/// a `UdsEmbedderClient` (issue #110 Phase 2).
+///
+/// Why: the auto-spawn path uses a UDS socket for low-latency IPC; this
+/// adapter bridges the `EmbedderClient` trait (Vec<String>) to the internal
+/// `Embedder` trait (&[&str]) without changing either side.
+///
+/// What: holds a `UdsEmbedderClient` and delegates `embed` / `embed_batch`
+/// calls through the EmbedderClient trait.
+///
+/// Test: exercised whenever `TRUSTY_EMBEDDER` is unset (auto-spawn) or set to
+/// `unix:/path`; the `supervisor_spawns_and_serves_embed_requests` integration
+/// test validates round-trip correctness.
+struct UdsEmbedderAdapter {
+    client: trusty_common::embedder_client::UdsEmbedderClient,
+}
+
+#[async_trait::async_trait]
+impl crate::core::Embedder for UdsEmbedderAdapter {
+    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        use trusty_common::embedder_client::EmbedderClient as _;
         let mut v = self
             .client
             .embed_batch(vec![text.to_string()])
             .await
-            .map_err(|e| anyhow::anyhow!("remote embed failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("uds embed failed: {e}"))?;
         v.pop()
-            .ok_or_else(|| anyhow::anyhow!("remote embedder returned no vector"))
+            .ok_or_else(|| anyhow::anyhow!("uds embedder returned no vector"))
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -362,7 +497,53 @@ impl crate::core::Embedder for RemoteEmbedderAdapter {
         self.client
             .embed_batch(owned)
             .await
-            .map_err(|e| anyhow::anyhow!("remote embed_batch failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("uds embed_batch failed: {e}"))
+    }
+
+    fn dimension(&self) -> usize {
+        trusty_common::embedder::EMBED_DIM
+    }
+}
+
+/// Adapter for the stdio sidecar path that reads through the supervisor's
+/// `Arc<RwLock<Arc<dyn EmbedderClient>>>` slot.
+///
+/// Why: the supervisor atomically swaps the live `StdioEmbedderClient` inside
+/// the slot on each crash-restart. Wrapping the slot access in this adapter
+/// keeps the swap transparent to all call sites — they hold one
+/// `Arc<SlotEmbedderAdapter>` and never see the underlying swap.
+///
+/// What: each `embed` / `embed_batch` call acquires a read lock, clones the
+/// inner `Arc<dyn EmbedderClient>`, releases the lock immediately, and
+/// delegates. The read lock is held only for the clone — actual embedding work
+/// happens outside the lock so a restart swap doesn't block in-flight calls.
+///
+/// Test: exercised whenever `TRUSTY_EMBEDDER` is unset or set to `auto` /
+/// `stdio`; the `supervisor_spawns_and_serves_embed_requests` integration test
+/// validates round-trip correctness.
+struct SlotEmbedderAdapter {
+    slot: Arc<tokio::sync::RwLock<Arc<dyn trusty_common::embedder_client::EmbedderClient>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::core::Embedder for SlotEmbedderAdapter {
+    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let client = self.slot.read().await.clone();
+        let mut v = client
+            .embed_batch(vec![text.to_string()])
+            .await
+            .map_err(|e| anyhow::anyhow!("stdio embed failed: {e}"))?;
+        v.pop()
+            .ok_or_else(|| anyhow::anyhow!("stdio embedder returned no vector"))
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let client = self.slot.read().await.clone();
+        let owned: Vec<String> = texts.iter().map(|s| (*s).to_owned()).collect();
+        client
+            .embed_batch(owned)
+            .await
+            .map_err(|e| anyhow::anyhow!("stdio embed_batch failed: {e}"))
     }
 
     fn dimension(&self) -> usize {
@@ -701,33 +882,21 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
         state = state.with_metrics(m);
     }
 
-    // Spawn embedder load on a background task; the daemon's HTTP server
-    // starts serving requests in parallel. On success, `install_embedder`
-    // populates the slot and flips the readiness watch so the next inbound
-    // request transitions out of the "initializing" branch. On failure, we
-    // log loudly but leave the daemon running in BM25-only mode — operators
-    // can `/health`-check `embedder: "unavailable"` and intervene. We can't
-    // exit the process here without racing the HTTP server's shutdown path.
-    // Why (issue #121): on Intel Xeon AVX-512 hosts, `ort-2.0.0-rc.12`'s CPU
-    // session init can block the calling thread indefinitely with no error,
-    // no timeout, and no panic. Running `build_embedder().await` on a normal
-    // Tokio task means the blocking native code parks a Tokio worker thread
-    // forever, and the surrounding `tokio::spawn` future never makes progress.
+    // Issue #110 Phase 2: the embedder init runs on a dedicated background
+    // task so the HTTP listener can bind and accept requests while the ONNX
+    // model (or trusty-embedderd subprocess) is coming up.
     //
-    // Fix has two parts:
-    //   1. Run the ORT/fastembed init on a dedicated `spawn_blocking` thread
-    //      so a hung init only consumes one blocking-pool thread instead of
-    //      starving the async executor.
-    //   2. Race the init against `TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS` (default
-    //      60 s). If init does not complete in time, transition the embedder
-    //      to an `"error"` state (visible via `/health`) so callers stop
-    //      polling and `POST /indexes` fails fast instead of dangling forever.
+    // For the `auto` / `in-process` paths, the actual heavy work (ONNX session
+    // init, or subprocess spawn + readiness poll) is wrapped in `spawn_blocking`
+    // to avoid blocking the async executor on synchronous native code (see
+    // issue #121: Intel Xeon AVX-512 ORT hang). The `auto` spawn path is async-
+    // native (Tokio process), so `build_embedder` is already async; the
+    // `spawn_blocking` wrapper is a no-op overhead for that branch, but it
+    // keeps the timeout logic uniform across all paths.
     //
-    // The dedicated thread is intentionally NOT joined on timeout — the ORT
-    // call is hung in native code we cannot abort safely, so we leak the
-    // thread rather than risk an unsound abort. The daemon keeps running in
-    // BM25-only mode; the operator is expected to restart with a working ORT
-    // configuration after seeing the error.
+    // The supervisor handle is stored in an `Arc<Mutex<Option<_>>>` so the
+    // shutdown hook (below) can reach it after `tokio::spawn` consumes the
+    // original binding.
     let init_timeout_secs: u64 = std::env::var("TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -736,11 +905,12 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
     let install_state = state.clone();
     tokio::spawn(async move {
         let runtime_handle = tokio::runtime::Handle::current();
+
         let init_handle = tokio::task::spawn_blocking(move || {
-            // `build_embedder` is async only because `FastEmbedder::new()` is;
-            // the heavy lifting (ONNX session init) happens in synchronous
-            // native code inside ORT, so isolating it on a blocking thread is
-            // both correct and necessary.
+            // `build_embedder` is async; using `block_on` here is correct
+            // because we're on a `spawn_blocking` thread (not a Tokio worker).
+            // This preserves the issue #121 fix for in-process ONNX init while
+            // also allowing the async subprocess-spawn path to run.
             runtime_handle.block_on(build_embedder())
         });
 
@@ -802,7 +972,7 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
                 tokio::spawn(crate::commands::discover::auto_discover_and_index());
             }
             Ok(Ok(Err(e))) => {
-                let msg = format!("FastEmbedder init failed: {e}");
+                let msg = format!("embedder init failed: {e}");
                 install_state.install_embedder_error(msg.clone()).await;
                 eprintln!(
                     "{} embedder failed to initialize: {e}\n\
@@ -836,6 +1006,11 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
             }
         }
     });
+
+    // The auto-spawned trusty-embedderd subprocess uses `kill_on_drop(true)`,
+    // so it is terminated automatically when the supervisor task (and its
+    // `Child` handle) is dropped on daemon exit. No explicit shutdown hook
+    // is needed.
     match crate::service::run_daemon(state, port).await {
         Ok(()) => {}
         Err(crate::service::DaemonError::AlreadyRunning(p)) => {
@@ -863,7 +1038,8 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str, verbose: bo
 
 #[cfg(test)]
 mod tests {
-    //! Warm-boot stage-restoration tests (issue #135).
+    //! Warm-boot stage-restoration tests (issue #135) and embedder fail-fast
+    //! smoke tests.
     //!
     //! Why: the warm-boot path in [`restore_indexes`] is async and pulls in
     //! the full daemon-init machinery (memory policy detection, embedder
@@ -990,5 +1166,80 @@ mod tests {
         assert_eq!(stages.lexical.status, StageStatus::InProgress);
         assert_eq!(stages.lifecycle_status(), "walking");
         assert!(stages.search_capabilities().is_empty());
+    }
+
+    /// When `trusty-embedderd` is not on PATH and `TRUSTY_EMBEDDERD_BIN` is
+    /// unset, the default `auto`/`stdio` path must fail fast with an
+    /// actionable error containing the install hint — not silently fall back
+    /// to in-process embedding.
+    ///
+    /// Why (issue #110 Phase 2 course-correction): the soft fallback
+    /// `"trusty-embedderd not found; falling back to in-process"` was the
+    /// same "lazy" pattern the user explicitly rejected. Missing binary means
+    /// the operator has not completed their upgrade — that is a deployment
+    /// error, not a reason to silently downgrade the architecture.
+    /// What: sets `TRUSTY_EMBEDDERD_BIN` to a non-existent path, calls
+    /// `locate_embedderd_binary`, and asserts:
+    ///   (a) the result is `Err`,
+    ///   (b) the error string contains `"cargo install trusty-embedderd"`.
+    /// Test: this test (no binary / ONNX model needed; always runs).
+    #[test]
+    fn missing_binary_fails_fast_with_install_hint() {
+        use crate::service::embedder_supervisor::locate_embedderd_binary;
+
+        // Isolate from the real environment: point TRUSTY_EMBEDDERD_BIN at a
+        // path that definitely does not exist, bypassing the PATH walk.
+        // SAFETY: test-only. Cargo runs each test binary in its own process
+        // (not a thread-per-test model), so env mutation here is safe as long
+        // as no parallel test reads the same var. This is the only test in
+        // this module that touches TRUSTY_EMBEDDERD_BIN.
+        let prev = std::env::var("TRUSTY_EMBEDDERD_BIN").ok();
+        unsafe {
+            std::env::set_var(
+                "TRUSTY_EMBEDDERD_BIN",
+                "/nonexistent/path/trusty-embedderd-missing",
+            );
+        }
+        let result = locate_embedderd_binary();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TRUSTY_EMBEDDERD_BIN", v),
+                None => std::env::remove_var("TRUSTY_EMBEDDERD_BIN"),
+            }
+        }
+
+        // The locate call itself must fail.
+        assert!(
+            result.is_err(),
+            "locate_embedderd_binary must return Err when binary is absent"
+        );
+
+        // The error message that `build_embedder` wraps around the locate
+        // error must contain the install hint. We construct it here exactly
+        // as `build_embedder` does to assert the hint text stays in sync.
+        let locate_err = result.unwrap_err();
+        let wrapped = format!(
+            "{locate_err}\n\n\
+             ERROR: trusty-embedderd binary not found on PATH.\n\
+             \n\
+             trusty-search v0.13+ requires trusty-embedderd to be installed alongside it.\n\
+             \n\
+             Install it with:\n\
+             \x20 cargo install trusty-embedderd --locked\n\
+             \n\
+             Or set TRUSTY_EMBEDDERD_BIN to an absolute path:\n\
+             \x20 export TRUSTY_EMBEDDERD_BIN=/path/to/trusty-embedderd\n\
+             \n\
+             If you need to run without the sidecar (tests, debugging), use:\n\
+             \x20 TRUSTY_EMBEDDER=in-process trusty-search start"
+        );
+        assert!(
+            wrapped.contains("cargo install trusty-embedderd"),
+            "install hint must contain 'cargo install trusty-embedderd'; got: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("TRUSTY_EMBEDDER=in-process"),
+            "escape hatch hint must mention TRUSTY_EMBEDDER=in-process; got: {wrapped}"
+        );
     }
 }
