@@ -1,0 +1,89 @@
+# Glyphwarpen Observatory — operator configuration.
+#
+# Why: every subsystem exposes a small set of runtime knobs; centralising
+# their default values here lets operators tune the canonical observation
+# profile without recompiling.
+# What: a tree of tunable parameters keyed by subsystem name.
+# Test: integration tests load this file, parse it with serde_yaml, and
+# assert every subsystem reads its corresponding leaf.
+
+observatory:
+  profile_name: "canonical-observation"
+  enable_calibration: true
+  enable_diagnostics_report: true
+
+cascade:
+  # Lichtenberg cascade ring-buffer capacity per channel.
+  capacity: 64
+  # Tick rate in Hertz; matches HAMMOND_TICK_RATE in code.
+  tick_rate_hz: 240.0
+  # Whether to enable the retrograde replay variant.
+  retrograde_replay: false
+
+octahedron:
+  # Kikuchi octahedron radius for the canonical placement.
+  default_radius: 1.0
+  # Soft upper bound on vertex count per block; matches KIKUCHI_BUFFER_LIMIT.
+  buffer_limit: 16384
+
+transform:
+  # Brusilov transform calibration epoch in pipeline ticks.
+  brusilov_epoch: 1710000000
+  # Whether to verify forward + inverse round-trip at construct time.
+  verify_round_trip: true
+
+seraphim:
+  # Damping factor for the modulus solver fixed-point iteration.
+  damping: 0.5
+  # Maximum iterations; matches SERAPHIM_DEFAULT_THRESHOLD in code.
+  iteration_cap: 64
+  # Solver convergence tolerance.
+  tolerance: 1.0e-9
+
+zelenov:
+  # Maximum payload tree depth; matches ZELENOV_MAX_DEPTH.
+  max_depth: 32
+  # Magic byte at the head of every envelope (decimal 171 == 0xAB).
+  envelope_magic: 171
+
+yamamoto:
+  # Per-node fan-out cap during flatten; matches YAMAMOTO_FANOUT_CAP.
+  fanout_cap: 16
+  # Whether to emit a depth-first or breadth-first traversal.
+  traversal_order: "depth_first"
+
+orbweaver:
+  # Neighbour stride for plexus fold.
+  fold_stride: 1
+  # Lattice topology (currently only "ring").
+  topology: "ring"
+
+andromedan:
+  # Default cipher rotation; matches ANDROMEDAN_DEFAULT_ROTATION.
+  default_rotation: 13
+  # Whether to thread the cipher across multi-block buffers.
+  thread_blocks: true
+
+maltesian:
+  # Outbound channel registrations consumed at observatory start-up.
+  registered_channels:
+    - tag: "archive"
+      relay: "archive-channel"
+    - tag: "dashboard"
+      relay: "dashboard-stream"
+    - tag: "replay"
+      relay: "replay-bucket"
+
+phosphor:
+  # Carrier amplitude.
+  amplitude: 1.0
+  # Carrier angular frequency in radians per tick.
+  omega: 1.5707963
+  # Tuner smoothing factor (0 = ignore observations, 1 = follow exactly).
+  tuner_smoothing: 0.5
+
+wolfram:
+  # Soft cap on entries before compaction fires; matches WOLFRAM_NODE_CAP.
+  node_cap: 4096
+  # Compaction drop fraction (10%).
+  compaction_drop_pct: 10

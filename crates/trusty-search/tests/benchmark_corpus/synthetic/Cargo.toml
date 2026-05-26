@@ -1,0 +1,36 @@
+# Synthetic benchmark corpus manifest for the glyphwarpen-observatory fixture.
+#
+# Why: trusty-search benchmarks against trusty-tools itself suffer BM25 circular
+# bias (#123) because benchmark query strings appear as assert literals in the
+# indexed test code. This fixture is a fake Rust workspace with distinctive
+# symbol names that never appear outside this directory, so the BM25 lane
+# cannot lift a query simply by seeing the query string verbatim.
+#
+# What: a standalone Cargo.toml that makes the directory tree-sitter-chunkable
+# as a Rust project. It is INTENTIONALLY isolated from the parent workspace
+# (the `[workspace]` table below tells Cargo "this is a standalone package,
+# stop searching upward") and INTENTIONALLY has no dependencies. Nothing in
+# this manifest is ever built — `cargo build` excludes the directory entirely.
+#
+# Test: verify isolation with `cargo metadata --no-deps | jq '.packages | length'`
+# from the repo root — should report only the real workspace members, not this
+# fixture.
+
+[workspace]
+# Marker telling Cargo this is a self-contained package, not a member of the
+# enclosing trusty-tools workspace.
+
+[package]
+name = "glyphwarpen-observatory"
+version = "0.1.0"
+edition = "2021"
+description = "Synthetic non-circular benchmark corpus for trusty-search (issue #123)."
+license = "Elastic-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Empty on purpose — the corpus must not pull external crates because nothing
+# actually compiles it. The `use` lines in source files reference fake crate
+# paths that exist only to give tree-sitter realistic shape to chunk.
