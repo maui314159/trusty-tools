@@ -77,6 +77,14 @@ Only set `publish = false` on crates that are **not** depended on by any publish
 
 When publishing a main crate for the first time (or after updating a sidecar), publish the sidecar lib first, wait for crates.io index propagation (~90s), then publish the main crate.
 
+### License field for crates.io (ALL published crates)
+
+crates.io requires either a valid SPDX identifier or a `license-file`. `Elastic-2.0` is NOT in the SPDX registry. Every Elastic-licensed crate MUST use:
+```toml
+license-file = "LICENSE"
+```
+NOT `license = "Elastic-2.0"` (will be rejected at publish time). MIT-licensed crates use `license = "MIT"` (that is SPDX-valid). Verify before publishing any new crate.
+
 ### [patch.crates-io] for sidecar crates
 
 After publishing a sidecar lib, add (or update) its entry in the workspace root `Cargo.toml` `[patch.crates-io]` section so local builds continue to use the in-tree source:
@@ -95,7 +103,7 @@ When adding a new sidecar to any main crate, update this list:
 | Main crate | Bundled binaries | Sidecar lib on crates.io |
 |---|---|---|
 | trusty-search | `trusty-search`, `trusty-embedderd` ✅ (PR #190) | `trusty-embedderd` v0.3.0 ✅ |
-| trusty-memory | `trusty-memory`, `trusty-bm25-daemon` ✅ (PR #191) | `trusty-bm25-daemon` — needs publish |
+| trusty-memory | `trusty-memory`, `trusty-bm25-daemon` ✅ (PR #191) | `trusty-bm25-daemon` v0.1.0 ✅ (PR #214) |
 | trusty-analyze | `trusty-analyze` (no sidecars) | — |
 | trusty-git-analytics | `tga` (no sidecars) | — |
 | trusty-mpm | `tm`, `trusty-mpm-daemon`, `trusty-mpm-mcp`, `trusty-mpm-tui`, `trusty-mpm-telegram` (feature-gated, publish=false) | n/a |
