@@ -165,6 +165,7 @@ tree-sitter-scala = "0.24"
 # Their [patch] entries are no longer needed.
 [patch.crates-io]
 trusty-common = { path = "crates/trusty-common" }
+trusty-embedderd = { path = "crates/trusty-embedderd" }
 
 [profile.dev]
 opt-level = 0
