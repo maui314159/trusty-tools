@@ -42,9 +42,26 @@ Examples:
 - `v0.8.1-2026-05-25.md` — v0.8.1 benchmarked on May 25, 2026
 - `v0.9.0-2026-06-15.md` — v0.9.0 benchmarked on June 15, 2026
 
-## Latest Baseline
+## Snapshot Index
 
-See `current.md` (symlink to the most recent snapshot) or the table in the tracking issue (#129).
+### Version snapshots (release-over-release)
+
+- [`v0.10.0-2026-05-25.md`](v0.10.0-2026-05-25.md) — #138 per-lane MCP tools landed. Hit@1 67%, Hit@5 72-78% on open-mpm.
+- [`v0.9.2-2026-05-25.md`](v0.9.2-2026-05-25.md) — #122 Function/Method Definition boost (metrics flat; blocked on #142+#143).
+- [`v0.9.1-2026-05-25.md`](v0.9.1-2026-05-25.md) — Async spawn Phase 2 experiments (latency p95 flat).
+- [`v0.9.0-2026-05-25.md`](v0.9.0-2026-05-25.md) — Staged pipeline Phase 1 shipped. Stage 1 (lexical-only, 302ms/100 files).
+- [`v0.8.3-2026-05-25.md`](v0.8.3-2026-05-25.md) — Docs-by-default + QueryClassifier acronym fixes.
+- [`v0.8.1-2026-05-25.md`](v0.8.1-2026-05-25.md) — Walker .gitignore fix (#100). First honest measurements post-corruption.
+
+### Alternate-corpus baselines
+
+- [`synthetic-corpus-baseline-2026-05-25.md`](synthetic-corpus-baseline-2026-05-25.md) — Non-circular 47-file synthetic corpus (#123 v2). Eliminates BM25 circular-bias contamination. Clean Hit@1: 43% lexical, 43% hybrid on definitions.
+- [`open-mpm-baseline-2026-05-25.md`](open-mpm-baseline-2026-05-25.md) — First organic-corpus measurement (282 files / 6,611 chunks via v0.10.0).
+- [`baseline-performance-2026-05-22.md`](baseline-performance-2026-05-22.md) — Pre-session baseline performance reference.
+
+### Latest
+
+[`current.md`](current.md) — symlink to the latest version snapshot (currently v0.10.0-2026-05-25).
 
 ## Caveat: BM25 Circular Bias (#123)
 
