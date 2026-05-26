@@ -20,7 +20,7 @@
 //! tests cover the RSS measurement helper. The full validation requires
 //! Apple Silicon hardware (and ideally a host with > 16 GB RAM so the
 //! 72 GB spike, if it recurs, doesn't take down the box) — results land
-//! in `docs/candle-metal-validation.md`.
+//! in `docs/research/candle-metal-validation-2026-05-22.md`.
 //!
 //! Usage:
 //!   cargo run -p trusty-embedder --features candle --release \
@@ -231,7 +231,7 @@ fn print_backend(r: &BackendResult) {
 ///
 /// Why: a written, mechanical rule is harder to fudge than a judgement
 /// call. The criteria intentionally mirror what's recorded in
-/// `docs/candle-metal-validation.md`.
+/// `docs/research/candle-metal-validation-2026-05-22.md`.
 /// What: returns `true` (GO) iff candle peak RSS is under the configured
 /// limit (default 8 GB) AND, when a baseline is present, candle
 /// throughput is within the configured slowdown factor (default 2×) of
