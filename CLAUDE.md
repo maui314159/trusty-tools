@@ -155,6 +155,42 @@ For the source layout of any crate, read its `README.md` or browse
 `crates/<name>/src/`. Each crate owns its own `README.md` covering purpose,
 usage, and design notes.
 
+## Documentation Layout
+
+Documentation is organized by **published crate**, not by topic. Each crate gets
+a directory under `docs/` containing three standard subdirectories:
+
+```
+docs/
+├── trusty-search/              # See here for the worked example
+│   ├── regression-testing/     # Versioned snapshots: v{VERSION}-{DATE}.md
+│   ├── research/               # Investigation & decision docs: *-{DATE}.md or *-decision-{DATE}.md
+│   └── sessions/               # Engineering session summaries: SESSION-{DATE}-{topic}.md
+├── trusty-memory/              # Follows the same three-subdir convention
+├── trusty-common/              # (and all other published crates)
+├── trusty-mpm/                 # covers all 8 trusty-mpm-* binaries
+├── open-mpm/
+├── trusty-analyze/
+└── trusty-git-analytics/
+```
+
+**Purpose of each subdir**:
+- **`regression-testing/`** — Performance snapshots tied to releases. One `.md`
+  file per measured release named `v{VERSION}-{YYYY-MM-DD}.md`; alternate-corpus
+  baselines (e.g., synthetic, open-mpm) live alongside; `current.md` is a
+  symlink to the latest snapshot.
+- **`research/`** — Investigation outcomes, audits, decision documents. Named
+  `{topic}-{YYYY-MM-DD}.md` or `{topic}-decision-{YYYY-MM-DD}.md`.
+- **`sessions/`** — Engineering-session narratives. Named
+  `SESSION-{YYYY-MM-DD}-{topic}.md`.
+
+Each subdir has a `README.md` explaining its purpose, file naming, and indexing
+conventions. **See `docs/trusty-search/` as the authoritative worked example.**
+
+For **cross-release performance tracking**, see GitHub issue
+[#129](https://github.com/bobmatnyc/trusty-tools/issues/129): it accumulates
+benchmark deltas across all measured versions.
+
 ## Key Conventions
 
 🔴 **Why/What/Test doc pattern** — every public item (function, struct, trait,
@@ -340,57 +376,20 @@ commit on `main` has a different hash — use `git branch -D <branch>` and
 `git push origin --delete <branch>` to clean up. These operations touch only
 refs, never working trees.
 
-## Crate-Specific Notes
+## Per-Crate Reference
 
-### trusty-common
-- Provides `openrouter_chat` (one-shot) and `openrouter_chat_stream` (SSE /
-  tokio mpsc). Both require `OPENROUTER_API_KEY` to be passed by the caller —
-  the library never reads environment variables directly.
-- Provides `init_tracing`, port-walking helpers, and daemon address utilities.
-- `axum-server` feature gates axum, tower, and tower-http. Do not enable unless
-  the crate serves HTTP.
+Detailed implementation information for each crate lives in its own documentation:
 
-### trusty-embedder
-- `FastEmbedder` defaults to `AllMiniLML6V2Q` (INT8 quantised, ~22 MB, 384-dim).
-- Falls back to full-precision `AllMiniLML6V2` (~86 MB) when the quantised
-  model is unavailable.
-- Output dimension: **384**.
+- **trusty-common** — see `crates/trusty-common/README.md` and `docs/trusty-common/`
+- **trusty-embedder** — see `crates/trusty-embedder/README.md`
+- **trusty-memory / trusty-memory-core** — see `crates/trusty-memory/README.md` and `docs/trusty-memory/` (licensed MIT, not Elastic-2.0)
+- **trusty-search** — see `crates/trusty-search/README.md` and **`docs/trusty-search/`** (primary worked example with regression testing, research, sessions)
+- **trusty-analyze** — see `crates/trusty-analyze/README.md` and `docs/trusty-analyze/` (licensed MIT, not Elastic-2.0)
+- **trusty-mpm-cli, trusty-mpm-daemon, trusty-mpm-tui, trusty-mpm-gui, trusty-mpm-telegram** — see `crates/trusty-mpm-{variant}/README.md` and `docs/trusty-mpm/`
+- **open-mpm** — see `crates/open-mpm/README.md` and `docs/open-mpm/`
+- **trusty-git-analytics** — see `crates/trusty-git-analytics/README.md` and `docs/trusty-git-analytics/`
 
-### trusty-common axum Middleware Stack
-`with_standard_middleware` applies in this order:
-1. `CorsLayer` — any origin/methods/headers (for local browser UIs)
-2. `TraceLayer` — HTTP request spans
-3. `CompressionLayer` — gzip, with `text/event-stream` excluded (SSE compat)
-
-### trusty-memory-core / trusty-memory
-- Licensed **MIT** (not Elastic-2.0). Check before assuming the workspace
-  default license applies.
-- `trusty-memory` (directory: `trusty-memory`) embeds a compiled Svelte UI via `rust-embed`.
-
-### trusty-mpm-gui
-- Tauri-based desktop GUI. Its `src-tauri/` subdirectory contains a nested
-  Cargo manifest that is excluded from the workspace glob to prevent Cargo from
-  treating it as a second member.
-
-### open-mpm
-- The top-level MPM orchestration platform. Consumes `trusty-search`,
-  `trusty-memory-core`, and `trusty-symgraph`.
-- Uses edition 2024 and let-chains extensively.
-
-### trusty-analyze
-- Directory `crates/trusty-analyze/`, package name `trusty-analyze`, binary
-  `trusty-analyze`. Use `cargo run -p trusty-analyze -- ...` or
-  `cargo check -p trusty-analyze`.
-- Licensed **MIT** (not Elastic-2.0).
-- Edition 2021. Uses tree-sitter 0.26 to share the `links = "tree-sitter"` slot
-  with `open-mpm` and `trusty-symgraph`. Do not pin tree-sitter 0.24 here — it
-  will collide with the rest of the workspace.
-- Hard runtime dependency on `trusty-search`: the daemon performs a startup
-  health check against `GET <search-url>/health` (default
-  `http://127.0.0.1:7878`) and exits 1 if unreachable. There is no offline mode.
-- Listens on port 7879 (HTTP API + MCP). Optional ONNX-backed NER lives behind
-  the `ner` feature flag (`--features ner`).
-- Facts store persisted via redb at the daemon's working directory.
+For license details, check each crate's `Cargo.toml`: most are **Elastic License 2.0**, but `trusty-memory`, `trusty-analyze`, and a few others are **MIT**.
 
 ## Abbreviations & Aliases
 
