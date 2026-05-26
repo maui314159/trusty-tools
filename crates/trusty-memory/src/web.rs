@@ -1437,10 +1437,7 @@ async fn prompt_context_handler(
     Query(_q): Query<PromptFactsQuery>,
 ) -> Result<Response, ApiError> {
     let cache_snapshot = {
-        let guard = state
-            .prompt_context_cache
-            .read()
-            .map_err(|e| ApiError::internal(format!("prompt cache lock poisoned: {e}")))?;
+        let guard = state.prompt_context_cache.read().await;
         guard.clone()
     };
     let body = if cache_snapshot.formatted.is_empty() {
@@ -3827,7 +3824,7 @@ mod tests {
 
         // Populate the cache and re-fetch.
         {
-            let mut guard = state.prompt_context_cache.write().expect("write lock");
+            let mut guard = state.prompt_context_cache.write().await;
             let triples = vec![(
                 "tga".to_string(),
                 "is_alias_for".to_string(),
@@ -3893,7 +3890,7 @@ mod tests {
         assert_eq!(v["object"], "trusty-memory");
 
         // The prompt cache must reflect the new alias.
-        let guard = state.prompt_context_cache.read().expect("read lock");
+        let guard = state.prompt_context_cache.read().await;
         assert!(
             guard.formatted.contains("tm → trusty-memory"),
             "cache missing alias; got: {}",
@@ -4035,7 +4032,7 @@ mod tests {
 
         // Cache must no longer contain the alias.
         {
-            let guard = state.prompt_context_cache.read().expect("read lock");
+            let guard = state.prompt_context_cache.read().await;
             assert!(
                 !guard.formatted.contains("ta → trusty-analyze"),
                 "alias still in cache after delete: {}",
@@ -4117,6 +4114,10 @@ mod tests {
             drawer_count: 0,
             source: ActivitySource::Http,
         });
+        // Issue #232: emits now fire-and-forget the redb write on the
+        // blocking pool; wait for the writes to settle before querying the
+        // activity endpoint.
+        state.flush_activity_writes().await;
 
         let app = router().with_state(state);
         let resp = app
@@ -4207,6 +4208,8 @@ mod tests {
             content_preview: "".into(),
             source: ActivitySource::Mcp,
         });
+        // Issue #232: drain the spawn_blocking writes before querying.
+        state.flush_activity_writes().await;
 
         let app = router().with_state(state);
         let resp = app
@@ -4300,6 +4303,8 @@ mod tests {
         // The activity log should now hold ≥ 2 entries (palace_created +
         // drawer_added). Also confirm the HTTP endpoint surfaces them with
         // `mcp` sources.
+        // Issue #232: drain fire-and-forget activity-log writes first.
+        state.flush_activity_writes().await;
         let app = router().with_state(state);
         let resp = app
             .oneshot(
@@ -4362,6 +4367,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // Issue #232: the hook handler emits via the fire-and-forget
+        // `spawn_blocking` path; wait for the write to settle before
+        // reading the activity history endpoint.
+        state.flush_activity_writes().await;
 
         // Read it back through the activity history endpoint.
         let app = router().with_state(state);

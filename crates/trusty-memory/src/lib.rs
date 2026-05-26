@@ -21,8 +21,9 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
-use tokio::sync::{broadcast, OnceCell};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{broadcast, OnceCell, RwLock};
 use tracing::info;
 use trusty_common::bm25_client::Bm25Client;
 use trusty_common::mcp::initialize_response;
@@ -290,34 +291,47 @@ pub enum DaemonEvent {
 }
 
 /// Open the activity log under `data_root`, falling back to a per-process
-/// tempdir when the primary location is unwritable.
+/// tempdir and finally to a no-op `Discard` variant when no writable
+/// directory is available.
 ///
-/// Why (issue #96): the activity log is a best-effort feature — if the data
-/// root is on a read-only mount, missing, or locked by another process, the
-/// daemon should still come up and serve every other endpoint. Falling back
-/// to a `std::env::temp_dir()`-anchored subdirectory keyed by the daemon's
-/// process id keeps the log available for the lifetime of the daemon while
-/// guaranteeing a unique writable directory.
+/// Why (issues #96, #225): the activity log is a best-effort feature — if
+/// the data root is on a read-only mount, missing, or locked by another
+/// process, the daemon should still come up and serve every other endpoint.
+/// The first fallback is a `std::env::temp_dir()`-anchored subdirectory
+/// keyed by the daemon's process id. Issue #225: a previous version called
+/// `expect()` on the tempdir fallback, which crashed the daemon on hosts
+/// where neither `data_root` nor `std::env::temp_dir()` is writable
+/// (read-only containers, locked-down sandboxes). The contract is
+/// "best-effort", so the final fallback is now `ActivityLog::discard()` —
+/// a no-op variant that drops every append and returns empty reads. The
+/// dashboard's activity feed simply shows up empty in that degraded state.
 /// What: tries `ActivityLog::open(data_root)`; on error logs a warning and
-/// retries against `<temp>/trusty-memory-activity-<pid>/`. The final
-/// fallback `expect` is only reachable when even `temp_dir()` is broken,
-/// which is a programmer-error class invariant.
-/// Test: covered indirectly by `app_state_default_constructs` and every
-/// test that builds an `AppState` against a tempdir.
+/// retries against `<temp>/trusty-memory-activity-<pid>/`. If both fail,
+/// emits a final warning and returns `ActivityLog::discard()`.
+/// Test: `open_activity_log_with_fallback_returns_discard_when_unwritable`
+/// covers the discard branch; existing `AppState` construction tests cover
+/// the happy and tempdir-fallback paths.
 fn open_activity_log_with_fallback(data_root: &Path) -> Arc<ActivityLog> {
     match ActivityLog::open(data_root) {
         Ok(log) => Arc::new(log),
-        Err(e) => {
+        Err(primary_err) => {
             tracing::warn!(
-                "could not open activity log at {}: {e:#}; falling back to per-process tempdir",
+                "could not open activity log at {}: {primary_err:#}; falling back to per-process tempdir",
                 data_root.display()
             );
             let fallback =
                 std::env::temp_dir().join(format!("trusty-memory-activity-{}", std::process::id()));
-            Arc::new(
-                ActivityLog::open(&fallback)
-                    .expect("activity fallback log must open in a fresh tempdir"),
-            )
+            match ActivityLog::open(&fallback) {
+                Ok(log) => Arc::new(log),
+                Err(fallback_err) => {
+                    tracing::warn!(
+                        "activity log tempdir fallback at {} also failed: {fallback_err:#}; \
+                         activity feed disabled for this process (no-op log)",
+                        fallback.display()
+                    );
+                    Arc::new(ActivityLog::discard())
+                }
+            }
         }
     }
 }
@@ -475,10 +489,12 @@ pub struct AppState {
     /// the KG. The cache is rebuilt by
     /// `prompt_facts::rebuild_prompt_cache` after any write that touches a
     /// hot predicate (`kg_assert`, `add_alias`, `remove_prompt_fact`).
-    /// What: An `Arc<RwLock<PromptFactsCache>>` so the hot read path takes
-    /// a brief read lock and clones the cache; rebuilds take a write lock
-    /// for the assignment only. An empty `triples` vec ↔ "no context
-    /// stored yet" (the tool handler renders a hint).
+    /// What: An `Arc<tokio::sync::RwLock<PromptFactsCache>>` so the hot
+    /// read path takes a brief read lock and clones the cache; rebuilds
+    /// take a write lock for the assignment only. The async-aware lock
+    /// (issue #229) yields to the tokio runtime instead of blocking a
+    /// runtime thread for the rebuild duration. An empty `triples` vec ↔
+    /// "no context stored yet" (the tool handler renders a hint).
     /// Test: `get_prompt_context_returns_cached_or_hint`,
     /// `get_prompt_context_filters_by_query`.
     pub prompt_context_cache: Arc<RwLock<prompt_facts::PromptFactsCache>>,
@@ -525,6 +541,45 @@ pub struct AppState {
     /// Test: covered by `bm25_supervisor_present_when_env_set` and the
     /// `bm25_supervisor::tests` unit tests.
     pub bm25_supervisor: Option<Arc<bm25_supervisor::Bm25Supervisor>>,
+    /// Per-palace write serialisation locks (issue #230).
+    ///
+    /// Why: the dedup gate in `tools.rs` previously read a snapshot of
+    /// existing drawers, checked for near-duplicates via Jaro-Winkler, and
+    /// then issued the write — a classic time-of-check/time-of-use race.
+    /// Two concurrent `memory_remember` calls with the same content could
+    /// both see the pre-write snapshot, both pass the gate, and both land
+    /// duplicate drawers. Serialising the gate-then-write sequence per
+    /// palace closes the window: while one task holds the mutex, any
+    /// concurrent writer for the same palace blocks until the first write
+    /// finishes and is visible to `list_drawers`. The lock is **per
+    /// palace** (not global) so writes to different palaces continue to
+    /// run in parallel.
+    /// What: a `DashMap` keyed by palace id, where each entry is an
+    /// `Arc<tokio::sync::Mutex<()>>`. The mutex is constructed lazily by
+    /// `palace_write_lock` on first access. `Arc` lets callers hold a
+    /// clone of the lock past the lifetime of the `DashMap` entry so the
+    /// map never needs to be held across an `.await`.
+    /// Test: `tools::tests::dedup_gate_blocks_concurrent_duplicate_writes`.
+    pub palace_write_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Counter of in-flight activity-log writes spawned by `emit`
+    /// (issue #232).
+    ///
+    /// Why: `emit` offloads the synchronous redb append to the tokio blocking
+    /// pool via `spawn_blocking` so the async runtime is never parked waiting
+    /// on fsync. The write is fire-and-forget — `emit` returns immediately
+    /// after spawning. Tests that observe the activity log right after a
+    /// burst of `emit` calls need a deterministic synchronization point;
+    /// holding an in-flight counter lets `flush_activity_writes` poll until
+    /// every spawned append has settled, which keeps the assertions
+    /// race-free without forcing every caller to `.await`.
+    /// What: an `Arc<AtomicUsize>` incremented before each `spawn_blocking`
+    /// and decremented inside the closure (after the append completes, even
+    /// if it errored). The counter is cheap (one atomic add per emit) and
+    /// stays at zero in steady-state production traffic.
+    /// Test: `web::tests::activity_endpoint_lists_recent_emits` and
+    /// `tests::emit_persists_mutations_but_skips_status_changed` call
+    /// `flush_activity_writes` to drain the counter before reading the log.
+    pub pending_activity_writes: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -569,7 +624,37 @@ impl AppState {
             activity_log,
             bm25_client: None,
             bm25_supervisor: None,
+            palace_write_locks: Arc::new(dashmap::DashMap::new()),
+            pending_activity_writes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Acquire (lazily, then clone) the per-palace write mutex.
+    ///
+    /// Why (issue #230): the dedup-check + `remember_with_options` write
+    /// sequence in `tools.rs` must be atomic per palace to prevent two
+    /// concurrent identical writes from both passing the dedup gate.
+    /// Callers hold the returned `Arc<Mutex<()>>`'s guard across the gate
+    /// check and the write so the second writer blocks until the first
+    /// write is visible to `list_drawers`. Returning a clone of the `Arc`
+    /// rather than a borrow into the `DashMap` lets the caller `.await`
+    /// while holding the lock without risking a deadlock against any
+    /// future map mutation (DashMap shards are sync mutexes).
+    /// What: looks up the palace id in `palace_write_locks` and returns
+    /// a clone of the existing mutex; on the first call for a palace,
+    /// inserts a freshly-constructed `tokio::sync::Mutex<()>` first. The
+    /// `DashMap::entry().or_insert_with` API guarantees the lazy
+    /// construction is racy-safe — only one mutex is ever inserted per
+    /// palace id.
+    /// Test: `tools::tests::dedup_gate_blocks_concurrent_duplicate_writes`.
+    pub fn palace_write_lock(&self, palace_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(existing) = self.palace_write_locks.get(palace_id) {
+            return existing.clone();
+        }
+        self.palace_write_locks
+            .entry(palace_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Builder-style: opt-in to the BM25 lexical lane (issue #156).
@@ -707,24 +792,69 @@ impl AppState {
     /// HTTP / Hook origins are visible to the operator. Persistence is
     /// also best-effort — a write failure is logged but never blocks the
     /// SSE broadcast.
+    ///
+    /// Issue #232: the activity-log append is a synchronous redb write +
+    /// fsync. Calling it directly on the async caller's task parked a tokio
+    /// worker thread on disk I/O for every SSE event. We now offload the
+    /// append to the blocking thread pool via `spawn_blocking` and return
+    /// immediately — `emit` stays synchronous so every existing caller
+    /// (including the sync `dispatch_hook_fired` JSON-RPC handler) keeps
+    /// compiling unchanged. The fire-and-forget pattern matches the
+    /// pre-fix semantics (best-effort, never blocks the SSE broadcast)
+    /// while freeing the async runtime to do real work during the write.
     /// What: serialises the event for the log (skipping `StatusChanged`
-    /// which is a recomputed aggregate, not a mutation), then sends it
-    /// over the broadcast channel.
+    /// which is a recomputed aggregate, not a mutation), spawns the redb
+    /// append on `tokio::task::spawn_blocking` keyed by a clone of the
+    /// `Arc<ActivityLog>` and the cloned event, then sends the event over
+    /// the broadcast channel. A `pending_activity_writes` counter is bumped
+    /// before the spawn and decremented inside the closure so
+    /// [`Self::flush_activity_writes`] can drain in tests.
     /// Test: `web::tests::sse_stream_receives_palace_created` confirms a
     /// subscriber observes the emitted event;
-    /// `activity_endpoint_lists_recent_emits` confirms persistence.
+    /// `activity_endpoint_lists_recent_emits` confirms persistence via
+    /// `flush_activity_writes`.
     pub fn emit(&self, event: DaemonEvent) {
         if let Some(source) = event.source() {
             let event_type = event.type_str();
             let palace_id = event.palace_id().map(|s| s.to_string());
-            if let Err(e) = self
-                .activity_log
-                .append(source, palace_id, event_type, &event)
-            {
-                tracing::warn!("activity_log.append failed for {event_type}: {e:#}");
-            }
+            let log = Arc::clone(&self.activity_log);
+            let event_for_log = event.clone();
+            let pending = Arc::clone(&self.pending_activity_writes);
+            pending.fetch_add(1, Ordering::SeqCst);
+            // Why: the synchronous redb append + fsync must not park an
+            // async worker thread (issue #232). Spawn the write on the
+            // blocking pool; the JoinHandle is intentionally dropped —
+            // the write is best-effort and any failure is logged below.
+            tokio::task::spawn_blocking(move || {
+                let result = log.append(source, palace_id, event_type, &event_for_log);
+                if let Err(e) = result {
+                    tracing::warn!("activity_log.append failed for {event_type}: {e:#}");
+                }
+                pending.fetch_sub(1, Ordering::SeqCst);
+            });
         }
         let _ = self.events.send(event);
+    }
+
+    /// Block (asynchronously) until every in-flight activity-log write
+    /// spawned by [`Self::emit`] has settled.
+    ///
+    /// Why: `emit` offloads its redb append to `tokio::task::spawn_blocking`
+    /// and returns immediately (issue #232). Tests that observe the
+    /// activity log right after a burst of emits would otherwise race the
+    /// blocking-pool worker; this helper gives them a deterministic
+    /// synchronization point. Production code never needs to call this —
+    /// the dashboard reads through `GET /api/v1/activity`, which already
+    /// tolerates writes settling asynchronously.
+    /// What: spins on `pending_activity_writes` with a 1 ms yield until the
+    /// counter is zero. Cheap: tests typically emit a handful of events
+    /// and the loop exits within a single scheduler tick.
+    /// Test: covered indirectly by `emit_persists_mutations_but_skips_status_changed`
+    /// and `web::tests::activity_endpoint_lists_recent_emits`.
+    pub async fn flush_activity_writes(&self) {
+        while self.pending_activity_writes.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     /// Open (or return cached) the chat-session store for a palace.
@@ -1381,6 +1511,89 @@ mod tests {
         assert!(s.default_palace.is_none());
     }
 
+    /// Why (issue #225): the previous implementation called `.expect()` on the
+    /// tempdir fallback, which panicked the daemon at startup on hosts where
+    /// neither the data root nor `std::env::temp_dir()` is writable
+    /// (read-only Docker overlays, locked-down sandboxes). The activity log
+    /// is documented as best-effort, so the fix returns a no-op `Discard`
+    /// variant instead. This test forces both paths to fail and asserts the
+    /// helper returns the discard variant rather than panicking.
+    ///
+    /// Skipped when running as root because `chmod 000` is a no-op for the
+    /// root user — the kernel grants root access regardless of mode bits.
+    /// CI typically runs as non-root, so coverage is preserved in the
+    /// common case; local root invocations simply skip with a warning.
+    #[test]
+    #[cfg(unix)]
+    fn open_activity_log_with_fallback_returns_discard_when_unwritable() {
+        // Skip when running as root — chmod is ignored.
+        // SAFETY: libc::geteuid is a thread-safe syscall with no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping open_activity_log_with_fallback_returns_discard_when_unwritable: running as root"
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+
+        // Build two unwritable directories: the primary "data root" and a
+        // shadow "TMPDIR" so the tempdir fallback also fails.
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let primary = outer.path().join("primary");
+        let tmpdir = outer.path().join("fake-tmp");
+        std::fs::create_dir(&primary).expect("create primary");
+        std::fs::create_dir(&tmpdir).expect("create tmpdir");
+
+        // chmod 000 on both — neither can be opened for write.
+        std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod primary");
+        std::fs::set_permissions(&tmpdir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod tmpdir");
+
+        // Override the tempdir lookup so `open_activity_log_with_fallback`
+        // hits our unwritable fake-tmp instead of the real system temp.
+        // Note: env var mutation is process-global; this test is the only
+        // accessor for `TMPDIR` in this test binary, and we restore the
+        // previous value before returning.
+        let prev_tmpdir = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", &tmpdir);
+
+        let log = open_activity_log_with_fallback(&primary);
+
+        // Restore TMPDIR ASAP so a panic later in the test doesn't leak it.
+        match prev_tmpdir {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
+
+        // Restore permissions so the outer tempdir can clean up.
+        let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&tmpdir, std::fs::Permissions::from_mode(0o700));
+
+        assert!(
+            log.is_discard(),
+            "expected ActivityLog::Discard when both data root and tempdir are unwritable"
+        );
+
+        // The Discard variant must still satisfy the public contract: no
+        // panic on append/count/list.
+        let id = log
+            .append(
+                ActivitySource::Http,
+                None,
+                "drawer_added",
+                json!({"smoke": true}),
+            )
+            .expect("discard append must succeed");
+        assert_eq!(id, 0);
+        assert_eq!(log.count().expect("discard count"), 0);
+        assert!(log
+            .list(&ActivityFilter::default(), 10, 0)
+            .expect("discard list")
+            .is_empty());
+    }
+
     /// Why: Issue #26 — when `serve --palace <name>` is set, the MCP server
     /// must (a) report the default in the `initialize` `serverInfo`, (b)
     /// drop `palace` from the required schema in `tools/list`, and (c) let
@@ -1949,6 +2162,10 @@ mod tests {
             content_preview: "x".into(),
             source: ActivitySource::Mcp,
         });
+        // Issue #232: `emit` now offloads the redb write to `spawn_blocking`,
+        // so the test must wait for the background pool to drain before
+        // asserting on the persisted count.
+        state.flush_activity_writes().await;
         let count = state.activity_log.count().unwrap();
         assert_eq!(count, 2, "only PalaceCreated + DrawerAdded must persist");
     }
