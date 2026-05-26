@@ -33,6 +33,7 @@ use std::process::ExitCode;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use trusty_memory::transport::uds::{socket_path, UDS_ADDR_FILE};
+use trusty_memory::resolve_palace_registry_dir;
 
 /// Environment variable that, when set, overrides the auto-detected
 /// socket path. Useful for integration tests that spin up a daemon on
@@ -44,8 +45,9 @@ const SOCKET_ENV: &str = "TRUSTY_MEMORY_SOCKET";
 /// Why: the daemon may have been started with an unusual `$TMPDIR`,
 /// or a test may have pinned it to an isolated tempdir. Trying the
 /// env override first, then the `<data_root>/uds_addr` discovery
-/// file, and finally the OS-default socket path gives the bridge
-/// three independent fallbacks before failing.
+/// file (checking both the data-dir root and the `palaces/` subdir),
+/// and finally the OS-default socket path gives the bridge four
+/// independent fallbacks before failing.
 /// What: returns the resolved [`PathBuf`].
 /// Test: `bridge_byte_pipe_smoke` exercises the env-override path.
 fn resolve_socket_path() -> PathBuf {
@@ -55,7 +57,23 @@ fn resolve_socket_path() -> PathBuf {
         }
     }
     // Try the `<data_root>/uds_addr` discovery file.
+    // The daemon writes to `<data_root>/uds_addr` where `data_root`
+    // is resolved via `resolve_palace_registry_dir`, which prefers
+    // `<data_dir>/palaces` if that directory exists. So we need to
+    // check both locations (palaces first, then the data_dir root).
     if let Ok(data_dir) = trusty_common::resolve_data_dir("trusty-memory") {
+        // Try `<data_dir>/palaces/uds_addr` first (the production case)
+        let palace_registry_dir = resolve_palace_registry_dir(data_dir.clone());
+        if palace_registry_dir != data_dir {
+            let addr_file = palace_registry_dir.join(UDS_ADDR_FILE);
+            if let Ok(contents) = std::fs::read_to_string(&addr_file) {
+                let path = contents.trim();
+                if !path.is_empty() {
+                    return PathBuf::from(path);
+                }
+            }
+        }
+        // Fallback: try `<data_dir>/uds_addr` (test case or legacy layout)
         let addr_file = data_dir.join(UDS_ADDR_FILE);
         if let Ok(contents) = std::fs::read_to_string(&addr_file) {
             let path = contents.trim();
