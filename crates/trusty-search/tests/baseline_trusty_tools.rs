@@ -7,7 +7,7 @@
 //!
 //! What: Each test hits the live HTTP daemon at `http://127.0.0.1:7878` (the
 //! default daemon port), exercises a known scenario, and asserts that measured
-//! values stay within the thresholds documented in `docs/regression-testing/baseline-performance-2026-05-22.md`.
+//! values stay within the thresholds documented in `docs/trusty-search/regression-testing/baseline-performance-2026-05-22.md`.
 //!
 //! Test: All tests are marked `#[ignore]` so the normal `cargo test` run stays
 //! fast. Run with:
