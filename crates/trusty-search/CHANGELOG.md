@@ -7,6 +7,25 @@ Versions correspond to `Cargo.toml` patch releases.
 
 ---
 
+## [0.12.0] — 2026-05-26
+
+### Added
+
+- **#110 Phase 1** **Optional remote embedder via `TRUSTY_EMBEDDER` env var.**
+  Set `TRUSTY_EMBEDDER=http://127.0.0.1:7890` to route all embed calls to a
+  running `trusty-embedderd` instance instead of running ONNX in-process.
+  Default behaviour (unset, `local`, or `in-process`) is unchanged.
+  The startup log now always prints `embedder: in-process` or
+  `embedder: remote <url>` so operators can confirm the active mode.
+
+  New companion crates (v0.1.0, MIT):
+  - `trusty-embedder-client` — `EmbedderClient` trait + JSON/HTTP wire types,
+    `InProcessEmbedderClient` (default), and `RemoteEmbedderClient`
+  - `trusty-embedderd` — standalone daemon that loads `AllMiniLML6V2(Q)` once
+    and serves `POST /embed` + `GET /health` (clap CLI + axum HTTP, stderr logging)
+
+---
+
 ## [0.11.1] — 2026-05-26
 
 ### Added
