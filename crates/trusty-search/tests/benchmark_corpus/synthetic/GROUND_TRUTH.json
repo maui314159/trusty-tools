@@ -1,7 +1,8 @@
 {
   "corpus": "glyphwarpen-observatory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "purpose": "Non-circular benchmark for trusty-search hybrid retrieval (issue #123).",
+  "schema_notes": "mode_hint controls the search mode sent to the daemon (code/text/data). Added in v0.2.0.",
   "categories": {
     "definition": "Single distinctive identifier — caller wants the file where it is defined.",
     "conceptual": "Multi-word phrase describing what the code does, not the identifier itself.",
@@ -14,7 +15,7 @@
       "id": "Q01",
       "text": "HammondLever",
       "category": "definition",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/cascade/lichtenberg.rs"],
       "notes": "Hammond appears only via HAMMOND_TICK_RATE consumption in LichtenbergCascade. Tests whether snake_case (constants.rs) vs PascalCase ranking surfaces the engine site that uses it."
     },
@@ -22,7 +23,7 @@
       "id": "Q02",
       "text": "LichtenbergCascade",
       "category": "definition",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/cascade/lichtenberg.rs"],
       "notes": "Exact PascalCase struct name. The trivial-positive: hybrid mode should hit-at-1."
     },
@@ -30,7 +31,7 @@
       "id": "Q03",
       "text": "parse_zelenov_payload",
       "category": "definition",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/zelenov/payload.rs"],
       "notes": "Snake_case function name. Tests #119 fix (snake_case Definition routing)."
     },
@@ -38,7 +39,7 @@
       "id": "Q04",
       "text": "BRUSILOV_EPOCH",
       "category": "definition",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/constants.rs"],
       "notes": "SCREAMING_SNAKE constant. Tests acronym/constant Definition routing."
     },
@@ -46,7 +47,7 @@
       "id": "Q05",
       "text": "compute seraphim modulus from descriptor",
       "category": "conceptual",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/seraphim/engine.rs"],
       "notes": "Multi-word description of what the engine does. Vector lane should win."
     },
@@ -54,7 +55,7 @@
       "id": "Q06",
       "text": "flatten clustered tree into depth first vector",
       "category": "conceptual",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/yamamoto/tree.rs"],
       "notes": "Conceptual description of yamamoto flatten. No exact identifier match."
     },
@@ -62,7 +63,7 @@
       "id": "Q07",
       "text": "fixed point iteration with damping factor",
       "category": "conceptual",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/seraphim/engine.rs"],
       "notes": "Describes the inner solver step. Hybrid should fuse on damping/iteration."
     },
@@ -70,7 +71,7 @@
       "id": "Q08",
       "text": "encrypt outbound telemetry stream cipher",
       "category": "conceptual",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": [
         "src/andromedan/cipher.rs",
         "src/andromedan/codec.rs"
@@ -81,7 +82,7 @@
       "id": "Q09",
       "text": "where is BrusilovTransform applied",
       "category": "usage",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": [
         "src/pipeline.rs",
         "src/observatory.rs",
@@ -93,7 +94,7 @@
       "id": "Q10",
       "text": "callers of fold_orbweaver_plexus",
       "category": "usage",
-      "expected_mode": "code",
+      "mode_hint": "code",
       "ground_truth_files": ["src/pipeline.rs"],
       "notes": "Single caller — pipeline.rs. Tests if KG-leading retrieval finds the call site."
     },
@@ -101,7 +102,7 @@
       "id": "Q11",
       "text": "Glyphwarpen Observatory benchmark corpus motivation",
       "category": "text",
-      "expected_mode": "text",
+      "mode_hint": "text",
       "ground_truth_files": ["README.md"],
       "notes": "README content query. Tests mode=text routing."
     },
@@ -109,7 +110,7 @@
       "id": "Q12",
       "text": "changelog initial release notes synthetic corpus",
       "category": "text",
-      "expected_mode": "text",
+      "mode_hint": "text",
       "ground_truth_files": ["CHANGELOG.md"],
       "notes": "CHANGELOG content query. Tests mode=text + filename-aware ranking."
     },
@@ -117,7 +118,7 @@
       "id": "Q13",
       "text": "configured outbound channels for archive and dashboard",
       "category": "data",
-      "expected_mode": "data",
+      "mode_hint": "data",
       "ground_truth_files": ["config.yaml"],
       "notes": "Targets the maltesian.registered_channels section of config.yaml."
     },
@@ -125,9 +126,64 @@
       "id": "Q14",
       "text": "seraphim damping factor and iteration cap",
       "category": "data",
-      "expected_mode": "data",
+      "mode_hint": "data",
       "ground_truth_files": ["config.yaml", "src/constants.rs"],
       "notes": "Operator config + constants both legitimately answer. config.yaml is the primary target."
+    },
+    {
+      "id": "Q15",
+      "text": "carrier signal drift correction with smoothing estimator",
+      "category": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/phosphor/tuner.rs",
+        "src/phosphor/oscillator.rs",
+        "src/calibration.rs"
+      ],
+      "notes": "Describes the PhosphorTuner lock loop — no symbol names present. Lexical should miss; hybrid/semantic should hit via 'carrier', 'drift', 'smoothing', 'estimate' in oscillator.rs and tuner.rs. Leak-check clean."
+    },
+    {
+      "id": "Q16",
+      "text": "evict oldest entries when storage reaches capacity limit",
+      "category": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/wolfram/registry.rs"
+      ],
+      "notes": "Describes the WolframRegistry compaction behaviour. No identifier overlap. 'evict', 'oldest', 'capacity' do not appear verbatim in symbol names. Lexical misses; hybrid should match via semantic similarity to the compact() + WOLFRAM_NODE_CAP logic."
+    },
+    {
+      "id": "Q17",
+      "text": "tag-keyed dispatch routes payload to registered sink",
+      "category": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/maltesian/circuit.rs",
+        "src/maltesian/relay.rs"
+      ],
+      "notes": "Describes MaltesianRouter dispatch without naming the type. 'tag-keyed', 'routes', 'registered sink' have no literal symbol overlap. Hybrid semantic lane should find circuit.rs and relay.rs."
+    },
+    {
+      "id": "Q18",
+      "text": "place six vertices on lattice then reject overflow",
+      "category": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/octahedron/layout.rs",
+        "src/octahedron/traversal.rs"
+      ],
+      "notes": "Describes octahedron_layout's shape + overflow guard. 'six vertices', 'lattice', 'reject overflow' have no literal match in function or type names. Lexical should fail; hybrid vector lane should surface layout.rs."
+    },
+    {
+      "id": "Q19",
+      "text": "accumulate pipeline metrics and expose read-only summary",
+      "category": "conceptual",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/wolfram/inventory.rs",
+        "src/diagnostics.rs"
+      ],
+      "notes": "Describes WolframInventory + DiagnosticsReport — no identifier overlap with 'accumulate', 'pipeline metrics', 'read-only summary'. A pure semantic hit; BM25 should score near zero."
     }
   ]
 }

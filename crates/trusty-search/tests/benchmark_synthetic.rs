@@ -12,7 +12,12 @@
 //! index pointing at the corpus, drives a reindex, polls until every stage
 //! is `Ready`, then runs each ground-truth query in three modes (lexical
 //! only / full hybrid / KG-leading), records Hit@1 and Hit@5, prints a
-//! comparison table, and deletes the index.
+//! per-(mode × query-category) comparison table, and deletes the index.
+//!
+//! `mode_hint` support (v0.2.0): each query in GROUND_TRUTH.json carries a
+//! `mode_hint` field (`"code"` / `"text"` / `"data"`). The harness forwards
+//! the hint as the `mode` parameter in the search request body so the daemon
+//! can route text/data queries away from the code-semantic pipeline.
 //!
 //! Test: gated `#[ignore]` so it does not run during default `cargo test`.
 //! Run with:
@@ -45,18 +50,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+/// One ground-truth entry loaded from GROUND_TRUTH.json.
+///
+/// Why: a typed struct avoids indexing into raw JSON throughout the harness.
+/// What: holds all GROUND_TRUTH.json fields for one query.
+/// Test: load_ground_truth() panics if any required field is missing.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // category + expected_mode are documented metadata; future
-                    // assertions may use them but the harness today reports by
-                    // mode tuple.
+#[allow(dead_code)] // category + mode_hint are used for the breakdown table; others retained for future assertions.
 struct GroundTruthQuery {
     id: String,
     text: String,
     category: String,
-    expected_mode: String,
+    /// Forwarded as `mode` in the search request body.
+    /// Values: "code", "text", "data" (from GROUND_TRUTH.json `mode_hint` field).
+    mode_hint: String,
     ground_truth_files: Vec<String>,
 }
 
+/// The three retrieval modes exercised per query.
+///
+/// Why: running all three against every query reveals where each mode wins or
+/// loses and validates that hybrid/KG-leading is worth the overhead.
+/// What: enum with a label method for table output.
+/// Test: iterated in the main test body.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     /// `?stage=lexical` — BM25 only.
@@ -77,11 +93,18 @@ impl Mode {
     }
 }
 
+/// Result for one (query, mode) pair.
+///
+/// Why: collecting all results into a Vec lets the summary tables iterate
+/// over any slice (by mode, by category, aggregate) without re-querying.
+/// What: hit booleans, latencies, and top file list for one search call.
+/// Test: populated inside run_query(); assertions in the main test body.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // query_text retained for diagnostic prints during failures.
 struct QueryResult {
     query_id: String,
     query_text: String,
+    query_category: String,
     mode: Mode,
     top_files: Vec<String>,
     hit_at_1: bool,
@@ -96,6 +119,11 @@ struct QueryResult {
 
 /// Build a reqwest client with the timeouts already tuned by
 /// `baseline_trusty_tools.rs`.
+///
+/// Why: we share the same daemon as everyday work; generous but finite
+/// timeouts prevent the test hanging on a hung daemon.
+/// What: returns a Client with 2 s connect and 30 s request timeouts.
+/// Test: any transport error will panic via .expect() in callers.
 fn make_client() -> Client {
     Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -105,6 +133,10 @@ fn make_client() -> Client {
 }
 
 /// Absolute path of the synthetic corpus root.
+///
+/// Why: the corpus root changes depending on where cargo runs the test.
+/// What: derives the path from CARGO_MANIFEST_DIR at compile time.
+/// Test: corpus_root().join("GROUND_TRUTH.json") must exist; load_ground_truth panics otherwise.
 fn corpus_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -114,6 +146,12 @@ fn corpus_root() -> PathBuf {
 }
 
 /// Load and parse `GROUND_TRUTH.json`.
+///
+/// Why: centralises all JSON field access so callers use typed structs.
+/// What: reads the file, parses every query array entry into GroundTruthQuery.
+///   Accepts both `expected_mode` (v0.1 key) and `mode_hint` (v0.2 key),
+///   preferring `mode_hint` when both are present.
+/// Test: panics with a clear message if the file is missing or malformed.
 fn load_ground_truth() -> Vec<GroundTruthQuery> {
     let path = corpus_root().join("GROUND_TRUTH.json");
     let bytes = std::fs::read(&path)
@@ -122,22 +160,34 @@ fn load_ground_truth() -> Vec<GroundTruthQuery> {
     let queries = raw["queries"].as_array().expect("queries array required");
     queries
         .iter()
-        .map(|q| GroundTruthQuery {
-            id: q["id"].as_str().unwrap().to_string(),
-            text: q["text"].as_str().unwrap().to_string(),
-            category: q["category"].as_str().unwrap().to_string(),
-            expected_mode: q["expected_mode"].as_str().unwrap().to_string(),
-            ground_truth_files: q["ground_truth_files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect(),
+        .map(|q| {
+            // Accept both v0.1 `expected_mode` and v0.2 `mode_hint`; prefer v0.2.
+            let mode_hint = q["mode_hint"]
+                .as_str()
+                .or_else(|| q["expected_mode"].as_str())
+                .unwrap_or("code")
+                .to_string();
+            GroundTruthQuery {
+                id: q["id"].as_str().unwrap().to_string(),
+                text: q["text"].as_str().unwrap().to_string(),
+                category: q["category"].as_str().unwrap().to_string(),
+                mode_hint,
+                ground_truth_files: q["ground_truth_files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect(),
+            }
         })
         .collect()
 }
 
 /// Sanity-check that the daemon is up.
+///
+/// Why: a clear early error is better than confusing transport failures later.
+/// What: GETs /health and asserts 200.
+/// Test: panics with a human-readable message if the daemon is unreachable.
 async fn assert_daemon_healthy(client: &Client) {
     let resp = client
         .get(format!("{DAEMON_URL}/health"))
@@ -149,6 +199,11 @@ async fn assert_daemon_healthy(client: &Client) {
 
 /// Create (or re-create) the `synthetic-benchmark` index. Returns immediately
 /// after the POST — the caller drives the reindex separately.
+///
+/// Why: starting from a clean slate prevents stale chunk data from a previous
+/// run from inflating Hit@K scores.
+/// What: DELETEs any existing index with this name, then POSTs to /indexes.
+/// Test: asserts 200 on POST; transport errors panic.
 async fn register_index(client: &Client) {
     // Delete first if it exists, to start from a clean slate.
     let _ = client
@@ -176,6 +231,11 @@ async fn register_index(client: &Client) {
 }
 
 /// Trigger a full force-reindex and wait for every stage to reach `Ready`.
+///
+/// Why: queries against a partially-indexed corpus produce misleading Hit@K.
+/// What: POSTs /reindex with force=true, then polls /status until lexical +
+///   semantic + graph stages all report status="ready".
+/// Test: panics with last-known status on REINDEX_TIMEOUT.
 async fn reindex_and_wait(client: &Client) {
     let root = corpus_root();
     let body = json!({
@@ -223,6 +283,10 @@ async fn reindex_and_wait(client: &Client) {
 }
 
 /// Fetch `/indexes/{INDEX_NAME}/status`.
+///
+/// Why: status polling and diagnostic footers both need this.
+/// What: GET /indexes/:id/status, returns parsed JSON Value.
+/// Test: transport or parse failures panic.
 async fn fetch_status(client: &Client) -> Value {
     let resp = client
         .get(format!("{DAEMON_URL}/indexes/{INDEX_NAME}/status"))
@@ -233,6 +297,11 @@ async fn fetch_status(client: &Client) -> Value {
 }
 
 /// Delete the synthetic-benchmark index. Best-effort.
+///
+/// Why: cleanup ensures the developer's daemon doesn't accumulate stale
+/// synthetic indexes between runs.
+/// What: DELETE /indexes/:id; prints the response status regardless.
+/// Test: failures are printed, not panicked (cleanup is best-effort).
 async fn cleanup_index(client: &Client) {
     let resp = client
         .delete(format!("{DAEMON_URL}/indexes/{INDEX_NAME}"))
@@ -249,19 +318,29 @@ async fn cleanup_index(client: &Client) {
     }
 }
 
-/// Run one query in one mode and report the result.
+/// Run one query in one retrieval mode and record the result.
+///
+/// Why: all three modes must run the same search path so results are
+/// comparable; only the JSON body fields differ.
+/// What: POSTs to /indexes/:id/search with mode-appropriate parameters
+///   plus the query's `mode_hint` forwarded as `mode`. Records Hit@1 and
+///   Hit@5 against the ground_truth_files list.
+/// Test: transport failures panic; JSON parse failures panic with status code.
 async fn run_query(client: &Client, query: &GroundTruthQuery, mode: Mode) -> QueryResult {
     let mut body = json!({
         "text": query.text,
         "top_k": 10,
         "compact": false,
+        // Forward the per-query mode hint so text/data queries are routed
+        // to the correct pipeline stage (not the code-semantic lane).
+        "mode": query.mode_hint,
     });
     match mode {
         Mode::Lexical => {
             body["stage"] = json!("lexical");
         }
         Mode::Hybrid => {
-            // No stage parameter — full hybrid is the default.
+            // No stage override — full hybrid is the daemon default.
         }
         Mode::KgLeading => {
             body["expand_graph"] = json!(true);
@@ -315,6 +394,7 @@ async fn run_query(client: &Client, query: &GroundTruthQuery, mode: Mode) -> Que
     QueryResult {
         query_id: query.id.clone(),
         query_text: query.text.clone(),
+        query_category: query.category.clone(),
         mode,
         top_files: normalised,
         hit_at_1,
@@ -328,6 +408,11 @@ async fn run_query(client: &Client, query: &GroundTruthQuery, mode: Mode) -> Que
 
 /// Normalise an absolute or repo-relative path to the relative-to-corpus form
 /// used by ground_truth_files.
+///
+/// Why: the daemon may return absolute paths or relative paths depending on
+/// index registration; normalising removes the ambiguity.
+/// What: strips the corpus root prefix when found; strips leading "./".
+/// Test: `any_match` relies on this to compare against ground_truth_files entries.
 fn normalise_path(file: &str) -> String {
     // Strip leading "./".
     let trimmed = file.trim_start_matches("./");
@@ -341,8 +426,11 @@ fn normalise_path(file: &str) -> String {
 }
 
 /// Returns true if `result_file` matches any entry in `ground_truth_files`.
-/// Match is "result_file ends with the truth path" so both absolute and
-/// relative result paths are accepted.
+///
+/// Why: the daemon may return paths with different root prefixes; an
+/// ends_with check is more robust than an exact-equals check.
+/// What: checks equality, path suffix, or slash-prefixed suffix.
+/// Test: normalise_path + any_match together tested by the main test body.
 fn any_match(result_file: &str, ground_truth_files: &[String]) -> bool {
     ground_truth_files.iter().any(|truth| {
         result_file == truth
@@ -352,14 +440,19 @@ fn any_match(result_file: &str, ground_truth_files: &[String]) -> bool {
 }
 
 /// Print a markdown-formatted per-query results table.
+///
+/// Why: per-query detail helps diagnose which specific queries drive mode
+/// differences that the aggregate table obscures.
+/// What: one row per (query, mode) with Hit@1, Hit@5, latencies, intent, category.
+/// Test: visual inspection of harness output.
 fn print_per_query_table(results: &[QueryResult]) {
     println!("\n## Per-query results\n");
     println!(
-        "| {:<4} | {:<10} | {:<8} | {:>4} | {:>4} | {:>8} | {:>9} | {:<14} | {:<12} |",
+        "| {:<4} | {:<10} | {:<10} | {:>4} | {:>4} | {:>8} | {:>9} | {:<14} | {:<12} |",
         "ID", "Mode", "Cat", "H@1", "H@5", "srv ms", "client ms", "Intent", "MatchReason"
     );
     println!(
-        "|{:-<6}|{:-<12}|{:-<10}|{:-<6}|{:-<6}|{:-<10}|{:-<11}|{:-<16}|{:-<14}|",
+        "|{:-<6}|{:-<12}|{:-<12}|{:-<6}|{:-<6}|{:-<10}|{:-<11}|{:-<16}|{:-<14}|",
         "", "", "", "", "", "", "", "", ""
     );
     for r in results {
@@ -370,10 +463,10 @@ fn print_per_query_table(results: &[QueryResult]) {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".into());
         println!(
-            "| {:<4} | {:<10} | {:<8} | {:>4} | {:>4} | {:>8} | {:>9} | {:<14} | {:<12} |",
+            "| {:<4} | {:<10} | {:<10} | {:>4} | {:>4} | {:>8} | {:>9} | {:<14} | {:<12} |",
             r.query_id,
             r.mode.label(),
-            "",
+            r.query_category,
             h1,
             h5,
             srv,
@@ -384,7 +477,86 @@ fn print_per_query_table(results: &[QueryResult]) {
     }
 }
 
-/// Print the aggregate Hit@K table comparing modes.
+/// Print the per-(mode × query-category) Hit@K breakdown table.
+///
+/// Why: this is the primary analytical artifact — it shows whether hybrid/KG
+/// modes outperform lexical specifically on conceptual queries (where BM25
+/// has no literal match advantage).
+/// What: rows = modes; columns = definition / conceptual / usage / text_data /
+///   aggregate. Prints Hit@1 and Hit@5 for each cell.
+/// Test: visual inspection; CI baseline doc records the numbers.
+fn print_category_breakdown_table(results: &[QueryResult]) {
+    let categories = ["definition", "conceptual", "usage", "text", "data"];
+    let header_cats = ["Def", "Concept", "Usage", "Text", "Data", "All"];
+
+    println!("\n## Per-(mode × query-category) Hit@K breakdown\n");
+    println!(
+        "| {:<10} | {} | {} | {} | {} | {} | {} |",
+        "Mode",
+        format!("{:^15}", "Def Hit@1/5"),
+        format!("{:^15}", "Concept Hit@1/5"),
+        format!("{:^15}", "Usage Hit@1/5"),
+        format!("{:^15}", "Text Hit@1/5"),
+        format!("{:^15}", "Data Hit@1/5"),
+        format!("{:^15}", "Aggregate Hit@1/5"),
+    );
+    println!(
+        "|{:-<12}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|",
+        "", "", "", "", "", "", ""
+    );
+
+    for mode in [Mode::Lexical, Mode::Hybrid, Mode::KgLeading] {
+        let mode_results: Vec<&QueryResult> = results
+            .iter()
+            .filter(|r| std::mem::discriminant(&r.mode) == std::mem::discriminant(&mode))
+            .collect();
+
+        let mut cells: Vec<String> = Vec::new();
+
+        // Per-category cells.
+        for cat in categories {
+            let subset: Vec<&&QueryResult> = mode_results
+                .iter()
+                .filter(|r| r.query_category == cat)
+                .collect();
+            if subset.is_empty() {
+                cells.push(format!("{:^15}", "n/a"));
+            } else {
+                let n = subset.len();
+                let h1 = subset.iter().filter(|r| r.hit_at_1).count();
+                let h5 = subset.iter().filter(|r| r.hit_at_5).count();
+                cells.push(format!("{:^15}", format!("{h1}/{n} | {h5}/{n}")));
+            }
+        }
+
+        // Aggregate cell.
+        let n = mode_results.len();
+        let h1 = mode_results.iter().filter(|r| r.hit_at_1).count();
+        let h5 = mode_results.iter().filter(|r| r.hit_at_5).count();
+        cells.push(format!("{:^15}", format!("{h1}/{n} | {h5}/{n}")));
+
+        println!(
+            "| {:<10} | {} | {} | {} | {} | {} | {} |",
+            mode.label(),
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+        );
+    }
+
+    // Print a separator and the category-column headers for clarity.
+    println!("\n  Columns: {}", header_cats.join(" / "));
+    println!("  Format per cell: Hit@1/total | Hit@5/total\n");
+}
+
+/// Print the aggregate Hit@K table comparing modes (identical to v0.1 table).
+///
+/// Why: aggregate numbers for backward compatibility with v0.1 baseline doc.
+/// What: one row per mode with overall Hit@1%, Hit@5%, p50 latencies.
+/// Test: visual inspection.
 fn print_aggregate_table(results: &[QueryResult]) {
     println!("\n## Aggregate by mode\n");
     println!(
@@ -396,8 +568,10 @@ fn print_aggregate_table(results: &[QueryResult]) {
         "", "", "", "", ""
     );
     for mode in [Mode::Lexical, Mode::Hybrid, Mode::KgLeading] {
-        let subset: Vec<&QueryResult> =
-            results.iter().filter(|r| matches!(r.mode, m if std::mem::discriminant(&m) == std::mem::discriminant(&mode))).collect();
+        let subset: Vec<&QueryResult> = results
+            .iter()
+            .filter(|r| std::mem::discriminant(&r.mode) == std::mem::discriminant(&mode))
+            .collect();
         if subset.is_empty() {
             continue;
         }
@@ -435,6 +609,11 @@ fn print_aggregate_table(results: &[QueryResult]) {
     }
 }
 
+/// Compute the p-th percentile of a sorted slice.
+///
+/// Why: latency reporting wants p50 without pulling in a stats crate.
+/// What: index arithmetic into a sorted slice; returns 0 on empty.
+/// Test: used by print_aggregate_table; correctness is visually checked.
 fn percentile(sorted: &[u128], p: usize) -> u128 {
     if sorted.is_empty() {
         return 0;
@@ -451,6 +630,7 @@ fn percentile(sorted: &[u128], p: usize) -> u128 {
 /// Why: this is the FIRST measurement of trusty-search hybrid retrieval that
 /// is provably free of BM25 circular bias (issue #123). The numbers it prints
 /// land in docs/regression-testing/synthetic-corpus-baseline-*.md.
+///   v0.2.0 adds: mode_hint forwarding and per-(mode × category) table.
 /// What: the steps documented in the file-level comment.
 /// Test: this IS the test.
 #[tokio::test]
@@ -458,7 +638,7 @@ fn percentile(sorted: &[u128], p: usize) -> u128 {
 async fn benchmark_synthetic_corpus_all_modes() {
     let client = make_client();
     assert_daemon_healthy(&client).await;
-    println!("\n=== synthetic-benchmark corpus, three-mode evaluation ===");
+    println!("\n=== synthetic-benchmark corpus, three-mode evaluation (v0.2.0) ===");
     println!("corpus root: {}", corpus_root().display());
 
     let queries = load_ground_truth();
@@ -481,9 +661,11 @@ async fn benchmark_synthetic_corpus_all_modes() {
         for q in &queries {
             let result = run_query(&client, q, mode).await;
             println!(
-                "  {} [{}]: H@1={} H@5={} top1={}",
+                "  {} [{}] (mode_hint={}, cat={}): H@1={} H@5={} top1={}",
                 q.id,
                 q.text,
+                q.mode_hint,
+                q.category,
                 if result.hit_at_1 { "Y" } else { "-" },
                 if result.hit_at_5 { "Y" } else { "-" },
                 result
@@ -497,6 +679,7 @@ async fn benchmark_synthetic_corpus_all_modes() {
     }
 
     print_per_query_table(&all_results);
+    print_category_breakdown_table(&all_results);
     print_aggregate_table(&all_results);
 
     println!("\n## Diagnostics");
