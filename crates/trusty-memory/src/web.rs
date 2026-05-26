@@ -61,7 +61,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(config))
         .route("/api/v1/palaces", get(list_palaces).post(create_palace))
-        .route("/api/v1/palaces/{id}", get(get_palace_handler))
+        .route(
+            "/api/v1/palaces/{id}",
+            get(get_palace_handler)
+                .delete(delete_palace_handler)
+                .patch(update_palace_handler),
+        )
         .route(
             "/api/v1/palaces/{id}/drawers",
             get(list_drawers).post(create_drawer),
@@ -762,6 +767,83 @@ async fn get_palace_handler(
     ))
 }
 
+/// Query parameters for `DELETE /api/v1/palaces/{id}`.
+///
+/// Why: Issue #180 — `force=true` is the explicit opt-in to delete a
+/// palace that still has drawers. Defaulting to `false` keeps the
+/// "must be empty" guard active when callers omit the flag.
+/// What: a single optional bool that the handler unwraps to `false`.
+/// Test: `delete_palace_refuses_when_drawers_present`,
+/// `delete_palace_force_removes_populated_palace`.
+#[derive(Deserialize, Default)]
+struct DeletePalaceQuery {
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+/// `DELETE /api/v1/palaces/{id}?force=<bool>` — drop an entire palace.
+///
+/// Why: Issue #180 — operators need a single call to clean up a palace
+/// they no longer want. The legacy drawer-by-drawer delete path is too
+/// noisy and leaves the palace's KG / vector index behind.
+/// What: delegates to `MemoryService::delete_palace`. Returns
+/// `204 No Content` on success, `404 Not Found` when the id is unknown,
+/// and `409 Conflict` when the palace still has drawers and `force` is
+/// not set. Other failures bubble up as 500.
+/// Test: `delete_palace_removes_dir_when_empty`,
+/// `delete_palace_refuses_when_drawers_present`,
+/// `delete_palace_force_removes_populated_palace`,
+/// `delete_palace_returns_not_found_for_missing_id`.
+async fn delete_palace_handler(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<DeletePalaceQuery>,
+) -> Result<StatusCode, ApiError> {
+    crate::service::MemoryService::new(state)
+        .delete_palace(&id, q.force.unwrap_or(false))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request body for `PATCH /api/v1/palaces/{id}`.
+///
+/// Why: The only mutable palace metadata exposed today is the display name;
+/// keeping the body to a single field keeps the wire contract obvious and
+/// lets us extend later without breaking older clients (additive fields
+/// only). Issue #180 follow-up.
+/// What: a single required `name` string. Empty / whitespace-only values
+/// are rejected with 400 by the handler.
+/// Test: `update_palace_name_renames_palace`,
+/// `update_palace_name_rejects_empty_name`.
+#[derive(Deserialize)]
+struct UpdatePalaceBody {
+    name: String,
+}
+
+/// `PATCH /api/v1/palaces/{id}` — rename a palace's display name.
+///
+/// Why: Issue #180 follow-up — operators need to relabel palaces without
+/// re-creating them (which would lose all stored drawers / KG / vectors).
+/// Only the human-readable `name` changes; the directory name (which is the
+/// palace id) is immutable.
+/// What: delegates to `MemoryService::update_palace_name_typed`. Returns
+/// `200 OK` with the updated palace info on success, `404 Not Found` when
+/// the id is unknown, and `400 Bad Request` when the supplied name is
+/// empty after trimming.
+/// Test: `update_palace_name_renames_palace`,
+/// `update_palace_name_rejects_empty_name`,
+/// `update_palace_name_returns_not_found_for_missing_id`.
+async fn update_palace_handler(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UpdatePalaceBody>,
+) -> Result<Json<Value>, ApiError> {
+    let value = crate::service::MemoryService::new(state)
+        .update_palace_name_typed(&id, &body.name)
+        .await?;
+    Ok(Json(value))
+}
+
 // ---------------------------------------------------------------------------
 // Drawers
 // ---------------------------------------------------------------------------
@@ -1407,6 +1489,21 @@ impl ApiError {
             message: msg.into(),
         }
     }
+    /// Build a 409 Conflict response.
+    ///
+    /// Why: `DELETE /palaces/{id}` (issue #180) returns 409 when the
+    /// palace still has drawers and `force=true` is not set. A 400 would
+    /// be misleading (the request is well-formed) and 404 would lie about
+    /// existence.
+    /// What: wraps the message with `StatusCode::CONFLICT`.
+    /// Test: `delete_palace_refuses_when_drawers_present`.
+    #[allow(dead_code)]
+    pub(crate) fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1426,6 +1523,7 @@ impl From<crate::service::ServiceError> for ApiError {
         match e {
             crate::service::ServiceError::BadRequest(m) => ApiError::bad_request(m),
             crate::service::ServiceError::NotFound(m) => ApiError::not_found(m),
+            crate::service::ServiceError::Conflict(m) => ApiError::conflict(m),
             crate::service::ServiceError::Internal(m) => ApiError::internal(m),
         }
     }
@@ -1993,6 +2091,344 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v.as_array().expect("array");
         assert!(arr.iter().any(|p| p["id"] == "web-test"));
+    }
+
+    /// Why: Issue #180 — verify the happy path: create an empty palace,
+    /// `DELETE /api/v1/palaces/{id}` returns 204, and a follow-up
+    /// `GET /api/v1/palaces/{id}` returns 404 because the directory is gone.
+    /// What: Drives the router through axum's `oneshot` testing layer; no
+    /// query parameters are passed so `force` defaults to `false`. A freshly
+    /// created palace has no drawers, so the conflict guard does not fire.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn delete_palace_removes_dir_when_empty() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+        let body = json!({"name": "to-delete"}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/palaces/to-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Confirm the palace is gone from the on-disk registry.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/to-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // And the on-disk directory itself was removed.
+        let palace_dir = state.data_root.join("to-delete");
+        assert!(
+            !palace_dir.exists(),
+            "palace dir should be removed: {}",
+            palace_dir.display()
+        );
+    }
+
+    /// Why: Issue #180 — without `force=true` we must refuse to drop a
+    /// palace that still has drawers, otherwise a stray DELETE could nuke
+    /// hours of memory in one request.
+    /// What: Create a palace, write a drawer into it, then DELETE without
+    /// `force`. Expect 409 Conflict and verify the palace and drawer are
+    /// still on disk.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn delete_palace_refuses_when_drawers_present() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+        // Create the palace.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "keep-me"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Add a drawer so the conflict guard fires.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces/keep-me/drawers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "content": "Important fact that should not be deleted accidentally.",
+                            "tags": [],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/palaces/keep-me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Palace still resolves.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/keep-me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Why: Issue #180 — `?force=true` is the explicit destructive opt-in;
+    /// the conflict guard must yield and the palace must vanish even with
+    /// drawers present.
+    /// What: Same setup as the conflict test, but pass `?force=true` and
+    /// assert the 204 + 404 follow-up shape.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn delete_palace_force_removes_populated_palace() {
+        let state = test_state();
+        let app = router().with_state(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "force-delete"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces/force-delete/drawers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"content": "Sacrificial drawer for the force-delete path.", "tags": []}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/palaces/force-delete?force=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/force-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Why: Issue #180 — deleting a missing palace must yield 404 so
+    /// idempotent retries on the client are distinguishable from the
+    /// "drawers present" precondition failure.
+    /// What: DELETE against a never-created id and assert 404.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn delete_palace_returns_not_found_for_missing_id() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/palaces/never-existed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Why: Issue #180 follow-up — verify the happy path of `PATCH
+    /// /api/v1/palaces/{id}`: create a palace, rename it, and confirm
+    /// `GET /api/v1/palaces/{id}` returns the new display name. The id
+    /// (which is the on-disk directory) must stay stable.
+    /// What: POST a palace named "rename-me", PATCH with a new display
+    /// name, expect 200 + payload showing the rename, then GET to confirm
+    /// persistence to disk.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn update_palace_name_renames_palace() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "rename-me"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/palaces/rename-me")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "New Display Name"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["id"].as_str(), Some("rename-me"));
+        assert_eq!(v["name"].as_str(), Some("New Display Name"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/rename-me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["id"].as_str(), Some("rename-me"));
+        assert_eq!(v["name"].as_str(), Some("New Display Name"));
+    }
+
+    /// Why: Issue #180 follow-up — empty / whitespace-only names would
+    /// break the dashboard label. Reject with 400 so the caller knows the
+    /// request was well-formed but the value is invalid.
+    /// What: Create a palace, PATCH with `{"name": "   "}`, expect 400.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn update_palace_name_rejects_empty_name() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "keep-name"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/palaces/keep-name")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "   "}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Why: Issue #180 follow-up — patching a non-existent palace must
+    /// yield 404 so retries against the wrong id surface the real problem
+    /// rather than silently no-op'ing.
+    /// What: PATCH against a never-created id and assert 404.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn update_palace_name_returns_not_found_for_missing_id() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/palaces/no-such-palace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "irrelevant"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Why: The operator TUI's MEMORY tab reads `node_count`, `edge_count`,
