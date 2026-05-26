@@ -1,0 +1,269 @@
+{
+  "corpus": "open-mpm",
+  "version": "0.1.0",
+  "purpose": "KG-targeted retrieval-lift determination for #145. The original open-mpm baseline (benchmark_open_mpm_ground_truth.json) found search_kg ≡ search_semantic on 18 mixed-intent queries (only 3 were KG-relevant). This query set is *specifically designed* to exercise the symbol graph — every query asks a question whose answer requires walking call / contains / inherits / impl-of edges, not raw text matching. If search_kg fails to lift Hit@K over search_semantic on THIS set, the KG signal is dead-code retrieval ornament.",
+  "schema_notes": "Each query carries a `class` (kg_callers / kg_traversal / kg_impl_of / kg_neighborhood), a `mode_hint` (always 'code'), a `seed_query` (the lexical string used to anchor the KG traversal — stage-1), an optional `seed_target_file` (where stage-1 SHOULD land for the test to be meaningful), and `ground_truth_files` (the symbol-graph-connected files that a graph-aware tool should surface). The harness runs each query through search_lexical / search_semantic / search_kg / search_all using the two-stage pattern: stage-1 lexical lookup → stage-2 same-text query with the chosen lane's stage selector.",
+  "classes": {
+    "kg_callers": "Question: who calls function/method X? Ground truth = set of files containing call sites. search_lexical will surface the DEFINITION (and possibly some call sites that happen to mention X literally). search_semantic will surface semantically-similar code. search_kg seeded at X should surface ALL callers via the 'called_by' edge.",
+    "kg_traversal": "Question: what does struct/type X contain or use? Ground truth = files containing types/functions reachable from X via contains/calls edges. search_lexical finds the definition only. search_semantic finds vaguely related types. search_kg should walk outward from X.",
+    "kg_impl_of": "Question: what types implement trait T? Ground truth = files containing `impl T for ...`. This is the cleanest KG win shape — `impl T for X` lines have a literal lexical token (`impl T for`) but the question is structurally about the impl-of edge.",
+    "kg_neighborhood": "Question: what is the call-neighborhood of entry-point Y? Ground truth = files reachable in 1-2 hops from Y. Broadest possible KG win shape."
+  },
+  "queries": [
+    {
+      "id": "KG01",
+      "class": "kg_callers",
+      "text": "who calls events::publish to broadcast events to the SSE bus",
+      "seed_query": "fn publish event",
+      "seed_target_file": "src/events.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/subprocess.rs",
+        "src/llm/mod.rs",
+        "src/ctrl/mod.rs",
+        "src/agents/claude_code_runner.rs",
+        "src/api/server.rs"
+      ],
+      "description": "events::publish has 25+ call sites across 5 files. KG seeded at events.rs should surface all five caller files. Lexical may surface a few but cannot enumerate them."
+    },
+    {
+      "id": "KG02",
+      "class": "kg_callers",
+      "text": "who calls cost_usd to record per-call LLM cost",
+      "seed_query": "fn cost_usd",
+      "seed_target_file": "src/perf.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/perf.rs",
+        "src/workflow/engine.rs"
+      ],
+      "description": "cost_usd has one external caller (workflow/engine.rs:1315) plus internal uses in perf.rs. KG seeded at perf.rs should surface workflow/engine.rs as the caller."
+    },
+    {
+      "id": "KG03",
+      "class": "kg_callers",
+      "text": "who calls atomic_write for crash-safe state persistence",
+      "seed_query": "fn atomic_write path",
+      "seed_target_file": "src/state_writer.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/state_writer.rs",
+        "src/skills/registry.rs"
+      ],
+      "description": "atomic_write defined in state_writer.rs, called externally from skills/registry.rs (line 415) and used in state_writer's own tests."
+    },
+    {
+      "id": "KG04",
+      "class": "kg_callers",
+      "text": "who calls atomic_append_line to write session records",
+      "seed_query": "fn atomic_append_line",
+      "seed_target_file": "src/state_writer.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/state_writer.rs",
+        "src/interaction_log.rs",
+        "src/session_record.rs"
+      ],
+      "description": "atomic_append_line called from interaction_log.rs:227 and session_record.rs:118. Pure call-site retrieval."
+    },
+    {
+      "id": "KG05",
+      "class": "kg_callers",
+      "text": "who calls register_tm_tools to attach trusty-memory tools to the registry",
+      "seed_query": "fn register_tm_tools",
+      "seed_target_file": "src/tools/tm_tools.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/tools/tm_tools.rs"
+      ],
+      "description": "register_tm_tools is internal to tm_tools.rs (one external sibling via register_tm_tools_for_state_dir, same file). Defines the upper bound of how cleanly KG can surface call sites when they are co-located."
+    },
+    {
+      "id": "KG06",
+      "class": "kg_callers",
+      "text": "who calls spawn_subagent_and_run to run a CLI subagent",
+      "seed_query": "fn spawn_subagent_and_run",
+      "seed_target_file": "src/subprocess.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/subprocess.rs",
+        "src/runtime.rs"
+      ],
+      "description": "spawn_subagent_and_run defined in subprocess.rs, called from runtime.rs."
+    },
+    {
+      "id": "KG07",
+      "class": "kg_traversal",
+      "text": "what does PluginManager contain and what does it use to manage MCP plugins",
+      "seed_query": "struct PluginManager",
+      "seed_target_file": "src/plugins/manager.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/plugins/manager.rs",
+        "src/plugins/mod.rs",
+        "src/plugins/trusty_search.rs",
+        "src/runtime.rs"
+      ],
+      "description": "Traversal from PluginManager outward — its module siblings, its consumers, the runtime that constructs it. KG should walk contains+called_by."
+    },
+    {
+      "id": "KG08",
+      "class": "kg_traversal",
+      "text": "what does SessionsRegistry use to load and write the on-disk session catalogue",
+      "seed_query": "struct SessionsRegistry",
+      "seed_target_file": "src/session_registry.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/session_registry.rs",
+        "src/runtime.rs"
+      ],
+      "description": "SessionsRegistry is consumed by runtime.rs. Traversal probe — small but real graph neighborhood."
+    },
+    {
+      "id": "KG09",
+      "class": "kg_traversal",
+      "text": "what does SubprocessAgentRunner use internally to spawn and capture subprocess output",
+      "seed_query": "struct SubprocessAgentRunner",
+      "seed_target_file": "src/subprocess.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/subprocess.rs",
+        "src/runtime.rs",
+        "src/ctrl/mod.rs"
+      ],
+      "description": "SubprocessAgentRunner is used by runtime.rs and dispatched into by ctrl/mod.rs. Traversal from a leaf struct outward to its consumers."
+    },
+    {
+      "id": "KG10",
+      "class": "kg_traversal",
+      "text": "what does EVENT_LINE_PREFIX get consumed by when relaying events over stderr",
+      "seed_query": "EVENT_LINE_PREFIX",
+      "seed_target_file": "src/events.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/events.rs",
+        "src/api/server.rs"
+      ],
+      "description": "EVENT_LINE_PREFIX defined in events.rs, referenced by api/server.rs:2347 in the workflow-stderr relay path."
+    },
+    {
+      "id": "KG11",
+      "class": "kg_impl_of",
+      "text": "what types implement the AgentRunner trait",
+      "seed_query": "trait AgentRunner",
+      "seed_target_file": "src/tools/traits.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/subprocess.rs",
+        "src/agents/claude_code_runner.rs",
+        "src/agents/in_process_runner.rs"
+      ],
+      "description": "AgentRunner is implemented by SubprocessAgentRunner (subprocess.rs), ClaudeCodeAgentRunner and DispatchingAgentRunner (claude_code_runner.rs), InProcessAgentRunner (in_process_runner.rs). Excludes test-only mocks."
+    },
+    {
+      "id": "KG12",
+      "class": "kg_impl_of",
+      "text": "what types implement the MemoryStore trait",
+      "seed_query": "trait MemoryStore",
+      "seed_target_file": "src/memory/store.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/memory/code_store.rs",
+        "src/memory/session_store.rs",
+        "src/memory/redb_usearch.rs",
+        "src/memory/trusty_backed.rs",
+        "src/memory/trusty_client.rs"
+      ],
+      "description": "MemoryStore has 5 production impls under src/memory/ plus test-only impls (excluded). Classic impl-of edge query."
+    },
+    {
+      "id": "KG13",
+      "class": "kg_impl_of",
+      "text": "what types implement the ModelAdapter trait for different LLM providers",
+      "seed_query": "trait ModelAdapter",
+      "seed_target_file": "src/llm/adapter.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/llm/adapter.rs"
+      ],
+      "description": "All five ModelAdapter impls (Anthropic / OpenAI / Bedrock / Ollama / Generic) live in the same file as the trait definition. Tests whether KG can isolate a single file when the answer is co-located — and whether lexical/semantic are competitive here."
+    },
+    {
+      "id": "KG14",
+      "class": "kg_impl_of",
+      "text": "what types implement the HarnessAdapter trait for external coding harnesses",
+      "seed_query": "trait HarnessAdapter",
+      "seed_target_file": "src/adapters/traits.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/adapters/shell.rs",
+        "src/adapters/claude_code.rs",
+        "src/adapters/augment.rs",
+        "src/adapters/claude_mpm.rs",
+        "src/adapters/gemini.rs",
+        "src/adapters/open_mpm.rs",
+        "src/adapters/codex.rs"
+      ],
+      "description": "HarnessAdapter has 7 production impls each in a sibling file under src/adapters/. Strongest impl-of probe in this set — answer requires walking the impl-of edge to 7 files."
+    },
+    {
+      "id": "KG15",
+      "class": "kg_impl_of",
+      "text": "what types implement the TicketingClient trait for ticket backends",
+      "seed_query": "trait TicketingClient",
+      "seed_target_file": "src/ticketing/mod.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/ticketing/linear.rs",
+        "src/ticketing/gh_cli.rs",
+        "src/ticketing/github.rs",
+        "src/ticketing/jira.rs"
+      ],
+      "description": "TicketingClient has 4 production impls (Linear / gh-cli / GitHub REST / Jira) in sibling files. Direct impl-of probe."
+    },
+    {
+      "id": "KG16",
+      "class": "kg_neighborhood",
+      "text": "what is the call neighborhood of runtime::run the main MPM entry point",
+      "seed_query": "pub async fn run runtime",
+      "seed_target_file": "src/runtime.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/runtime.rs",
+        "src/ctrl/mod.rs",
+        "src/api/server.rs",
+        "src/main.rs"
+      ],
+      "description": "runtime::run is the top-level MPM entry. Its call-neighborhood includes main.rs (caller), api/server.rs (HTTP server bootstrap), ctrl/mod.rs (dispatch). Broad neighborhood probe."
+    },
+    {
+      "id": "KG17",
+      "class": "kg_neighborhood",
+      "text": "what is the call neighborhood of the API server search session dispatcher",
+      "seed_query": "fn run_session api server",
+      "seed_target_file": "src/api/server.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/api/server.rs",
+        "src/ctrl/mod.rs",
+        "src/runtime.rs",
+        "src/events.rs"
+      ],
+      "description": "Session-running code in api/server.rs spawns into ctrl/mod.rs, publishes to events.rs, queries runtime state. Broad neighborhood probe."
+    },
+    {
+      "id": "KG18",
+      "class": "kg_neighborhood",
+      "text": "what is the call neighborhood of the llm completion dispatcher",
+      "seed_query": "fn complete llm chat",
+      "seed_target_file": "src/llm/mod.rs",
+      "mode_hint": "code",
+      "ground_truth_files": [
+        "src/llm/mod.rs",
+        "src/llm/adapter.rs",
+        "src/llm/bedrock.rs"
+      ],
+      "description": "LLM completion dispatcher in llm/mod.rs delegates to adapter.rs and bedrock.rs. Tight neighborhood probe."
+    }
+  ]
+}
