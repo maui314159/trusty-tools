@@ -15,8 +15,8 @@ GitHub Issues is the ticket source. Use `gh issue list`, `gh issue view`, `gh is
 
 This is a unified Cargo workspace. Key rules:
 
-### No [patch.crates-io] needed
-Internal crates resolve via path deps. Never add `[patch.crates-io]` for internal crates.
+### [patch.crates-io] rules
+Internal-only crates (never published) resolve via workspace path deps — no `[patch.crates-io]` entry needed. Published sidecar lib crates (e.g. `trusty-embedderd`, `trusty-bm25-daemon`) DO need `[patch.crates-io]` entries in the workspace root `Cargo.toml` so local builds use the in-tree source. See the Single-Install Convention section below.
 
 ### Required Workflow Sequence
 (prompt → ticket) OR (check tickets) → read ticket → implement → test → build → version bump → publish → update consumers → verify CI
@@ -56,15 +56,47 @@ The following repos are now READ-ONLY and point here: trusty-common, trusty-sear
 
 Each main crate's `cargo install` must produce **every binary required to run that crate**. Users invoke ONE `cargo install <main-crate>` command; sidecar daemons, helper binaries, and any other runtime executables are bundled automatically via `[[bin]]` targets in the main crate.
 
+### How to bundle a sidecar binary into a main crate
+
+1. The sidecar crate exposes a `[lib]` with a `pub async fn run() -> Result<()>` entry point (and keeps its own `src/main.rs` as a thin shim for standalone use if desired).
+2. The main crate adds a `[[bin]]` target:
+   ```toml
+   [[bin]]
+   name = "<sidecar-binary-name>"
+   path = "src/bin/<sidecar-binary-name>.rs"
+   ```
+3. The main crate's `src/bin/<sidecar-binary-name>.rs` is a 5-line shim: `trusty_<sidecar>::run().await`.
+4. The main crate depends on the sidecar library crate via `[workspace.dependencies]`.
+5. Any supervisor/discovery code falls back to `std::env::current_exe().parent().join("<sidecar-binary-name>")` — `cargo install` puts all bins from a single crate in the same directory.
+
+### Sidecar publish rule (IMPORTANT)
+
+**Sidecar lib crates MUST be published to crates.io.** Do NOT set `publish = false` on a sidecar whose lib is a dependency of a published main crate — Cargo's dependency resolver requires all lib deps to exist on crates.io when publishing the depending crate. The single-install convention means users don't `cargo install <sidecar>` directly, but the crate must still be on crates.io as a library.
+
+Only set `publish = false` on crates that are **not** depended on by any published crate (e.g., internal tooling, workspace-only binaries).
+
+When publishing a main crate for the first time (or after updating a sidecar), publish the sidecar lib first, wait for crates.io index propagation (~90s), then publish the main crate.
+
+### [patch.crates-io] for sidecar crates
+
+After publishing a sidecar lib, add (or update) its entry in the workspace root `Cargo.toml` `[patch.crates-io]` section so local builds continue to use the in-tree source:
+```toml
+[patch.crates-io]
+trusty-embedderd = { path = "crates/trusty-embedderd" }
+trusty-bm25-daemon = { path = "crates/trusty-bm25-daemon" }
+```
+
+The earlier rule "No [patch.crates-io] needed" applies only to strictly-internal crates that are never published. Published sidecar libs need the patch entry.
+
 ### Sidecar inventory (audit checklist)
 
 When adding a new sidecar to any main crate, update this list:
 
-| Main crate | Bundled binaries |
-|---|---|
-| trusty-search | `trusty-search`, `trusty-embedderd` ✅ (PR #190) |
-| trusty-memory | `trusty-memory`, `trusty-memory-mcp-bridge`, `trusty-bm25-daemon` ✅ (feat/trusty-memory-bundled-bm25-daemon-install) |
-| trusty-analyze | `trusty-analyze` (audit needed) |
-| trusty-git-analytics | `tga` (audit needed) |
-| trusty-mpm | `tm`, `trusty-mpm-daemon`, `trusty-mpm-mcp`, `trusty-mpm-tui`, `trusty-mpm-telegram` (feature-gated bins) |
-| open-mpm | `open-mpm` (audit needed) |
+| Main crate | Bundled binaries | Sidecar lib on crates.io |
+|---|---|---|
+| trusty-search | `trusty-search`, `trusty-embedderd` ✅ (PR #190) | `trusty-embedderd` v0.3.0 ✅ |
+| trusty-memory | `trusty-memory`, `trusty-bm25-daemon` ✅ (PR #191) | `trusty-bm25-daemon` — needs publish |
+| trusty-analyze | `trusty-analyze` (no sidecars) | — |
+| trusty-git-analytics | `tga` (no sidecars) | — |
+| trusty-mpm | `tm`, `trusty-mpm-daemon`, `trusty-mpm-mcp`, `trusty-mpm-tui`, `trusty-mpm-telegram` (feature-gated, publish=false) | n/a |
+| open-mpm | `open-mpm` (publish=false) | n/a |
