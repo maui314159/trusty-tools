@@ -456,11 +456,21 @@ impl CodeIndexer {
             effective_mode
         );
 
-        // Staged-pipeline lane selector (issue #109, Phase 1). When the
-        // caller pinned `stage=lexical` we route through BM25 + grep only,
-        // even if the index has a ready HNSW lane. Lets grep-replacement
-        // callers (`?stage=lexical`) skip semantic noise on demand.
+        // Staged-pipeline lane selector (issue #109, Phase 1; extended #138
+        // for per-lane MCP tools). Each `SearchStage` pins the dispatcher to
+        // a fixed lane combination regardless of what's ready on the index:
+        //   * `Lexical`  → BM25 + grep only (no HNSW, no KG).
+        //   * `Semantic` → BM25 + HNSW via RRF; KG expansion skipped.
+        //   * `Graph`    → BM25 + HNSW + KG expansion forced ON.
+        //   * `None`     → legacy adaptive routing (every ready lane runs).
         let lexical_only = matches!(query.stage, Some(super::SearchStage::Lexical));
+        let semantic_lane = matches!(query.stage, Some(super::SearchStage::Semantic));
+        let graph_lane = matches!(query.stage, Some(super::SearchStage::Graph));
+        // KG expansion is force-enabled by `Graph`, force-disabled by
+        // `Lexical` or `Semantic`, and otherwise honours the caller's
+        // `expand_graph` flag combined with the intent's `use_kg_first`.
+        let force_kg = graph_lane;
+        let skip_kg = lexical_only || semantic_lane;
 
         // 1) Embed (cache-first) — None when no embedder is wired OR the
         //    caller has opted out of the semantic lane via `?stage=lexical`.
@@ -528,12 +538,19 @@ impl CodeIndexer {
 
         // 4) KG expand (conditional). Track which IDs came **only** from KG
         //    so the materialization step can label them "hybrid+kg".
-        //    `lexical_only` short-circuits the KG lane regardless of intent
-        //    (issue #109, Phase 1).
-        let (all, kg_ids) = if lexical_only {
+        //    Lane gating:
+        //      * `Lexical` / `Semantic`  → skip KG entirely (issue #138).
+        //      * `Graph`                 → force-enable KG even when
+        //        `intent.use_kg_first` is false; the LLM explicitly asked
+        //        for graph expansion by picking `search_kg`.
+        //      * `None` (default)        → existing behaviour: KG runs iff
+        //        `use_kg_first && query.expand_graph`.
+        let (all, kg_ids) = if skip_kg {
             (fused, std::collections::HashSet::new())
         } else {
-            self.expand_with_kg(fused, &intent, use_kg_first, query.expand_graph)
+            let effective_use_kg = use_kg_first || force_kg;
+            let effective_expand = query.expand_graph || force_kg;
+            self.expand_with_kg(fused, &intent, effective_use_kg, effective_expand)
                 .await
         };
 

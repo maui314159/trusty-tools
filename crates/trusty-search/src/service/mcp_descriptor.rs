@@ -73,14 +73,16 @@ mod tests {
     }
 
     #[test]
-    fn tools_returns_exactly_fifteen() {
-        // Issue #76 added `get_call_chain` (→ 14); the grep MCP tool brings
-        // the total to 15.
+    fn tools_returns_exactly_eighteen() {
+        // Issue #76 added `get_call_chain` (→ 14); the grep MCP tool brought
+        // the total to 15. Issue #138 added the per-lane search tools
+        // (`search_lexical`, `search_semantic`, `search_kg`) for an updated
+        // total of 18. `search_all` was already counted in the pre-#138 15.
         let tools = SearchMcpService.tools();
         assert_eq!(
             tools.len(),
-            15,
-            "expected 15 MCP tools, got {}: {:?}",
+            18,
+            "expected 18 MCP tools, got {}: {:?}",
             tools.len(),
             tools
                 .iter()
@@ -124,8 +126,10 @@ mod tests {
     fn trait_object_dispatch() {
         // Why: open-mpm collects services as `Box<dyn ServiceDescriptor>`;
         // make sure SearchMcpService is object-safe and dispatches correctly.
+        // Issue #138: total bumped from 15 → 18 with the per-lane search
+        // tools.
         let svc: Box<dyn ServiceDescriptor> = Box::new(SearchMcpService);
         assert_eq!(svc.name(), "trusty-search");
-        assert_eq!(svc.tools().len(), 15);
+        assert_eq!(svc.tools().len(), 18);
     }
 }

@@ -49,9 +49,13 @@ mod scopes {
 pub fn scopes_for_tool(name: &str) -> Vec<String> {
     use scopes::*;
     let s: &[&str] = match name {
-        // Read-only / query / introspection
-        "search_all" | "search" | "search_similar" | "search_health" | "list_indexes"
-        | "index_status" | "list_chunks" | "chat" | "get_call_chain" | "grep" => &[SEARCH_READ],
+        // Read-only / query / introspection. Issue #138 added the per-lane
+        // search tools (`search_lexical`, `search_semantic`, `search_kg`)
+        // alongside the existing `search_all` (now polymorphic between
+        // cross-project fan-out and per-index hybrid).
+        "search_all" | "search" | "search_lexical" | "search_semantic" | "search_kg"
+        | "search_similar" | "search_health" | "list_indexes" | "index_status" | "list_chunks"
+        | "chat" | "get_call_chain" | "grep" => &[SEARCH_READ],
 
         // Mutating
         "index_file" | "remove_file" | "create_index" | "delete_index" | "reindex" => {

@@ -401,18 +401,42 @@ pub struct SearchQuery {
     pub stage: Option<SearchStage>,
 }
 
-/// Stage selector for a single search query (issue #109, Phase 1).
+/// Stage selector for a single search query (issue #109, Phase 1; extended
+/// in issue #138).
 ///
-/// Why: `?stage=lexical` lets callers force Stage-1-only lanes even when
-/// the index is fully ready. Routes the query through BM25 + grep-fallback
-/// and skips HNSW + KG entirely.
-/// What: a tiny enum, serialised in lowercase. Phase 1 ships only `Lexical`;
-/// future phases may add `Semantic` for HNSW-only queries.
-/// Test: `stage_1_completes_and_search_works_before_embedding`.
+/// Why: lets callers (HTTP `?stage=...` or the per-lane MCP tools added in
+/// #138) force a specific lane combination even when the index is fully
+/// ready. Pushes intent classification to the LLM — the LLM picks
+/// `search_lexical` / `search_semantic` / `search_kg` and the server simply
+/// routes the lane mix.
+///
+/// What: a lowercase-serialised enum mapping each variant to a fixed lane
+/// combination in [`CodeIndexer::search`]. `Lexical` runs BM25 plus the
+/// grep-fallback only (no HNSW, no KG). `Semantic` runs BM25 plus HNSW
+/// via RRF (no KG expansion, no community-cohesion bonus). `Graph` runs
+/// the full BM25 plus HNSW plus KG expansion pipeline (hybrid AND).
+/// `None` keeps the legacy adaptive behaviour where the daemon's
+/// `search_capabilities` decides which lanes participate.
+///
+/// Test: `stage_1_completes_and_search_works_before_embedding` (lexical),
+/// `search_semantic_stage_skips_kg_expansion` (semantic), and
+/// `search_graph_stage_forces_kg_expansion_on_definition_query` (graph)
+/// in `core::indexer::tests`. Tool-level routing is covered by
+/// `mcp::tools::tests::search_*_tool_routes_to_*_stage`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchStage {
+    /// BM25 + grep-fallback only — ripgrep-equivalent latency. Skips
+    /// HNSW + KG regardless of index readiness.
     Lexical,
+    /// BM25 + HNSW vector lane fused via RRF. Skips KG expansion. The
+    /// embedder must be wired and Stage 2 ready; otherwise the HNSW
+    /// lane silently contributes nothing.
+    Semantic,
+    /// BM25 + HNSW + KG expansion. Forces KG traversal regardless of
+    /// query intent (which `expand_with_kg` would otherwise gate on
+    /// `use_kg_first`). Equivalent to the full hybrid pipeline.
+    Graph,
 }
 
 impl SearchQuery {

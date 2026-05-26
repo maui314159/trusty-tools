@@ -33,6 +33,23 @@ use serde_json::Value;
 // to keep `pub use` consumers (and `crate::mcp::tools::error_codes` etc.) working.
 pub use trusty_common::mcp::{error_codes, initialize_response, JsonRpcError, Request, Response};
 
+/// Application-level JSON-RPC error code surfaced when a per-lane MCP tool
+/// (`search_semantic`, `search_kg`) is invoked but its prerequisite stage
+/// is not yet `Ready` on the target index (issue #138).
+///
+/// Why: Falls inside the JSON-RPC 2.0 "server reserved" range (`-32099` ..
+/// `-32000`) so it never collides with transport-level codes (parse error,
+/// invalid request, method not found, invalid params, internal error). The
+/// LLM and any orchestrator can branch on this code to retry against
+/// `search_lexical` instead of asking the user.
+/// What: a free integer constant; emitted on bare-method invocations. The
+/// `tools/call` form surfaces the same condition via `_meta.error_code =
+/// "STAGE_NOT_READY"` per MCP's in-band error convention.
+/// Test: covered by `search_semantic_tool_returns_stage_not_ready_when_*`
+/// and `search_kg_tool_returns_stage_not_ready_when_*` in the unit tests
+/// at the bottom of this file.
+pub const STAGE_NOT_READY_CODE: i32 = -32010;
+
 /// Tool dispatcher backed by an HTTP client targeting the daemon.
 #[derive(Clone)]
 pub struct McpServer {
@@ -150,6 +167,14 @@ impl McpServer {
                 ),
                 Err(DispatchError::InvalidParams(msg)) => Response::ok(id, wrap_tool_error(&msg)),
                 Err(DispatchError::Transport(msg)) => Response::ok(id, wrap_tool_error(&msg)),
+                Err(DispatchError::StageNotReady {
+                    message,
+                    current_stages,
+                    suggested_tools,
+                }) => Response::ok(
+                    id,
+                    wrap_stage_not_ready_error(&message, &current_stages, &suggested_tools),
+                ),
             }
         } else {
             match outcome {
@@ -165,16 +190,50 @@ impl McpServer {
                 Err(DispatchError::Transport(msg)) => {
                     Response::err(id, error_codes::INTERNAL_ERROR, msg)
                 }
+                Err(DispatchError::StageNotReady {
+                    message,
+                    current_stages,
+                    suggested_tools,
+                }) => {
+                    // Bare-method form has no `_meta` slot, so we surface
+                    // the structured payload as the error `data` field and
+                    // keep the message human-readable. JSON-RPC `code` -32010
+                    // is in the server-defined range reserved for app-level
+                    // semantics (issue #138).
+                    let data = serde_json::json!({
+                        "error_code": "STAGE_NOT_READY",
+                        "current_stages": current_stages,
+                        "suggested_tools": suggested_tools,
+                    });
+                    let mut resp = Response::err(id, STAGE_NOT_READY_CODE, message);
+                    if let Some(ref mut e) = resp.error {
+                        e.data = Some(data);
+                    }
+                    resp
+                }
             }
         }
     }
 
     async fn call_tool(&self, tool: &str, args: &Value) -> Result<Value, DispatchError> {
         match tool {
+            // Issue #138 — per-lane search tools that push intent
+            // classification to the LLM. Each tool pins the daemon to a
+            // fixed lane combination and returns a structured
+            // STAGE_NOT_READY error when its prerequisite stage isn't
+            // ready, instead of silently degrading.
+            "search_lexical" => self.run_lane_search(args, SearchLane::Lexical).await,
+            "search_semantic" => self.run_lane_search(args, SearchLane::Semantic).await,
+            "search_kg" => self.run_lane_search(args, SearchLane::Graph).await,
             "search_all" => {
-                // Issue #10 — cross-project fan-out search. Maps directly to
-                // `POST /search` (the top-level endpoint, distinct from
-                // per-index `/indexes/:id/search`).
+                // Polymorphic for back-compat (issue #138):
+                //   * with `index_id`  → per-index full hybrid (alias for
+                //     `search`; matches the #138 ticket spec).
+                //   * without `index_id` → cross-project fan-out (legacy
+                //     issue #10 behaviour preserved).
+                if args.get("index_id").and_then(Value::as_str).is_some() {
+                    return self.run_lane_search(args, SearchLane::All).await;
+                }
                 let query = require_str(args, "query")?;
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(10);
                 let full_content = args
@@ -533,6 +592,280 @@ impl McpServer {
         }
         Ok(body)
     }
+
+    /// Common dispatcher for the four per-lane search tools introduced in
+    /// issue #138 (`search_lexical`, `search_semantic`, `search_kg`,
+    /// `search_all`).
+    ///
+    /// Why: every per-lane tool follows the same recipe — parse `index_id`
+    /// plus `query`, optionally pre-check `search_capabilities` against
+    /// the lane's prerequisite stage, build a `SearchQuery` body with the
+    /// correct `stage` / `expand_graph` pinning, and POST to the
+    /// per-index search endpoint. Factoring this out keeps `call_tool`
+    /// readable and guarantees all four tools share identical schema,
+    /// error shape, and logging.
+    ///
+    /// What: validates args; for lanes that require a stage beyond Stage
+    /// 1 (`Semantic` needs `vector`, `Graph` needs `kg`), fetches `GET
+    /// /indexes/:id/status` and inspects `search_capabilities`. If the
+    /// prerequisite lane is missing, returns
+    /// `DispatchError::StageNotReady` carrying a human-readable message,
+    /// the full stages snapshot, and a `suggested_tools` retry hint.
+    /// Otherwise constructs the search body (including lane-specific
+    /// `stage` and `expand_graph` settings), forwards optional caller
+    /// fields (`top_k`, `mode`, branch-aware boost, archive filter),
+    /// POSTs the request, and mirrors the daemon's per-query INFO log.
+    ///
+    /// Test: unit tests at the bottom of this file exercise each tool's
+    /// happy path, stage-not-ready path, and routing shape.
+    async fn run_lane_search(
+        &self,
+        args: &Value,
+        lane: SearchLane,
+    ) -> Result<Value, DispatchError> {
+        let index_id = require_str(args, "index_id")?;
+        let query_text = require_str(args, "query")?;
+
+        // Pre-flight stage check for lanes that need Stage 2 or Stage 3.
+        // The lexical and `search_all` tools always work — they degrade
+        // gracefully through the daemon's adaptive routing.
+        if let Some(required) = lane.required_capability() {
+            let status = self.get(&format!("/indexes/{index_id}/status")).await?;
+            let caps: Vec<String> = status
+                .get("search_capabilities")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !caps.iter().any(|c| c == required) {
+                let stages = status
+                    .get("stages")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
+                let stages_summary = summarise_stages(&stages);
+                let suggested = lane.suggested_fallback_tools(&caps);
+                let suggested_list = suggested.join(", ");
+                let stage_label = lane.stage_label();
+                let message = format!(
+                    "{tool} requires Stage {stage_num} ({stage_name}), which is not yet \
+                     ready on index '{index_id}'. Current stages: {stages_summary}. \
+                     Suggested: use {suggested_list}, or wait for the reindex to complete.",
+                    tool = lane.tool_name(),
+                    stage_num = lane.stage_number(),
+                    stage_name = stage_label,
+                );
+                return Err(DispatchError::StageNotReady {
+                    message,
+                    current_stages: stages,
+                    suggested_tools: suggested,
+                });
+            }
+        }
+
+        // Build the SearchQuery body honouring the lane pin plus optional
+        // caller-supplied fields. The bare-string `query` form is the
+        // primary shape; advanced callers may still pass `query` as an
+        // object to override defaults (kept for symmetry with `search`).
+        let mut body = match args.get("query") {
+            Some(v @ Value::Object(_)) => v.clone(),
+            _ => serde_json::json!({ "text": query_text }),
+        };
+        // Lane-specific `stage` and `expand_graph` pinning. Always
+        // overwrites whatever the caller may have set so the LLM's tool
+        // selection is honoured (a `search_lexical` call must NOT silently
+        // run the full hybrid pipeline because the caller forgot to clear
+        // `stage`).
+        if let Some(stage_str) = lane.stage_serde_value() {
+            body["stage"] = Value::String(stage_str.into());
+        } else {
+            body.as_object_mut().map(|m| m.remove("stage"));
+        }
+        body["expand_graph"] = Value::Bool(lane.expand_graph_default());
+
+        // Pass-through optional caller fields. `top_k` is the only one
+        // that's lane-relevant for cost control; the rest are shared with
+        // the `search` tool for parity.
+        if let Some(k) = args.get("top_k").and_then(Value::as_u64) {
+            body["top_k"] = Value::from(k);
+        }
+        if let Some(bf) = args.get("branch_files") {
+            body["branch_files"] = bf.clone();
+        }
+        if let Some(bb) = args.get("branch_boost") {
+            body["branch_boost"] = bb.clone();
+        }
+        if let Some(br) = args.get("branch").and_then(Value::as_str) {
+            body["branch"] = Value::String(br.to_string());
+        }
+        if let Some(m) = args.get("mode").and_then(Value::as_str) {
+            body["mode"] = Value::String(m.to_string());
+        }
+        if let Some(ea) = args.get("exclude_archived").and_then(Value::as_bool) {
+            body["exclude_archived"] = Value::Bool(ea);
+        }
+
+        let resp = self
+            .post(&format!("/indexes/{index_id}/search"), &body)
+            .await?;
+        // Mirror the daemon's per-query INFO log so the MCP transport
+        // surfaces the same query/intent/latency line.
+        let log_intent = resp
+            .get("intent")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+        let log_latency = resp.get("latency_ms").and_then(Value::as_u64).unwrap_or(0);
+        let log_results = resp
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let tool_name = lane.tool_name();
+        tracing::info!(
+            tool = %tool_name,
+            index_id = %index_id,
+            intent = %log_intent,
+            latency_ms = log_latency,
+            results = log_results,
+            query = %&query_text[..query_text.len().min(80)],
+            "search"
+        );
+        Ok(resp)
+    }
+}
+
+/// Per-lane router (issue #138).
+///
+/// Why: maps the four MCP tool names to their canonical lane combination
+/// without scattering the policy across the dispatcher arms.
+/// What: a unit-like enum that knows its `SearchStage` serde value,
+/// `expand_graph` default, prerequisite `search_capabilities` entry, and
+/// human-readable stage label / number for STAGE_NOT_READY messages.
+/// Test: per-lane routing covered by `search_*_tool_routes_to_*_stage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchLane {
+    /// BM25 + grep-fallback only. Always available; no prerequisite.
+    Lexical,
+    /// BM25 + HNSW via RRF. Requires Stage 2 (`vector`).
+    Semantic,
+    /// BM25 + HNSW + KG expansion. Requires Stage 3 (`kg`).
+    Graph,
+    /// Full hybrid pipeline; adaptive routing chooses what to run.
+    All,
+}
+
+impl SearchLane {
+    fn tool_name(self) -> &'static str {
+        match self {
+            SearchLane::Lexical => "search_lexical",
+            SearchLane::Semantic => "search_semantic",
+            SearchLane::Graph => "search_kg",
+            SearchLane::All => "search_all",
+        }
+    }
+
+    /// Serialised value for `SearchQuery::stage`, or `None` for adaptive
+    /// (no pin).
+    fn stage_serde_value(self) -> Option<&'static str> {
+        match self {
+            SearchLane::Lexical => Some("lexical"),
+            SearchLane::Semantic => Some("semantic"),
+            SearchLane::Graph => Some("graph"),
+            SearchLane::All => None,
+        }
+    }
+
+    fn expand_graph_default(self) -> bool {
+        matches!(self, SearchLane::Graph | SearchLane::All)
+    }
+
+    /// Required entry in `search_capabilities` (returned by
+    /// `GET /indexes/:id/status`). `None` for lanes that always work.
+    fn required_capability(self) -> Option<&'static str> {
+        match self {
+            SearchLane::Lexical | SearchLane::All => None,
+            SearchLane::Semantic => Some("vector"),
+            SearchLane::Graph => Some("kg"),
+        }
+    }
+
+    fn stage_number(self) -> u8 {
+        match self {
+            SearchLane::Lexical => 1,
+            SearchLane::Semantic => 2,
+            SearchLane::Graph => 3,
+            SearchLane::All => 0,
+        }
+    }
+
+    fn stage_label(self) -> &'static str {
+        match self {
+            SearchLane::Lexical => "lexical",
+            SearchLane::Semantic => "embeddings",
+            SearchLane::Graph => "symbol graph",
+            SearchLane::All => "all",
+        }
+    }
+
+    /// Compute the LLM's retry hint when this lane is unavailable. Returns
+    /// a small ordered list of alternative tools that are likely to
+    /// succeed given the current `caps` snapshot.
+    fn suggested_fallback_tools(self, caps: &[String]) -> Vec<&'static str> {
+        let has_vector = caps.iter().any(|c| c == "vector");
+        match self {
+            // Semantic missing: lexical always works; full hybrid degrades
+            // to whatever's ready.
+            SearchLane::Semantic => vec!["search_lexical", "search_all"],
+            // Graph missing: semantic if vector ready, else lexical.
+            SearchLane::Graph => {
+                if has_vector {
+                    vec!["search_semantic", "search_lexical", "search_all"]
+                } else {
+                    vec!["search_lexical", "search_all"]
+                }
+            }
+            // Lexical / All never fall through this path (no prereq).
+            SearchLane::Lexical | SearchLane::All => vec!["search_lexical"],
+        }
+    }
+}
+
+/// Render an `IndexStages` JSON value as a compact debug-style string for
+/// the human-readable STAGE_NOT_READY message. Lifted into a free
+/// function so the unit tests can call it directly.
+///
+/// Why: the `current_stages` JSON snapshot already lives in the structured
+/// `_meta` / `error.data` field; the textual message just needs a short
+/// summary like `lexical=Ready, semantic=InProgress, graph=Pending` so a
+/// human reader (or LLM) can see at a glance which stages are blocking.
+/// What: walks the three known stage keys (`lexical`, `semantic`, `graph`)
+/// and pulls each one's `.status` field, falling back to `"unknown"` when
+/// the field is missing or non-string.
+/// Test: `summarise_stages_renders_in_order`.
+fn summarise_stages(stages: &Value) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    for key in ["lexical", "semantic", "graph"] {
+        let status = stages
+            .get(key)
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        // Title-case the status for human readability (snake_case → CamelCase).
+        let pretty = status
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<String>();
+        parts.push(format!("{key}={pretty}"));
+    }
+    parts.join(", ")
 }
 
 #[derive(Debug)]
@@ -540,6 +873,15 @@ enum DispatchError {
     UnknownTool,
     InvalidParams(String),
     Transport(String),
+    /// Issue #138 — a per-lane tool was called but its prerequisite stage
+    /// is not `Ready` on this index. Carries the resolved stage map and a
+    /// retry hint so the LLM can pick a different tool without a second
+    /// round-trip.
+    StageNotReady {
+        message: String,
+        current_stages: Value,
+        suggested_tools: Vec<&'static str>,
+    },
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, DispatchError> {
@@ -582,20 +924,126 @@ fn wrap_tool_error(msg: &str) -> Value {
     })
 }
 
+/// Wrap a STAGE_NOT_READY error in MCP's structured tool-error envelope
+/// (issue #138).
+///
+/// Why: MCP `tools/call` failures use `isError: true` rather than the
+/// JSON-RPC error envelope. The LLM gets the human-readable text in
+/// `content[]` AND a machine-readable `_meta` block with the exact retry
+/// hint (`suggested_tools`) and the current stages snapshot so it can
+/// pick the right fallback tool without a second probe.
+/// What: returns a JSON object matching the spec in issue #138 — `isError:
+/// true`, single text content node, and `_meta` carrying `error_code`,
+/// `current_stages`, and `suggested_tools`.
+/// Test: `search_semantic_tool_returns_stage_not_ready_when_stage_2_missing`.
+fn wrap_stage_not_ready_error(
+    message: &str,
+    current_stages: &Value,
+    suggested_tools: &[&'static str],
+) -> Value {
+    serde_json::json!({
+        "isError": true,
+        "content": [{
+            "type": "text",
+            "text": message,
+        }],
+        "_meta": {
+            "error_code": "STAGE_NOT_READY",
+            "current_stages": current_stages,
+            "suggested_tools": suggested_tools,
+        }
+    })
+}
+
 /// Static metadata for `tools/list`. Keep in sync with [`McpServer::call_tool`].
 pub fn tool_descriptors() -> Value {
     serde_json::json!([
+        // Issue #138 — per-lane MCP tools. Tool descriptions are
+        // first-class LLM prompts: each one opens with "when to use",
+        // gives concrete fit/don't-fit examples, states the cost, and
+        // explains the failure mode (STAGE_NOT_READY). The legacy
+        // `search` tool is preserved below as a back-compat alias.
+        {
+            "name": "search_lexical",
+            "description": "Find code by exact symbol name, regex, or literal string. Equivalent to a fast ripgrep on the indexed codebase. Use this FIRST for any query where the user mentions a specific identifier (function name, struct name, file name) or a literal phrase. Best for: `apply_archive_downrank`, `pub fn main`, `\"TODO: refactor\"`, filename globs like `*.toml`. Don't use for: conceptual queries like \"how does authentication work\" — use `search_semantic` instead. Always available on any indexed project. Cheapest tool in this family.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id", "query"],
+                "properties": {
+                    "index_id":         { "type": "string", "description": "Target index id (from `list_indexes`)" },
+                    "query":            { "type": "string", "description": "Exact symbol, regex, or literal phrase" },
+                    "top_k":            { "type": "integer", "default": 10 },
+                    "mode":             { "type": "string", "enum": ["code", "text", "data"], "default": "code" },
+                    "exclude_archived": { "type": "boolean", "default": false },
+                    "branch_files":     { "type": "array", "items": { "type": "string" } },
+                    "branch_boost":     { "type": "number" },
+                    "branch":           { "type": "string" }
+                },
+                "examples": [
+                    { "index_id": "trusty-tools", "query": "apply_archive_downrank" },
+                    { "index_id": "trusty-tools", "query": "pub fn main" },
+                    { "index_id": "trusty-tools", "query": "TODO: refactor" }
+                ]
+            }
+        },
+        {
+            "name": "search_semantic",
+            "description": "Find code by meaning, not by literal text. Uses embedding-based similarity to retrieve chunks that semantically match the query, even when the query words don't appear in the code. Best for: \"code that handles JWT verification\", \"the place that does community detection\", \"how does the embedder batch requests\". Don't use for: exact symbol lookups (use `search_lexical`) or finding callers of a known function (use `search_kg`). Requires Stage 2 (embeddings) to be ready on the index — returns a STAGE_NOT_READY error with a `suggested_tools` retry hint if not. Medium cost.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id", "query"],
+                "properties": {
+                    "index_id":         { "type": "string" },
+                    "query":            { "type": "string", "description": "Conceptual query — meaning, not literal text" },
+                    "top_k":            { "type": "integer", "default": 10 },
+                    "mode":             { "type": "string", "enum": ["code", "text", "data"], "default": "code" },
+                    "exclude_archived": { "type": "boolean", "default": false }
+                },
+                "examples": [
+                    { "index_id": "trusty-tools", "query": "code that handles JWT verification" },
+                    { "index_id": "trusty-tools", "query": "the place that does community detection" }
+                ]
+            }
+        },
+        {
+            "name": "search_kg",
+            "description": "Explore code structure from a known seed — either a chunk_id (from a previous search result) or a symbol name. Returns chunks connected to the seed via `calls`, `called_by`, `contains`, `inherits` edges. Best for: \"what calls `validate_token`\", \"what does `Authenticator` use internally\", impact analysis before a refactor. Don't use for: free-text discovery (use `search_semantic`) or initial entry-point finding (use `search_lexical` first). Requires Stage 3 (symbol graph) to be ready. Returns empty if the seed is not in the index. Cheap once you have a seed.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id", "query"],
+                "properties": {
+                    "index_id":         { "type": "string" },
+                    "query":            { "type": "string", "description": "Seed: a symbol name or chunk_id from a previous result" },
+                    "top_k":            { "type": "integer", "default": 10 },
+                    "mode":             { "type": "string", "enum": ["code", "text", "data"], "default": "code" }
+                },
+                "examples": [
+                    { "index_id": "trusty-tools", "query": "validate_token" },
+                    { "index_id": "trusty-tools", "query": "Authenticator" }
+                ]
+            }
+        },
         {
             "name": "search_all",
-            "description": "Cross-project hybrid search: fan out to every registered index, merge results via RRF, tag each chunk with its index_id (issue #10).",
+            "description": "When in doubt, use this. Runs the full hybrid pipeline (lexical + semantic + KG expansion) and merges results via RRF. More expensive than the targeted tools but catches edge cases. Use when: your query has both literal symbols AND conceptual phrasing (\"find the `AuthValidator` that handles refresh tokens\"), or when you've tried the targeted tools and they didn't surface what you need. Always available; gracefully degrades to whatever lanes are ready. When called without `index_id`, falls back to legacy cross-project fan-out behaviour (issue #10) — provide `index_id` for the per-index hybrid path.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
                 "properties": {
-                    "query":        { "type": "string" },
-                    "top_k":        { "type": "integer", "default": 10 },
-                    "full_content": { "type": "boolean", "default": false }
-                }
+                    "index_id":         { "type": "string", "description": "Target index (omit for cross-project fan-out)" },
+                    "query":            { "type": "string" },
+                    "top_k":            { "type": "integer", "default": 10 },
+                    "mode":             { "type": "string", "enum": ["code", "text", "data"], "default": "code" },
+                    "exclude_archived": { "type": "boolean", "default": false },
+                    "full_content":     { "type": "boolean", "default": false, "description": "Legacy fan-out only: include full chunk content in each hit" },
+                    "branch_files":     { "type": "array", "items": { "type": "string" } },
+                    "branch_boost":     { "type": "number" },
+                    "branch":           { "type": "string" }
+                },
+                "examples": [
+                    { "index_id": "trusty-tools", "query": "AuthValidator that handles refresh tokens" },
+                    { "query": "global cross-project fan-out without index_id" }
+                ]
             }
         },
         {
@@ -1072,5 +1520,555 @@ mod tests {
             required.iter().any(|v| v.as_str() == Some("pattern")),
             "grep schema must require 'pattern'"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #138 — per-lane MCP tools
+    // ----------------------------------------------------------------
+
+    /// Spin up a one-shot axum mock daemon on a loopback port. The handler
+    /// closure controls what `GET /indexes/:id/status` and
+    /// `POST /indexes/:id/search` return. Each call captures the inbound
+    /// request body into the shared `captured` slot so tests can assert
+    /// against the SearchQuery shape the MCP tool dispatched.
+    ///
+    /// Returns `(base_url, captured_search_bodies, captured_search_paths)`.
+    async fn spawn_mock_daemon(
+        status_response: Value,
+        search_response: Value,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Vec<Value>>>,
+        std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        #[derive(Clone)]
+        struct MockState {
+            status_response: Value,
+            search_response: Value,
+            captured_bodies: Arc<Mutex<Vec<Value>>>,
+            captured_paths: Arc<Mutex<Vec<String>>>,
+        }
+
+        let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let state = MockState {
+            status_response,
+            search_response,
+            captured_bodies: Arc::clone(&captured_bodies),
+            captured_paths: Arc::clone(&captured_paths),
+        };
+
+        async fn status_handler(Path(id): Path<String>, State(s): State<MockState>) -> Json<Value> {
+            // Inject the index_id so the handler returns a payload that
+            // looks like a real daemon response.
+            let mut v = s.status_response.clone();
+            if v.is_object() {
+                v["index_id"] = Value::String(id);
+            }
+            Json(v)
+        }
+
+        async fn search_handler_mock(
+            Path(id): Path<String>,
+            State(s): State<MockState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            s.captured_paths
+                .lock()
+                .await
+                .push(format!("/indexes/{id}/search"));
+            s.captured_bodies.lock().await.push(body);
+            Json(s.search_response.clone())
+        }
+
+        let app = Router::new()
+            .route("/indexes/{id}/status", get(status_handler))
+            .route("/indexes/{id}/search", post(search_handler_mock))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        (base_url, captured_bodies, captured_paths)
+    }
+
+    /// `summarise_stages` renders the three known keys in lexical →
+    /// semantic → graph order and Title-cases snake_case statuses.
+    #[test]
+    fn summarise_stages_renders_in_order() {
+        let stages = serde_json::json!({
+            "lexical":  { "status": "ready" },
+            "semantic": { "status": "in_progress" },
+            "graph":    { "status": "pending" },
+        });
+        let s = summarise_stages(&stages);
+        assert_eq!(s, "lexical=Ready, semantic=InProgress, graph=Pending");
+    }
+
+    /// `tools/list` returns five search tools after #138 (legacy `search`
+    /// plus the four per-lane tools). Bumps the original
+    /// `test_tools_list_complete` assertion.
+    #[tokio::test]
+    async fn tools_list_returns_five_search_tools() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        for required in [
+            "search",
+            "search_lexical",
+            "search_semantic",
+            "search_kg",
+            "search_all",
+        ] {
+            assert!(
+                names.contains(&required),
+                "tools/list missing '{required}' (got {names:?})"
+            );
+        }
+        // Spec: exactly five "search*" tools (the four new + legacy).
+        let search_tools: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| *n == "search" || n.starts_with("search_"))
+            .collect();
+        // `search_similar` and `search_health` also start with "search_"
+        // but are distinct surfaces; assert only on the lane-related ones.
+        let lane_tools: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| {
+                matches!(
+                    *n,
+                    "search" | "search_lexical" | "search_semantic" | "search_kg" | "search_all"
+                )
+            })
+            .collect();
+        assert_eq!(
+            lane_tools.len(),
+            5,
+            "expected exactly 5 lane-related search tools, got {lane_tools:?} (all: {search_tools:?})"
+        );
+    }
+
+    /// Each per-lane tool description embeds the authoring-guide hook
+    /// (when-to-use phrasing) so the LLM can pick reliably.
+    #[tokio::test]
+    async fn per_lane_tool_descriptions_carry_when_to_use_hooks() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
+        for (name, hook) in [
+            ("search_lexical", "exact symbol name"),
+            ("search_semantic", "by meaning"),
+            ("search_kg", "from a known seed"),
+            ("search_all", "When in doubt"),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("tool {name} missing"));
+            let desc = tool["description"].as_str().expect("description");
+            assert!(
+                desc.contains(hook),
+                "tool {name} description must mention '{hook}': {desc}"
+            );
+        }
+    }
+
+    /// `search_lexical` pins `stage=lexical` and `expand_graph=false` on
+    /// the dispatched SearchQuery. Always-available — no status pre-check
+    /// because Stage 1 is the baseline for every index.
+    #[tokio::test]
+    async fn search_lexical_tool_routes_to_lexical_stage_only() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "pending" },
+                "graph":    { "status": "pending" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match"],
+        });
+        let search = serde_json::json!({
+            "results": [],
+            "intent": "Definition",
+            "latency_ms": 1,
+        });
+        let (base, bodies, paths) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let resp = server
+            .dispatch(req(
+                "search_lexical",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "apply_archive_downrank",
+                    "top_k": 5,
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "lexical tool must not error");
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 1, "exactly one search dispatched");
+        let dispatched = &bodies[0];
+        assert_eq!(dispatched["stage"], "lexical");
+        assert_eq!(dispatched["expand_graph"], false);
+        assert_eq!(dispatched["text"], "apply_archive_downrank");
+        assert_eq!(dispatched["top_k"], 5);
+        let paths = paths.lock().await;
+        assert_eq!(paths[0], "/indexes/demo/search");
+    }
+
+    /// `search_semantic` pins `stage=semantic` and `expand_graph=false`.
+    /// Requires Stage 2 (`vector`) capability; happy path verifies the
+    /// pre-flight status check sees the ready vector lane.
+    #[tokio::test]
+    async fn search_semantic_tool_routes_to_semantic_stage_when_stage_2_ready() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "ready" },
+                "graph":    { "status": "pending" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match", "vector"],
+        });
+        let search = serde_json::json!({
+            "results": [],
+            "intent": "Conceptual",
+            "latency_ms": 7,
+        });
+        let (base, bodies, _paths) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let resp = server
+            .dispatch(req(
+                "search_semantic",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "code that handles JWT verification",
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_none());
+
+        let bodies = bodies.lock().await;
+        let dispatched = &bodies[0];
+        assert_eq!(dispatched["stage"], "semantic");
+        assert_eq!(dispatched["expand_graph"], false);
+    }
+
+    /// `search_semantic` returns a STAGE_NOT_READY structured error when
+    /// the index lacks the `vector` capability. The error includes the
+    /// full stages snapshot and a `suggested_tools` retry hint.
+    #[tokio::test]
+    async fn search_semantic_tool_returns_stage_not_ready_when_stage_2_missing() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "in_progress" },
+                "graph":    { "status": "pending" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match"],
+        });
+        let search = serde_json::json!({ "results": [] });
+        let (base, bodies, _) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+
+        // Bare-method form returns a JSON-RPC error with code STAGE_NOT_READY_CODE.
+        let resp = server
+            .dispatch(req(
+                "search_semantic",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "anything",
+                }),
+            ))
+            .await;
+        let err = resp.error.expect("expected JSON-RPC error");
+        assert_eq!(err.code, STAGE_NOT_READY_CODE);
+        assert!(err.message.contains("Stage 2"), "{}", err.message);
+        assert!(err.message.contains("embeddings"), "{}", err.message);
+        let data = err.data.expect("data field");
+        assert_eq!(data["error_code"], "STAGE_NOT_READY");
+        let suggested = data["suggested_tools"]
+            .as_array()
+            .expect("suggested_tools array");
+        assert!(suggested
+            .iter()
+            .any(|v| v.as_str() == Some("search_lexical")));
+        assert_eq!(data["current_stages"]["semantic"]["status"], "in_progress");
+
+        // No daemon search call must have happened — the pre-check short-circuited.
+        assert!(bodies.lock().await.is_empty());
+
+        // `tools/call` form returns the same condition as
+        // `{ isError: true, _meta: { error_code: ... } }`.
+        let resp = server
+            .dispatch(req(
+                "tools/call",
+                serde_json::json!({
+                    "name": "search_semantic",
+                    "arguments": { "index_id": "demo", "query": "x" }
+                }),
+            ))
+            .await;
+        let result = resp.result.expect("tools/call returns result envelope");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["_meta"]["error_code"], "STAGE_NOT_READY");
+        let suggested = result["_meta"]["suggested_tools"]
+            .as_array()
+            .expect("suggested array");
+        assert!(suggested
+            .iter()
+            .any(|v| v.as_str() == Some("search_lexical")));
+    }
+
+    /// `search_kg` pins `stage=graph`, `expand_graph=true`, and pre-checks
+    /// the `kg` capability.
+    #[tokio::test]
+    async fn search_kg_tool_routes_to_graph_stage_when_stage_3_ready() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "ready" },
+                "graph":    { "status": "ready" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match", "vector", "kg"],
+        });
+        let search = serde_json::json!({
+            "results": [],
+            "intent": "Usage",
+            "latency_ms": 12,
+        });
+        let (base, bodies, _) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let resp = server
+            .dispatch(req(
+                "search_kg",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "validate_token",
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_none());
+
+        let bodies = bodies.lock().await;
+        let dispatched = &bodies[0];
+        assert_eq!(dispatched["stage"], "graph");
+        assert_eq!(dispatched["expand_graph"], true);
+    }
+
+    /// `search_kg` returns STAGE_NOT_READY when the index lacks the `kg`
+    /// capability, with appropriate fallback hints.
+    #[tokio::test]
+    async fn search_kg_tool_returns_stage_not_ready_when_stage_3_missing() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "ready" },
+                "graph":    { "status": "in_progress" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match", "vector"],
+        });
+        let search = serde_json::json!({ "results": [] });
+        let (base, bodies, _) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let resp = server
+            .dispatch(req(
+                "search_kg",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "Authenticator",
+                }),
+            ))
+            .await;
+        let err = resp.error.expect("expected JSON-RPC error");
+        assert_eq!(err.code, STAGE_NOT_READY_CODE);
+        assert!(err.message.contains("Stage 3"), "{}", err.message);
+        assert!(err.message.contains("symbol graph"), "{}", err.message);
+        let data = err.data.expect("data");
+        // Semantic IS ready, so the fallback should suggest search_semantic
+        // ahead of search_lexical.
+        let suggested = data["suggested_tools"].as_array().expect("suggested_tools");
+        assert_eq!(
+            suggested[0].as_str(),
+            Some("search_semantic"),
+            "stage 3 missing with stage 2 ready should suggest search_semantic first"
+        );
+        // No search was dispatched.
+        assert!(bodies.lock().await.is_empty());
+    }
+
+    /// `search_all` with `index_id` runs the per-index full hybrid: no
+    /// stage pin, `expand_graph: true`. Mirrors the ticket's #138 spec.
+    #[tokio::test]
+    async fn search_all_with_index_id_routes_to_full_hybrid() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "ready" },
+                "graph":    { "status": "ready" },
+            },
+            "search_capabilities": ["bm25", "literal", "exact_match", "vector", "kg"],
+        });
+        let search = serde_json::json!({
+            "results": [],
+            "intent": "Conceptual",
+            "latency_ms": 8,
+        });
+        let (base, bodies, paths) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let resp = server
+            .dispatch(req(
+                "search_all",
+                serde_json::json!({
+                    "index_id": "demo",
+                    "query": "AuthValidator that handles refresh tokens",
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_none());
+
+        let bodies = bodies.lock().await;
+        let dispatched = &bodies[0];
+        // No stage pin (full hybrid adaptive).
+        assert!(
+            dispatched.get("stage").is_none() || dispatched["stage"].is_null(),
+            "search_all must not pin a stage: got {dispatched:?}"
+        );
+        assert_eq!(dispatched["expand_graph"], true);
+        let paths = paths.lock().await;
+        assert_eq!(paths[0], "/indexes/demo/search");
+    }
+
+    /// `search_all` and the legacy `search` tool produce identical
+    /// dispatched SearchQuery shapes — `search` stays as a back-compat
+    /// alias per the ticket's spec.
+    #[tokio::test]
+    async fn search_all_and_legacy_search_dispatch_equivalent_bodies() {
+        let status = serde_json::json!({
+            "stages": {
+                "lexical":  { "status": "ready" },
+                "semantic": { "status": "ready" },
+                "graph":    { "status": "ready" },
+            },
+            "search_capabilities": ["bm25", "vector", "kg"],
+        });
+        let search = serde_json::json!({ "results": [] });
+        let (base, bodies, _) = spawn_mock_daemon(status, search).await;
+        let server = McpServer::new(base);
+        let args = serde_json::json!({
+            "index_id": "demo",
+            "query": "find the AuthValidator",
+            "top_k": 7,
+        });
+        let _ = server.dispatch(req("search_all", args.clone())).await;
+        let _ = server.dispatch(req("search", args.clone())).await;
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "both tools must dispatch a search");
+        // Compare text / top_k / expand_graph. `search_all` explicitly
+        // sets `expand_graph=true`; the legacy `search` tool does NOT set
+        // expand_graph in its body (the daemon defaults to true). Both
+        // shapes resolve to identical SearchQuery semantics at the daemon.
+        assert_eq!(bodies[0]["text"], bodies[1]["text"]);
+        assert_eq!(bodies[0]["top_k"], bodies[1]["top_k"]);
+        // Daemon-side: SearchQuery::default sets expand_graph=true, so
+        // omitting the field is semantically equivalent to setting true.
+        let expand_a = bodies[0]
+            .get("expand_graph")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let expand_b = bodies[1]
+            .get("expand_graph")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        assert!(expand_a && expand_b, "both must expand the graph");
+        // Neither pins a stage.
+        assert!(bodies[0].get("stage").is_none_or(|v| v.is_null()));
+        assert!(bodies[1].get("stage").is_none_or(|v| v.is_null()));
+    }
+
+    /// Missing-arg fast-fail: every per-lane tool rejects an empty arg
+    /// object before any HTTP round-trip.
+    #[tokio::test]
+    async fn per_lane_tools_require_index_id_and_query() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        for tool in ["search_lexical", "search_semantic", "search_kg"] {
+            let resp = server.dispatch(req(tool, serde_json::json!({}))).await;
+            let err = resp.error.expect("expected error");
+            assert_eq!(
+                err.code,
+                error_codes::INVALID_PARAMS,
+                "{tool} must reject empty args"
+            );
+        }
+    }
+
+    /// `search_all` without `index_id` keeps the legacy fan-out behaviour
+    /// (issue #10) — the tool's input schema requires `query` only, and
+    /// the daemon's `POST /search` endpoint is responsible for the fan-out
+    /// logic. The pre-#138 missing-query test already pins the validation
+    /// error; this test just guards that adding `index_id` does NOT
+    /// activate fan-out mode.
+    #[tokio::test]
+    async fn search_all_without_index_id_calls_global_fanout_endpoint() {
+        // Mock daemon that returns a fan-out response from POST /search.
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        async fn fanout_handler(
+            State(captured): State<Arc<Mutex<Vec<String>>>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            captured.lock().await.push("/search".into());
+            Json(serde_json::json!({ "results": [] }))
+        }
+        use axum::extract::State;
+
+        let app = Router::new()
+            .route("/search", post(fanout_handler))
+            .with_state(captured_clone);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let server = McpServer::new(format!("http://{addr}"));
+        let resp = server
+            .dispatch(req(
+                "search_all",
+                serde_json::json!({ "query": "anything" }),
+            ))
+            .await;
+        assert!(resp.error.is_none());
+        assert_eq!(captured.lock().await.as_slice(), &["/search".to_string()]);
     }
 }

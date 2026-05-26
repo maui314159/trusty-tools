@@ -513,6 +513,161 @@ async fn test_kg_expansion_disabled_by_expand_graph_false() {
     );
 }
 
+/// Issue #138 — `SearchStage::Semantic` skips KG expansion even when the
+/// query intent would otherwise enable it. `stage=semantic` selects the
+/// BM25 + HNSW lanes but explicitly drops the graph hop. Mirrors the
+/// behaviour the new `search_semantic` MCP tool needs.
+///
+/// Why: the LLM that chose `search_semantic` is asking for conceptual
+/// recall, not a callgraph walk; surfacing KG-only neighbours would muddle
+/// the result set and defeat the per-tool intent split.
+/// What: build a corpus where a caller-only chunk would surface via KG
+/// expansion under default Usage-intent routing; assert `stage=Semantic`
+/// suppresses it.
+/// Test: covers the search dispatcher's `skip_kg` branch for the
+/// Semantic variant added in #138.
+#[tokio::test]
+async fn search_semantic_stage_skips_kg_expansion() {
+    let idx = make_indexer();
+    idx.add_chunk(RawChunk {
+        id: "h:1".to_string(),
+        file: "h.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        content: "fn caller() { /* dispatch */ }".to_string(),
+        function_name: Some("caller".to_string()),
+        language: Some("rust".to_string()),
+        chunk_type: crate::core::chunker::ChunkType::Function,
+        calls: vec!["target".to_string()],
+        inherits_from: Vec::new(),
+        chunk_depth: 0,
+        parent_chunk_id: None,
+        child_chunk_ids: Vec::new(),
+        nlp_keywords: Vec::new(),
+        nlp_code_refs: Vec::new(),
+        virtual_terms: Vec::new(),
+    })
+    .await
+    .unwrap();
+    idx.add_chunk(RawChunk {
+        id: "t:1".to_string(),
+        file: "t.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        content: "fn target() {}".to_string(),
+        function_name: Some("target".to_string()),
+        language: Some("rust".to_string()),
+        chunk_type: crate::core::chunker::ChunkType::Function,
+        calls: Vec::new(),
+        inherits_from: Vec::new(),
+        chunk_depth: 0,
+        parent_chunk_id: None,
+        child_chunk_ids: Vec::new(),
+        nlp_keywords: Vec::new(),
+        nlp_code_refs: Vec::new(),
+        virtual_terms: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let q = SearchQuery {
+        text: "callers of target".to_string(),
+        top_k: 10,
+        expand_graph: true,
+        compact: false,
+        stage: Some(super::SearchStage::Semantic),
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert!(
+        !results.iter().any(|c| c.match_reason.contains("kg")),
+        "stage=Semantic must suppress KG expansion, got {results:#?}"
+    );
+}
+
+/// Issue #138 — `SearchStage::Graph` forces KG expansion ON regardless
+/// of the intent's `use_kg_first` weighting. Mirrors the `search_kg`
+/// MCP tool: when the LLM picked the KG tool, the daemon must expand the
+/// graph even on a Definition-intent seed query that would normally
+/// suppress it.
+///
+/// Why: the per-lane MCP tools are an explicit contract — when the LLM
+/// chose `search_kg`, the user's mental model is "explore the graph from
+/// this seed", not "let the intent classifier decide".
+/// What: build a corpus with a caller→target edge; query with the seed
+/// "target" (a Definition-intent query that ordinarily disables KG); pin
+/// `stage=Graph` and assert the caller surfaces via KG expansion.
+/// Test: covers the search dispatcher's `force_kg` branch for the
+/// Graph variant added in #138.
+#[tokio::test]
+async fn search_graph_stage_forces_kg_expansion_on_definition_query() {
+    // BM25-only mode so the vector lane can't pull `caller` into the
+    // result set as a near-neighbour and mask the KG expansion signal we
+    // are testing. The body of `caller` deliberately omits the literal
+    // token "target" so its only path into the result set is via KG.
+    let idx = CodeIndexer::new("graph-stage-force", "/tmp/test");
+    idx.add_chunk(RawChunk {
+        id: "h:1".to_string(),
+        file: "h.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        content: "fn caller() { /* dispatch to function */ }".to_string(),
+        function_name: Some("caller".to_string()),
+        language: Some("rust".to_string()),
+        chunk_type: crate::core::chunker::ChunkType::Function,
+        calls: vec!["target".to_string()],
+        inherits_from: Vec::new(),
+        chunk_depth: 0,
+        parent_chunk_id: None,
+        child_chunk_ids: Vec::new(),
+        nlp_keywords: Vec::new(),
+        nlp_code_refs: Vec::new(),
+        virtual_terms: Vec::new(),
+    })
+    .await
+    .unwrap();
+    idx.add_chunk(RawChunk {
+        id: "t:1".to_string(),
+        file: "t.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        content: "fn target() {}".to_string(),
+        function_name: Some("target".to_string()),
+        language: Some("rust".to_string()),
+        chunk_type: crate::core::chunker::ChunkType::Function,
+        calls: Vec::new(),
+        inherits_from: Vec::new(),
+        chunk_depth: 0,
+        parent_chunk_id: None,
+        child_chunk_ids: Vec::new(),
+        nlp_keywords: Vec::new(),
+        nlp_code_refs: Vec::new(),
+        virtual_terms: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Use a bare-symbol query — would otherwise classify as Definition
+    // intent (use_kg_first = false). The Graph stage must override that.
+    let q = SearchQuery {
+        text: "target".to_string(),
+        top_k: 10,
+        expand_graph: true,
+        compact: false,
+        stage: Some(super::SearchStage::Graph),
+        ..Default::default()
+    };
+    let results = idx.search(&q).await.unwrap();
+    let caller = results
+        .iter()
+        .find(|c| c.id == "h:1")
+        .unwrap_or_else(|| panic!("caller must surface via KG, got {results:#?}"));
+    assert!(
+        caller.match_reason.contains("kg"),
+        "stage=Graph must force KG expansion on caller, got match_reason={}",
+        caller.match_reason
+    );
+}
+
 #[tokio::test]
 async fn test_symbol_graph_rebuilds_after_indexing() {
     let idx = make_indexer();

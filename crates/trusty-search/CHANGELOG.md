@@ -13,6 +13,59 @@ _(no unreleased changes)_
 
 ---
 
+## [0.10.0] — 2026-05-25
+
+### Added
+
+- **#138** **Per-lane MCP tools — push intent classification to the LLM.**
+  Four new MCP tools — `search_lexical`, `search_semantic`, `search_kg`,
+  `search_all` — let the calling LLM pick the right lane combination
+  instead of relying on the server-side regex intent classifier.
+  - `search_lexical` — BM25 + grep only, ripgrep-equivalent latency.
+    Always available.
+  - `search_semantic` — BM25 + HNSW via RRF, no KG. Requires Stage 2
+    (`vector`) on the index.
+  - `search_kg` — BM25 + HNSW + KG expansion, forced ON. Requires Stage 3
+    (`kg`).
+  - `search_all` — full hybrid (lexical + semantic + KG), adaptive
+    routing. Polymorphic: with `index_id` it's per-index hybrid (ticket
+    spec); without, it falls back to legacy cross-project fan-out
+    (issue #10) for back-compat.
+
+  The legacy `search` tool stays as a back-compat alias for the
+  per-index full hybrid. The MCP `tools/list` response now surfaces
+  five lane-related search tools.
+
+  When a per-lane tool is called against an index whose prerequisite
+  stage isn't `Ready`, the daemon returns a structured `STAGE_NOT_READY`
+  error (JSON-RPC code `-32010` or, via `tools/call`, `isError: true`
+  with `_meta.error_code = "STAGE_NOT_READY"`). The error carries the
+  full `current_stages` snapshot and a `suggested_tools` retry hint so
+  the LLM can pick a fallback without a second status probe.
+
+  `SearchStage` gains `Semantic` and `Graph` variants alongside the
+  existing `Lexical`. The search dispatcher routes each variant to its
+  fixed lane combination: `Lexical` skips HNSW + KG; `Semantic` runs
+  BM25 + HNSW but skips KG; `Graph` forces KG expansion even on
+  Definition-intent seed queries. `stage = None` keeps the legacy
+  adaptive routing.
+
+  Tool descriptions follow the ticket's authoring guide (when-to-use
+  hook, fit/don't-fit examples, cost class, failure-mode hint) and
+  carry `examples` arrays in their JSON schemas to nudge LLM tool
+  selection. The classifier and per-stage gating remain in place as
+  defensive fallbacks for non-MCP HTTP callers.
+
+### Changed
+
+- The `search_all` MCP tool is now polymorphic: when invoked with an
+  `index_id`, it dispatches the per-index full hybrid (matching the
+  #138 spec); when invoked without one, it preserves the legacy
+  cross-project fan-out behaviour. Callers using either form keep
+  working without code changes.
+
+---
+
 ## [0.9.2] — 2026-05-25
 
 ### Fixed

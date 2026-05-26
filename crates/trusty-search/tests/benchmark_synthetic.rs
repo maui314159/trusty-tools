@@ -491,14 +491,14 @@ fn print_category_breakdown_table(results: &[QueryResult]) {
 
     println!("\n## Per-(mode × query-category) Hit@K breakdown\n");
     println!(
-        "| {:<10} | {} | {} | {} | {} | {} | {} |",
+        "| {:<10} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15} |",
         "Mode",
-        format!("{:^15}", "Def Hit@1/5"),
-        format!("{:^15}", "Concept Hit@1/5"),
-        format!("{:^15}", "Usage Hit@1/5"),
-        format!("{:^15}", "Text Hit@1/5"),
-        format!("{:^15}", "Data Hit@1/5"),
-        format!("{:^15}", "Aggregate Hit@1/5"),
+        "Def Hit@1/5",
+        "Concept Hit@1/5",
+        "Usage Hit@1/5",
+        "Text Hit@1/5",
+        "Data Hit@1/5",
+        "Aggregate Hit@1/5",
     );
     println!(
         "|{:-<12}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|{:-<17}|",
