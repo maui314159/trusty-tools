@@ -582,8 +582,8 @@ pub(crate) const STRUCT_DEFINITION_BOOST: f32 = 2.0;
 /// stay on the default multiplier so usage and method-of-struct chunks
 /// don't accidentally outrank the struct definition itself.
 /// What: returns `true` for `Struct`, `Enum`, `Class`, `Trait`, and
-/// `TypeAlias`; `false` for everything else (including `Function`/`Method`
-/// — those have their own ranking signal via `inject_entity_exact_match`).
+/// `TypeAlias`; `false` for everything else. Note: `Function` and `Method`
+/// are handled by [`is_function_definition_chunk_type`] (issue #122).
 /// Test: covered indirectly by
 /// `test_struct_definition_boost_surfaces_struct_over_usage`.
 pub(crate) fn is_struct_definition_chunk_type(
@@ -598,6 +598,36 @@ pub(crate) fn is_struct_definition_chunk_type(
             | ChunkType::Trait
             | ChunkType::TypeAlias
     )
+}
+
+/// Decide whether `chunk_type` participates in the Definition-intent
+/// function-definition boost (issue #122).
+///
+/// Why: the synthetic-corpus baseline (#123) reproduced a regression where
+/// function-name queries (e.g. `BRUSILOV_EPOCH`, `get_call_chain`) returned
+/// usage sites or string-literal occurrences at rank 1 instead of the
+/// canonical function declaration. The existing struct-definition boost
+/// (#117) deliberately excluded `Function`/`Method` because we assumed the
+/// `inject_entity_exact_match` lane would carry them — but in practice
+/// usage chunks with high BM25 TF can still out-rank the synthetic-injected
+/// entity hit once RRF fuses lanes. Extending the boost to function-like
+/// chunks closes that gap.
+/// What: returns `true` for `Function` and `Method` (constructor variants
+/// would also belong here but the current `ChunkType` enum has no
+/// `Constructor` variant — tree-sitter constructors get classified as
+/// `Function` or `Method` depending on the language); `false` for
+/// everything else. Critically: `Constant` is excluded so chunks whose
+/// only mention of the query token is a string literal (e.g.
+/// `mcp_descriptor.rs` with `"get_call_chain"` in a JSON tool descriptor)
+/// are NOT boosted.
+/// Test: covered by
+/// `test_function_definition_boost_surfaces_function_over_string_literal_usage`
+/// and `test_method_definition_boost_fires`.
+pub(crate) fn is_function_definition_chunk_type(
+    chunk_type: &crate::core::chunker::ChunkType,
+) -> bool {
+    use crate::core::chunker::ChunkType;
+    matches!(chunk_type, ChunkType::Function | ChunkType::Method)
 }
 
 /// Lowercase the meaningful query tokens for the Definition-intent structural

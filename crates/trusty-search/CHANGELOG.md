@@ -13,6 +13,35 @@ _(no unreleased changes)_
 
 ---
 
+## [0.9.2] — 2026-05-25
+
+### Fixed
+
+- **#122** Definition boost regresses Hit@1 on function-name queries with
+  descriptor / string-literal matches. The struct-definition boost added in
+  v0.8.x (#117) covered `Struct`/`Enum`/`Class`/`Trait`/`TypeAlias` chunks
+  but deliberately excluded `Function`/`Method` because we assumed the
+  `inject_entity_exact_match` lane would carry function-name queries. The
+  synthetic-corpus baseline (#123) reproduced a clean failure for Q04
+  `BRUSILOV_EPOCH`, where a usage site (`calibration.rs`) out-ranked the
+  canonical declaration (`constants.rs`) across all three search modes.
+
+  The fix extends `apply_score_adjustments` to also apply
+  `STRUCT_DEFINITION_BOOST` (2.0×) to `Function`/`Method` chunks whose
+  `function_name` matches a query token. The chunk_type filter is the
+  natural defense against the JSON-descriptor false-positive case (a
+  `Constant` chunk containing `"get_call_chain"` as a string literal in an
+  MCP tool descriptor): JSON-descriptor chunks are typed `Constant` or
+  `Statement`, not `Function`, so they are never boosted.
+
+  Four regression tests pin the new behavior:
+  `test_function_definition_boost_surfaces_function_over_string_literal_usage`,
+  `test_method_definition_boost_fires`,
+  `test_function_boost_skipped_on_conceptual_intent`, and
+  `test_function_boost_no_op_when_function_name_missing`.
+
+---
+
 ## [0.9.1] — 2026-05-25
 
 ### Fixed

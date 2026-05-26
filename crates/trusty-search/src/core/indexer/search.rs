@@ -24,8 +24,9 @@ use super::archive::{self, MarkerCache};
 use super::docs_penalty;
 use super::{
     build_compact_snippet, compute_match_reason, definition_boost_query_tokens,
-    file_type_score_multiplier, hash_query, is_struct_definition_chunk_type, raw_to_code_chunk,
-    CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS, STRUCT_DEFINITION_BOOST,
+    file_type_score_multiplier, hash_query, is_function_definition_chunk_type,
+    is_struct_definition_chunk_type, raw_to_code_chunk, CodeChunk, CodeIndexer, SearchQuery,
+    HNSW_OVERSAMPLE, KG_EXPAND_HOPS, STRUCT_DEFINITION_BOOST,
 };
 
 /// Score assigned to grep-fallback hits (issue #75). Intentionally tiny so
@@ -735,11 +736,18 @@ impl CodeIndexer {
     /// literally matches a query token — this surfaces canonical
     /// declarations (`hnsw_store.rs::HnswStore`) above usage chunks
     /// (`retrieval.rs`) for queries like `HNSW vector similarity search`.
-    /// Finally re-sorts by score descending with id as a stable tie-breaker.
+    /// Issue #122 extends the same boost to `Function`/`Method` chunks so
+    /// function-name queries (`BRUSILOV_EPOCH`, `get_call_chain`) surface
+    /// the canonical declaration ahead of usage sites and string-literal
+    /// occurrences (e.g. a JSON tool descriptor containing the function
+    /// name as a string). Finally re-sorts by score descending with id as
+    /// a stable tie-breaker.
     /// Test: covered by `test_definition_demotes_markdown_below_source`,
     /// `test_kg_results_survive_top_k_truncation`,
     /// `test_code_mode_source_outranks_changelog_pre_truncation` (issue #72),
-    /// and `test_struct_definition_boost_surfaces_struct_over_usage` (#117).
+    /// `test_struct_definition_boost_surfaces_struct_over_usage` (#117),
+    /// and `test_function_definition_boost_surfaces_function_over_string_literal_usage`
+    /// (#122).
     async fn apply_score_adjustments(
         &self,
         candidates: Vec<(String, f32)>,
@@ -790,22 +798,36 @@ impl CodeIndexer {
                     let (docs_mult, _) = docs_penalty::doc_score_penalty(&r.file, effective_mode);
                     multiplier *= docs_mult;
                 }
-                // Issue #117: Definition-intent structural boost — multiply
-                // by [`STRUCT_DEFINITION_BOOST`] when the chunk is the
-                // declaration of a Struct/Enum/Class/Trait/TypeAlias whose
-                // `function_name` contains (case-insensitive) at least one
-                // query token. Substring rather than exact match so the
-                // canonical case — query `HNSW vector similarity search` vs
-                // declaration `HnswStore` — fires: lowercased, the
-                // function-name `hnswstore` contains the token `hnsw`.
+                // Issue #117 / #122: Definition-intent structural boost —
+                // multiply by [`STRUCT_DEFINITION_BOOST`] when the chunk is
+                // the declaration of a Struct/Enum/Class/Trait/TypeAlias
+                // (#117) OR a Function/Method (#122) whose `function_name`
+                // contains (case-insensitive) at least one query token.
+                // Substring rather than exact match so the canonical
+                // type-declaration case — query
+                // `HNSW vector similarity search` vs declaration
+                // `HnswStore` — fires: lowercased, the function-name
+                // `hnswstore` contains the token `hnsw`.
+                //
+                // String-literal false-positive defense (#122): the
+                // chunk_type filter naturally excludes string-literal-only
+                // matches because the JSON-descriptor case is chunked as
+                // Constant/Statement, not Function. False positives are
+                // possible if a Function chunk contains ONLY a string
+                // literal of the query — a known edge case to revisit if
+                // it emerges in production.
+                //
                 // Skipped when:
                 //   * intent != Definition (struct_boost_tokens is empty)
-                //   * chunk_type is not a struct-like declaration
+                //   * chunk_type is not a struct- or function-like
+                //     declaration (e.g. Constant, Statement, Docstring)
                 //   * the chunk has no `function_name` (anonymous code)
                 //   * no query token is a substring of the function name
                 if !struct_boost_tokens.is_empty() {
                     if let Some(r) = raw {
-                        if is_struct_definition_chunk_type(&r.chunk_type) {
+                        let eligible = is_struct_definition_chunk_type(&r.chunk_type)
+                            || is_function_definition_chunk_type(&r.chunk_type);
+                        if eligible {
                             if let Some(name) = r.function_name.as_deref() {
                                 let name_lower = name.to_ascii_lowercase();
                                 if struct_boost_tokens
