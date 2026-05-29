@@ -54,9 +54,10 @@ Controller (single long-running process)
 - **Socket probe → client-or-controller.** A new invocation probes the project's
   `.ctrl.sock` with a 50 ms timeout. On connect, it acts as a thin CLI client:
   write a JSON command, stream replies, exit. On no-connect, it becomes the
-  controller. 🟡 — *singleton enforcement is not guaranteed*: two near-simultaneous
-  invocations can race on the socket rather than the second reliably routing to
-  the first (see PRD FR-1.3).
+  controller. ✅ — *singleton enforcement is now guaranteed at the socket layer*:
+  the probe-then-bind, anti-clobber socket handling (PR #411) ends the race, so
+  the second of two near-simultaneous invocations reliably routes to the first
+  rather than clobbering the socket (see PRD FR-1.3 and §1.1 below).
 
 ### Process module support
 
@@ -66,6 +67,65 @@ Controller (single long-running process)
   `src/ctrl/socket_listener.rs`. ✅
 - **Real-time push is incomplete:** the web UI polls every ~2 s; SSE is designed
   and partly built; token streaming is Phase 4. 🟡
+
+### 1.1 Daemon topology & three-tier process hierarchy
+
+> **Decided** — see [ADR-0003](../decisions/0003-daemon-process-model.md) and
+> PRD FR-1.3 / FR-1.6 / FR-1.7.
+
+open-mpm runs as a **daemon**, and the intended topology is a process hierarchy
+of four roles: **daemon per user-facing agent identity → { one PM process per
+project, one TPM ("tmux PM") per session } → coding agents / external
+harnesses**. The PM and TPM are *sibling* roles under an identity daemon: the
+**PM** orchestrates open-mpm's own native agents (subprocess runners, NDJSON
+IPC), while the **TPM** orchestrates *external* harnesses (claude-code, codex,
+aider, …) by automating tmux.
+
+```
+Agent identity          Project (PM) / Session (TPM)        Workers
+──────────────────────────────────────────────────────────────────────────────
+CTRL (daemon)  ───┬──►  PM(CTRL, ~/proj-a)  ──────────►  [agent₁ … agentₙ] (n ≤ 20)
+                  ├──►  PM(CTRL, ~/proj-b)  ──────────►  [agent₁ … agentₙ] (n ≤ 20)
+                  └──►  TPM(CTRL, session-x) ─tmux────►  [claude-code | codex | aider …]
+
+Izzie (daemon) ──────►  PM(Izzie, ~/proj-a) ──────────►  [agent₁ … agentₙ] (n ≤ 20)
+
+CTO Assistant ───────►  PM(CTO, ~/proj-c)   ──────────►  [agent₁ … agentₙ] (n ≤ 20)
+ (daemon)
+```
+
+- **Tier 1 — one daemon per user-facing agent identity.** CTRL, Izzie, and CTO
+  Assistant each run as their **own** daemon; multiple identity daemons coexist
+  on one machine. This is *not* a single global singleton. 🔵 *(daemonization +
+  per-identity process separation designed-not-built)*
+- **Tier 2a — one PM process per project, singleton per `(identity, project)`.**
+  Each project's PM is a singleton; the guarantee is scoped to the
+  `(agent-identity, project)` pair, so `(CTRL, ~/proj-a)` and
+  `(Izzie, ~/proj-a)` are distinct singletons. The PM drives open-mpm's **native**
+  agents over NDJSON IPC. The socket-level enforcement of this singleton is
+  **implemented** (probe-then-bind, anti-clobber socket handling — PR #411).
+  ✅ *(today keyed on `(project)` socket path; per-identity keying via
+  `~/.open-mpm/processes.json` is the 🔵 gap)*
+- **Tier 2b — one TPM ("tmux PM") per session.** A sibling to the PM that drives
+  **external** harnesses (claude-code, codex, aider, …) inside tmux panes rather
+  than as native NDJSON subprocesses; cardinality is one TPM per session. The
+  tmux-driving substrate is largely built in `src/tm/` — `TmManager`
+  (`src/tm/manager.rs`) over a `TmuxOrchestrator`, an `AdapterRegistry`
+  (`src/adapters/`, with detectors for claude-code/codex/augment/gemini), and a
+  JSON `TmSessionRegistry`, with real `new_session`/`kill_session`/`pause`/
+  `resume`/`capture_pane`/`send_message`/`reconcile`. 🟡 *(tmux machinery built;
+  formalization as a daemon-managed per-session process role is the 🔵 gap)*
+- **Tier 3 — ≤20 coding-agent subprocesses per PM.** A PM may have at most a
+  bounded number of coding-agent subprocesses spawned concurrently — documented
+  default **20** (configurable). Requests beyond the cap queue / apply
+  backpressure. Each subprocess speaks NDJSON over stdin/stdout (§2, ADR-0001).
+  🔵 *(cap + queue/backpressure designed-not-built)*
+
+**Current vs. gap:** the per-(identity, project) singleton **enforcement** at the
+socket layer is built (PR #411, ✅), and the **TPM's tmux-driving machinery**
+(`src/tm/`, `src/adapters/`) is largely built (🟡). Daemonization, per-identity
+process separation, the **per-session TPM role**, and the 20-process
+coding-agent cap are **designed-not-built** (🔵).
 
 ---
 
