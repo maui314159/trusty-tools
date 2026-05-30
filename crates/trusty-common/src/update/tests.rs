@@ -227,7 +227,10 @@ async fn live_crates_io_with_old_version_returns_some() {
     // Verify the notice string renders correctly
     let n = notice(&info);
     println!("Notice: {n}");
-    assert!(n.contains("cargo install trusty-search --locked"), "notice missing install cmd: {n}");
+    assert!(
+        n.contains("cargo install trusty-search --locked"),
+        "notice missing install cmd: {n}"
+    );
     assert!(n.contains(&info.latest), "notice missing latest version");
     assert!(n.contains("0.0.1"), "notice missing current version");
 }
