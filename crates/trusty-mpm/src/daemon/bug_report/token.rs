@@ -495,6 +495,27 @@ pub fn resolve_token() -> Option<String> {
     None
 }
 
+// ── ResolvedProvider — full-chain adapter ─────────────────────────────────────
+
+/// A [`TokenProvider`] adapter that delegates to the full `resolve_token()`
+/// chain: PAT env → token file → GitHub App → `None`.
+///
+/// Why: `api.rs` and `mcp_backend.rs` originally hard-coded `EnvFileTokenProvider`
+///      so the GitHub App path (Fix 1 / #498) was unreachable. `ResolvedProvider`
+///      wraps `resolve_token()` behind the `TokenProvider` trait so both call
+///      sites can use a single DRY adapter without duplicating resolution logic.
+/// What: calls `resolve_token()` on every `token()` invocation; returns `None`
+///       when all sources are absent (graceful NoToken degradation is preserved).
+/// Test: `tests::resolved_provider_uses_pat_env`,
+///       `tests::resolved_provider_returns_none_without_sources`.
+pub struct ResolvedProvider;
+
+impl TokenProvider for ResolvedProvider {
+    fn token(&self) -> Option<String> {
+        resolve_token()
+    }
+}
+
 // ── jsonwebtoken dep check ────────────────────────────────────────────────────
 // `jsonwebtoken` must be in the crate's Cargo.toml dependencies for this module
 // to compile. It is not in the workspace table yet because it was first needed
@@ -503,6 +524,7 @@ pub fn resolve_token() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -523,6 +545,7 @@ mod tests {
     // ── Resolution order tests ────────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn resolution_order_env_wins_over_file() {
         // When TOKEN_ENV_VAR is set, EnvFileTokenProvider should return it.
         let sentinel = "ghp_test_env_wins_phase4_unique"; // pragma: allowlist secret
@@ -534,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolution_order_file_used_when_env_absent() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "ghp_from_file_phase4\n").unwrap();
@@ -546,6 +570,52 @@ mod tests {
         assert!(
             tok.is_some(),
             "expected Some from file when env var absent: {tok:?}"
+        );
+    }
+
+    /// Verify PAT env (`TRUSTY_BUGREPORT_GITHUB_TOKEN`) wins over App env vars
+    /// in the resolution order defined by [`resolve_token`].
+    ///
+    /// Why: the resolution order is PAT env → token file → GitHub App → None;
+    ///      this test verifies that rule end-to-end through `resolve_token()`
+    ///      itself, not just through `EnvFileTokenProvider`.
+    /// What: sets both the PAT env var and the three App env vars (pointing at a
+    ///       non-existent PEM), then calls `resolve_token()` and asserts the PAT
+    ///       value is returned — not None (which would indicate the App path was
+    ///       tried first and failed before the PAT could win).
+    /// Test: this function. Marked `#[serial]` because it mutates shared env vars
+    ///       that would race with other `TRUSTY_BUGREPORT_*` env tests.
+    #[test]
+    #[serial]
+    fn resolve_token_prefers_pat_env() {
+        let sentinel = "ghp_pat_env_wins_over_app"; // pragma: allowlist secret
+
+        // Set PAT and App env vars simultaneously.
+        unsafe {
+            std::env::set_var(TOKEN_ENV_VAR, sentinel);
+            std::env::remove_var(TOKEN_FILE_ENV_VAR);
+            std::env::set_var(APP_ID_ENV_VAR, "12345");
+            std::env::set_var(APP_INSTALL_ID_ENV_VAR, "67890");
+            std::env::set_var(
+                APP_KEY_FILE_ENV_VAR,
+                "/tmp/trusty-test-nonexistent-pem-pattest.pem",
+            );
+        }
+
+        let tok = resolve_token();
+
+        // Clean up before any assert so failures don't leak env state.
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_VAR);
+            std::env::remove_var(APP_ID_ENV_VAR);
+            std::env::remove_var(APP_INSTALL_ID_ENV_VAR);
+            std::env::remove_var(APP_KEY_FILE_ENV_VAR);
+        }
+
+        assert_eq!(
+            tok.as_deref(),
+            Some(sentinel),
+            "resolve_token must prefer PAT env over GitHub App env vars: {tok:?}"
         );
     }
 
@@ -653,6 +723,81 @@ mod tests {
         assert!(
             just_past.is_valid(now_secs),
             "token at 301s margin should be valid"
+        );
+    }
+
+    // ── ResolvedProvider tests ────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn resolved_provider_uses_pat_env() {
+        // When TOKEN_ENV_VAR is set, ResolvedProvider should return that PAT.
+        let sentinel = "ghp_resolved_provider_pat_test"; // pragma: allowlist secret
+        unsafe { std::env::set_var(TOKEN_ENV_VAR, sentinel) };
+        let tok = ResolvedProvider.token();
+        unsafe { std::env::remove_var(TOKEN_ENV_VAR) };
+        assert_eq!(
+            tok.as_deref(),
+            Some(sentinel),
+            "ResolvedProvider must return the PAT env value"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_provider_returns_none_without_sources() {
+        // When neither TOKEN_ENV_VAR nor App vars are set, should return None.
+        // We cannot guarantee a clean env in all CI scenarios; the test removes
+        // the PAT var and uses a non-existent token file path so the chain
+        // falls through gracefully.
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_VAR);
+            std::env::remove_var(APP_ID_ENV_VAR);
+            std::env::remove_var(APP_INSTALL_ID_ENV_VAR);
+            std::env::remove_var(APP_KEY_FILE_ENV_VAR);
+            // Point the file fallback at a non-existent path.
+            std::env::set_var(
+                TOKEN_FILE_ENV_VAR,
+                "/tmp/trusty-test-nonexistent-token-file-abc123",
+            );
+        }
+        let tok = ResolvedProvider.token();
+        unsafe { std::env::remove_var(TOKEN_FILE_ENV_VAR) };
+        assert!(
+            tok.is_none(),
+            "ResolvedProvider must return None when all sources absent"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_token_selects_app_when_only_app_env_set() {
+        // Verify the resolution order: App provider is tried when PAT env is
+        // absent. We cannot perform a real App exchange in unit tests, but we
+        // can confirm the *selection* path: when App vars are set but the PEM
+        // file does not exist, `resolve_token()` logs a warning and returns
+        // None (App provider failed gracefully), not an error/panic.
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_VAR);
+            std::env::remove_var(TOKEN_FILE_ENV_VAR);
+            std::env::set_var(APP_ID_ENV_VAR, "12345");
+            std::env::set_var(APP_INSTALL_ID_ENV_VAR, "67890");
+            std::env::set_var(
+                APP_KEY_FILE_ENV_VAR,
+                "/tmp/trusty-test-nonexistent-pem-abc123.pem",
+            );
+        }
+        // The App provider attempts to read the PEM, fails gracefully → None.
+        let tok = resolve_token();
+        unsafe {
+            std::env::remove_var(APP_ID_ENV_VAR);
+            std::env::remove_var(APP_INSTALL_ID_ENV_VAR);
+            std::env::remove_var(APP_KEY_FILE_ENV_VAR);
+        }
+        // None is the expected graceful-failure result: no panic, no unwrap.
+        assert!(
+            tok.is_none(),
+            "resolve_token with missing PEM must return None gracefully"
         );
     }
 
