@@ -1,0 +1,204 @@
+# CI workflow for the trusty-tools Cargo workspace.
+#
+# Jobs:
+#   fmt    – cargo fmt --all --check (stable)
+#   clippy – cargo clippy --workspace --all-targets -D warnings (stable, SKIP_UI_BUILD=1)
+#   test   – cargo test --workspace (stable, SKIP_UI_BUILD=1, full clone for git tests)
+#   msrv   – cargo check --workspace (toolchain 1.91, SKIP_UI_BUILD=1)
+#
+# trusty-mpm-gui is excluded from all jobs: it is a Tauri desktop GUI
+# (publish = false) that requires WebKit2GTK on Linux (~100 MB apt chain).
+# It is not a deployable service and cannot be meaningfully validated in a
+# headless CI runner. Exclude it via --exclude trusty-mpm-gui on every
+# cargo invocation.
+#
+# SKIP_UI_BUILD=1 is set globally: the four crates with build.rs Svelte
+# pipelines (trusty-search, trusty-memory, trusty-analyze, open-mpm) skip
+# pnpm when this env var is set. The committed ui-dist/ artefacts embedded
+# via include_dir!/include_str! are sufficient for compilation.
+#
+# The 7 env-sensitive trusty-memory tests (project_slug_returns_none_without_markers,
+# project_slug_at_returns_none_without_markers, cwd_palace_slug_falls_back_to_basename,
+# palace_slug_from_stdin_cwd_uses_stdin_path, resolve_palace_for_log_prefers_stdin_cwd,
+# prompt_context_recall_filters_deny_tags, prompt_context_recalls_palace_drawers) fail
+# on developer machines because tempfile::tempdir() creates dirs under a path that is
+# itself inside the trusty-tools git worktree, causing find_project_root to return a
+# non-None value. On the CI runner /tmp is a clean filesystem with no git ancestor, so
+# these tests are expected to pass. They are NOT excluded here; if they go red in CI
+# that is a real bug and should block the PR.
+#
+# open-mpm git tests (git::branch::tests::list_branches_includes_current,
+# git::log::tests::search_commits_finds_known_keyword) require a full git clone
+# with local branch refs and commit history. The test job uses fetch-depth: 0
+# to ensure a full (non-shallow) clone is present.
+#
+# MSRV NOTE: [workspace.package] rust-version = "1.88" in Cargo.toml is STALE.
+# The current Cargo.lock pulls aws-sdk-* / aws-smithy-* crates at versions that
+# declare rust-version = "1.91.1". The effective MSRV is therefore 1.91, not 1.88.
+# The msrv job below is pinned to 1.91 to reflect reality. The Cargo.toml
+# rust-version field should be updated to "1.91" in a follow-up commit.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs for the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# SKIP_UI_BUILD=1 prevents the four build.rs Svelte pipelines from invoking pnpm.
+env:
+  SKIP_UI_BUILD: "1"
+  CARGO_TERM_COLOR: always
+  # Reduce noise from ort/fastembed download progress bars.
+  RUST_LOG: "warn"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # fmt: enforce cargo fmt --all --check (stable toolchain + rustfmt component)
+  # --------------------------------------------------------------------------
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Note: rustfmt.toml uses imports_granularity and group_imports which are
+      # nightly-only; stable rustfmt silently ignores them (emits warnings, exit 0).
+      # The format check itself is not affected.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  # --------------------------------------------------------------------------
+  # clippy: deny warnings across the whole workspace (stable, all targets)
+  # trusty-mpm-gui excluded: Tauri desktop GUI, needs WebKit2GTK on Linux.
+  # --------------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key per job so fmt/clippy/test/msrv don't fight
+          # over incompatible target directories.
+          key: clippy
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude trusty-mpm-gui -- -D warnings
+
+  # --------------------------------------------------------------------------
+  # test: run all unit + integration tests (stable, no --include-ignored).
+  # ONNX-backed tests are #[ignore]-tagged; they are intentionally skipped here
+  # because they require model downloads and a running embedderd daemon.
+  # trusty-mpm-gui excluded: see clippy note above.
+  # fetch-depth: 0 (full clone) required for open-mpm git tests that inspect
+  # local branch refs and search commit history.
+  # --------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # open-mpm's git tests (list_branches_includes_current) assert that the
+      # local branch list includes "main". GitHub Actions PR checkouts only create
+      # a local branch for the PR head; "main" is only a remote ref unless we
+      # explicitly create a local tracking branch for it.
+      - name: Create local main branch for git tests
+        run: git fetch origin main:main || true
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: cargo test --workspace
+        # Unset CI so trusty-common's update::check_throttled runs the
+        # cache-freshness code path. The function returns None immediately
+        # when CI is non-empty; tests like cache_fresh_returns_some_when_newer
+        # expect the cache path (is_some), which requires CI to be unset.
+        # We set CI="" here to shadow the global CI=true injected by the runner.
+        env:
+          CI: ""
+        run: cargo test --workspace --exclude trusty-mpm-gui
+
+  # --------------------------------------------------------------------------
+  # msrv: verify the workspace compiles on the effective MSRV.
+  # cargo check is used (not test) to keep this job fast: the MSRV guarantee
+  # is that the code *compiles* on the minimum toolchain, not that tests pass.
+  # trusty-mpm-gui excluded: see clippy note above.
+  #
+  # Toolchain is 1.91 — NOT the 1.88 declared in [workspace.package].rust-version.
+  # The current Cargo.lock pulls aws-sdk-*/aws-smithy-* at versions that require
+  # rustc >= 1.91.1. [workspace.package].rust-version = "1.88" in the root
+  # Cargo.toml is therefore stale and should be updated to "1.91". This CI job
+  # enforces the real minimum; the Cargo.toml value is a known inconsistency
+  # tracked as a follow-up: bump rust-version to 1.91 in Cargo.toml.
+  # --------------------------------------------------------------------------
+  msrv:
+    name: MSRV check (1.91)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91 toolchain
+        uses: dtolnay/rust-toolchain@1.91
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1-91
+
+      - name: cargo check --workspace
+        run: cargo check --workspace --exclude trusty-mpm-gui
