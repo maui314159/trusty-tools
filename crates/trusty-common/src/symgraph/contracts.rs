@@ -101,6 +101,14 @@ pub enum EdgeKind {
     ReferencesConcept,
     Aliases,
     ErrorDescribes,
+    // Extensible — externally-contributed relation (spike for discussion #580).
+    /// Open-ended relation supplied by an external extractor — e.g. a T-SQL
+    /// sidecar emitting `reads_table` / `writes_table` / `calls_proc`. The
+    /// payload is the relation name. It round-trips through persistence via the
+    /// `custom:` tag prefix (see `edge_kind_tag` / `edge_kind_from_tag` in
+    /// `trusty-search`) and inherits the default `score_multiplier`, so adding a
+    /// new relation kind requires **no** core enum edit and **no** recompile.
+    Custom(String),
 }
 
 impl EdgeKind {
@@ -222,6 +230,9 @@ mod tests {
         assert!((EdgeKind::ReferencesConcept.score_multiplier() - 0.60).abs() < 1e-6);
         // Default branch.
         assert!((EdgeKind::CallsFunction.score_multiplier() - 0.70).abs() < 1e-6);
+        // Extensibility (discussion #580): a Custom relation contributed by an
+        // external extractor inherits the default multiplier with no enum edit.
+        assert!((EdgeKind::Custom("reads_table".into()).score_multiplier() - 0.70).abs() < 1e-6);
     }
 
     #[test]

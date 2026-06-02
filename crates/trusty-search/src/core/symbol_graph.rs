@@ -398,32 +398,43 @@ impl SymbolGraph {
 /// `serde` representation. Funnelling every persistence + API hop through this
 /// helper keeps the tag stable across rust-version / serde-format changes and
 /// makes the round-trip easy to reason about.
-/// What: returns the matching variant name (`Debug`-style spelling).
-/// Test: covered transitively by `test_save_load_round_trip_preserves_graph`.
-fn edge_kind_tag(kind: &EdgeKind) -> &'static str {
+/// What: returns the matching variant name (`Debug`-style spelling). An
+/// extensible [`EdgeKind::Custom`] relation is serialised as `custom:<name>`.
+/// Test: covered transitively by `test_save_load_round_trip_preserves_graph`
+/// and directly by `test_custom_edge_kind_survives_round_trip` (discussion #580).
+fn edge_kind_tag(kind: &EdgeKind) -> String {
     match kind {
-        EdgeKind::CallsFunction => "CallsFunction",
-        EdgeKind::CalledByFunction => "CalledByFunction",
-        EdgeKind::Implements => "Implements",
-        EdgeKind::UsesType => "UsesType",
-        EdgeKind::Derives => "Derives",
-        EdgeKind::ModuleContains => "ModuleContains",
-        EdgeKind::ReExports => "ReExports",
-        EdgeKind::RaisesError => "RaisesError",
-        EdgeKind::Configures => "Configures",
-        EdgeKind::TestedBy => "TestedBy",
-        EdgeKind::TestUsesFixture => "TestUsesFixture",
-        EdgeKind::CoOccursInTest => "CoOccursInTest",
-        EdgeKind::Documents => "Documents",
-        EdgeKind::ReferencesConcept => "ReferencesConcept",
-        EdgeKind::Aliases => "Aliases",
-        EdgeKind::ErrorDescribes => "ErrorDescribes",
+        EdgeKind::CallsFunction => "CallsFunction".to_string(),
+        EdgeKind::CalledByFunction => "CalledByFunction".to_string(),
+        EdgeKind::Implements => "Implements".to_string(),
+        EdgeKind::UsesType => "UsesType".to_string(),
+        EdgeKind::Derives => "Derives".to_string(),
+        EdgeKind::ModuleContains => "ModuleContains".to_string(),
+        EdgeKind::ReExports => "ReExports".to_string(),
+        EdgeKind::RaisesError => "RaisesError".to_string(),
+        EdgeKind::Configures => "Configures".to_string(),
+        EdgeKind::TestedBy => "TestedBy".to_string(),
+        EdgeKind::TestUsesFixture => "TestUsesFixture".to_string(),
+        EdgeKind::CoOccursInTest => "CoOccursInTest".to_string(),
+        EdgeKind::Documents => "Documents".to_string(),
+        EdgeKind::ReferencesConcept => "ReferencesConcept".to_string(),
+        EdgeKind::Aliases => "Aliases".to_string(),
+        EdgeKind::ErrorDescribes => "ErrorDescribes".to_string(),
+        // Extensible relation (discussion #580): prefix with `custom:` so the
+        // inverse parser can distinguish it from a built-in tag and recover the
+        // relation name verbatim.
+        EdgeKind::Custom(name) => format!("custom:{name}"),
     }
 }
 
 /// Inverse of [`edge_kind_tag`]: parse a persisted edge tag back into the
-/// `EdgeKind` variant (issue #41 phase 2).
+/// `EdgeKind` variant (issue #41 phase 2; extensibility added per discussion #580).
 fn edge_kind_from_tag(tag: &str) -> Option<EdgeKind> {
+    // Extensible relation: a `custom:` prefix carries an externally-contributed
+    // relation name (e.g. from a T-SQL sidecar). Recover it as `Custom`.
+    if let Some(name) = tag.strip_prefix("custom:") {
+        return Some(EdgeKind::Custom(name.to_string()));
+    }
     Some(match tag {
         "CallsFunction" => EdgeKind::CallsFunction,
         "CalledByFunction" => EdgeKind::CalledByFunction,
@@ -441,7 +452,10 @@ fn edge_kind_from_tag(tag: &str) -> Option<EdgeKind> {
         "ReferencesConcept" => EdgeKind::ReferencesConcept,
         "Aliases" => EdgeKind::Aliases,
         "ErrorDescribes" => EdgeKind::ErrorDescribes,
-        _ => return None,
+        // Silent-drop fix (discussion #580): preserve any other unknown tag as a
+        // Custom relation (forward-compatibility) instead of dropping the edge on
+        // reload — previously `_ => return None`, which discarded it.
+        other => EdgeKind::Custom(other.to_string()),
     })
 }
 
@@ -1577,6 +1591,51 @@ mod tests {
             b.sort();
             assert_eq!(a, b, "callees_of({sym}) diverged");
         }
+    }
+
+    /// Discussion #580 (spike): an extensible `EdgeKind::Custom` relation —
+    /// the shape a T-SQL sidecar would contribute (`reads_table`) — survives a
+    /// save → reload round-trip. This proves two things at once: (1) a brand-new
+    /// relation type flows through the graph and its persistence purely as data,
+    /// with no per-relation enum edit; (2) the previous silent-drop-on-reload
+    /// (`edge_kind_from_tag` returning `None` → edge discarded) is fixed.
+    #[test]
+    fn test_custom_edge_kind_survives_round_trip() {
+        use crate::core::corpus::CorpusStore;
+
+        let mut original = SymbolGraph::new();
+        let proc = original.graph.add_node(SymbolNode {
+            symbol: "usp_GetProperty".into(),
+            chunk_id: "sql:1".into(),
+            file: "procs.sql".into(),
+        });
+        let table = original.graph.add_node(SymbolNode {
+            symbol: "Property".into(),
+            chunk_id: "sql:2".into(),
+            file: "tables.sql".into(),
+        });
+        original.by_symbol.insert("usp_GetProperty".into(), proc);
+        original.by_symbol.insert("Property".into(), table);
+        // A relation that has NO built-in variant — supplied purely as data.
+        original
+            .graph
+            .add_edge(proc, table, EdgeKind::Custom("reads_table".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.redb");
+        {
+            let store = CorpusStore::open(&path).unwrap();
+            original.save_to_corpus(&store).expect("save kg");
+        }
+        let store = CorpusStore::open(&path).unwrap();
+        let restored = SymbolGraph::load_from_corpus(&store)
+            .expect("load kg")
+            .expect("graph present");
+
+        // Pre-fix, this edge vanished on reload (unknown tag → dropped).
+        assert_eq!(restored.edge_count(), 1, "custom edge dropped on reload");
+        let kinds: Vec<EdgeKind> = restored.all_edges().into_iter().map(|(_, _, k)| k).collect();
+        assert_eq!(kinds, vec![EdgeKind::Custom("reads_table".into())]);
     }
 
     /// Issue #41 phase 2: `load_from_corpus` on an empty database returns
