@@ -43,8 +43,8 @@ pub use trusty_common::embedder_client::EmbedderSupervisor;
 /// What: wraps the field names used by `trusty_common::embedder_client::SupervisorConfig`
 /// and provides a `from_env()` constructor that reads the `TRUSTY_EMBEDDERD_*`
 /// environment variables with trusty-search's preferred defaults.
-/// The `into_common()` method converts to the type expected by
-/// `EmbedderSupervisor::spawn_stdio`.
+/// The `into_common_for_tests()` method converts to the type expected by
+/// `EmbedderSupervisor::spawn_stdio` for lifecycle-only test spawns.
 /// Test: `config_from_env_defaults` and `config_from_env_overrides` in the
 /// `tests` module below.
 #[derive(Debug, Clone)]
@@ -91,19 +91,38 @@ impl SupervisorConfig {
         }
     }
 
-    /// Convert to the `trusty_common` supervisor config type.
+    /// Convert to the `trusty_common` supervisor config type without a
+    /// sidecar batch size — **for test/lifecycle spawns only**.
     ///
     /// Why: `EmbedderSupervisor::spawn_stdio` expects
     /// `trusty_common::embedder_client::SupervisorConfig`; this conversion
-    /// avoids duplicating field names at the call site.
+    /// avoids duplicating field names at the call site. It is used by the
+    /// integration tests (`tests/embedder_supervisor_e2e.rs`) that test
+    /// process lifecycle (spawn, crash-restart, shutdown) and do not need
+    /// batch forwarding. The production code path (`do_spawn`) does NOT use
+    /// this method — it builds the common config directly so it can populate
+    /// `sidecar_batch_size: Some(forwarded_batch)` after resolving the
+    /// execution provider (see Fix C, issue #747). The two paths are therefore
+    /// intentionally divergent: `into_common_for_tests` is for lifecycle/test
+    /// spawns where batch forwarding is irrelevant. **Do not use this method
+    /// in production spawn paths** — the `None` batch size means the sidecar
+    /// will use its own default (32), silently losing batch forwarding.
+    ///
     /// What: maps the three spawn-relevant fields 1:1; `idle_shutdown_secs` is
     /// trusty-search–specific and has no counterpart in the common type.
-    /// Test: `into_common_maps_fields`.
-    pub fn into_common(self) -> trusty_common::embedder_client::SupervisorConfig {
+    /// `sidecar_batch_size` is always `None`. Use `do_spawn` for production
+    /// paths where batch forwarding is required.
+    ///
+    /// Test: `into_common_for_tests_maps_fields`.
+    pub fn into_common_for_tests(self) -> trusty_common::embedder_client::SupervisorConfig {
         trusty_common::embedder_client::SupervisorConfig {
             startup_timeout_secs: self.startup_timeout_secs,
             backoff_max_secs: self.backoff_max_secs,
             max_restarts: self.max_restarts,
+            // sidecar_batch_size intentionally None: this method is used by
+            // integration tests that exercise lifecycle, not batch forwarding.
+            // Production spawns go through do_spawn, which sets Some(batch).
+            sidecar_batch_size: None,
         }
     }
 }
@@ -357,15 +376,12 @@ impl LazyEmbedderHandle {
 /// Spawn the sidecar, wire the supervisor, optionally arm the idle-shutdown
 /// watchdog, and return the `SpawnedState`.
 ///
-/// Why: extracted from `LazyEmbedderHandle::embed_via` so the spawn logic
-/// can be tested in isolation and the embed path stays readable.
-///
-/// What: calls `EmbedderSupervisor::spawn_stdio` to start the child, detaches
-/// the crash-restart loop via `start_supervisor_task`, updates `app_pid_slot`
-/// with the initial child PID, arms the idle-shutdown watchdog when
-/// `idle_shutdown_secs > 0`, and returns `SpawnedState` for storage in the
-/// handle's `state` field.
-///
+/// Why: extracted from `LazyEmbedderHandle::embed_via` so the spawn logic can
+/// be tested in isolation. Also resolves and forwards the ONNX batch size to
+/// the sidecar as `TRUSTY_EMBED_BATCH_SIZE` (issue #747 Fix C).
+/// What: calls `EmbedderSupervisor::spawn_stdio`, detaches the crash-restart
+/// loop, updates `app_pid_slot`, and arms the idle-shutdown watchdog when
+/// `idle_shutdown_secs > 0`.
 /// Test: `lazy_handle_defers_spawn` — the spawn is triggered inside `embed_via`.
 async fn do_spawn(
     binary_path: &Path,
@@ -379,10 +395,40 @@ async fn do_spawn(
         "LazyEmbedderHandle: first embed request — spawning trusty-embedderd",
     );
 
+    // Fix C (issue #747): forward the auto-tuned batch size to the sidecar.
+    // Without this the sidecar always defaulted to 32 regardless of the
+    // parent's resolved value (e.g. 256 on Medium-tier + CoreML).
+    // CoreML cap: oversized batches inflate unified-memory RSS and trigger
+    // jetsam SIGKILL, so cap at coreml_cap on the CoreML path.
+    //
+    // Why re-resolve on each (re)spawn: intentional. The batch size and CoreML
+    // cap can change between spawns if the operator updates daemon.env and
+    // SIGTERM-restarts the daemon, or if the idle-shutdown watchdog fires and
+    // the sidecar is re-spawned later. Re-resolving here means config changes
+    // take effect on the next spawn without requiring a full daemon restart.
+    let predicted_provider = trusty_common::embedder::resolve_expected_provider();
+    let is_coreml = matches!(
+        predicted_provider,
+        trusty_common::embedder::ExecutionProvider::CoreML
+            | trusty_common::embedder::ExecutionProvider::CoreMLAne
+    );
+    let resolved_batch = crate::core::indexer::embed_batch_size();
+    let coreml_cap = crate::core::resolve_coreml_batch_size();
+    let forwarded_batch =
+        trusty_common::embedder_client::sidecar_batch_size(resolved_batch, is_coreml, coreml_cap);
+    tracing::info!(
+        resolved_batch,
+        forwarded_batch,
+        is_coreml,
+        coreml_cap,
+        "LazyEmbedderHandle: TRUSTY_EMBED_BATCH_SIZE={forwarded_batch} (resolved={resolved_batch})"
+    );
+
     let common_config = trusty_common::embedder_client::SupervisorConfig {
         startup_timeout_secs: config.startup_timeout_secs,
         backoff_max_secs: config.backoff_max_secs,
         max_restarts: config.max_restarts,
+        sidecar_batch_size: Some(forwarded_batch),
     };
 
     let (supervisor, client_slot, child_pid_slot) =
@@ -654,24 +700,32 @@ mod tests {
         assert_eq!(cfg.idle_shutdown_secs, 0);
     }
 
-    /// `into_common()` must map fields correctly to the trusty-common type.
+    /// `into_common_for_tests()` must map fields correctly to the trusty-common
+    /// type and always set `sidecar_batch_size: None`.
     ///
     /// Why: field mismatch would silently use wrong defaults at runtime.
-    /// What: construct a custom config, convert, and assert the common fields.
+    /// What: construct a custom config, convert via `into_common_for_tests`,
+    /// and assert the common fields.
     /// Test: this test.
     #[test]
-    fn into_common_maps_fields() {
+    fn into_common_for_tests_maps_fields() {
         let cfg = SupervisorConfig {
             startup_timeout_secs: 99,
             backoff_max_secs: 77,
             max_restarts: 3,
             idle_shutdown_secs: 600,
         };
-        let common = cfg.into_common();
+        let common = cfg.into_common_for_tests();
         assert_eq!(common.startup_timeout_secs, 99);
         assert_eq!(common.backoff_max_secs, 77);
         assert_eq!(common.max_restarts, 3);
         // idle_shutdown_secs is trusty-search–specific; not in the common type.
+        // sidecar_batch_size must be None — this method is for test/lifecycle
+        // spawns only; production paths use do_spawn to populate Some(batch).
+        assert!(
+            common.sidecar_batch_size.is_none(),
+            "into_common_for_tests must not set sidecar_batch_size"
+        );
     }
 
     // ── default_socket_path ─────────────────────────────────────────────────
