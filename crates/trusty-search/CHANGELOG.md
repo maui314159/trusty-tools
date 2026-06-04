@@ -7,6 +7,84 @@ Versions correspond to `Cargo.toml` patch releases.
 
 ---
 
+## [0.23.2] — 2026-06-04
+
+### Fixed
+
+- **Shared-channel probe collection — no fast-volume starvation** (review #727
+  pass-3 HIGH, issue #723) — `probe_all_volumes` previously iterated pending
+  per-volume receivers SEQUENTIALLY: if the first volume's `recv_timeout`
+  consumed the full deadline budget, every subsequent receiver got
+  `Duration::ZERO` and was wrongly classified as inaccessible — even if its
+  probe thread had already finished and sent a result. Fixed by replacing the
+  per-volume channel design with a SINGLE shared `mpsc::channel`: all probe
+  threads send tagged `(vol_key, sample_path)` results into one channel;
+  the collector pulls results in ARRIVAL ORDER until all N volumes report or
+  the shared deadline elapses. Fast volumes are now collected immediately
+  regardless of spawn order. Total wait ≈ ONE deadline regardless of N;
+  `LEAKED_PROBE_THREAD_COUNT` is still incremented once per timed-out volume.
+  Regression test: `probe_all_volumes_multi_volume_no_fast_starvation`. (PR #727)
+
+- **Multi-volume starvation regression test** (review #727 pass-3, issue #723)
+  — added `probe_all_volumes_multi_volume_no_fast_starvation`: uses injected
+  probe delays (2 fast volumes at 5 ms, 1 slow at 250 ms, deadline 50 ms) to
+  assert fast volumes are Accessible, only the slow volume is Inaccessible,
+  total elapsed < 2 × deadline, and `LEAKED_PROBE_THREAD_COUNT` increments by
+  exactly 1. (PR #727)
+
+- **Health-test TOCTOU fix** (review #727 pass-3, issue #723) —
+  `health_includes_warmboot_leaked_probe_threads` in `server.rs` previously
+  read `leaked_probe_thread_count()` AFTER calling the handler; a concurrent
+  serial test incrementing the counter between the handler return and the read
+  could produce `expected > resp.field`, causing a spurious failure. Fixed by
+  reading the counter BEFORE the handler call and marking the test
+  `#[serial_test::serial]` to prevent concurrent counter mutations. (PR #727)
+
+- **Parallel volume probing — bounded warm-boot time** (review #727 finding 1,
+  issue #723) — `probe_all_volumes` now spawns ALL per-volume probe threads
+  simultaneously and collects their results under a SINGLE shared wall-clock
+  deadline. Total warm-boot stall is bounded at ≈ONE deadline regardless of
+  how many distinct volumes are being probed (previously N × deadline). Each
+  blocked volume still leaks exactly one OS thread; the
+  `LEAKED_PROBE_THREAD_COUNT` counter is incremented once per timed-out volume
+  as before. (PR #727)
+
+- **Deterministic probe counter tests** (review #727 finding 2) —
+  `probe_timeout_increments_leaked_thread_count` no longer restores the global
+  `LEAKED_PROBE_THREAD_COUNT` counter via `store(before, ...)` at the end of
+  the test. The restore was racy: it could silently roll back increments from
+  a concurrent serial test that also touches the counter. The test now asserts
+  `after >= before + 1` (monotone growth) which is the correct invariant and
+  is deterministic under a multi-threaded runner. (PR #727)
+
+- **Linux volume-key false-positive guard** (review #727 finding 3) —
+  `volume_key` now uses an exact string match (`== "Volumes"`) instead of
+  `eq_ignore_ascii_case("Volumes")`, and the `/Volumes/<label>` special-casing
+  is fully gated behind `#[cfg(target_os = "macos")]`. On Linux, paths like
+  `/volumes/...` (lowercase) were previously mis-classified as external macOS
+  volume keys, producing spurious warm-boot `TIMED_OUT` warnings. macOS
+  behavior is unchanged. (PR #727)
+
+- **Probe deeper index path for TCC detection** (review #727 finding 2, issue
+  #723) — the per-volume warm-boot probe now calls `stat` on the representative
+  sample index path inside the volume (e.g.
+  `/Volumes/SSD1/Projects/myrepo`) instead of the bare volume mount-point root
+  (`/Volumes/SSD1`). On macOS, `stat` on the volume root can succeed even when
+  TCC denies access to files inside the volume; probing the deeper path is what
+  actually detects the TCC-blocked-inside-volume scenario that issue #723
+  targets. The once-per-volume design (at most one leaked thread per blocked
+  volume) is preserved.
+
+- **Surface leaked probe-thread count in `/health`** (review #727 finding 3,
+  issue #723) — a timed-out volume probe now increments a process-global
+  `LEAKED_PROBE_THREAD_COUNT` counter and emits a `tracing::warn!` with the
+  running total. The counter is exposed in `GET /health` as
+  `warmboot_leaked_probe_threads` (integer, always present, zero on healthy
+  machines), giving operators visibility into probe thread accumulation on
+  launchd-managed daemons that restart repeatedly.
+
+---
+
 ## [0.23.0] — 2026-06-03
 
 ### Changed
