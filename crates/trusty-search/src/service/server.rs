@@ -1722,37 +1722,84 @@ async fn create_index_handler(
     req.root_path = canonical_root;
 
     // Issue #767: opt-in allowlist — default-deny + hard sensitive-path denylist.
+    // Issue #811 (security): restructured so the denylist is unconditional.
     //
-    // Skip the allowlist check in two cases:
-    // 1. `cfg!(test)` — unit tests call this handler directly with synthetic
-    //    temp-dir paths that cannot be in the real allowlist; bypassing the
-    //    check lets them test the surrounding logic (path validation, embedder
-    //    readiness, registry state) without coupling to the on-disk config.
-    // 2. `TRUSTY_ALLOW_UNLISTED=1` env var — operators or scripts that need
-    //    to pre-populate an index registry during controlled setup can opt out
-    //    of the allowlist check at runtime. NEVER set this on a production
-    //    host that handles untrusted input.
-    let skip_allowlist = cfg!(test)
-        || std::env::var("TRUSTY_ALLOW_UNLISTED")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-    if !skip_allowlist {
+    // Two env vars can relax ONLY the allowlist membership check (issue #795):
+    //
+    // `TRUSTY_TEST_SKIP_ALLOWLIST=1` — set only by the specific unit tests that
+    //   call this handler directly with synthetic temp-dir paths (which may land
+    //   under /var/folders on macOS, a sensitive prefix).  Bypasses ONLY the
+    //   "is this path in indexes.toml?" check.  The hard denylist always runs,
+    //   even when this var is set — a test cannot index ~/.ssh or /etc.
+    //
+    // `TRUSTY_ALLOW_UNLISTED=1` — operators or scripts that pre-populate the
+    //   registry during controlled setup.  Bypasses ONLY the allowlist
+    //   membership check.  The hard denylist is STILL enforced: sensitive
+    //   paths (e.g. ~/.ssh, /tmp, ~/.aws) are always rejected.
+    //   NEVER set on a production host that handles untrusted input.
+    let test_skip = std::env::var("TRUSTY_TEST_SKIP_ALLOWLIST")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let allow_unlisted = std::env::var("TRUSTY_ALLOW_UNLISTED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    if test_skip {
+        // Emit an auditable warning so accidental production use is visible in logs.
+        tracing::warn!(
+            "TRUSTY_TEST_SKIP_ALLOWLIST is set — allowlist membership check \
+             bypassed (hard denylist still enforced)"
+        );
+    }
+
+    // ── Hard denylist: ALWAYS enforced, unconditionally. ──────────────────────
+    // No env var (TRUSTY_TEST_SKIP_ALLOWLIST, TRUSTY_ALLOW_UNLISTED, or any
+    // future flag) can bypass this check.  A sensitive-path hit → 403.
+    if let Some(reason) = crate::allowlist::is_denied(&req.root_path) {
+        tracing::warn!(
+            path = %req.root_path.display(),
+            reason = %reason,
+            "POST /indexes rejected: sensitive path"
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!(
+                    "path '{}' matches a sensitive-path denylist pattern and cannot be indexed: {}",
+                    req.root_path.display(), reason
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // ── Allowlist membership: relaxable by operator/test env vars. ────────────
+    // Only skip when both env vars are absent. The denylist above already
+    // rejected any truly dangerous path, so skipping here is safe only for
+    // paths that passed the denylist.
+    if !test_skip && !allow_unlisted {
         match crate::allowlist::check_path(&req.root_path, None) {
             Ok(crate::allowlist::AllowlistCheck::Allowed) => {
                 // Path is explicitly allowlisted and safe — proceed.
             }
-            Ok(crate::allowlist::AllowlistCheck::Denied { reason }) => {
-                tracing::warn!(
-                    path = %req.root_path.display(),
-                    reason = %reason,
-                    "POST /indexes rejected: sensitive path"
+            Ok(crate::allowlist::AllowlistCheck::Denied { .. }) => {
+                // The unconditional is_denied check above runs before
+                // check_path, so this arm is unreachable in normal operation.
+                // Guard defensively: emit a loud assertion in debug builds and
+                // return 403 in all builds so a denylist hit can never slip
+                // through to registration.
+                debug_assert!(
+                    false,
+                    "AllowlistCheck::Denied reached after is_denied() passed — \
+                     denylist logic is inconsistent"
                 );
                 return (
                     axum::http::StatusCode::FORBIDDEN,
                     Json(serde_json::json!({
                         "error": format!(
-                            "path '{}' matches a sensitive-path denylist pattern and cannot be indexed: {}",
-                            req.root_path.display(), reason
+                            "path '{}' matches a sensitive-path denylist pattern \
+                             and cannot be indexed",
+                            req.root_path.display()
                         )
                     })),
                 )
@@ -1761,7 +1808,8 @@ async fn create_index_handler(
             Ok(crate::allowlist::AllowlistCheck::NotAllowlisted) => {
                 tracing::warn!(
                     path = %req.root_path.display(),
-                    "POST /indexes rejected: path not in allowlist (~/.config/trusty-search/indexes.toml)"
+                    "POST /indexes rejected: path not in allowlist \
+                     (~/.config/trusty-search/indexes.toml)"
                 );
                 return (
                     axum::http::StatusCode::FORBIDDEN,
@@ -1769,7 +1817,8 @@ async fn create_index_handler(
                         "error": format!(
                             "path '{}' is not in the allowlist. \
                              Run `trusty-search index add {}` to approve it, \
-                             or add an [[index]] entry to ~/.config/trusty-search/indexes.toml.",
+                             or add an [[index]] entry to \
+                             ~/.config/trusty-search/indexes.toml.",
                             req.root_path.display(), req.root_path.display()
                         )
                     })),
@@ -4411,7 +4460,14 @@ mod tests {
     /// `POST /indexes` must return a 503 carrying the error message rather
     /// than the generic "initializing" reason. Callers (CLI, MCP) rely on
     /// the message to surface the underlying cause to operators.
+    // Issue #795/#811: tests that call `create_index_handler` with temp-dir paths
+    // must set `TRUSTY_TEST_SKIP_ALLOWLIST=1` to bypass the allowlist membership
+    // check (temp-dirs land under `/var/folders` on macOS which is in the denylist,
+    // so those tests also need to use non-denylist paths — the hard denylist still
+    // fires even with this var set).  Marked `serial`: env-var mutation is safe.
+
     #[tokio::test]
+    #[serial_test::serial]
     async fn create_index_returns_503_with_error_when_embedder_failed() {
         use crate::core::registry::IndexRegistry;
         use axum::body::to_bytes;
@@ -4421,15 +4477,19 @@ mod tests {
             .install_embedder_error("init timed out after 60s")
             .await;
         let state_arc = Arc::new(state);
-        // Use a real tempdir so the issue #63 root_path validator (which now
-        // runs ahead of the embedder check) accepts the path and the
-        // handler proceeds to the embedder-error branch we're asserting on.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        // Use the crate source directory as the root_path: it is absolute,
+        // exists, and is not in the hard denylist (issue #811 requires that
+        // TRUSTY_TEST_SKIP_ALLOWLIST no longer bypasses the denylist, so
+        // tempdir() paths under /var/folders or /tmp would now fail).
+        // Set TRUSTY_TEST_SKIP_ALLOWLIST so the allowlist membership check is
+        // bypassed (issue #795/#811). Serialised: env-var mutation is safe.
+        unsafe { std::env::set_var("TRUSTY_TEST_SKIP_ALLOWLIST", "1") };
+        let safe_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let resp = create_index_handler(
             State(state_arc),
             Json(CreateIndexRequest {
                 id: "demo".to_string(),
-                root_path: tmp.path().to_path_buf(),
+                root_path: safe_root,
                 include_paths: None,
                 exclude_globs: None,
                 extensions: None,
@@ -4442,6 +4502,7 @@ mod tests {
             }),
         )
         .await;
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body_bytes = to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -4994,19 +5055,28 @@ mod tests {
     /// `file_is_within_root` won't match.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn create_index_canonicalizes_symlinked_root_path() {
         use crate::core::registry::IndexId;
         use crate::core::registry::IndexRegistry;
         use std::os::unix::fs::symlink;
+
+        // Issue #795/#811: bypass allowlist membership check.
+        // Use the crate source directory (CARGO_MANIFEST_DIR) as real_root: it
+        // is absolute, exists, and is NOT in the hard denylist (unlike tempdir()
+        // paths which land under /private/var/folders on macOS — now blocked by
+        // the unconditional denylist gate). The symlink is created alongside
+        // `real_root` in its parent directory and removed at test-end.
+        unsafe { std::env::set_var("TRUSTY_TEST_SKIP_ALLOWLIST", "1") };
 
         let state = SearchAppState::new(IndexRegistry::new());
         let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
         state.install_embedder(embedder).await;
         let state_arc = Arc::new(state);
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let real_root = std::fs::canonicalize(tmp.path()).expect("canonicalize real root");
-        let parent = real_root.parent().expect("tempdir has parent");
+        let real_root =
+            std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonicalize manifest dir");
+        let parent = real_root.parent().expect("manifest dir has parent");
         let link_path = parent.join(format!(
             "trusty-search-server-symlink-{}",
             std::process::id()
@@ -5049,23 +5119,32 @@ mod tests {
             handle.root_path, link_path,
             "registry retained the symlink alias — downstream walkers will mismatch",
         );
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
     }
 
     /// Issue #63: an absolute, existing directory must be accepted.
     #[tokio::test]
+    #[serial_test::serial]
     async fn create_index_accepts_valid_absolute_root_path() {
         use crate::core::registry::IndexRegistry;
+
+        // Issue #795/#811: bypass allowlist membership check.
+        // Use the crate source directory instead of tempdir() — tempdir() resolves
+        // to /private/var/folders on macOS which is now blocked by the
+        // unconditional denylist gate (TRUSTY_TEST_SKIP_ALLOWLIST no longer
+        // bypasses the denylist, only the allowlist membership check).
+        unsafe { std::env::set_var("TRUSTY_TEST_SKIP_ALLOWLIST", "1") };
 
         let state = SearchAppState::new(IndexRegistry::new());
         let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
         state.install_embedder(embedder).await;
         let state_arc = Arc::new(state);
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let safe_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let resp = create_index_handler(
             State(Arc::clone(&state_arc)),
             Json(CreateIndexRequest {
                 id: "valid-abs".into(),
-                root_path: tmp.path().to_path_buf(),
+                root_path: safe_root,
                 include_paths: None,
                 exclude_globs: None,
                 extensions: None,
@@ -5078,6 +5157,7 @@ mod tests {
             }),
         )
         .await;
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -5837,6 +5917,209 @@ mod tests {
         );
     }
 
+    // ── Issue #795: allowlist bypass env-var semantics ────────────────────
+
+    /// `TRUSTY_ALLOW_UNLISTED=1` bypasses the allowlist check but the hard
+    /// denylist is still enforced: a path under a sensitive prefix is always
+    /// rejected, even when `TRUSTY_ALLOW_UNLISTED=1` is set.
+    ///
+    /// Why (issue #795): the missing test that proves `TRUSTY_ALLOW_UNLISTED`
+    /// does NOT suppress the denylist.  The old `cfg!(test)` bypass skipped
+    /// both, which masked this distinction.
+    /// What: attempt to register a real tempdir (which lands under
+    /// `/var/folders/...` on macOS or `/tmp/...` on Linux — both are in
+    /// `SENSITIVE_PATH_PREFIXES`) while `TRUSTY_ALLOW_UNLISTED=1` is set.
+    /// The handler must return 403 (denylist hit), not 200 (allowed).
+    /// Test: this test.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn trusty_allow_unlisted_does_not_bypass_hard_denylist() {
+        use crate::core::registry::IndexRegistry;
+        use axum::body::to_bytes;
+
+        // Set TRUSTY_ALLOW_UNLISTED=1 to bypass the allowlist.
+        unsafe { std::env::set_var("TRUSTY_ALLOW_UNLISTED", "1") };
+        // Ensure TRUSTY_TEST_SKIP_ALLOWLIST is NOT set so only TRUSTY_ALLOW_UNLISTED
+        // is active and the denylist is still enforced.
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+
+        // tempfile::tempdir() produces a path under /var/folders/... (macOS) or
+        // /tmp/... (Linux), both of which are in SENSITIVE_PATH_PREFIXES.
+        // The path is absolute and exists, so it passes validate_root_path.
+        // The denylist check must then fire and return 403.
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "denylist-test-795".into(),
+                root_path: tmp.path().to_path_buf(),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+                include_docs: None,
+                respect_gitignore: None,
+                lexical_only: None,
+                skip_kg: None,
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("TRUSTY_ALLOW_UNLISTED") };
+
+        // The denylist must fire even with TRUSTY_ALLOW_UNLISTED=1.
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "TRUSTY_ALLOW_UNLISTED=1 must NOT bypass the hard denylist; \
+             a tempdir path (under /var/folders or /tmp) must be rejected"
+        );
+        let body = to_bytes(resp.into_body(), 4096).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("sensitive"),
+            "error must mention denylist; got: {err}"
+        );
+    }
+
+    /// `TRUSTY_TEST_SKIP_ALLOWLIST=1` bypasses only the allowlist membership
+    /// check.  The hard denylist still fires: a path under a sensitive prefix
+    /// (e.g. /tmp, /var/folders) must return 403 even when the test bypass is
+    /// active.
+    ///
+    /// Why (issue #811): this is the exact regression that was possible before
+    /// the restructure — `test_skip` used to also gate `is_denied`.
+    /// What: set TRUSTY_TEST_SKIP_ALLOWLIST=1 and attempt to register a tempdir
+    /// (which lands under a sensitive prefix on both macOS and Linux).  Must be
+    /// 403, not 200.
+    /// Test: this test + serial invariant doc below.
+    ///
+    /// Serialization invariant: this test mutates env vars shared across tests in
+    /// the same process; `#[serial_test::serial]` ensures no two env-mutating
+    /// tests run concurrently.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_skip_allowlist_does_not_bypass_hard_denylist() {
+        use crate::core::registry::IndexRegistry;
+        use axum::body::to_bytes;
+
+        unsafe { std::env::set_var("TRUSTY_TEST_SKIP_ALLOWLIST", "1") };
+        unsafe { std::env::remove_var("TRUSTY_ALLOW_UNLISTED") };
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+
+        // tempfile::tempdir() lands under /tmp or /var/folders — both are in
+        // SENSITIVE_PATH_PREFIXES.  The handler must still return 403.
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "skip-denylist-test-811".into(),
+                root_path: tmp.path().to_path_buf(),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+                include_docs: None,
+                respect_gitignore: None,
+                lexical_only: None,
+                skip_kg: None,
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "TRUSTY_TEST_SKIP_ALLOWLIST=1 must NOT bypass the hard denylist; \
+             a tempdir path (under /var/folders or /tmp) must be rejected with 403"
+        );
+        let body = to_bytes(resp.into_body(), 4096).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("sensitive"),
+            "error body must mention denylist; got: {err}"
+        );
+    }
+
+    /// `TRUSTY_TEST_SKIP_ALLOWLIST=1` allows indexing a path that is NOT in the
+    /// allowlist but also NOT in the denylist.  This validates that the env var
+    /// relaxes exactly the allowlist membership check and nothing else.
+    ///
+    /// Why (issue #811): confirm the allowlist relaxation still works after the
+    /// denylist was moved unconditionally above the allowlist check.
+    /// What: use a known-safe, existing non-allowlisted directory.  With
+    /// TRUSTY_TEST_SKIP_ALLOWLIST=1 the handler must proceed past the allowlist
+    /// gate and either succeed (200) or fail for a reason other than allowlist
+    /// (e.g. embedder not ready → 503).  It must NOT return 403.
+    /// Test: this test.
+    ///
+    /// Serialization invariant: env-var mutation; `#[serial_test::serial]`
+    /// prevents concurrent test interference.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_skip_allowlist_allows_safe_unlisted_path() {
+        use crate::core::registry::IndexRegistry;
+
+        unsafe { std::env::set_var("TRUSTY_TEST_SKIP_ALLOWLIST", "1") };
+        unsafe { std::env::remove_var("TRUSTY_ALLOW_UNLISTED") };
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        let state_arc = Arc::new(state);
+
+        // Use the crate's own source directory — guaranteed to exist, absolute,
+        // outside the denylist, and not in the allowlist (tests don't write
+        // indexes.toml entries for it).
+        let safe_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "skip-allowlist-safe-811".into(),
+                root_path: safe_path,
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+                include_docs: None,
+                respect_gitignore: None,
+                lexical_only: None,
+                skip_kg: None,
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("TRUSTY_TEST_SKIP_ALLOWLIST") };
+
+        // The handler must NOT return 403 (denylist or allowlist rejection).
+        // It may return 200, 503 (embedder not ready), or other non-403 codes.
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "TRUSTY_TEST_SKIP_ALLOWLIST=1 must bypass the allowlist membership \
+             check for a safe path; expected non-403 but got FORBIDDEN"
+        );
+    }
+
     // ── Issue #750: unknown index id returns 404 with JSON body ──────────
 
     /// `POST /indexes/{id}/search` with an unknown id must return HTTP 404
@@ -5909,5 +6192,58 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "unknown index");
         assert_eq!(json["index_id"], "ghost-index");
+    }
+
+    // ── Issue #749: remaining per-index 404 coverage ──────────────────────
+
+    /// `POST /indexes/{id}/index-file` with an unknown id returns 404 with a
+    /// decodable JSON error body (closes #749).
+    ///
+    /// Why: `index_file_handler` also uses `unknown_index_response`; this test
+    /// completes the per-endpoint 404 coverage set started by #750.
+    #[tokio::test]
+    async fn index_file_unknown_index_returns_404_json() {
+        use crate::core::registry::IndexRegistry;
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let err = index_file_handler(
+            State(state),
+            Path("no-such-index".to_string()),
+            Json(IndexFileRequest {
+                path: "src/main.rs".to_string(),
+                content: "fn main() {}".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown index must 404");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(err.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "unknown index");
+        assert_eq!(json["index_id"], "no-such-index");
+    }
+
+    /// `POST /indexes/{id}/remove-file` with an unknown id returns 404 with a
+    /// decodable JSON error body (closes #749).
+    ///
+    /// Why: `remove_file_handler` uses `unknown_index_response`; this test
+    /// completes the per-endpoint 404 coverage.
+    #[tokio::test]
+    async fn remove_file_unknown_index_returns_404_json() {
+        use crate::core::registry::IndexRegistry;
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let err = remove_file_handler(
+            State(state),
+            Path("no-such-index".to_string()),
+            Json(RemoveFileRequest {
+                path: "src/main.rs".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown index must 404");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(err.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "unknown index");
+        assert_eq!(json["index_id"], "no-such-index");
     }
 }
