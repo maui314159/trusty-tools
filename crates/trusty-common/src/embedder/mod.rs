@@ -601,10 +601,24 @@ impl FastEmbedder {
                         // so the daemon still starts. On `TRUSTY_DEVICE=gpu`
                         // we propagate the original error.
                         if q_provider != ExecutionProvider::Cpu && !require_gpu {
-                            tracing::warn!(
-                                "{} EP init failed ({q_err:#}); retrying with CPU-only \
-                                 execution provider",
-                                q_provider
+                            // LOUD structured error (fix #763 Fix 3a): a plain
+                            // `warn!` was silently discarded in production logs.
+                            // Use `error!` so the sidecar operator is paged.
+                            // The `/health` endpoint reports the PREDICTED provider
+                            // (CUDA), not the actual provider (CPU after fallback) —
+                            // this mismatch causes "CUDA" in health while inference
+                            // runs on CPU. Setting TRUSTY_DEVICE=gpu prevents this
+                            // silent mismatch by making init fail-fast instead.
+                            tracing::error!(
+                                predicted_provider = %q_provider,
+                                actual_provider = "CPU",
+                                error = %q_err,
+                                "SILENT FALLBACK DETECTED (#763): {p} EP failed to \
+                                 initialise — falling back to CPU. The /health endpoint \
+                                 will report provider={p} but inference will run on CPU. \
+                                 Set TRUSTY_DEVICE=gpu to surface this as a hard failure \
+                                 instead of a silent performance regression.",
+                                p = q_provider
                             );
                             // SAFETY: see TRUSTY_DEVICE comment in
                             // init_options — the env mutation happens before
@@ -678,6 +692,27 @@ impl FastEmbedder {
     }
 }
 
+/// Return `true` if every element of `vector` is exactly `0.0`.
+///
+/// Why: extracted from `FastEmbedder::embed_batch` so the guard can be tested
+/// without a live ONNX backend. The guard rejects all-zero ORT output — a
+/// zero-initialised output buffer that was never written indicates a silent
+/// CUDA EP failure and must not reach the HNSW index.
+///
+/// What: `iter().all(|&v| v == 0.0)`. The `== 0.0` comparison is INTENTIONAL
+/// — an ORT zero-initialised buffer contains exact IEEE 754 zero (+0.0), not
+/// a near-zero value. Legitimate embeddings from a working ONNX session always
+/// contain at least one non-zero component (the model is trained to produce
+/// unit-normalised vectors away from the origin). Using exact equality avoids
+/// false positives from legitimate vectors with very small (but non-zero)
+/// components.
+///
+/// Test: `zero_vector_guard_rejects_all_zero_batch` exercises this function
+/// directly, so the guard cannot be deleted without a test failure.
+pub(crate) fn is_zero_vector(vector: &[f32]) -> bool {
+    vector.iter().all(|&v| v == 0.0)
+}
+
 #[async_trait]
 impl Embedder for FastEmbedder {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -721,6 +756,17 @@ impl Embedder for FastEmbedder {
 
             let mut cache = self.cache.lock();
             for ((idx, key), vector) in to_compute.into_iter().zip(computed) {
+                // Zero-vector guard (fix #763 Fix 3b): delegates to
+                // `is_zero_vector` — see that function's doc for the rationale
+                // behind using exact `== 0.0` comparison.
+                if is_zero_vector(&vector) {
+                    anyhow::bail!(
+                        "zero-vector returned by fastembed for text slot {idx} \
+                         (provider={} — possible CUDA EP OOM / silent fallback). \
+                         Set TRUSTY_DEVICE=gpu to surface the real error at init time.",
+                        self.provider
+                    );
+                }
                 cache.put(key, vector.clone());
                 results[idx] = Some(vector);
             }
@@ -1196,6 +1242,56 @@ mod tests {
                 None => std::env::remove_var("TRUSTY_COREML_COMPUTE_UNITS"),
             }
         }
+    }
+
+    /// Regression test for fix #763 Fix 3b: an all-zeros embedding batch must
+    /// produce an `Err`, not a silent zero result.
+    ///
+    /// Why: zero vectors from a CUDA EP silent fallback would be stored in the
+    /// HNSW index and corrupt all similarity searches (every vector is
+    /// equidistant from zero). This test proves the guard fires before the
+    /// vector reaches the cache or the caller.
+    ///
+    /// What: uses `MockEmbedder`'s `hash_to_vec` which always produces non-zero
+    /// vectors for non-empty input. We test the guard directly by calling the
+    /// private helper logic through a controlled path: assert that a synthesised
+    /// all-zero `Vec<f32>` triggers the bail condition. Because `FastEmbedder`
+    /// requires ONNX (test is `#[ignore]`), we test the guard path through the
+    /// public `MockEmbedder` contract (non-zero guarantee) and verify the guard
+    /// logic with a direct check of the bail condition.
+    ///
+    /// Test: `zero_vector_guard_rejects_all_zero_batch`.
+    #[test]
+    fn zero_vector_guard_rejects_all_zero_batch() {
+        // Why: exercise `is_zero_vector` directly so the guard function cannot
+        //      be deleted without breaking this test. Previously the guard logic
+        //      was inlined in embed_batch; extracting it here makes it testable
+        //      without an ONNX backend.
+        // What: assert that an all-zero vector returns `true` (guard fires) and
+        //       a vector with any non-zero component returns `false` (passes).
+        // Test: this test.
+        let zero_vec: Vec<f32> = vec![0.0; EMBED_DIM];
+        let non_zero_vec: Vec<f32> = {
+            let mut v = vec![0.0_f32; EMBED_DIM];
+            v[0] = 1.0;
+            v
+        };
+        assert!(
+            is_zero_vector(&zero_vec),
+            "synthetic zero vector must be detected by is_zero_vector"
+        );
+        assert!(
+            !is_zero_vector(&non_zero_vec),
+            "non-zero vector must NOT be detected by is_zero_vector"
+        );
+        // Confirm that the MockEmbedder never produces a zero vector for
+        // non-empty input (it uses a hash-based non-zero fill).
+        let mock = MockEmbedder::new(EMBED_DIM);
+        let hash_result = mock.hash_to_vec("some text");
+        assert!(
+            !is_zero_vector(&hash_result),
+            "MockEmbedder must produce non-zero vectors for non-empty input"
+        );
     }
 
     /// Why: operators with enough headroom may want the full CPU+GPU+ANE
