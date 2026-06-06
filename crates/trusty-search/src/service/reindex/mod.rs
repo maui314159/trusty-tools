@@ -14,9 +14,12 @@
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
 mod hash_cache;
+mod prune;
 pub mod quarantine;
 mod staging;
 mod validate;
+
+use prune::{prune_deleted_files_from_staging, to_corpus_relative_path};
 
 pub use quarantine::ReindexQuarantine;
 
@@ -1067,11 +1070,13 @@ async fn prepare_batch_payload(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchPayloa
     let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
     let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
     for (path, content_res) in read_results {
-        let rel = path
-            .strip_prefix(&ctx.root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        // Use the shared canonical normalisation from `prune` so every
+        // relative-path string stored in the corpus is produced by the
+        // same function that the prune pass uses when building its walked-set.
+        // This ensures the set-difference in `prune_deleted_files_from_staging`
+        // can never generate a false "deleted" entry due to a per-site
+        // divergence in how the relative path is formatted.  (Issue #854.)
+        let rel = to_corpus_relative_path(&ctx.root, &path);
         let content = match content_res {
             Ok(c) => c,
             Err(e) => {
@@ -1109,12 +1114,9 @@ async fn prepare_batch_payload(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchPayloa
         // returns canonicalised paths under the root; the `unwrap_or` is a
         // defensive fallback that preserves the previous behaviour for any edge-
         // case path that somehow escapes the root (e.g. a symlink target outside
-        // the tree).
-        let path_str = path
-            .strip_prefix(&ctx.root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        // the tree).  `rel` above was already computed via `to_corpus_relative_path`,
+        // which uses the same strip_prefix + unwrap_or + display idiom — reuse it.
+        let path_str = rel.clone();
         to_index.push((path_str, content));
         to_index_paths.push(path.clone());
         new_hashes.push((path, h));
@@ -1151,7 +1153,7 @@ async fn emit_batch_error(ctx: &BatchCtx, to_index_paths: &[PathBuf], err: anyho
     use std::sync::atomic::Ordering;
     let files_in_batch: Vec<String> = to_index_paths
         .iter()
-        .map(|p| p.strip_prefix(&ctx.root).unwrap_or(p).display().to_string())
+        .map(|p| to_corpus_relative_path(&ctx.root, p))
         .collect();
     ctx.progress
         .errors
@@ -2248,6 +2250,35 @@ pub fn spawn_reindex_with_cleanup(
         // lexical-only and zero-files cases are legitimate (see
         // `validate::reindex_outcome`).
         let memory_aborted = mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire);
+
+        // Issue #848 — prune pass: remove stale chunks from files deleted on disk.
+        //
+        // After the #839 staging-carryover fix, `copy_all_from` pre-seeds the
+        // staging corpus with ALL live rows (correct for unchanged files).
+        // But a file deleted from disk is never walked → never re-indexed →
+        // its rows are carried forward unchanged, and search returns content
+        // from files that no longer exist.
+        //
+        // Fix: after the batch loop drains (so all changed/new files are
+        // committed to staging) and BEFORE the atomic promote, compute the
+        // set-difference between (files in staging corpus) and (files walked)
+        // and remove every deleted file's data from ALL stores atomically.
+        //
+        // Applies ONLY to the non-force path: --force starts with an empty
+        // staging corpus that is rebuilt from the current walk, so it is
+        // already correct.  `corpus_swap_tmp.is_some()` is the staging gate;
+        // `!force` guards the non-force path specifically.  Skip on memory
+        // abort (the staging corpus is being discarded anyway).
+        if corpus_swap_tmp.is_some() && !force && !memory_aborted {
+            prune_deleted_files_from_staging(
+                &handle,
+                &walk.files,
+                &canonical_root,
+                &hashes,
+                &index_id,
+            )
+            .await;
+        }
         // `has_embedder()` distinguishes a genuine embed failure (embedder
         // wired, zero vectors) from a legitimately embedder-less BM25-only /
         // test index. Only the former is a #601 failure.
