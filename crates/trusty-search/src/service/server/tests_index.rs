@@ -247,6 +247,13 @@ async fn create_index_rejects_nonexistent_root_path() {
 /// the symlink alias, the walker emits file paths under the alias, and
 /// search queries from the canonical mount point return zero hits because
 /// `file_is_within_root` won't match.
+///
+/// Note: `tempfile::tempdir()` creates dirs under `/tmp/` which is now in
+/// the sensitive-root denylist. This test uses `tempfile::Builder` with a
+/// `prefix_dir` under `target/` (which is never in the denylist) so that
+/// `validate_root_path` accepts the directory while still exercising the
+/// symlink-canonicalization logic. `TempDir` provides RAII cleanup even on
+/// panic, ensuring no leaked directories in `target/`.
 #[cfg(unix)]
 #[tokio::test]
 async fn create_index_canonicalizes_symlinked_root_path() {
@@ -259,13 +266,19 @@ async fn create_index_canonicalizes_symlinked_root_path() {
     state.install_embedder(embedder).await;
     let state_arc = Arc::new(state);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let real_root = std::fs::canonicalize(tmp.path()).expect("canonicalize real root");
-    let parent = real_root.parent().expect("tempdir has parent");
-    let link_path = parent.join(format!(
-        "trusty-search-server-symlink-{}",
-        std::process::id()
-    ));
+    // Create the real directory under target/ (not /tmp) so the denylist allows
+    // it. TempDir provides RAII cleanup even on panic.
+    let cwd = std::env::current_dir().expect("cwd");
+    let base = cwd.join("target");
+    std::fs::create_dir_all(&base).expect("create target/");
+    let real_dir = tempfile::Builder::new()
+        .prefix("ts-symlink-real-")
+        .tempdir_in(&base)
+        .expect("create real_root under target/");
+    let real_root = std::fs::canonicalize(real_dir.path()).expect("canonicalize real root");
+
+    // The symlink lives alongside the real dir (also under target/).
+    let link_path = base.join(format!("ts-symlink-link-{}", std::process::id()));
     let _ = std::fs::remove_file(&link_path);
     symlink(&real_root, &link_path).expect("create symlink");
 
@@ -289,7 +302,7 @@ async fn create_index_canonicalizes_symlinked_root_path() {
         }),
     )
     .await;
-    let _ = std::fs::remove_file(&link_path); // best-effort cleanup
+    let _ = std::fs::remove_file(&link_path); // cleanup symlink (TempDir drops real_dir)
     assert_eq!(resp.status(), StatusCode::OK);
 
     let handle = state_arc
@@ -307,6 +320,11 @@ async fn create_index_canonicalizes_symlinked_root_path() {
 }
 
 /// Issue #63: an absolute, existing directory must be accepted.
+///
+/// Note: uses `tempfile::Builder` rooted under `target/` (never in the
+/// denylist) instead of `tempfile::tempdir()` (which creates dirs under
+/// `/tmp/`, now in the sensitive-root denylist). `TempDir` provides RAII
+/// cleanup even on panic — no leaked directories.
 #[tokio::test]
 async fn create_index_accepts_valid_absolute_root_path() {
     use crate::core::registry::IndexRegistry;
@@ -315,12 +333,21 @@ async fn create_index_accepts_valid_absolute_root_path() {
     let embedder: Arc<dyn Embedder> = Arc::new(crate::core::embed::MockEmbedder::new(8));
     state.install_embedder(embedder).await;
     let state_arc = Arc::new(state);
-    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // TempDir under target/ — RAII cleanup on drop, never under /tmp/.
+    let cwd = std::env::current_dir().expect("cwd");
+    let base = cwd.join("target");
+    std::fs::create_dir_all(&base).expect("create target/");
+    let test_dir = tempfile::Builder::new()
+        .prefix("ts-valid-abs-")
+        .tempdir_in(&base)
+        .expect("create test_dir under target/");
+
     let resp = create_index_handler(
         State(Arc::clone(&state_arc)),
         Json(CreateIndexRequest {
             id: "valid-abs".into(),
-            root_path: tmp.path().to_path_buf(),
+            root_path: test_dir.path().to_path_buf(),
             include_paths: None,
             exclude_globs: None,
             extensions: None,
@@ -333,5 +360,7 @@ async fn create_index_accepts_valid_absolute_root_path() {
         }),
     )
     .await;
+    // test_dir is dropped here → RAII cleanup
     assert_eq!(resp.status(), StatusCode::OK);
 }
+// Denylist tests live in `tests_denylist.rs` (split to keep this file ≤ 500 lines).
