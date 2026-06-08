@@ -603,6 +603,11 @@ pub async fn run_reindex_with(
     let mut received_walk_complete = false;
     let mut lexical_only = false;
     let mut entered_embedding = false;
+    // Issue #929: whether the daemon is running embedding as a background job.
+    // Set from the `defer_embed` field in the `start` SSE event (new in #929).
+    // When true, the CLI prints a "searchable now; embedding in background" note
+    // after `complete` instead of treating completion as fully done.
+    let mut defer_embed = false;
 
     // Elapsed-ms accumulators for per-stage done frames. Walk/chunk don't have
     // SSE timing events, so we approximate from wall-clock; Embed and KG have
@@ -692,6 +697,13 @@ pub async fn run_reindex_with(
                 let total = evt.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
                 lexical_only = evt
                     .get("lexical_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // Issue #929: detect defer-embed mode from the start event.
+                // Old daemons (pre-#929) don't emit this field; absence → false
+                // (assume synchronous, no background note).
+                defer_embed = evt
+                    .get("defer_embed")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 // Issue #744: set the authoritative total so the ticker always
@@ -1095,10 +1107,13 @@ pub async fn run_reindex_with(
     //   3. some files changed  → "Indexed N changed files" with unchanged tally
     let elapsed = fmt_elapsed(outcome.elapsed_ms);
     let changed = outcome.indexed.saturating_sub(outcome.skipped);
+    // Issue #929: all three completion branches include the index_id so piped
+    // / non-TTY multi-index runs can clearly associate each block with its index.
     let final_msg = if outcome.errors > 0 {
         format!(
-            "{} Indexed {} files \u{2192} {} chunks  [took {}, {} errors, {} unchanged]",
+            "{} '{}' — indexed {} files \u{2192} {} chunks  [took {}, {} errors, {} unchanged]",
             "\u{2713}".green(),
+            index_id,
             format_with_commas(changed),
             format_with_commas(outcome.total_chunks),
             elapsed,
@@ -1115,9 +1130,14 @@ pub async fn run_reindex_with(
             elapsed,
         )
     } else {
+        // Issue #929: include the index_id in the normal completion line so
+        // piped / non-TTY multi-index runs clearly show which index each
+        // completion block belongs to. Format mirrors the "up to date" line
+        // above which already includes the id.
         format!(
-            "{} Indexed {} changed file{} \u{2192} {} chunks  [took {}, {} unchanged]",
+            "{} '{}' — indexed {} changed file{} \u{2192} {} chunks  [took {}, {} unchanged]",
             "\u{2713}".green(),
+            index_id,
             format_with_commas(changed),
             if changed == 1 { "" } else { "s" },
             format_with_commas(outcome.total_chunks),
@@ -1132,7 +1152,32 @@ pub async fn run_reindex_with(
     // Pass the SSE `elapsed_ms` (wall-clock total) so the breakdown can
     // print it as the single authoritative number — subsystem times overlap.
     if let Some(t) = outcome.timings {
-        print_timing_breakdown(&t, outcome.total_chunks, outcome.elapsed_ms);
+        // Issue #929: pass defer_embed + lexical_only so the embed timing
+        // line is context-aware (suppressed when deferred, calm when
+        // lexical-only, loud when the embedder was expected but absent).
+        print_timing_breakdown(
+            &t,
+            outcome.total_chunks,
+            outcome.elapsed_ms,
+            defer_embed,
+            lexical_only,
+        );
+    }
+
+    // Issue #929: if the daemon is running embedding in the background, print a
+    // clear "searchable now; embedding running in background" note so the user
+    // knows:
+    //   1. The index is already queryable via lexical + KG search.
+    //   2. Semantic (vector) search will be available once the background job
+    //      finishes — they can track it via `trusty-search status <id> --watch`.
+    if defer_embed {
+        println!();
+        println!("{} Searchable now (lexical + graph).", "\u{2713}".green());
+        println!("\u{23f3} Semantic embedding running in background.");
+        println!(
+            "   Track:  trusty-search status {} --watch",
+            index_id.cyan()
+        );
     }
 
     // Post-reindex health check (blue-green safety net).

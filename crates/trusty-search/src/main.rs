@@ -132,6 +132,30 @@ enum Commands {
     #[command(alias = "st", display_order = 3)]
     Status,
 
+    /// Show per-stage status for an index, with optional live embed tracking
+    ///
+    /// Displays per-stage status (lexical / semantic / graph) for the given index.
+    /// When the deferred-embed background job is running, shows embed progress as
+    /// `embedded / total chunks (N%)`.  When INDEX is omitted, defaults to the
+    /// index(es) whose root_path covers the current working directory (same
+    /// defaulting convention as `trusty-search index .`).  Multiple matches are
+    /// shown in turn.  `--watch` requires an explicit INDEX when >1 match.
+    ///
+    /// Examples:
+    ///   trusty-search index-status              # cwd default
+    ///   trusty-search index-status my-index --watch
+    ///   trusty-search index-status my-index --json
+    #[command(display_order = 4)]
+    #[allow(clippy::doc_markdown)]
+    IndexStatus {
+        /// Index ID to inspect; omit to use the index(es) covering the cwd
+        index_id: Option<String>,
+
+        /// Poll every ~1 s until semantic embedding finishes, then exit
+        #[arg(long)]
+        watch: bool,
+    },
+
     /// Register and index a project, or remove an existing registration  [alias: idx]
     ///
     /// With no subcommand: registers the index with the daemon if needed, then
@@ -1059,6 +1083,11 @@ async fn run() -> Result<()> {
 
         Commands::Status => {
             commands::status::handle_status(cli.json).await?;
+        }
+
+        Commands::IndexStatus { index_id, watch } => {
+            commands::index_status::handle_index_status(index_id.as_deref(), watch, cli.json)
+                .await?;
         }
 
         Commands::Init {
