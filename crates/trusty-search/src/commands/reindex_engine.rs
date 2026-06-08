@@ -1240,10 +1240,10 @@ pub async fn register_index_with_daemon(
 /// forwards the resolved values to the daemon when registering each
 /// index so the daemon stores them on the `IndexHandle` and applies them
 /// to subsequent reindex + search calls.
-/// What: thin struct carrying the four fields. `Default` = empty everywhere,
-/// which keeps the original single-index path unchanged.
+/// What: thin struct carrying the four fields. `Default` has empty collections,
+/// `lexical_only=false`, `skip_kg=false`, `defer_embed=true` (issue #923 default).
 /// Test: `commands::index::handle_index` populates this from `IndexConfig`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RegisterFilters {
     pub include_paths: Vec<String>,
     pub exclude_globs: Vec<String>,
@@ -1264,6 +1264,28 @@ pub struct RegisterFilters {
     /// `"skip_kg": true`. The daemon stores it in `indexes.toml`.
     /// Test: covered by `skip_kg_index_never_runs_phase3` (end-to-end).
     pub skip_kg: bool,
+    /// Issue #923: deferred-embedding (default `true`). Fast pass completes
+    /// synchronously (lexical + KG `Ready`); semantic embedding is deferred to
+    /// a background job. Set `false` for synchronous full-index behaviour.
+    /// Why/What/Test: see `register_index_with_daemon_filtered`.
+    pub defer_embed: bool,
+}
+
+impl Default for RegisterFilters {
+    /// Why: `bool::default()=false` would mis-set `defer_embed`; manual impl
+    /// sets `defer_embed=true` (issue #923 default-on).
+    /// What/Test: all collections empty; `lexical_only=skip_kg=false`, `defer_embed=true`.
+    fn default() -> Self {
+        Self {
+            include_paths: vec![],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+            lexical_only: false,
+            skip_kg: false,
+            defer_embed: true,
+        }
+    }
 }
 
 /// Variant of [`register_index_with_daemon`] that forwards filter/domain
@@ -1303,6 +1325,10 @@ pub async fn register_index_with_daemon_filtered(
     }
     if filters.skip_kg {
         create_body["skip_kg"] = serde_json::json!(true);
+    }
+    // Issue #923: omit `defer_embed` when true (server default); only send when opting out.
+    if !filters.defer_embed {
+        create_body["defer_embed"] = serde_json::json!(false);
     }
     match client.post(&create_url).json(&create_body).send().await {
         Ok(resp) if resp.status().is_success() => {
