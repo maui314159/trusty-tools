@@ -21,7 +21,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, OnceCell, RwLock};
 use trusty_common::bm25_client::Bm25Client;
@@ -38,6 +38,45 @@ use trusty_common::ChatProvider;
 //      `AppState` so it stays unconditional.
 #[cfg(feature = "axum-server")]
 use tracing::info;
+
+/// Two-phase daemon readiness state (issues #910/#911).
+///
+/// Why: The embedder cold-init (CoreML compile, 30-120 s) blocks the first
+/// real `memory_remember`/`memory_recall` call if it arrives before warm-up
+/// completes.  Advertising the state lets handlers return an explicit, fast
+/// error ("daemon is warming up, retry shortly") instead of blocking for
+/// minutes.
+/// What: Two stable values stored atomically.  `Warming` (0) is the initial
+/// state; `Ready` (1) is set once the embedder has been successfully
+/// initialised by `spawn_startup_tasks`.  The transition is one-way and
+/// lock-free: a single `AtomicU8` compare-and-swap.
+/// Test: `daemon_readiness_transitions_warming_to_ready` in this module;
+///       end-to-end warming-error path covered by
+///       `tools::tests::remember_returns_warming_error_while_state_is_warming`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonReadiness {
+    /// Embedder cold-init (and/or pin scan) still in progress.
+    Warming = 0,
+    /// Embedder initialised; all handlers may proceed normally.
+    Ready = 1,
+}
+
+impl DaemonReadiness {
+    /// Decode the raw atomic value.
+    ///
+    /// Why: centralises the `0 → Warming, else Ready` mapping so every
+    /// caller loads a meaningful enum rather than comparing raw integers.
+    /// What: returns `Warming` for `0`, `Ready` for any other value (only
+    /// `1` is ever written).
+    /// Test: `daemon_readiness_from_u8` in this module.
+    pub fn from_u8(v: u8) -> Self {
+        if v == 0 {
+            Self::Warming
+        } else {
+            Self::Ready
+        }
+    }
+}
 
 pub mod activity;
 pub mod attribution;
@@ -694,6 +733,21 @@ pub struct AppState {
     /// `spawn_startup_tasks` (main.rs) after the daemon binds.
     /// Test: indirectly by the `/health` endpoint tests in `web.rs`.
     pub update_available: Arc<std::sync::Mutex<Option<String>>>,
+    /// Two-phase readiness state — `Warming` until the embedder is initialised,
+    /// then `Ready` (issues #910 / #911).
+    ///
+    /// Why: `AppState::embedder()` used to call `FastEmbedder::new()` without
+    /// any timeout, so the first `memory_recall`/`memory_remember` that arrived
+    /// before CoreML finished compiling would block for 5–11 hours until the
+    /// OnceCell resolved (issue #910). Exposing this state lets the preflight
+    /// guards in `tools.rs` return an explicit fast error immediately —
+    /// `"trusty-memory is warming up, retry shortly"` — instead of queueing
+    /// behind an open-ended init.
+    /// What: An `AtomicU8` starting at `DaemonReadiness::Warming` (0) and flipped
+    /// to `DaemonReadiness::Ready` (1) by `spawn_startup_tasks` after the embedder
+    /// warm-up succeeds.  The transition is one-way and lock-free.
+    /// Test: `daemon_readiness_transitions_warming_to_ready`.
+    pub daemon_readiness: Arc<AtomicU8>,
 }
 
 impl AppState {
@@ -760,6 +814,9 @@ impl AppState {
             pin_project_map: Arc::new(dashmap::DashMap::new()),
             bm25_index_tx,
             update_available: Arc::new(std::sync::Mutex::new(None)),
+            // Start in Warming state; flipped to Ready by spawn_startup_tasks
+            // once the embedder warm-up succeeds (issues #910/#911).
+            daemon_readiness: Arc::new(AtomicU8::new(DaemonReadiness::Warming as u8)),
         }
     }
 
@@ -1184,15 +1241,98 @@ impl AppState {
         });
     }
 
+    /// Return the current readiness state.
+    ///
+    /// Why: tool handlers and the `/health` endpoint need a cheap, lock-free
+    /// way to check whether the embedder has been initialised yet.
+    /// What: loads `daemon_readiness` with `Acquire` ordering so the caller
+    /// sees all writes the startup task made before setting the state.
+    /// Test: `daemon_readiness_transitions_warming_to_ready`.
+    pub fn readiness(&self) -> DaemonReadiness {
+        DaemonReadiness::from_u8(self.daemon_readiness.load(Ordering::Acquire))
+    }
+
+    /// Flip the readiness state from `Warming` to `Ready`.
+    ///
+    /// Why: called by `spawn_startup_tasks` in `main.rs` once the embedder
+    /// warm-up succeeds — this is the single state-transition site.
+    /// What: `store(Ready, Release)` so subsequent `Acquire` loads in handlers
+    /// observe a consistent state.  Idempotent: calling it multiple times is
+    /// harmless.
+    /// Test: `daemon_readiness_transitions_warming_to_ready`.
+    pub fn set_ready(&self) {
+        self.daemon_readiness
+            .store(DaemonReadiness::Ready as u8, Ordering::Release);
+    }
+
+    /// Return `Ok(())` when `Ready`, or an explicit `Err` with the warming
+    /// message when still `Warming`.
+    ///
+    /// Why: the preflight in every bounded handler calls this and returns the
+    /// error immediately so no embedding / redb I/O is attempted while the
+    /// daemon is still initialising (tracks #911 internally).
+    /// What: cheaply reads `daemon_readiness`; returns the fast error string
+    /// on `Warming`.  Zero allocation on the happy path.
+    /// Test: covered by `tools::tests::remember_returns_warming_error_while_state_is_warming`.
+    pub fn readiness_check(&self) -> Result<()> {
+        if self.readiness() == DaemonReadiness::Warming {
+            return Err(anyhow::anyhow!(
+                "trusty-memory is warming up (embedder initialising); \
+                 please retry in a few seconds"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Obtain the shared `FastEmbedder` instance, initialising it on first call.
+    ///
+    /// Why: centralises lazy embedder access so every tool handler goes through
+    /// one bounded init path (tracks #910 internally).
+    /// What: wraps `OnceCell::get_or_try_init` with a timeout so a slow
+    /// CoreML/CUDA first-compile cannot block a handler indefinitely.  On
+    /// timeout the `OnceCell` is left unresolved and the next caller retries.
+    ///
+    /// **Callers on the request path MUST call `readiness_check()` before
+    /// this method.**  The four guarded handlers (`memory_remember`,
+    /// `memory_recall`, `memory_recall_deep`, `memory_note`) do so; any new
+    /// handler that calls `embedder()` must follow the same pattern.
+    /// Reaching this method while still `Warming` is not a bug — the warm-up
+    /// task itself calls `embedder()` while in `Warming` state — but request
+    /// handlers should have short-circuited before here via `readiness_check()`.
+    ///
+    /// The `readiness_check()` preflight is the PRIMARY guard (fast rejection
+    /// with no I/O).  This timeout is the last-resort backstop in case a
+    /// handler bypasses the preflight or the warm-up task itself hits a
+    /// pathological init delay.  If this timeout fires the `OnceCell` is left
+    /// in the unresolved state and the next call retries from scratch.
     pub async fn embedder(&self) -> Result<Arc<FastEmbedder>> {
+        use trusty_common::memory_core::timeouts;
         let cell = self.embedder.clone();
-        let embedder = cell
-            .get_or_try_init(|| async {
+        let timeout = timeouts::embedder_init_timeout();
+        // `readiness_check()` is the PRIMARY guard — handlers return a fast
+        // warming error before reaching here.  This timeout is the last-resort
+        // backstop: if the embedder init races past the preflight (e.g. in the
+        // warm-up task itself, which calls embedder() while still Warming) or
+        // the CoreML/CUDA compile stalls, we fail fast rather than blocking
+        // indefinitely.  On timeout the OnceCell stays unresolved; the next
+        // caller will retry the init from scratch.
+        let embedder = tokio::time::timeout(
+            timeout,
+            cell.get_or_try_init(|| async {
                 let e = FastEmbedder::new().await?;
                 Ok::<Arc<FastEmbedder>, anyhow::Error>(Arc::new(e))
-            })
-            .await?
-            .clone();
+            }),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "AppState::embedder() timed out after {:?}; \
+                 the CoreML/CUDA model is taking unusually long to compile — \
+                 increase TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS if needed",
+                timeout
+            )
+        })??
+        .clone();
         Ok(embedder)
     }
 }
@@ -1811,6 +1951,29 @@ mod tests {
         unsafe {
             std::env::set_var("TRUSTY_SKIP_PALACE_ENFORCEMENT", "1");
         }
+        let state = AppState::new(root);
+        // Pre-existing tests exercise functional paths — flip to Ready so the
+        // issue #911 warming preflight does not reject them.
+        state.set_ready();
+        (state, tmp)
+    }
+
+    /// Why: DaemonReadiness tests need a state that starts in Warming; this
+    /// variant skips `set_ready()` so the transition can be tested explicitly.
+    /// Test: `daemon_readiness_transitions_warming_to_ready`,
+    ///       `readiness_check_ok_when_ready_err_when_warming`.
+    fn test_state_warming() -> (AppState, tempfile::TempDir) {
+        // Use OnceLock so the env var is written exactly once across all
+        // parallel test threads — avoids the unsynchronised set_var race while
+        // remaining consistent with the idempotent-write approach used in
+        // `test_state()`.
+        static SKIP_ENFORCEMENT_SET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SKIP_ENFORCEMENT_SET.get_or_init(|| unsafe {
+            std::env::set_var("TRUSTY_SKIP_PALACE_ENFORCEMENT", "1");
+        });
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Deliberately do NOT call set_ready() — stays in Warming state.
         (AppState::new(root), tmp)
     }
 
@@ -1992,6 +2155,9 @@ mod tests {
             .expect("create_palace");
 
         let state = AppState::new(root).with_default_palace(Some("default-pal".to_string()));
+        // Flip to Ready so the readiness preflight (#911) does not reject the
+        // `memory_remember` call below.
+        state.set_ready();
 
         // (a) initialize advertises the default.
         let init = handle_message(
@@ -2726,6 +2892,66 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("TRUSTY_BM25_DAEMON", v) },
             None => unsafe { std::env::remove_var("TRUSTY_BM25_DAEMON") },
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Issues #910 / #911 — DaemonReadiness
+    // -------------------------------------------------------------------------
+
+    /// Why (issue #910/#911): `AppState` starts in `Warming` state; `set_ready`
+    /// must flip it to `Ready` atomically; subsequent `readiness()` calls must
+    /// observe `Ready`.
+    /// What: construct a state, assert `Warming`, call `set_ready`, assert
+    /// `Ready`.
+    /// Test: this test.
+    #[tokio::test]
+    async fn daemon_readiness_transitions_warming_to_ready() {
+        let (state, _tmp) = test_state_warming();
+        assert_eq!(
+            state.readiness(),
+            DaemonReadiness::Warming,
+            "daemon must start in Warming state"
+        );
+        state.set_ready();
+        assert_eq!(
+            state.readiness(),
+            DaemonReadiness::Ready,
+            "daemon must be Ready after set_ready()"
+        );
+    }
+
+    /// Why (issue #911): `readiness_check` must return `Ok(())` when Ready and
+    /// an explicit `Err` when Warming, so tool handlers can use `?` to short-
+    /// circuit without blocking.
+    /// What: verify both states.
+    /// Test: this test.
+    #[tokio::test]
+    async fn readiness_check_ok_when_ready_err_when_warming() {
+        let (state, _tmp) = test_state_warming();
+        // Warming → should error.
+        let err = state
+            .readiness_check()
+            .expect_err("readiness_check must fail when Warming");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("warming up"),
+            "error must mention 'warming up'; got: {msg}"
+        );
+        // Ready → should succeed.
+        state.set_ready();
+        state
+            .readiness_check()
+            .expect("readiness_check must succeed when Ready");
+    }
+
+    /// Why (issue #911): `DaemonReadiness::from_u8` must map 0 → Warming and
+    /// any non-zero → Ready.
+    /// Test: this test.
+    #[test]
+    fn daemon_readiness_from_u8() {
+        assert_eq!(DaemonReadiness::from_u8(0), DaemonReadiness::Warming);
+        assert_eq!(DaemonReadiness::from_u8(1), DaemonReadiness::Ready);
+        assert_eq!(DaemonReadiness::from_u8(255), DaemonReadiness::Ready);
     }
 
     // -------------------------------------------------------------------------
