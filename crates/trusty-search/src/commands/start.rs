@@ -169,6 +169,10 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
     // ── Phase 1: legacy indexes (indexes.toml) ─────────────────────────────
     let legacy_entries = collect_legacy_entries();
     let mut seen_ids: HashSet<String> = HashSet::new();
+    // Issue #860: track canonicalized root_paths from legacy entries so that
+    // Phase 2 can suppress colocated entries for the same root even when
+    // the two ID schemes differ (basename vs. full-path-sanitized).
+    let mut seen_root_paths: HashSet<std::path::PathBuf> = HashSet::new();
 
     if legacy_entries.is_empty() {
         tracing::warn!(
@@ -198,6 +202,17 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
         let mut legacy_skipped: usize = 0;
         for entry in legacy_entries {
             seen_ids.insert(entry.id.clone());
+            // Issue #860: record the canonicalized root_path BEFORE the
+            // inaccessible-volume guard so Phase 2 never duplicates this root
+            // even if the legacy restore is skipped.
+            //
+            // Intentional: even when a legacy entry is skipped (inaccessible
+            // volume), the colocated scan is independently filtered by
+            // `inaccessible_volumes` (via `is_on_inaccessible_volume`), so a
+            // colocated entry for the same root would be skipped anyway. Inserting
+            // the root_path here is therefore safe — it cannot suppress a colocated
+            // entry that would otherwise succeed.
+            seen_root_paths.insert(canonicalize_best_effort(&entry.root_path));
             if is_on_inaccessible_volume(&entry.root_path, &inaccessible_volumes) {
                 tracing::warn!(
                     "warm-boot: skipping index '{}' — volume {} inaccessible (issue #723)",
@@ -243,7 +258,10 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             Err(_) => std::collections::HashSet::new(),
         }
     };
-    let colocated_entries = collect_colocated_entries(&seen_ids, &colocated_inaccessible).await;
+    // Issue #860: pass seen_root_paths so the colocated scan suppresses ghost
+    // entries whose root is already owned by a legacy entry (even if the IDs differ).
+    let colocated_entries =
+        collect_colocated_entries(&seen_ids, &seen_root_paths, &colocated_inaccessible).await;
 
     if colocated_entries.is_empty() {
         tracing::debug!("warm-boot: no additional colocated indexes discovered");
@@ -443,22 +461,14 @@ pub(crate) fn try_locate_moved_root(
 /// path from a previous registration. Re-canonicalizing at warm-boot makes
 /// `handle.root_path` match the absolute paths that the indexer stored in
 /// chunk records, preventing `file_is_within_root` from dropping valid results.
+/// This is a re-export of the canonical implementation that lives in
+/// `service::warm_boot` (where it is also used for Phase 2 root-path dedup, #860
+/// / #864) so both call sites use the same function and their fallback behaviour
+/// (raw path on error, `debug` log) is guaranteed identical.
 /// What: calls `std::fs::canonicalize`; on `Err` logs at `debug` level and
 /// returns the original path unchanged so warm-boot is never blocked.
 /// Test: `warm_boot_canonicalize_best_effort_*` unit tests in this module.
-pub(crate) fn canonicalize_best_effort(path: &std::path::Path) -> std::path::PathBuf {
-    match std::fs::canonicalize(path) {
-        Ok(canonical) => canonical,
-        Err(e) => {
-            tracing::debug!(
-                "warm-boot: could not canonicalize root_path {}: {} (using stored path)",
-                path.display(),
-                e,
-            );
-            path.to_path_buf()
-        }
-    }
-}
+pub(crate) use crate::service::warm_boot::canonicalize_best_effort;
 
 /// Register one index entry into the in-memory registry, restoring HNSW + corpus.
 ///
