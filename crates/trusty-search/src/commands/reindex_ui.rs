@@ -134,7 +134,21 @@ pub(crate) enum BarState {
 // ─── Style helpers ────────────────────────────────────────────────────────────
 
 /// Label prefix for each slot (matches the 4 stages in issue #401 order).
-const STAGE_LABELS: [&str; 4] = ["Crawl", "Chunk", "Embed", "KG"];
+///
+/// Slot 2 uses "Embed*" — the asterisk is **intentional**: it signals that
+/// during the Embed phase the consumer (BM25 + HNSW upsert + redb) runs
+/// concurrently with the producer (parse+embed), so the two subsystems
+/// overlap in wall-clock time.  The footnote `EMBED_STAR_NOTE` explains this
+/// annotation in the post-reindex timing breakdown.  Do not remove the `*`.
+const STAGE_LABELS: [&str; 4] = ["Crawl", "Chunk", "Embed*", "KG"];
+
+/// Footnote displayed beneath the timing breakdown to explain the Embed* bar
+/// annotation in the live progress display.
+///
+/// NOTE (forward-compat): a future "searchable now; embeddings N% backfilling"
+/// line can be added adjacent to this constant when deferred-embed is supported.
+const EMBED_STAR_NOTE: &str =
+    "  * Embed bar runs concurrently with BM25 + vector-upsert commit (overlapping pipeline)";
 
 /// Build the `ProgressStyle` for a bar in each of the three lifecycle states.
 ///
@@ -522,69 +536,124 @@ impl ReindexUi {
 
 // ─── Timing breakdown (re-exported from here so engine.rs stays lean) ─────────
 
-/// Print the per-phase indexing time breakdown after a successful reindex.
+/// Format the per-phase indexing time breakdown into a `String`.
 ///
-/// Why: gives the operator proof that each phase (parse/chunk, embed, vector
-/// upsert, BM25, knowledge graph) actually ran and how long each took. The
-/// daemon reports these as a post-hoc `timings` payload on the terminal
-/// `complete` SSE event — they cannot be streamed live because the daemon's
-/// orchestrator fuses parse/embed/commit per batch and runs BM25/KG/upsert as
-/// finalization. The vector-count check is the smoking-gun signal for the
-/// "embedder silently fell back to BM25" failure mode — printed as a loud
-/// warning so it can never go unnoticed.
-/// What: a 5-line phase breakdown (Parse/chunk, Embed, Upsert vectors, BM25,
-/// Knowledge graph), with the Embed line replaced by a warning when
-/// `vector_count == 0` despite non-zero chunks (the BM25-only-mode signal).
-/// Test: `tests::timing_breakdown_*` exercise the warning and normal paths.
-pub fn print_timing_breakdown(t: &ReindexTimings, total_chunks: u64) {
+/// Why: separating the formatting logic from the print call allows unit tests
+/// to assert on the actual rendered text rather than on a local copy of the
+/// template strings — a refactor that changes the output now fails the test
+/// rather than silently diverging.
+/// What: returns the full multi-line breakdown string.  Every path — including
+/// the vector>0 footnote path and the BM25-only path — ends with exactly one
+/// trailing `\n` so `print_timing_breakdown`'s `print!` leaves the cursor on
+/// a fresh line without needing `println!`.
+/// Test: `tests::timing_breakdown_contains_overlap_disclaimer` and related
+/// tests assert on the returned string directly; `tests::timing_breakdown_ends_with_newline`
+/// asserts the single trailing `\n` invariant for both paths.
+pub fn format_timing_breakdown(t: &ReindexTimings, total_chunks: u64, elapsed_ms: u64) -> String {
+    let mut out = String::new();
+
     // Issue #744: show walk time first so the phase breakdown is in pipeline order.
     if t.walk_ms > 0 {
-        println!(
-            "  {} {:>7}",
+        out.push_str(&format!(
+            "  {} {:>7}\n",
             "File walk:     ".dimmed(),
             fmt_elapsed(t.walk_ms),
-        );
+        ));
     }
-    println!(
-        "  {} {:>7}  ({} chunks)",
-        "Parse/chunk:   ".dimmed(),
-        fmt_elapsed(t.parse_ms),
+    // Wall-clock total — the single authoritative number the operator should
+    // trust.  All subsystem times below overlap; this is the real duration.
+    out.push_str(&format!(
+        "  {} {:>7}\n",
+        "Wall-clock total:".bold(),
+        fmt_elapsed(elapsed_ms),
+    ));
+
+    // Pipeline subsystem times — overlapping, informational only.
+    out.push_str(&format!(
+        "  {}\n",
+        "Pipeline (overlapping \u{2014} subsystem times do not sum to total):".dimmed()
+    ));
+    let parse_line = format!("{} {:>7}", "parse  ".dimmed(), fmt_elapsed(t.parse_ms));
+    out.push_str(&format!(
+        "    {}  ({} chunks)\n",
+        parse_line,
         format_with_commas(total_chunks),
-    );
+    ));
     if t.vector_count == 0 && total_chunks > 0 {
-        println!(
-            "  {} {}",
-            "Embed:         ".dimmed(),
+        out.push_str(&format!(
+            "    {} {}\n",
+            "embed  ".dimmed(),
             "SKIPPED (embedder unavailable \u{2014} BM25-only mode)"
                 .yellow()
                 .bold(),
-        );
+        ));
     } else {
-        println!(
-            "  {} {:>7}  ({} vectors)",
-            "Embed:         ".dimmed(),
-            fmt_elapsed(t.embed_ms),
+        let embed_line = format!("{} {:>7}", "embed  ".dimmed(), fmt_elapsed(t.embed_ms));
+        out.push_str(&format!(
+            "    {}  ({} vectors)\n",
+            embed_line,
             format_with_commas(t.vector_count),
-        );
+        ));
     }
-    println!(
-        "  {} {:>7}  ({} vectors)",
-        "Upsert vectors:".dimmed(),
-        fmt_elapsed(t.vector_upsert_ms),
+    // bm25 and upsert: the vector count is parenthetical to upsert only —
+    // "(N vectors upserted)" makes it unambiguous which subsystem the count
+    // belongs to.  bm25 has no per-call vector annotation.
+    let bm25_line = format!("{} {:>7}", "bm25   ".dimmed(), fmt_elapsed(t.bm25_ms));
+    let upsert_line = format!(
+        "{} {:>7}",
+        "upsert ".dimmed(),
+        fmt_elapsed(t.vector_upsert_ms)
+    );
+    out.push_str(&format!(
+        "    {} \u{00b7} {} ({} vectors upserted)\n",
+        bm25_line,
+        upsert_line,
         format_with_commas(t.vector_count),
+    ));
+
+    // KG is a genuine tail stage — it runs after the batch loop completes.
+    let kg_line = format!(
+        "{} {:>7}",
+        "Knowledge graph (tail stage):".dimmed(),
+        fmt_elapsed(t.kg_ms)
     );
-    println!(
-        "  {} {:>7}",
-        "BM25 index:    ".dimmed(),
-        fmt_elapsed(t.bm25_ms)
-    );
-    println!(
-        "  {} {:>7}  ({} symbols, {} edges)",
-        "Knowledge graph:".dimmed(),
-        fmt_elapsed(t.kg_ms),
+    out.push_str(&format!(
+        "  {}  ({} symbols, {} edges)\n",
+        kg_line,
         format_with_commas(t.symbol_count),
         format_with_commas(t.edge_count),
-    );
+    ));
+    // Footnote for the Embed* bar label — only meaningful when vectors were
+    // actually committed (BM25-only mode has no concurrent upsert to explain).
+    //
+    // Newline discipline: the KG line above already ends with `\n`, so the
+    // BM25-only path (no footnote) terminates correctly.  The vector>0 path
+    // appends the footnote text and then its own `\n`, so both paths end with
+    // exactly one trailing newline.  `print!` in `print_timing_breakdown` then
+    // leaves the cursor on a fresh line without needing a `println!` wrapper.
+    if t.vector_count > 0 {
+        out.push_str(&EMBED_STAR_NOTE.dimmed().to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Print the per-phase indexing time breakdown after a successful reindex.
+///
+/// Why: gives the operator proof that each subsystem ran and how long it took.
+/// The breakdown must be **honest about the pipeline architecture**: the daemon
+/// runs a producer (parse + embed, no write lock) concurrently with a consumer
+/// (commit = BM25 + HNSW upsert + redb, holds write lock), so the subsystem
+/// times overlap and do NOT sum to the wall-clock total.  Displaying them as a
+/// stacked sequential list implied a false causal ordering and made the numbers
+/// look wrong (they don't add up).
+///
+/// What: delegates to `format_timing_breakdown` and prints the result.
+/// Test: `tests::timing_breakdown_*` exercise warning and normal paths on the
+/// `format_timing_breakdown` helper; this function is exercised by the
+/// smoke-test calls in the same suite.
+pub fn print_timing_breakdown(t: &ReindexTimings, total_chunks: u64, elapsed_ms: u64) {
+    print!("{}", format_timing_breakdown(t, total_chunks, elapsed_ms));
 }
 
 /// Per-subsystem indexing timings parsed from the SSE `complete` event.
@@ -1066,7 +1135,7 @@ mod tests {
     /// Why: the BM25-only warning path exercises a branch that historically
     /// panicked on a formatting mismatch; pinning it here prevents regression.
     /// What: calls `print_timing_breakdown` with `vector_count = 0` and non-zero
-    /// chunks; asserts no panic.
+    /// chunks and a wall-clock total; asserts no panic.
     /// Test: this test.
     #[test]
     fn timing_breakdown_bm25_only_does_not_panic() {
@@ -1081,7 +1150,7 @@ mod tests {
             symbol_count: 10,
             edge_count: 4,
         };
-        print_timing_breakdown(&t, 1_234);
+        print_timing_breakdown(&t, 1_234, 1_500);
     }
 
     /// `print_timing_breakdown` must not panic for a normal completion with
@@ -1089,8 +1158,8 @@ mod tests {
     ///
     /// Why: the normal path has the same format; pinning it here ensures both
     /// paths are regression-tested.
-    /// What: calls `print_timing_breakdown` with realistic values; asserts no
-    /// panic.
+    /// What: calls `print_timing_breakdown` with realistic values and a
+    /// wall-clock total; asserts no panic.
     /// Test: this test.
     #[test]
     fn timing_breakdown_normal_does_not_panic() {
@@ -1105,7 +1174,170 @@ mod tests {
             symbol_count: 14_823,
             edge_count: 41_002,
         };
-        print_timing_breakdown(&t, 62_926);
+        print_timing_breakdown(&t, 62_926, 95_000);
+    }
+
+    /// `format_timing_breakdown` output must contain the "overlapping / does not
+    /// sum" disclaimer, the wall-clock total line, and label KG as "tail stage".
+    ///
+    /// Why: the previous version of this test asserted on a locally-constructed
+    /// copy of the disclaimer string rather than on the actual rendered output,
+    /// meaning a refactor could silently remove the text while the test still
+    /// passed.  This version calls `format_timing_breakdown` and asserts on the
+    /// real string it returns.
+    /// What: calls `format_timing_breakdown` with vectors > 0, checks that the
+    /// rendered output contains "overlapping", "do not sum", "Wall-clock total",
+    /// "tail stage", a wall-clock time string, and the EMBED_STAR_NOTE footnote.
+    /// Test: this test.
+    #[test]
+    fn timing_breakdown_contains_overlap_disclaimer() {
+        // Disable ANSI color codes so assertions match plain text regardless of
+        // TERM, CLICOLOR_FORCE, or NO_COLOR in the test environment.
+        colored::control::set_override(false);
+        let t = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 5_000,
+            embed_ms: 90_000,
+            bm25_ms: 1_200,
+            vector_upsert_ms: 3_400,
+            kg_ms: 800,
+            vector_count: 62_926,
+            symbol_count: 14_823,
+            edge_count: 41_002,
+        };
+        let out = format_timing_breakdown(&t, 62_926, 95_000);
+        assert!(
+            out.contains("overlapping"),
+            "output must contain 'overlapping'; got:\n{out}"
+        );
+        assert!(
+            out.contains("do not sum"),
+            "output must contain 'do not sum'; got:\n{out}"
+        );
+        assert!(
+            out.contains("Wall-clock total"),
+            "output must contain 'Wall-clock total'; got:\n{out}"
+        );
+        assert!(
+            out.contains("tail stage"),
+            "output must contain 'tail stage' for KG; got:\n{out}"
+        );
+        // Wall-clock time string must be non-empty (fmt_elapsed sanity).
+        assert!(
+            !fmt_elapsed(95_000).is_empty(),
+            "fmt_elapsed must return a non-empty string"
+        );
+        // Footnote must be present when vectors > 0.
+        assert!(
+            out.contains("overlapping pipeline"),
+            "EMBED_STAR_NOTE footnote must appear when vector_count > 0; got:\n{out}"
+        );
+        // Smoke-test the print path too (no panic = structural correctness).
+        print_timing_breakdown(&t, 62_926, 95_000);
+    }
+
+    /// The EMBED_STAR_NOTE footnote must be absent in BM25-only mode and present
+    /// when vectors were committed.
+    ///
+    /// Why: printing the "Embed* runs concurrently with BM25 + vector-upsert"
+    /// footnote when no vectors were upserted is misleading — there was no
+    /// concurrent commit to explain.
+    /// What: calls `format_timing_breakdown` with vector_count==0 and asserts
+    /// the footnote is absent; then repeats with vector_count>0 and asserts it
+    /// is present.
+    /// Test: this test.
+    #[test]
+    fn embed_star_footnote_guarded_by_vector_count() {
+        // Disable ANSI color codes so substring assertions match plain text
+        // regardless of TERM / CLICOLOR_FORCE in the test environment.
+        colored::control::set_override(false);
+        let bm25_only = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 1_000,
+            embed_ms: 0,
+            bm25_ms: 200,
+            vector_upsert_ms: 0,
+            kg_ms: 50,
+            vector_count: 0,
+            symbol_count: 10,
+            edge_count: 4,
+        };
+        let out_bm25 = format_timing_breakdown(&bm25_only, 1_234, 1_500);
+        assert!(
+            !out_bm25.contains("overlapping pipeline"),
+            "EMBED_STAR_NOTE must be absent when vector_count==0; got:\n{out_bm25}"
+        );
+
+        let with_vectors = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 5_000,
+            embed_ms: 90_000,
+            bm25_ms: 1_200,
+            vector_upsert_ms: 3_400,
+            kg_ms: 800,
+            vector_count: 62_926,
+            symbol_count: 14_823,
+            edge_count: 41_002,
+        };
+        let out_vec = format_timing_breakdown(&with_vectors, 62_926, 95_000);
+        assert!(
+            out_vec.contains("overlapping pipeline"),
+            "EMBED_STAR_NOTE must be present when vector_count>0; got:\n{out_vec}"
+        );
+    }
+
+    /// The `(N vectors upserted)` annotation must appear adjacent to the upsert
+    /// timing, not shared ambiguously between bm25 and upsert.
+    ///
+    /// Why: the previous format was `bm25 1.2s · upsert 3.4s (62,926 vectors)`
+    /// which could be read as the count belonging to both subsystems.  The fix
+    /// appends "upserted" to make ownership unambiguous.
+    /// What: asserts "vectors upserted" appears in the rendered output and that
+    /// the upsert line contains the vector count.
+    /// Test: this test.
+    #[test]
+    fn upsert_vector_count_annotation_is_unambiguous() {
+        // Disable ANSI color codes so substring assertions match plain text
+        // regardless of TERM / CLICOLOR_FORCE in the test environment.
+        colored::control::set_override(false);
+        let t = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 5_000,
+            embed_ms: 90_000,
+            bm25_ms: 1_200,
+            vector_upsert_ms: 3_400,
+            kg_ms: 800,
+            vector_count: 62_926,
+            symbol_count: 14_823,
+            edge_count: 41_002,
+        };
+        let out = format_timing_breakdown(&t, 62_926, 95_000);
+        assert!(
+            out.contains("vectors upserted"),
+            "output must contain 'vectors upserted' to unambiguously attribute the \
+             count to the upsert subsystem; got:\n{out}"
+        );
+        assert!(
+            out.contains("62,926"),
+            "output must contain formatted vector count; got:\n{out}"
+        );
+    }
+
+    /// `STAGE_LABELS[2]` must contain the asterisk annotation that signals
+    /// concurrent BM25+vector commit during the Embed phase.
+    ///
+    /// Why: the live bar label is the first place operators see the "Embed*"
+    /// annotation; a regression here would silently remove the concurrent-
+    /// pipeline signal.
+    /// What: asserts `STAGE_LABELS[2]` contains `"*"`.
+    /// Test: this test.
+    #[test]
+    fn stage_label_embed_has_concurrent_annotation() {
+        assert!(
+            STAGE_LABELS[2].contains('*'),
+            "Embed stage label must carry '*' to signal concurrent commit; got {:?}",
+            STAGE_LABELS[2]
+        );
     }
 
     /// `print_timing_breakdown` with `walk_ms > 0` must print the "File walk"
@@ -1129,6 +1361,69 @@ mod tests {
             edge_count: 8_000,
         };
         // No assertion on output text — just no panic.
-        print_timing_breakdown(&t, 10_000);
+        print_timing_breakdown(&t, 10_000, 44_000);
+    }
+
+    /// `format_timing_breakdown` must end with exactly one `\n` in both the
+    /// vector>0 (footnote) path and the BM25-only (no footnote) path.
+    ///
+    /// Why: `print_timing_breakdown` uses `print!` not `println!`; if the
+    /// returned string does not end with `\n` the subsequent output (e.g.
+    /// the post-reindex health check) collides with the last line of the
+    /// breakdown.  Conversely, two trailing newlines insert an unwanted blank
+    /// line.  This test pins the single-`\n` invariant so regressions are
+    /// caught immediately.
+    /// What: calls `format_timing_breakdown` for both the vector>0 and the
+    /// BM25-only case and asserts `ends_with('\n')` and
+    /// `!ends_with("\n\n")` for each.
+    /// Test: this test.
+    #[test]
+    fn timing_breakdown_ends_with_newline() {
+        // Disable ANSI color codes so the string comparison is deterministic.
+        colored::control::set_override(false);
+
+        // vector > 0 path (footnote appended)
+        let with_vectors = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 5_000,
+            embed_ms: 90_000,
+            bm25_ms: 1_200,
+            vector_upsert_ms: 3_400,
+            kg_ms: 800,
+            vector_count: 62_926,
+            symbol_count: 14_823,
+            edge_count: 41_002,
+        };
+        let out_vec = format_timing_breakdown(&with_vectors, 62_926, 95_000);
+        assert!(
+            out_vec.ends_with('\n'),
+            "vector>0 path: output must end with '\\n'; got:\n{out_vec:?}"
+        );
+        assert!(
+            !out_vec.ends_with("\n\n"),
+            "vector>0 path: output must not have double trailing newline; got:\n{out_vec:?}"
+        );
+
+        // BM25-only path (no footnote)
+        let bm25_only = ReindexTimings {
+            walk_ms: 0,
+            parse_ms: 1_000,
+            embed_ms: 0,
+            bm25_ms: 200,
+            vector_upsert_ms: 0,
+            kg_ms: 50,
+            vector_count: 0,
+            symbol_count: 10,
+            edge_count: 4,
+        };
+        let out_bm25 = format_timing_breakdown(&bm25_only, 1_234, 1_500);
+        assert!(
+            out_bm25.ends_with('\n'),
+            "BM25-only path: output must end with '\\n'; got:\n{out_bm25:?}"
+        );
+        assert!(
+            !out_bm25.ends_with("\n\n"),
+            "BM25-only path: output must not have double trailing newline; got:\n{out_bm25:?}"
+        );
     }
 }
