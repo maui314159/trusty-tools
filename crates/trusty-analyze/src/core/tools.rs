@@ -12,7 +12,7 @@
 //! Test: `severity_serializes_lowercase` pins the wire format; the per-tool
 //! impl tests in `tool_impls` exercise `run` against captured fixtures.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,21 @@ pub trait StaticTool: Send + Sync {
     /// (`"rust"`, `"python"`, `"typescript"`, ...).
     fn language(&self) -> &str;
 
+    /// Additional language buckets this tool should also be registered under,
+    /// beyond its primary [`language`](Self::language).
+    ///
+    /// Why: a single binary often lints several `LanguageDetector` tags — e.g.
+    /// biome lints both `"typescript"` and `"javascript"`. Without this, files
+    /// routed to the secondary tag find an empty bucket and are silently
+    /// skipped (the JS half of the #963 class of bug). Defaults to no aliases.
+    /// What: each returned tag gets its own registry entry pointing at this
+    /// tool, in addition to `language()`.
+    /// Test: `aliases_register_tool_under_every_bucket` and
+    /// `biome_covers_typescript_and_javascript`.
+    fn aliases(&self) -> &[&str] {
+        &[]
+    }
+
     /// Cheap availability probe — confirms the backing binary is on `PATH`.
     fn is_available(&self) -> bool;
 
@@ -70,6 +85,55 @@ pub trait StaticTool: Send + Sync {
     /// normalized diagnostics. Returns `Ok(vec![])` when the tool runs cleanly
     /// with no findings; returns `Err` only for unexpected failures.
     fn run(&self, file: &Path, content: &str) -> anyhow::Result<Vec<ToolDiagnostic>>;
+
+    /// Returns true when this tool needs to build the whole compilation unit
+    /// (project / solution / package) rather than analyze files in isolation.
+    ///
+    /// Why: some tools (e.g. `RoslynTool`) can only produce meaningful output
+    /// by invoking the compiler with the full project graph. Dispatching them
+    /// file-by-file in a scratch dir yields nothing because the `.csproj` is
+    /// absent. The dispatcher calls `run_project` for these tools instead of
+    /// the per-file `run` path.
+    /// What: defaults to `false`; override to `true` in tools that require
+    /// a real project tree (currently only `RoslynTool`).
+    /// Test: `RoslynTool::is_project_scoped` test in `tool_impls/csharp.rs`.
+    fn is_project_scoped(&self) -> bool {
+        false
+    }
+
+    /// Run the tool across a set of real on-disk files, building the project
+    /// once and returning diagnostics for all of them.
+    ///
+    /// Why: project-scoped tools build the whole compilation unit once and
+    /// filter to the provided files, so dispatch must hand them real on-disk
+    /// paths and call `run_project` (not per-file `run()`). The default
+    /// implementation falls back to calling `run` per file so the other ten
+    /// tools are unaffected.
+    /// What: default iterates `files`, calls `self.run(f, "")` for each, and
+    /// merges the results. Per-file errors are logged at warn level and
+    /// skipped (log-and-continue) so one failing file does not abort the
+    /// remaining files — this matches the dispatcher's own log-and-continue
+    /// behavior for file-scoped tools. Override in project-scoped tools to
+    /// build once and filter.
+    /// Test: default fallback is exercised by non-project tools in the
+    /// diagnostics pipeline. `RoslynTool`'s override is tested in
+    /// `tool_impls/csharp.rs`.
+    fn run_project(&self, files: &[PathBuf]) -> anyhow::Result<Vec<ToolDiagnostic>> {
+        let mut out = Vec::new();
+        for f in files {
+            match self.run(f, "") {
+                Ok(diags) => out.extend(diags),
+                Err(e) => {
+                    tracing::warn!(
+                        tool = self.name(),
+                        file = %f.display(),
+                        "run_project default: per-file run failed, skipping: {e:#}"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
