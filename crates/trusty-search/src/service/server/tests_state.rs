@@ -276,3 +276,114 @@ async fn health_includes_resource_fields() {
     assert_eq!(resp.disk_bytes, 0, "disk ticker has not ticked yet");
     let _ = resp.rss_limit_mb;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1006 — accept-loop starvation tests
+// ---------------------------------------------------------------------------
+
+/// Issue #1006 — Option B: `try_current_embedder()` must return `None`
+/// immediately when another task holds a write lock on `embedder_slot`
+/// (i.e. `install_embedder` is in progress, e.g. during a 30 s CoreML stall).
+///
+/// Why: the health handler uses `try_current_embedder()` instead of
+/// `current_embedder().await` so it never blocks when the embedder slot is
+/// write-locked. This test is the mechanical proof that `try_read()` returns
+/// `None` under contention rather than deadlocking.
+/// What: acquires a write lock on `embedder_slot`, then calls
+/// `try_current_embedder()` — must return `None` without blocking.
+/// Test: this test.
+#[tokio::test]
+async fn health_non_blocking_when_embedder_slot_write_locked() {
+    let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+
+    // Acquire a write lock to simulate an in-progress install_embedder.
+    let _write_guard = state.embedder_slot.write().await;
+
+    // try_current_embedder must return None without blocking — if this
+    // call were to `.await` the lock it would deadlock in a single-threaded
+    // test context. The test passing proves non-blocking semantics.
+    let result = state.try_current_embedder();
+    assert!(
+        result.is_none(),
+        "try_current_embedder must return None when write lock is held"
+    );
+
+    // Verify health_handler also completes without deadlock while
+    // the write lock is held (embedder_info block will be absent / None).
+    let Json(resp) = health_handler(State(Arc::clone(&state))).await;
+    assert_eq!(
+        resp.status, "ok",
+        "health must return ok even when embedder slot is write-locked"
+    );
+    // embedder_info is None because try_current_embedder returned None.
+    assert!(
+        resp.embedder_info.is_none(),
+        "embedder_info must be absent when slot is write-locked (non-blocking fallback)",
+    );
+}
+
+/// Issue #1006 — Option B: once an embedder is installed, `/health`
+/// surfaces the embedder_info block via the non-blocking `try_current_embedder()`.
+///
+/// Why: `health_handler` must still provide `embedder_info` when the
+/// embedder slot is available (the common steady-state path). This test
+/// guards against accidentally always returning `None`.
+/// What: installs a `MockEmbedder` (384-dim), calls `/health`, and asserts
+/// `embedder_info` is present (non-None) and the response reports "ready".
+/// Test: this test.
+#[tokio::test]
+async fn health_includes_embedder_info_when_ready() {
+    use crate::core::embed::MockEmbedder;
+
+    let state = SearchAppState::new(IndexRegistry::new());
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(384));
+    state.install_embedder(embedder).await;
+    let state_arc = Arc::new(state);
+
+    let Json(resp) = health_handler(State(state_arc)).await;
+    assert_eq!(resp.embedder, "ready");
+    assert!(
+        resp.embedder_info.is_some(),
+        "embedder_info must be present when embedder is installed and slot is uncontended"
+    );
+}
+
+/// Issue #1006 — Option A: the tokio runtime builder must configure at
+/// least 16 worker threads so the accept loop has room to run even when
+/// embed-pool workers saturate the default `num_cpus` thread count.
+///
+/// Why: with only `num_cpus` workers (e.g. 8 on a 4-core machine) and
+/// embed-pool tasks blocking on 30 s sidecar calls, the axum accept loop
+/// is scheduled too rarely, causing health probes to time out.
+/// What: verifies the `worker_thread_count` helper enforces the 16-thread
+/// floor — specifically that a single-CPU machine is lifted to 16, and
+/// that a 32-CPU machine is NOT clamped (returns 32). The helper is also
+/// used in `main()` so this test guards any future removal of the floor.
+/// Test: this test.
+#[test]
+fn worker_thread_count_at_least_16() {
+    use crate::worker_thread_count;
+
+    // Floor: a 1-CPU machine must produce exactly 16 workers.
+    assert_eq!(
+        worker_thread_count(1),
+        16,
+        "worker_thread_count(1) must return 16 (floor enforced)"
+    );
+
+    // Pass-through: a 32-CPU machine must produce exactly 32 workers.
+    assert_eq!(
+        worker_thread_count(32),
+        32,
+        "worker_thread_count(32) must return 32 (no artificial cap)"
+    );
+
+    // Verify the runtime can actually be built with the floor count.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_thread_count(1))
+        .enable_all()
+        .build()
+        .expect("runtime builder must succeed with worker_thread_count(1) == 16");
+    // rt is intentionally dropped immediately — we only needed to verify it builds.
+    drop(rt);
+}

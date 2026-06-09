@@ -23,9 +23,13 @@ pub(super) struct HealthResponse {
     pub(super) embedder: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) embedder_error: Option<String>,
+    /// Process RSS in MB. On `try_lock` contention returns the last
+    /// successfully-sampled value; `0` only before the very first sample.
     pub(super) rss_mb: u64,
     pub(super) rss_limit_mb: u64,
     pub(super) disk_bytes: u64,
+    /// CPU usage percent. Same staleness semantics as `rss_mb`: returns the
+    /// last good sample on contention, `0.0` only before the first sample.
     pub(super) cpu_pct: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) embedder_info: Option<EmbedderInfo>,
@@ -79,6 +83,14 @@ pub(super) async fn health_handler(
     // and `uptime_secs` is wall-clock seconds since AppState construction.
     // Test: register N indexes, GET /health, assert `indexes == N` and
     // `uptime_secs >= 0`.
+    //
+    // Issue #1006 — Option B: this handler MUST NOT block on any contended
+    // lock. An embed stall (CoreML/CUDA) can hold `embedder_slot` in a write
+    // lock for up to 30 s; `.await`-ing it here would block the health handler
+    // for the same duration, causing external probes (trusty-review, open-mpm)
+    // to see a false "daemon down". All lock accesses below use either the
+    // watch-based `is_embedder_ready()` (no lock) or `try_read()` / `try_lock()`
+    // (returns immediately rather than parking the handler).
     let embedder_error = state.current_embedder_error();
     let embedder_status = if state.is_embedder_ready() {
         "ready"
@@ -103,9 +115,34 @@ pub(super) async fn health_handler(
     };
     // Issue #35: sample process RSS + CPU. The sampler is shared behind a
     // Mutex because sysinfo derives CPU% from the delta between refreshes.
-    let (rss_mb, cpu_pct) = {
-        let mut metrics = state.sys_metrics.lock().await;
-        metrics.sample()
+    //
+    // Issue #1006 — Option B: use `try_lock()` instead of `.lock().await` so
+    // the health handler never parks waiting for the sys-metrics lock.
+    //
+    // Issue #1016 review: on contention return the last successfully-sampled
+    // values from the atomic cache instead of zeros — zeroed metrics can
+    // false-alarm monitors that alert on rss_mb == 0 or cpu_pct == 0.
+    let (rss_mb, cpu_pct) = if let Ok(mut metrics) = state.sys_metrics.try_lock() {
+        let (rss, cpu) = metrics.sample();
+        // Update the atomic cache so contended future polls have a real fallback.
+        state
+            .last_rss_mb
+            .store(rss, std::sync::atomic::Ordering::Relaxed);
+        state
+            .last_cpu_pct_bits
+            .store(cpu.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        (rss, cpu)
+    } else {
+        // Lock contended: return the last successfully-sampled values.
+        // Falls back to (0, 0.0) only before the very first sample lands,
+        // which is preferable to blocking the handler.
+        let rss = state.last_rss_mb.load(std::sync::atomic::Ordering::Relaxed);
+        let cpu = f32::from_bits(
+            state
+                .last_cpu_pct_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        (rss, cpu)
     };
     // `rss_limit_mb` mirrors the resolved TRUSTY_MEMORY_LIMIT_MB soft cap.
     // `memory_limit_mb()` returns `None` when no limit is configured.
@@ -113,7 +150,14 @@ pub(super) async fn health_handler(
     let disk_bytes = state.disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
     // Issue #38: surface model detail (dimension + provider) once the embedder
     // is wired so the admin UI's Health view doesn't need a separate request.
-    let embedder_info = state.current_embedder().await.map(|e| {
+    //
+    // Issue #1006 — Option B: use `try_current_embedder()` (non-blocking
+    // `try_read()`) instead of `current_embedder().await`. When the write lock
+    // is held by `install_embedder` during init/hot-swap, fall back to `None`
+    // and return no `embedder_info` block — the status field already carries
+    // the readiness signal. This is correct: the client can re-poll /health on
+    // the next cycle to pick up the info once init completes.
+    let embedder_info = state.try_current_embedder().map(|e| {
         let dimension = e.dimension();
         EmbedderInfo {
             dimension,
