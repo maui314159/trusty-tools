@@ -62,3 +62,7 @@ Proposed ──► Accepted ──► Superseded (by ADR-NNNN)
 | [0002](./0002-single-install-convention.md) | Single-install convention for main crates | Accepted |
 | [0003](./0003-msrv-and-edition-policy.md) | MSRV 1.88 and per-crate Rust edition policy | Accepted |
 | [0004](./0004-three-harnesses-shared-event-driven-common.md) | Three distinct harnesses on a shared event-driven trusty-common foundation | Proposed |
+| [0005](./0005-harness-event-bus.md) | Shared HarnessEvent envelope + process-global event bus in trusty-agents-common | Accepted |
+| [0006](./0006-trusty-controller-naming.md) | Name the stack control plane `trusty-controller` (binary `tctl`) | Accepted |
+| [0007](./0007-tool-contract-versioning-and-verb-model.md) | Monotonic-integer `contract_version` + 3-layer extensible verb model | Accepted |
+| [0008](./0008-project-identity-convention.md) | Project-identity convention: full-path slug of the nearest git root | Accepted |
