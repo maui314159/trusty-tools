@@ -95,16 +95,26 @@ Restart=on-failure
 # restart cascade is the root cause.
 RestartSec=5
 
-# ── Working directory ─────────────────────────────────────────────────────────
-# Set to the data volume. The daemon resolves its facts store and addr file
-# relative to `$HOME/.trusty-tools/trusty-analyze/` (XDG / dirs-rs default)
-# regardless of WorkingDirectory, but pointing WorkingDirectory at the data
-# volume is good practice for log aggregation.
-WorkingDirectory=/data/trusty-analyze
+# ── Working directory & persistent data ──────────────────────────────────────
+# StateDirectory= instructs systemd to create /var/lib/trusty-analyze with the
+# correct ownership (User=trusty) before the service starts, so the directory
+# is always trusty-owned without a root-owned ExecStartPre mkdir step.
+# WorkingDirectory= points at the same path for log-aggregation convenience.
+# The daemon resolves its facts store and http_addr discovery file relative to
+# `$HOME/.trusty-tools/trusty-analyze/` (XDG / dirs-rs default) regardless of
+# WorkingDirectory, so this does not change the path contract for those files.
+StateDirectory=trusty-analyze
+WorkingDirectory=/var/lib/trusty-analyze
 
 # ── Environment ──────────────────────────────────────────────────────────────
 # Core logging level.  Use debug for initial bring-up; info for steady state.
 Environment=RUST_LOG=info
+
+# TRUSTY_SEARCH_URL: the binary accepts this as an alternative to --search-url.
+# Set it here instead of (or in addition to) the --search-url flag above when
+# you want to centralise URL config in one place and keep ExecStart concise.
+# Must match the --search-url value; if both are set, the CLI flag takes precedence.
+# Environment=TRUSTY_SEARCH_URL=http://127.0.0.1:7878
 
 # TRUSTY_SEARCH_URL: base URL of the running trusty-search daemon.
 # Must match the --search-url flag above or be set here instead.
@@ -140,11 +150,6 @@ Environment=RUST_LOG=info
 # Environment=AWS_ACCESS_KEY_ID=…
 # Environment=AWS_SECRET_ACCESS_KEY=…
 # Environment=AWS_SESSION_TOKEN=…
-
-# ── trusty-search URL (alternative to --search-url flag) ─────────────────────
-# Setting TRUSTY_SEARCH_URL here is equivalent to passing --search-url.
-# Useful when the search daemon port changes across environments.
-# Environment=TRUSTY_SEARCH_URL=http://127.0.0.1:7878
 
 # ── ONNX Runtime (load-dynamic builds only) ──────────────────────────────────
 # ORT_DYLIB_PATH: required on Amazon Linux 2023 (glibc < 2.38) with the
