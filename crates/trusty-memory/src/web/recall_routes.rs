@@ -62,6 +62,37 @@ pub(super) async fn recall_handler(
 #[allow(unused_imports)]
 pub(crate) use crate::service::recall_entry_json;
 
+/// Extracts a human-readable error message from a partial-failure envelope.
+///
+/// Why: `recall_all` may return an object with a non-empty `"errors"` array
+/// when one or more palaces fail during fan-out while others succeed. Without
+/// this guard, that envelope passes through as 200 OK and callers receive
+/// silent data loss. Extracting the detection into a pure function lets unit
+/// tests verify every branch directly, without spinning up the HTTP stack.
+/// What: Inspects `value` for a non-empty `"errors"` array. If found, formats
+/// a message from the first entry — plain string, `{"message":"..."}` object,
+/// or a generic fallback — and returns `Some(message)`. Returns `None` when
+/// the array is absent or empty (i.e. no partial failure detected).
+/// Test: `extract_partial_error_*` unit tests in `web::tests::recall_tests`.
+pub(super) fn extract_partial_error(value: &Value) -> Option<String> {
+    let errors = value.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let first = errors
+        .first()
+        .and_then(|e| {
+            e.as_str()
+                .map(str::to_owned)
+                .or_else(|| e.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+        })
+        .unwrap_or_else(|| "partial recall failure".to_owned());
+    Some(format!(
+        "recall_all partial failure ({} error(s)): {first}",
+        errors.len()
+    ))
+}
+
 /// `GET /api/v1/recall?q=<query>&top_k=<n>&deep=<bool>[&palace=<id>]` — recall
 /// with optional palace scoping.
 ///
@@ -76,13 +107,21 @@ pub(crate) use crate::service::recall_entry_json;
 /// present and non-empty, route the recall to that specific palace (matching
 /// the behaviour of `GET /api/v1/palaces/{id}/recall`). When absent, fall back
 /// to the cross-palace fan-out.
+/// Issue #1102: hardened error detection on the cross-palace fan-out path.
+/// `recall_all` now returns either a JSON array (success) or an object
+/// carrying an `"error"` string (full failure). Both are detected; a
+/// non-empty `"errors"` array in any future partial-success envelope is also
+/// surfaced as an internal error rather than silently passed through as 200 OK
+/// (see `extract_partial_error` for the branch logic, which is unit-tested
+/// independently).
 /// What: If `palace` query param is set, delegates to `MemoryService::recall`
-/// for that palace. Otherwise lists all palaces, opens each (skipping any that
-/// fail to open with a warning), and delegates to `execute_recall_all`. Returns
-/// a JSON array of `{ palace_id, drawer, score, layer }` entries sorted by
-/// score descending.
+/// for that palace. Otherwise delegates to `MemoryService::recall_all`.
+/// Returns a JSON array of `{ palace_id, drawer_id, content, score, layer }`
+/// entries sorted by score descending, or a 500 on failure.
 /// Test: `recall_all_handler_honors_palace_filter`,
-/// `recall_all_handler_fans_out_without_palace_param`.
+/// `recall_all_handler_fans_out_without_palace_param`,
+/// `recall_all_handler_surfaces_error_envelope`,
+/// `extract_partial_error_*` (unit tests for the branch logic).
 pub(super) async fn recall_all_handler(
     State(state): State<AppState>,
     Query(q): Query<RecallQuery>,
@@ -102,8 +141,18 @@ pub(super) async fn recall_all_handler(
     let value = crate::service::MemoryService::new(state)
         .recall_all(&q.q, q.top_k.unwrap_or(10), q.deep.unwrap_or(false))
         .await;
+
+    // Issue #1102: surface all failure envelopes rather than only checking the
+    // top-level "error" key. `recall_all` currently returns `{"error":"..."}` on
+    // full failure and a JSON array on success; the `extract_partial_error`
+    // helper guards against a future partial-success envelope carrying a
+    // non-empty "errors" array so that partial failure is never silently
+    // passed through as 200 OK.
     if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
         return Err(ApiError::internal(err.to_string()));
+    }
+    if let Some(msg) = extract_partial_error(&value) {
+        return Err(ApiError::internal(msg));
     }
     Ok(Json(value))
 }
